@@ -288,6 +288,9 @@ main:focus { outline: none; }
   border-color: var(--text-dim);
   color: var(--text-dim);
 }
+/* The discovery picker lists readiness in a badge; on a phone those sentences must wrap instead of
+   widening the table. */
+.battery-picker .badge { white-space: normal; }
 
 .banner {
   border: 1px solid var(--border);

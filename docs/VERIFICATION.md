@@ -1,7 +1,7 @@
 # Verification record — Smart Energy Manager add-on
 
 Authoritative verification record for the tree published from this repository. Every number below
-was produced by a gate named in §7 on the frozen tree; nothing here is a projection. This record
+was produced by a gate named in §8 on the frozen tree; nothing here is a projection. This record
 supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figures in previous
 revisions described pre-audit trees and are obsolete.
 
@@ -15,15 +15,15 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **501 passed** (two consecutive runs) |
+| Test suite | `python3 -m pytest tests -q` | **519 passed** (two consecutive runs) |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 85 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
 
-Frozen digest of the verified artifact (recipe in §7, normative):
+Frozen digest of the verified artifact (recipe in §8, normative):
 
 * **code + tests (73 files, documentation excluded)**:
-  `094ed3017783113a357a2a2782b117925dd611b26decd427fbcdf9124cad13b8`
+  `beee73a5e6a5cd555458072d693eb09b15fcd42f9e85e1caabd232ddd8c84b2d`
 * **path list of the same 73 files** (detects an added, removed or renamed file):
   `553c23454f8aa5a3efbac4a327d1341f4b4b61211871ab1d28ec8fbdfb2d6216`
 
@@ -143,6 +143,8 @@ The final verifier re-ran **13 mutations** against the frozen tree. All 13 are c
 | 12 | The override reserve removed | `test_override_pinning_respects_the_pinned_batterys_own_floor` |
 | 13 | An inexact round-trip split | the `round_trip_efficiency_pct` splitting / exactness tests (`test_round_trip_efficiency_pct_splits_evenly`, `test_round_trip_pct_is_exact_for_common_values`, `test_break_even_uses_the_requested_round_trip`) |
 
+| 14 | `available_kwh` matched the `capacity` role again (the pre-0.2.0 role hint), or its role stopped resolving to `available_kwh_entity` | `test_usable_energy_is_not_offered_as_capacity` (proved failing on the old vocabulary), `test_the_energy_roles_map_to_different_driver_keys` |
+
 Honest notes on this table: mutations 4 and 11 were **initially survivors on the previous hash** and
 were closed by adding a two-battery barrier test (mutation 4) and a port-hold assertion
 (mutation 11). The verifier also corrected one of its own earlier mutants — it had released the file
@@ -169,7 +171,44 @@ regressions; it proves these specific, previously demonstrated defects cannot re
 
 ---
 
-## 5. R1 scanner (`tools/audit.sh`)
+## 5. The battery picker (0.2.0), checked against a real registry
+
+The battery dialog used to ask for a slug. It now lists the batteries discovery can see, filters them
+as the user types, and fills the whole form from one row. That behaviour sits on data no synthetic
+test could anticipate, so it was checked twice: by the suite (node-eval of the pure helpers, plus mock
+and manifest parity) and against the live instance's own registries.
+
+Rows are grouped per device (entity-registry `device_id`, enriched from the device registry by
+`Engine.discover`), and a group becomes a picker row only when it is plausibly a battery: a known
+battery platform, or at least one control role together with one state role. On the real registry that
+is 50 candidate rows over **13 device groups: 3 offered, 10 rejected** — a thermostat, a printer, a
+toothbrush, four phones, a bridge, an add-on's `running` binary sensor and a tuya device, each of
+which matched a lone `soc`, `connection` or `manual_mode` hypothesis.
+
+Three things were visible only on real data, and each changed the result:
+
+* **limits.** The device publishes its charge and discharge limit entities as positive-only ranges
+  (`0…1000 W`, `0…800 W`). A sign-based prefill would have written the charge bound into the discharge
+  field; the prefill is role-aware, so each limit comes from its own entity, and on the live rows it
+  fills `max_charge_w = 1000` and `max_discharge_w = 800`.
+* **usable energy versus capacity.** `available_kwh` (usable energy above `min_soc`, reading `-0.0384`
+  on the live battery) and `total_kwh` (the pack, `1.92`) both matched the single `capacity` role at
+  equal confidence, and the tie-break chose the first alphabetically: the wizard would have written a
+  momentary reading into `capacity_entity`. Usable energy now has its own role and its own driver key,
+  the picker maps `capacity_entity` to the pack figure and `available_kwh_entity` to the usable one,
+  and it prefills the capacity from the former. `test_usable_energy_is_not_offered_as_capacity` was
+  proved failing against the old vocabulary; mutation 14 records the regression.
+* **writability.** Control roles require a writable entity (`number`/`select`/…). The live registry
+  contains a device whose control-role matches are all read-only sensors, which would otherwise rank
+  equal to the real battery; it is now reported as `control entities are read-only`, ranked below, and
+  given no control role by the auto-mapping.
+
+From that one click on the live battery the picker fills: driver `zendure`, **10 roles** mapped,
+capacity `1.92 kWh`, charge `1000 W`, discharge `800 W`.
+
+---
+
+## 6. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:
 
@@ -192,18 +231,27 @@ value that may be sensitive.
 
 ---
 
-## 6. What is not verified
+## 7. What is not verified
 
 * **No real battery or Zendure hardware.** Driver behaviour is asserted against the documented
   integration semantics and a fake over loopback, not observed on a device.
 * **No live price, PV or load provider calls.** The fallback chain and rate-limit handling were
   exercised with injected fakes; real payloads, headers and timezone edge cases remain unverified.
-* **No full add-on install.** The packaged image's entrypoint was verified from a locally built
-  image: `/bin/sh /run.sh` without a token exits 1 with the clear message, and with a token it execs
-  the app. The Home Assistant Supervisor install path itself was not exercised.
+* **No behaviour on real hardware.** The add-on *is* installed and running on the owner's Home
+  Assistant in advisory mode with `dry_run: true`, but no battery, price or solar entity is mapped
+  yet, so nothing here proves it plans correctly on that instance. The packaged image's entrypoint was
+  verified both ways from a locally built image (without a token it exits 1 with the clear message,
+  with one it execs the app), and the two defects the real install did find are recorded in §2.
 * **Threaded timing** is asserted with deterministic barriers, not wall-clock races.
 * **A persisted plan is never restored**, so the stored plan summary's efficiency fields matter only
   on the API path — no on-disk plan is resumed after a restart.
+* **The picker has not been clicked through in a real browser** by this author: its pure helpers are
+  exercised in node and a stub DOM was driven once during development, but the suite contains no DOM
+  test and no human click-through is recorded here. The live-registry check in §5 replaces what a
+  synthetic fixture cannot provide, not what a browser would.
+* **Saving a battery after a *Select*** (`POST /api/v1/batteries`) is covered by the API contract
+  tests but has not been exercised against the live instance; nothing was added to the running
+  add-on's configuration during this work.
 
 Known behaviour, accepted and deliberate:
 
@@ -214,7 +262,7 @@ Known behaviour, accepted and deliberate:
 
 ---
 
-## 7. How to reproduce
+## 8. How to reproduce
 
 No network access and no hardware are needed for any command below.
 
@@ -222,7 +270,7 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 501 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 519 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 

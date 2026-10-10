@@ -87,7 +87,21 @@ and the exact `seconds` from the response, with `ok: false` shown as `FAILED` pl
 and message. Add/edit opens a wizard that lists role inputs per driver, loads candidates
 from `GET /api/v1/discover?kind=battery` (max 50 rows, optional search filter) and assigns a
 candidate to a role on selection; validation rejects an incomplete generic mapping before any
-request; saving shows a confirmation dialog listing the exact mapping. The efficiency field is one
+request; saving shows a confirmation dialog listing the exact mapping. A **Find a battery** block
+sits above the form: it reads the same discovery rows once on open, groups them per device
+(`device_id`, or entity id when the server reports none) and lists only groups that could be a
+battery — a known battery platform, or a control role plus a state role, where a control role must
+be a *writable* entity (`number`/`select`/`input_number`/`input_select`/`switch`), because
+discovery also suggests sensors for setpoint roles and a battery that cannot be driven is not a
+battery. Rows are ranked by control-readiness, then mappable roles, then confidence; each row shows
+the device label, model/manufacturer, platform, how many roles are mappable and a `control-ready` /
+`partial — missing …` / `control entities are read-only` badge. `Select` fills id (slugified,
+made unique), name, driver (`zendure` on `platform: zendure_ha` or a zendure-only role, else
+`generic`), the best mapping per role at ≥ 0.5 confidence and the numbers the rows state
+(capacity in kWh, charge/discharge limits from the mapped entity's `min`/`max`, never the SoC
+window), and the note under it says what was filled and that it still needs confirming. Search
+filters locally over device name, manufacturer, model, platform and entity id, and only falls back
+to the server's entity-text search when the local filter finds nothing. The efficiency field is one
 number — the **round trip** in percent, **90 % by default** (about 94.9 % charge *and* discharge,
 i.e. `eta = sqrt(0.9)`) — with an advanced *charge/discharge efficiency* override that previews the
 resulting round trip and shows which one wins; values that make either direction 0 or greater than

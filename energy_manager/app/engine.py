@@ -83,6 +83,9 @@ MAX_REPLAN_BACKOFF_S = 900.0
 ALERT_DEDUPE_S = 900.0
 SAVINGS_FLUSH_S = 300.0
 DISCOVER_CACHE_S = 60.0
+#: Seconds a fetched device registry stays cached: the wizard's search box must not open a new
+#: WebSocket command per keystroke (names change far slower than the user types).
+DEVICE_CACHE_S = 5.0
 MAX_DISCOVER_ROWS = 50
 
 #: Discovery kinds accepted by ``GET /api/v1/discover`` (SPEC 10).
@@ -240,6 +243,7 @@ class Engine:
         sampler: Callable[[datetime], Mapping[str, Any]] | None = None,
         registry_source: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
         states_source: Callable[[], Mapping[str, Mapping[str, Any]]] | None = None,
+        device_client_factory: Callable[[], Any] | None = None,
         notifier: Notifier | None = None,
         maintenance: Callable[[datetime], Any] | None = None,
         location: str = "",
@@ -256,6 +260,7 @@ class Engine:
         self._sampler = sampler
         self._registry_source = registry_source
         self._states_source = states_source
+        self._device_client_factory = device_client_factory
         self._maintenance = maintenance
         self._clock = clock
         self._version = version
@@ -291,6 +296,7 @@ class Engine:
         self._last_sample_values: dict[str, Any] = {}
         self._published: dict[str, tuple[datetime, str]] = {}
         self._discover_cache: tuple[datetime, list[dict[str, Any]]] | None = None
+        self._device_cache: tuple[datetime, dict[str, dict[str, Any]]] | None = None
         self._force_replan = False
         # Warming-up gate (SPEC 9.1): a plan anchored on an assumed floor SoC must never be
         # published or dispatched, so planning starts only once a battery has really been read.
@@ -1018,20 +1024,29 @@ class Engine:
 
         ``app.haws.discover_candidates`` is the *single* registry-scoring helper (platform plus
         translation key, never a unique-id prefix); this method only translates its role slugs into
-        the driver's mapping keys and adds the settings key a grid confirmation must be saved to.
+        the driver's mapping keys, adds the settings key a grid confirmation must be saved to, and
+        names the device a battery row belongs to (``device_name``/``manufacturer``/``model``).
         """
         if kind not in DISCOVER_KINDS:
             raise ValueError(f"unknown discover kind: {kind!r}")
         rows = clamp(int(limit or MAX_DISCOVER_ROWS), 1, MAX_DISCOVER_ROWS)
-        entries = self._registry_entries(self._clock())
+        now = self._clock()
+        entries = self._registry_entries(now)
         if not entries or haws is None:
             return []
         found = haws.discover_candidates(
             kind, entries, self._states_map(), search=search, limit=rows
         )
+        # A battery is identified by its *device*: the picker groups the rows into devices and
+        # shows what the user called them.  Only fetched when there is something to enrich.
+        devices = self._device_map(now) if kind == "battery" and found else {}
         for row in found:
             role = str(row.get("suggested_role") or "")
             if kind == "battery":
+                device = devices.get(str(row.get("device_id") or "")) or {}
+                row["device_name"] = device.get("device_name")
+                row["manufacturer"] = device.get("manufacturer")
+                row["model"] = device.get("model")
                 row["mapping_key"] = driver_registry.role_to_mapping(
                     "zendure", role
                 ) or driver_registry.role_to_mapping("generic", role)
@@ -1072,6 +1087,56 @@ class Engine:
             entries = []
         self._discover_cache = (now, entries)
         return entries
+
+    def _device_map(self, now: datetime) -> dict[str, dict[str, Any]]:
+        """``device_id -> {device_name, manufacturer, model}`` for the mapping wizard.
+
+        Short TTL so typing in the search box cannot hammer Home Assistant; an unreachable or
+        malformed registry simply yields an empty map and the device fields stay null.
+        """
+        cache = self._device_cache
+        if cache is not None and (now - cache[0]).total_seconds() < DEVICE_CACHE_S:
+            return cache[1]
+        devices: dict[str, dict[str, Any]] = {}
+        for row in self._device_registry_rows():
+            device_id = str(row.get("id") or "")
+            if not device_id:
+                continue
+            # A user rename wins: the picker must show what the user calls the battery.
+            devices[device_id] = {
+                "device_name": str(row.get("name_by_user") or row.get("name") or "").strip() or None,
+                "manufacturer": str(row.get("manufacturer") or "").strip() or None,
+                "model": str(row.get("model") or "").strip() or None,
+            }
+        self._device_cache = (now, devices)
+        return devices
+
+    def _device_registry_rows(self) -> list[Mapping[str, Any]]:
+        """``config/device_registry/list`` rows, ``[]`` whenever they cannot be fetched.
+
+        The client is the same WebSocket wrapper the entity-registry source uses, built per call by
+        the injected factory (``haws.HAWebSocket`` by default) and closed again.  Every failure path
+        -- no client, a client without the command, a transport error, malformed rows -- degrades to
+        ``[]``: discovery must not break over the device names.
+        """
+        factory = self._device_client_factory or (None if haws is None else haws.HAWebSocket)
+        if factory is None:
+            return []
+        client = None
+        try:
+            client = factory()
+            fetch = getattr(client, "list_device_registry", None)
+            rows = fetch() if callable(fetch) else []
+        except Exception as exc:
+            log.debug("device registry unavailable: %s", exc)
+            return []
+        finally:
+            if callable(getattr(client, "close", None)):
+                try:
+                    client.close()
+                except Exception:  # pragma: no cover - closing is best effort
+                    log.debug("closing the device-registry client failed", exc_info=True)
+        return [row for row in rows or [] if isinstance(row, Mapping)]
 
     # ------------------------------------------------------------------ settings
 

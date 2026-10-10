@@ -18,6 +18,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import socket
 import ssl
@@ -470,7 +471,10 @@ _ROLE_HINTS: dict[str, tuple[_RoleHint, ...]] = {
         _RoleHint("discharge_limit", ("output_limit", "discharge_limit", "discharge_power"), ("discharge", "output_limit"), "power"),
         _RoleHint("power_setpoint", ("power_setpoint", "setpoint"), ("setpoint", "target_power"), "power"),
         _RoleHint("soc", ("electric_level", "battery_level", "soc", "state_of_charge"), ("soc", "battery_level", "electric_level"), "battery", ("%",)),
-        _RoleHint("capacity", ("available_kwh", "total_kwh", "capacity"), ("capacity", "available_kwh", "total_kwh"), "energy", ("kWh",)),
+        _RoleHint("capacity", ("total_kwh", "capacity"), ("capacity", "total_kwh"), "energy", ("kWh",)),
+        # Usable energy above min_soc is not the installed capacity: on a partly empty battery it
+        # reads near zero (or negative), which is why it must never be offered as `capacity`.
+        _RoleHint("available_energy", ("available_kwh",), ("available_kwh", "usable_energy"), "energy", ("kWh",)),
         _RoleHint("pv_power", ("solar_input_power", "pv_power", "solar_power"), ("solar_input", "pv_power", "solar_power"), "power"),
         _RoleHint("output_power", ("output_home_power", "output_power"), ("output_home", "output_power"), "power"),
         _RoleHint("manual_mode", ("ac_mode", "manual_mode"), ("ac_mode", "manual"), None),
@@ -522,6 +526,26 @@ def registry_entries_for_integration(
             continue
         out.append(dict(entry))
     return out
+
+
+def _finite_bound(raw: Any) -> float | None:
+    """A finite numeric bound or None (SPEC 10: discovery never invents a limit).
+
+    Home Assistant publishes ``min``/``max`` as numbers or as numeric strings; everything else --
+    "unknown", free text, booleans, NaN, +-inf -- is not a bound and stays null.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    elif isinstance(raw, str):
+        try:
+            value = float(raw.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return value if math.isfinite(value) else None
 
 
 def discover_candidates(
@@ -582,6 +606,12 @@ def discover_candidates(
                     "platform": platform,
                     "suggested_role": hint.role,
                     "confidence": confidence,
+                    # The device join key and the state's numeric bounds are additive: the picker
+                    # names a battery instead of hand-typing a slug and never invents a limit.
+                    # Both stay null when Home Assistant does not publish them.
+                    "device_id": str(entry["device_id"]) if entry.get("device_id") else None,
+                    "min": _finite_bound(attributes.get("min")),
+                    "max": _finite_bound(attributes.get("max")),
                 }
             )
     rows.sort(key=lambda row: (-row["confidence"], row["entity_id"], row["suggested_role"]))

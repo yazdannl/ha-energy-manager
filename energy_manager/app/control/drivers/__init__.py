@@ -54,6 +54,10 @@ ROLE_TO_MAPPING: dict[str, dict[str, str]] = {
         "manual_mode": "operation_entity",
         "min_soc": "min_soc_entity",
         "soc_target": "soc_target_entity",
+        # Usable energy above min_soc is a different quantity from the installed capacity, so it
+        # gets its own role: before the split both matched the `capacity` role and the wizard could
+        # write a partly-empty battery's "available" reading into `capacity_entity`.
+        "available_energy": "available_kwh_entity",
     },
 }
 

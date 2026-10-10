@@ -1142,12 +1142,378 @@
       ["soc_target_entity", "SoC target entity"],
       ["min_soc_entity", "Minimum SoC entity"],
       ["capacity_entity", "Capacity sensor"],
+      // Usable energy above min_soc is a different quantity from the installed capacity: on a
+      // nearly empty battery it reads near zero, so it must never be mapped as capacity_entity.
+      ["available_kwh_entity", "Usable energy above the minimum SoC (kWh)"],
       ["pv_power_entity", "PV power sensor"],
       ["output_power_entity", "Output power sensor"],
       ["ac_mode_entity", "AC mode entity"]
     ]
   };
   var NON_ENTITY_ROLES = { mode_manual_value: "Manual mode value (e.g. manual)" };
+
+  /* ---- battery discovery picker (SPEC §5/§10) -----------------------------------------------
+   * /discover?kind=battery returns one row per (entity, role), so a battery is only obvious once
+   * the rows are grouped per device — and the registry happily returns battery-ish rows for
+   * devices that are not batteries (a thermostat's battery level, a bridge's `connection`
+   * sensor). These helpers decide which groups are picker rows and what a Select click fills.
+   * They are pure so node can run them; the dialog below only renders their result. */
+
+  // Devices of these platforms are batteries by identity, so such a group is a picker row even
+  // when discovery ranks nothing above the confidence floor.
+  var BATTERY_PLATFORMS = ["zendure_ha"];
+  // Only these entity domains can be written: discovery also suggests read-only SENSORS for
+  // control roles, and mapping a sensor to a setpoint role produces a battery that cannot be driven.
+  var BATTERY_WRITABLE_DOMAINS = ["number", "select", "input_number", "input_select", "switch"];
+  var BATTERY_SENSOR_DOMAINS = ["sensor", "binary_sensor"];
+  // Role slugs from haws._ROLE_HINTS(battery). Power/control = the battery can be driven,
+  // manual_mode counts as control because it is how the manager is switched to manual dispatch.
+  var BATTERY_POWER_ROLES = ["power_setpoint", "charge_limit", "discharge_limit"];
+  var BATTERY_CONTROL_ROLES = BATTERY_POWER_ROLES.concat(["manual_mode"]);
+  var BATTERY_STATE_ROLES = ["soc", "capacity"];
+  var BATTERY_SETPOINT_ROLES = ["power_setpoint", "manual_mode"];
+  // Roles that must come from a writable entity, and roles that are read from the device instead.
+  var BATTERY_WRITABLE_ROLES = BATTERY_CONTROL_ROLES.concat(["min_soc", "soc_target"]);
+  var BATTERY_MEASUREMENT_ROLES = ["soc", "capacity", "available_energy", "output_power", "pv_power", "connection"];
+  // Same floor as haws.suggested_mapping: a weaker suggestion is not mapped anywhere.
+  var BATTERY_MIN_CONFIDENCE = 0.5;
+
+  function batteryDomainOf(row) {
+    return String(row && row.entity_id || "").split(".")[0].toLowerCase();
+  }
+
+  function batteryIsWritable(row) {
+    return BATTERY_WRITABLE_DOMAINS.indexOf(batteryDomainOf(row)) >= 0;
+  }
+
+  function batteryIsSensor(row) {
+    return BATTERY_SENSOR_DOMAINS.indexOf(batteryDomainOf(row)) >= 0;
+  }
+
+  /** Mapping keys the driver's own role table offers (`driver` null = every driver).
+   *  Derived from BATTERY_ROLES so the picker can never drift from the Assign dropdowns, which is
+   *  also why there is no second role table to maintain. */
+  function batteryRoleKeys(driver) {
+    var names = driver ? [driver] : Object.keys(BATTERY_ROLES);
+    var keys = {};
+    names.forEach(function (name) {
+      (BATTERY_ROLES[name] || []).forEach(function (role) { keys[role[0]] = true; });
+    });
+    return keys;
+  }
+
+  /** Role slug -> mapping key for the driver whose key table is `keys`.
+   *  "<role>_entity" is only used when that key really is in BATTERY_ROLES (the server's own
+   *  mapping_key first when it agrees), so a role the driver cannot store is left for the Assign
+   *  table instead of being guessed at. ponytail: that leaves charge_limit/discharge_limit
+   *  unmappable on a generic battery (generic stores charge_power/discharge_power); the user
+   *  assigns those with the Assign dropdown, exactly as before this picker existed. */
+  function batteryRoleKey(role, keys, serverKey) {
+    var slug = String(role || "");
+    if (!slug) return null;
+    if (serverKey && keys[serverKey]) return serverKey;
+    return keys[slug + "_entity"] ? slug + "_entity" : null;
+  }
+
+  function batteryRowConfidence(row) {
+    var value = numeric(row && row.confidence);
+    return value == null ? 0 : value;
+  }
+
+  /** Backend ordering (haws.suggested_mapping): higher confidence, then smallest entity_id. */
+  function batteryRowBetter(row, other) {
+    var mine = batteryRowConfidence(row);
+    var theirs = batteryRowConfidence(other);
+    if (mine !== theirs) return mine > theirs;
+    return String(row.entity_id || "") < String(other.entity_id || "");
+  }
+
+  /** The right kind of entity for this role: control roles must be writable, so a sensor that
+   *  happens to match a setpoint role is never chosen (and never silently mapped). */
+  function batteryRoleAccepts(row, role) {
+    if (BATTERY_WRITABLE_ROLES.indexOf(role) >= 0) return batteryIsWritable(row);
+    return true;
+  }
+
+  /** Preference inside one role: the right kind of entity first, then the backend order above. */
+  function batteryRowRank(row, role) {
+    if (BATTERY_WRITABLE_ROLES.indexOf(role) >= 0) return batteryIsWritable(row) ? 0 : 1;
+    if (BATTERY_MEASUREMENT_ROLES.indexOf(role) >= 0) return batteryIsSensor(row) ? 0 : 1;
+    return 0;
+  }
+
+  function batteryRoleRowBetter(row, other, role) {
+    var mine = batteryRowRank(row, role);
+    var theirs = batteryRowRank(other, role);
+    if (mine !== theirs) return mine < theirs;
+    return batteryRowBetter(row, other);
+  }
+
+  /** Best usable candidate per role, above the confidence floor: writable for a control role,
+   *  sensor-preferred for a measurement role. Control roles whose only match is read-only are
+   *  reported separately so the dialog can say so instead of mapping an unusable entity. */
+  function batteryGroupRoles(group) {
+    var chosen = {};
+    var skipped = [];
+    group.rows.forEach(function (row) {
+      var role = String(row.suggested_role || "");
+      if (!role || batteryRowConfidence(row) < BATTERY_MIN_CONFIDENCE) return;
+      if (!batteryRoleAccepts(row, role)) {
+        if (skipped.indexOf(role) < 0) skipped.push(role);
+        return;
+      }
+      if (!chosen[role] || batteryRoleRowBetter(row, chosen[role], role)) chosen[role] = row;
+    });
+    return { chosen: chosen, skipped: skipped };
+  }
+
+  /** device_name, else manufacturer + model, else the best candidate's name, else its entity id. */
+  function batteryGroupLabel(group) {
+    if (group.deviceName) return String(group.deviceName);
+    if (group.manufacturer && group.model) return group.manufacturer + " " + group.model;
+    var best = null;
+    group.rows.forEach(function (row) { if (!best || batteryRowBetter(row, best)) best = row; });
+    return best ? String(best.name || best.entity_id || "") : "";
+  }
+
+  /** Which roles this group can map, whether it can be driven at all, and why it is a picker
+   *  row in the first place. Returns null when the group is not plausibly a battery. */
+  function batteryGroupInfo(group) {
+    var found = batteryGroupRoles(group);
+    var chosen = found.chosen;
+    var keys = batteryRoleKeys(null);
+    var mappable = [];
+    Object.keys(chosen).sort().forEach(function (role) {
+      if (batteryRoleKey(role, keys, chosen[role].mapping_key)) mappable.push(role);
+    });
+    var viaPlatform = (group.platforms || []).some(function (platform) {
+      return BATTERY_PLATFORMS.indexOf(platform) >= 0;
+    });
+    // Control roles are writable by construction (batteryGroupRoles drops the read-only ones).
+    var controls = mappable.filter(function (role) { return BATTERY_CONTROL_ROLES.indexOf(role) >= 0; });
+    var states = mappable.filter(function (role) { return BATTERY_STATE_ROLES.indexOf(role) >= 0; });
+    // A group qualifies on a known battery platform, or on being able to both drive and read a
+    // battery: one lone role (a thermostat's soc, a bridge's connection, a camera's manual_mode
+    // button) is not a battery and must never become a picker row. Sensor-only control matches
+    // still count here — such a device looks exactly like a battery, it just cannot be driven.
+    if (!viaPlatform && !((controls.length || found.skipped.length) && states.length)) return null;
+    var writableControl = controls.length > 0;
+    var soc = mappable.indexOf("soc") >= 0;
+    var capacity = mappable.indexOf("capacity") >= 0;
+    var missing = [];
+    if (!writableControl) missing.push("a writable control entity");
+    if (!soc) missing.push("soc");
+    if (!capacity) missing.push("capacity");
+    return {
+      roles: chosen,
+      mappable: mappable,
+      skipped: found.skipped,
+      writableControl: writableControl,
+      readOnlyControl: !writableControl && found.skipped.length > 0,
+      controlReady: writableControl && (soc || capacity),
+      missing: missing,
+      viaPlatform: viaPlatform,
+      confidence: mappable.reduce(function (sum, role) { return sum + batteryRowConfidence(chosen[role]); }, 0)
+    };
+  }
+
+  /** Candidate rows -> picker groups: grouped per device, only the plausible batteries left,
+   *  writable-control groups first, then most mappable roles, then summed confidence, then label. */
+  function batteryGroupsFromCandidates(rows) {
+    var groups = [];
+    var index = {};
+    (Array.isArray(rows) ? rows : []).forEach(function (row) {
+      if (!row) return;
+      var deviceId = row.device_id ? String(row.device_id) : "";
+      // No device_id: group by entity id. One entity can appear once per role, and dropping these
+      // rows would hide batteries whose registry entry lost its device.
+      var key = deviceId ? "device:" + deviceId : "entity:" + String(row.entity_id || "");
+      var group = index[key];
+      if (!group) {
+        group = {
+          key: key,
+          deviceId: deviceId || null,
+          deviceName: row.device_name ? String(row.device_name) : "",
+          manufacturer: row.manufacturer ? String(row.manufacturer) : null,
+          model: row.model ? String(row.model) : null,
+          platform: row.platform ? String(row.platform) : "",
+          platforms: [],
+          rows: []
+        };
+        index[key] = group;
+        groups.push(group);
+      }
+      group.rows.push(row);
+      if (!group.deviceName && row.device_name) group.deviceName = String(row.device_name);
+      if (!group.manufacturer && row.manufacturer) group.manufacturer = String(row.manufacturer);
+      if (!group.model && row.model) group.model = String(row.model);
+      if (row.platform) {
+        var platform = String(row.platform);
+        if (group.platforms.indexOf(platform) < 0) group.platforms.push(platform);
+        if (!group.platform) group.platform = platform;
+      }
+    });
+    var picker = [];
+    groups.forEach(function (group) {
+      group.label = batteryGroupLabel(group);
+      var info = batteryGroupInfo(group);
+      if (!info) return;
+      group.roles = info.roles;
+      group.mappable = info.mappable;
+      group.skipped = info.skipped;
+      group.writableControl = info.writableControl;
+      group.readOnlyControl = info.readOnlyControl;
+      group.controlReady = info.controlReady;
+      group.missing = info.missing;
+      group.viaPlatform = info.viaPlatform;
+      group.confidence = info.confidence;
+      picker.push(group);
+    });
+    // Writable-control batteries first, then role coverage, then summed confidence, then label.
+    return picker.sort(function (a, b) {
+      if (a.writableControl !== b.writableControl) return a.writableControl ? -1 : 1;
+      if (a.controlReady !== b.controlReady) return a.controlReady ? -1 : 1;
+      if (a.mappable.length !== b.mappable.length) return b.mappable.length - a.mappable.length;
+      if (a.confidence !== b.confidence) return b.confidence - a.confidence;
+      return a.label < b.label ? -1 : a.label > b.label ? 1 : 0;
+    });
+  }
+
+  /** Search text of one row: entity text plus the device fields the server does not match on. */
+  function batteryRowMatchesQuery(row, query) {
+    var needle = String(query == null ? "" : query).trim().toLowerCase();
+    if (!needle) return true;
+    var haystack = [row.entity_id, row.name, row.device_name, row.manufacturer, row.model, row.platform]
+      .map(function (part) { return String(part == null ? "" : part).toLowerCase(); })
+      .join(" ");
+    return haystack.indexOf(needle) >= 0;
+  }
+
+  function batteryGroupMatchesQuery(group, query) {
+    return group.rows.some(function (row) { return batteryRowMatchesQuery(row, query); });
+  }
+
+  /** Local search first (it sees device name, manufacturer, model and platform), the server only
+   *  when nothing matches: the server matches entity text and caps at 50 rows, so it can hide a
+   *  battery the user found by its model name. */
+  function batterySearchGroups(rows, query) {
+    var groups = batteryGroupsFromCandidates(rows);
+    var needle = String(query == null ? "" : query).trim();
+    if (!needle) return { groups: groups, fromServer: false };
+    var matches = groups.filter(function (group) { return batteryGroupMatchesQuery(group, needle); });
+    return { groups: matches, fromServer: !matches.length };
+  }
+
+  /** slugify(label) made unique against the configured battery ids (_2, _3, …). */
+  function batterySlugFor(label, takenIds) {
+    var taken = {};
+    (Array.isArray(takenIds) ? takenIds : []).forEach(function (id) {
+      var key = String(id == null ? "" : id).toLowerCase();
+      if (key) taken[key] = true;
+    });
+    var base = slugify(label) || "battery";
+    if (!taken[base]) return base;
+    var suffix = 2;
+    while (taken[base + "_" + suffix]) suffix += 1;
+    return base + "" + "_" + suffix;
+  }
+
+  /** Roles -> mapping keys for one driver, plus the role each key came from. */
+  function batteryMappingFor(group, driver) {
+    var keys = batteryRoleKeys(driver);
+    var roles = batteryGroupRoles(group).chosen;
+    var mapping = {};
+    var keyRoles = {};
+    Object.keys(roles).sort().forEach(function (role) {
+      var key = batteryRoleKey(role, keys, roles[role].mapping_key);
+      if (!key) return;
+      mapping[key] = String(roles[role].entity_id || "");
+      keyRoles[key] = role;
+    });
+    return { mapping: mapping, roles: roles, keyRoles: keyRoles };
+  }
+
+  /** zendure when the platform says so or a role maps to a zendure-only key, else generic. */
+  function batteryDriverFor(group) {
+    if ((group.platforms || []).some(function (platform) { return BATTERY_PLATFORMS.indexOf(platform) >= 0; })) {
+      return "zendure";
+    }
+    var zendure = batteryRoleKeys("zendure");
+    var generic = batteryRoleKeys("generic");
+    var roles = batteryGroupRoles(group).chosen;
+    return Object.keys(roles).some(function (role) {
+      var key = batteryRoleKey(role, zendure, roles[role].mapping_key);
+      return key && !generic[key];
+    }) ? "zendure" : "generic";
+  }
+
+  /** A candidate row's min/max state attribute. The backend started sending these after the rest
+   *  of this file, so both shapes are accepted and anything not a finite number is ignored. */
+  function batteryRowLimit(row, which) {
+    var value = row ? row[which] : null;
+    if (value == null && row && row.attributes) value = row.attributes[which];
+    return numeric(value);
+  }
+
+  /** Absolute bound of a limit entity: abs(min) when the range starts negative, else its max. */
+  function batteryAbsoluteBound(min, max) {
+    var bound = min != null && min < 0 ? Math.abs(min) : max;
+    return isNum(bound) && bound > 0 ? bound : null;
+  }
+
+  /** Numeric prefill, only where discovery states a number (SPEC R4: never invent one).
+   *  Capacity comes from the capacity role and only when its unit is kWh. The power limits are
+   *  role-aware: a charge/discharge *limit* entity is a positive range (0..N) and only ever fills
+   *  its own direction, so the sign convention (negative min bounds charge, positive max bounds
+   *  discharge) applies to a signed setpoint (or manual-mode) entity alone. A side with no source
+   *  keeps whatever the form already had, and min_soc/soc_target state an allowed range (0..100 %)
+   *  rather than the user's window, so they never prefill a SoC limit. */
+  function batteryNumbersFor(bundle) {
+    var numbers = {};
+    var roles = bundle.roles || {};
+    Object.keys(bundle.keyRoles).forEach(function (key) {
+      var role = bundle.keyRoles[key];
+      var row = roles[role];
+      if (!row) return;
+      if (role === "capacity") {
+        var capacity = numeric(row.state);
+        var unit = String(row.unit == null ? "" : row.unit).trim().toLowerCase();
+        if (capacity != null && capacity > 0 && unit === "kwh") numbers.capacity_kwh = capacity;
+        return;
+      }
+      if (role === "min_soc" || role === "soc_target") return;   // allowed range, not the chosen window
+      var min = batteryRowLimit(row, "min");
+      var max = batteryRowLimit(row, "max");
+      if (role === "charge_limit") {
+        var charge = batteryAbsoluteBound(min, max);
+        if (charge != null) numbers.max_charge_w = charge;
+        return;
+      }
+      if (role === "discharge_limit") {
+        var discharge = batteryAbsoluteBound(min, max);
+        if (discharge != null) numbers.max_discharge_w = discharge;
+        return;
+      }
+      if (BATTERY_SETPOINT_ROLES.indexOf(role) < 0) return;
+      // One signed entity states both directions; a dedicated limit entity above still wins.
+      if (min != null && min < 0 && numbers.max_charge_w == null) numbers.max_charge_w = Math.abs(min);
+      if (max != null && max > 0 && numbers.max_discharge_w == null) numbers.max_discharge_w = max;
+    });
+    return numbers;
+  }
+
+  /** What one Select click fills: id, name, driver, role mapping and the stated numbers. */
+  function batterySelection(group, takenIds) {
+    var driver = batteryDriverFor(group);
+    var bundle = batteryMappingFor(group, driver);
+    return {
+      id: batterySlugFor(group.label, takenIds),
+      name: group.label,
+      driver: driver,
+      mapping: bundle.mapping,
+      numbers: batteryNumbersFor(bundle)
+    };
+  }
 
   function numeric(value) {
     if (isNum(value)) return value;
@@ -1345,7 +1711,7 @@
     return dlg;
   }
 
-  function batteryCard(body, record, status, cycleCost, reload) {
+  function batteryCard(body, record, status, cycleCost, reload, takenIds) {
     var config = record.config || {};
     var st = record.state || {};
     var capabilities = record.capabilities || {};
@@ -1388,7 +1754,7 @@
     });
     actions.appendChild(test);
 
-    var edit = button("Edit", "", function () { openBatteryDialog(record, reload); });
+    var edit = button("Edit", "", function () { openBatteryDialog(record, reload, takenIds); });
     actions.appendChild(edit);
 
     var remove = button("Delete", "btn-danger");
@@ -1439,14 +1805,15 @@
 
   function renderBatteries(body, data) {
     body.appendChild(el("p", { class: "muted", text: "Batteries are confirmed by you: the wizard only suggests entities from the Home Assistant registry. Advisory/off and dry run stop new plan writes, but the device has no watchdog — a setpoint written earlier stays in force until Stop now (or the device's own app) neutralises it." }));
-    var add = button("Add battery", "btn-primary", function () { openBatteryDialog(null, data.reload); });
-    body.appendChild(el("div", { class: "battery-actions" }, [add]));
     var list = Array.isArray(data.batteries) ? data.batteries : [];
+    var ids = list.map(function (record) { return record && record.config ? record.config.id : ""; });
+    var add = button("Add battery", "btn-primary", function () { openBatteryDialog(null, data.reload, ids); });
+    body.appendChild(el("div", { class: "battery-actions" }, [add]));
     if (!list.length) {
       body.appendChild(el("p", { class: "muted", text: "No batteries configured yet. Use Add battery to map one." }));
       return;
     }
-    list.forEach(function (record) { batteryCard(body, record, data.status, data.cycleCost, data.reload); });
+    list.forEach(function (record) { batteryCard(body, record, data.status, data.cycleCost, data.reload, ids); });
   }
 
   function viewBatteries(host) {
@@ -1470,9 +1837,13 @@
     return String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 32);
   }
 
-  function openBatteryDialog(record, reload) {
+  function openBatteryDialog(record, reload, takenIds) {
     var editing = !!record;
     var source = editing ? record.config || {} : {};
+    // Uniqueness for the picked id: every configured battery except the one being edited.
+    var configuredIds = (Array.isArray(takenIds) ? takenIds : []).map(function (id) {
+      return editing && id === source.id ? "" : id;
+    });
     var sourceEfficiency = batteryEfficiency(source);
     // The advanced per-direction fields are only prefilled for a stored asymmetric override; a
     // symmetric battery stays on the primary round-trip input.
@@ -1643,6 +2014,127 @@
       discoveryHost.appendChild(table("Entity candidates", ["Entity", "Name", "Platform", "Suggested role", "Confidence", "Assign"], rows));
     }
 
+    // ---- discovery picker: find a battery and fill the form in one click ---------------------
+    var pickerNotes = el("div");
+    var pickerHost = el("div");
+    var pickerSearch = el("input", { type: "search", placeholder: "device name, model, platform or entity id", "aria-label": "Search batteries" });
+    var findBatteries = button("Find batteries", "", function () { runBatterySearch(pickerSearch.value); });
+    var discoveryRows = null;   // the empty-query discovery result: the local search corpus
+    var pendingQuery = "";     // a search typed before that first read came back
+
+    function batteryStatusBadge(group) {
+      if (group.controlReady) return badge("control-ready", "ok");
+      if (group.readOnlyControl) return badge("control entities are read-only", "err");
+      return badge("partial — missing " + group.missing.join(", "), "warn");
+    }
+
+    function renderBatteryGroups(groups, rowCount, query) {
+      clear(pickerHost);
+      if (!groups.length) {
+        var needle = String(query || "").trim();
+        var message = needle
+          ? "No battery matched “" + needle + "”. The id and the entity table below are the manual path."
+          : (rowCount
+              ? "Discovery returned " + rowCount + " candidate row(s), but no group of them is a battery: rows are grouped per device, so a server that reports no device_id cannot be picked. Type the id and map entities by hand below."
+              : "Discovery returned no candidate rows here. Type the id and map entities by hand below.");
+        pickerHost.appendChild(el("p", { class: "muted", text: message }));
+        return;
+      }
+      pickerHost.appendChild(el("div", { class: "battery-picker" }, [table("Batteries discovered in Home Assistant", ["Battery", "Model / manufacturer", "Platform", "Roles", "Use"], groups.map(function (group) {
+        return [
+          el("div", null, [
+            el("strong", { text: group.label }),
+            group.deviceId ? null : el("div", { class: "field-help", text: "entity without a device" })
+          ]),
+          el("span", { text: [group.model, group.manufacturer].filter(function (part) { return !!part; }).join(" · ") || "—" }),
+          el("span", { text: group.platform || "—" }),
+          el("div", null, [
+            el("div", { text: group.mappable.length + " battery role" + (group.mappable.length === 1 ? "" : "s") + " mappable" }),
+            el("div", null, [batteryStatusBadge(group)]),
+            group.viaPlatform ? null : el("div", { class: "field-help", text: "matched by role, not by a known battery platform" })
+          ]),
+          button("Select", "btn-primary", function () { selectBattery(group); })
+        ];
+      }))]));
+    }
+
+    /** Selecting a battery fills id, name, driver, roles and every number discovery states. */
+    function selectBattery(group) {
+      var selection = batterySelection(group, configuredIds);
+      if (!editing) inputs.id.value = selection.id;
+      inputs.name.value = selection.name;
+      driverSelect.value = selection.driver;
+      // Select means "use this battery's discovery mapping": replace the entity keys and keep
+      // anything typed by hand for the non-entity roles (mode_manual_value is never discovered).
+      // ponytail: switching the driver dropdown afterwards re-renders the rows for that driver, so
+      // keys the new driver does not use stay stored but unrendered (the pre-existing behaviour);
+      // pressing Select again rebuilds the mapping.
+      Object.keys(mapping).forEach(function (key) {
+        if (!NON_ENTITY_ROLES[key]) delete mapping[key];
+      });
+      Object.keys(selection.mapping).forEach(function (key) { mapping[key] = selection.mapping[key]; });
+      Object.keys(selection.numbers).forEach(function (key) {
+        if (inputs[key]) inputs[key].value = String(selection.numbers[key]);
+      });
+      renderMappingRows();
+      var mapped = Object.keys(selection.mapping).map(function (key) { return key + " = " + selection.mapping[key]; });
+      var numbers = [];
+      if (isNum(selection.numbers.capacity_kwh)) numbers.push(fmtKwh(selection.numbers.capacity_kwh) + " capacity");
+      if (isNum(selection.numbers.max_charge_w)) numbers.push("max charge " + fmtPower(selection.numbers.max_charge_w));
+      if (isNum(selection.numbers.max_discharge_w)) numbers.push("max discharge " + fmtPower(selection.numbers.max_discharge_w));
+      var unmapped = group.skipped || [];
+      setNote(pickerNotes, "Filled from " + selection.name + " (driver " + selection.driver + "): " +
+        (mapped.length ? mapped.join(", ") : "no role mapped") +
+        (numbers.length ? "; " + numbers.join(", ") : "") +
+        (!editing ? "; id set to " + selection.id : "") +
+        (unmapped.length ? "; left unmapped because only a read-only sensor matched: " + unmapped.join(", ") : "") +
+        ". This is only a suggestion — confirm every entity belongs to this battery before saving.", false);
+    }
+
+    function renderBatterySearch(rows, query) {
+      var plan = batterySearchGroups(rows, query);
+      var count = Array.isArray(rows) ? rows.length : 0;
+      if (!plan.fromServer) {
+        renderBatteryGroups(plan.groups, count, query);
+        return;
+      }
+      // Nothing matched locally: ask the server. It matches entity text only and caps at 50 rows,
+      // so it is the fallback rather than the default path.
+      performWrite(findBatteries, pickerNotes, function () {
+        return get("/discover", { kind: "battery", search: String(query || "").trim() });
+      }, function (res) {
+        var candidates = res && Array.isArray(res.candidates) ? res.candidates : [];
+        renderBatteryGroups(batteryGroupsFromCandidates(candidates), candidates.length, "");
+        return "Searched the Home Assistant entity registry for “" + String(query || "").trim() + "”.";
+      });
+    }
+
+    function runBatterySearch(query) {
+      var needle = String(query == null ? "" : query).trim();
+      if (!discoveryRows) {
+        // The corpus is always the unfiltered discovery read; a query typed meanwhile is applied
+        // to it as soon as it lands.
+        pendingQuery = needle;
+        loadBatteryCandidates();
+        return;
+      }
+      renderBatterySearch(discoveryRows, needle);
+    }
+
+    function loadBatteryCandidates() {
+      performWrite(findBatteries, pickerNotes, function () {
+        return get("/discover", { kind: "battery", search: "" });
+      }, function (res) {
+        discoveryRows = res && Array.isArray(res.candidates) ? res.candidates : [];
+        var query = pendingQuery;
+        pendingQuery = "";
+        renderBatterySearch(discoveryRows, query);
+        return discoveryRows.length + " discovery row(s) read from Home Assistant; only groups that could be a battery are listed.";
+      });
+    }
+
+    pickerSearch.addEventListener("change", function () { runBatterySearch(pickerSearch.value); });
+
     var errorHost = el("div");
 
     function collect() {
@@ -1727,6 +2219,14 @@
     append(body, [
       el("h2", { text: editing ? "Edit battery" : "Add battery" }),
       el("p", { class: "muted", text: "Discovery only suggests; the mapping is stored after your explicit confirmation." }),
+      el("h3", { text: "Find a battery" }),
+      el("p", { class: "field-help", text: "Pick a discovered battery to fill the id, name, driver, roles and every number Home Assistant states. Only groups that could be a battery are listed — devices that merely mention a battery level are not — and nothing is chosen until you press Select." }),
+      el("div", { class: "toolbar" }, [
+        el("label", { class: "field" }, [el("span", { text: "Search batteries" }), pickerSearch]),
+        findBatteries
+      ]),
+      pickerNotes,
+      pickerHost,
       identity,
       efficiencyBlock,
       el("p", null, [enabledInput, el("label", { for: "battery-enabled", text: " Enabled for dispatch" })]),
@@ -1741,6 +2241,7 @@
     append(dlg, [body, el("div", { class: "dialog-actions" }, [button("Cancel", "", function () { dlg.close(); }), save])]);
     document.body.appendChild(dlg);
     dlg.addEventListener("close", function () { dlg.remove(); });
+    loadBatteryCandidates();
     dlg.showModal();
     return dlg;
   }
@@ -2180,6 +2681,12 @@
     planEfficiency: planEfficiency,
     planBreakEvenEur: planBreakEvenEur,
     cycleCostFromConfig: cycleCostFromConfig,
+    batteryGroupsFromCandidates: batteryGroupsFromCandidates,
+    batteryGroupMatchesQuery: batteryGroupMatchesQuery,
+    batteryRowMatchesQuery: batteryRowMatchesQuery,
+    batterySearchGroups: batterySearchGroups,
+    batterySlugFor: batterySlugFor,
+    batterySelection: batterySelection,
     basePath: basePath,
     apiPath: apiPath,
     isMock: MOCK,

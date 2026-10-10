@@ -1354,3 +1354,16 @@ def test_driver_protocol_shapes():
 
 def test_driver_error_class_is_reachable():
     assert issubclass(DriverError, RuntimeError)
+
+
+def test_the_energy_roles_map_to_different_driver_keys():
+    """SPEC 10 / appendix A: the wizard must not be able to write usable energy into the capacity key.
+
+    ``available_kwh`` is energy above ``min_soc`` and ``total_kwh`` the installed capacity; the
+    Zendure driver stores them under separate mapping keys, so the role slugs must not collapse into
+    one. The generic driver has no such key, and a role it cannot store must stay unmapped rather
+    than being guessed into an unrelated one.
+    """
+    assert registry.role_to_mapping("zendure", "capacity") == "capacity_entity"
+    assert registry.role_to_mapping("zendure", "available_energy") == "available_kwh_entity"
+    assert registry.role_to_mapping("generic", "available_energy") is None

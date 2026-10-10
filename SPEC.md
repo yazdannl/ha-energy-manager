@@ -627,6 +627,16 @@ GET  /                         -> SPA index.html (+ /app.js, /style.css, /charts
 translation key) plus state attributes. It must never leak the whole entity list by default — cap at
 50 rows per request with a `search` filter, and mark instance-specific values as runtime-only.
 
+Candidate rows of every kind carry `entity_id`, `name`, `unit`, `device_class`, `state`, `platform`,
+`suggested_role` and `confidence`. They additionally carry the state attributes `min` and `max` when
+those are finite numbers, and `kind=battery` rows carry the entity's `device_id` plus, when the device
+registry is reachable, `device_name`, `manufacturer` and `model` (all nullable). A battery is a
+*device*, so these fields are what let the wizard offer a searchable list of batteries instead of
+asking for a hand-typed slug, and prefill real device limits instead of invented ones. These keys are
+additive: a missing device registry, an absent attribute or an older consumer must leave every
+existing field untouched, and `control/drivers` stays the only authority on which role maps to which
+mapping key.
+
 Details the UI needs, so they are contract and not implementation detail:
 
 * `/plan` slots carry `soc_pct` (capacity-weighted mean SoC), `pv_source` and `price_source` alongside the
@@ -908,6 +918,15 @@ round, with the reason:
   says the API reports `pending_holds`/`mode_persisted` instead of claiming they are `SystemState` fields;
   and the R1 scanner gained rules for 4-decimal unlabelled coordinate pairs, private hostnames, MACs and
   bare 32-hex ids, all of which the final verifier demonstrated it previously missed.
+
+- **§10 (battery picker, requested after the first live install)** — `/api/v1/discover` rows gained the
+  additive device fields (`device_id`, `device_name`, `manufacturer`, `model`) and the optional numeric
+  `min`/`max` attributes. The request was that a battery be *selected* from what the instance already
+  has rather than typed as a slug; entity-level rows cannot express a device. The wizard therefore
+  filters device groups to plausible batteries — a known battery platform, or at least one control role
+  together with one state role — because discovery legitimately returns lone `soc`, `connection` or
+  `manual_mode` matches for thermostats, bridges, printers and add-ons; it ranks control-ready groups
+  first, labels what is missing, and still allows a slug to be typed for anything discovery cannot see.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

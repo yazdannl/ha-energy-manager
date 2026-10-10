@@ -237,12 +237,14 @@ def test_call_answers_server_ping_while_waiting_for_the_result():
 # ---------------------------------------------------------------------------------------------
 
 
-def _entry(entity_id, *, platform="demo", translation_key=None, disabled_by=None):
+def _entry(entity_id, *, platform="demo", translation_key=None, disabled_by=None, device_id=None):
     entry = {"entity_id": entity_id, "platform": platform, "original_name": entity_id}
     if translation_key:
         entry["translation_key"] = translation_key
     if disabled_by:
         entry["disabled_by"] = disabled_by
+    if device_id:
+        entry["device_id"] = device_id
     return entry
 
 
@@ -320,3 +322,115 @@ def test_registry_entries_for_integration_and_mapping():
     assert mapping["charge_limit"] == "sensor.example_input_limit"
     assert mapping["soc"] == "sensor.example_electric_level"
     assert suggested_mapping("battery", candidates, min_confidence=0.99) == {}
+
+
+def test_candidate_rows_carry_the_device_id():
+    """SPEC 10: a battery is a *device*, so a row names the device it belongs to.
+
+    Additive contract: the published keys stay exactly as they were and ``device_id`` is the entry's
+    registry device id, or null when Home Assistant has not attached one.
+    """
+    entries = [
+        _entry("sensor.example_battery_soc", translation_key="electric_level", device_id="example_device_1"),
+        _entry("sensor.example_orphan_soc", translation_key="electric_level"),
+    ]
+    states = [
+        _state("sensor.example_battery_soc", "55", device_class="battery", unit_of_measurement="%"),
+        _state("sensor.example_orphan_soc", "60", device_class="battery", unit_of_measurement="%"),
+    ]
+    rows = discover_candidates("battery", entries, states)
+    by_entity = {row["entity_id"]: row for row in rows}
+    assert by_entity["sensor.example_battery_soc"]["device_id"] == "example_device_1"
+    assert by_entity["sensor.example_orphan_soc"]["device_id"] is None
+    # every other key is untouched: exactly one key more than the published set
+    assert set(rows[0]) == {
+        "entity_id",
+        "name",
+        "unit",
+        "device_class",
+        "state",
+        "platform",
+        "suggested_role",
+        "confidence",
+        "device_id",
+        "min",
+        "max",
+    }
+
+
+def test_candidate_rows_carry_the_numeric_bounds():
+    """SPEC 10: the picker needs the entity's real ``min``/``max``, never an invented bound.
+
+    Bounds are copied from the state attributes only when they are finite numbers (HA publishes
+    them as numbers or numeric strings); anything else stays null and no other key moves.
+    """
+    entries = [
+        _entry("number.example_input_limit", translation_key="input_limit"),
+        _entry("sensor.example_electric_level", translation_key="electric_level"),
+        _entry("number.example_text_bounds", translation_key="input_limit"),
+        _entry("sensor.example_nonfinite_bounds", translation_key="electric_level"),
+    ]
+    states = [
+        _state("number.example_input_limit", "400", min=0, max=1200),
+        _state("sensor.example_electric_level", "55", min="unavailable", max="not-a-number"),
+        _state("number.example_text_bounds", "400", min="0", max="1200.5"),
+        _state(
+            "sensor.example_nonfinite_bounds",
+            "55",
+            min=float("inf"),
+            max=float("nan"),
+        ),
+    ]
+    by_entity = {row["entity_id"]: row for row in discover_candidates("battery", entries, states)}
+    assert by_entity["number.example_input_limit"]["min"] == 0.0
+    assert by_entity["number.example_input_limit"]["max"] == 1200.0
+    assert by_entity["sensor.example_electric_level"]["min"] is None
+    assert by_entity["sensor.example_electric_level"]["max"] is None
+    # numeric strings are copied as numbers; non-finite values are not bounds at all
+    assert by_entity["number.example_text_bounds"]["min"] == 0.0
+    assert by_entity["number.example_text_bounds"]["max"] == 1200.5
+    assert by_entity["sensor.example_nonfinite_bounds"]["min"] is None
+    assert by_entity["sensor.example_nonfinite_bounds"]["max"] is None
+    # no bounds at all in the attributes: still null, and the published keys are untouched
+    plain = discover_candidates(
+        "battery", [_entry("sensor.example_plain_soc", translation_key="electric_level")],
+        [_state("sensor.example_plain_soc", "60", device_class="battery")],
+    )
+    assert plain[0]["min"] is None and plain[0]["max"] is None
+    assert set(plain[0]) == {
+        "entity_id",
+        "name",
+        "unit",
+        "device_class",
+        "state",
+        "platform",
+        "suggested_role",
+        "confidence",
+        "device_id",
+        "min",
+        "max",
+    }
+
+
+def test_usable_energy_is_not_offered_as_capacity():
+    """SPEC 10 / appendix A: usable energy above min_soc is not the installed capacity.
+
+    Both quantities come from the same integration, both carry kWh and both are matched by
+    translation key, so they used to share the single ``capacity`` role at equal confidence. The
+    wizard could then write a nearly empty battery's ``available_kwh`` reading -- which may even be
+    negative -- into the driver's ``capacity_entity``, i.e. use "what is left right now" as "how big
+    the pack is". They must stay distinguishable roles.
+    """
+    entries = [
+        _entry("sensor.example_available_kwh", translation_key="available_kwh"),
+        _entry("sensor.example_total_kwh", translation_key="total_kwh"),
+    ]
+    states = [
+        _state("sensor.example_available_kwh", "-0.04", unit_of_measurement="kWh"),
+        _state("sensor.example_total_kwh", "1.92", unit_of_measurement="kWh"),
+    ]
+    rows = discover_candidates("battery", entries, states)
+    roles = {(row["entity_id"], row["suggested_role"]) for row in rows}
+    assert ("sensor.example_available_kwh", "available_energy") in roles
+    assert ("sensor.example_total_kwh", "capacity") in roles
+    assert not any(entity.endswith("available_kwh") and role == "capacity" for entity, role in roles)

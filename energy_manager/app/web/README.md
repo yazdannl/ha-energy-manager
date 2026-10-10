@@ -66,5 +66,12 @@ derives the base from `location.pathname` (`basePath()`) and builds
   `round_trip_efficiency_pct` (split evenly into both directions); explicit `eta_charge`/
   `eta_discharge` win and the dialog says so. The plan chart's break-even curve uses the aggregate
   the summary reports and is omitted (with a note) when the summary omits it.
+- The battery dialog opens with a discovery picker: `/discover?kind=battery` rows are grouped
+  per device and only groups that could be a battery are listed (a known battery platform, or a
+  *writable* control role plus a state role — discovery also suggests sensors for setpoint roles,
+  and those are never mapped). `Select` fills the form; the mapping and the numbers are suggestions
+  the user confirms before saving. The pure helpers (`batteryGroupsFromCandidates`,
+  `batterySelection`, `batterySlugFor`, `batterySearchGroups`) are exported on `SEM_APP` so node can
+  test them without a DOM.
 - `node --check` must stay clean; the pytest suite in `tests/test_wp3_*.py` covers assets, routes
   and mock payload fields but does not need a browser.

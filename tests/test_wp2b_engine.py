@@ -540,6 +540,150 @@ def test_discover_suggests_battery_roles_from_the_registry():
     assert found[0]["mapping_key"] == "charge_limit_entity"
 
 
+class _FakeDeviceClient:
+    """Synthetic ``config/device_registry/list`` rows (R1: example ids only)."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = 0
+
+    def list_device_registry(self):
+        self.calls += 1
+        return self.rows
+
+
+class _BrokenDeviceClient:
+    def list_device_registry(self):
+        raise RuntimeError("example_registry_exploded")
+
+
+class _NoDeviceMethodClient:
+    """An HA client without the device-registry command (older facade / REST-only)."""
+
+
+def _example_battery_entries():
+    return [
+        {
+            "entity_id": "number.example_device_input_limit",
+            "platform": "zendure_ha",
+            "translation_key": "input_limit",
+            "device_id": "example_device_1",
+            "name": "Input limit",
+        },
+        {
+            "entity_id": "sensor.example_device_electric_level",
+            "platform": "zendure_ha",
+            "translation_key": "electric_level",
+            "device_id": "example_device_2",
+            "name": "Electric level",
+        },
+    ]
+
+
+def _example_device_rows():
+    return [
+        {
+            "id": "example_device_1",
+            "name_by_user": "Example Attic Battery",
+            "name": "SolarFlow 800",
+            "manufacturer": "Example Vendor",
+            "model": "Example Model 1000",
+        },
+        # no user rename and no manufacturer: the wizard falls back to the device name
+        {"id": "example_device_2", "name": "Example Balcony Battery"},
+    ]
+
+
+def test_discover_battery_rows_name_the_device():
+    """SPEC 10: the wizard lists batteries as devices, so a row carries the device identity."""
+    engine, _store, _ha, _clock, _settings = build_engine()
+    engine._device_client_factory = lambda: _FakeDeviceClient(  # noqa: SLF001
+        _example_device_rows()
+    )
+    engine._registry_source = lambda: _example_battery_entries()  # noqa: SLF001
+    engine._discover_cache = None  # noqa: SLF001
+    found = engine.discover("battery")
+    by_entity = {row["entity_id"]: row for row in found}
+    assert set(by_entity) == {
+        "number.example_device_input_limit",
+        "sensor.example_device_electric_level",
+    }
+    first = by_entity["number.example_device_input_limit"]
+    assert first["device_id"] == "example_device_1"
+    assert first["device_name"] == "Example Attic Battery"
+    assert first["manufacturer"] == "Example Vendor"
+    assert first["model"] == "Example Model 1000"
+    assert first["mapping_key"] == "charge_limit_entity"
+    second = by_entity["sensor.example_device_electric_level"]
+    assert second["device_id"] == "example_device_2"
+    assert second["device_name"] == "Example Balcony Battery"
+    assert second["manufacturer"] is None and second["model"] is None
+
+
+def test_discover_device_fields_are_null_when_the_registry_fails():
+    """A broken, missing or unknown client must never break discovery: null device fields only."""
+    for factory in (
+        lambda: _BrokenDeviceClient(),
+        lambda: _NoDeviceMethodClient(),
+        lambda: None,
+    ):
+        engine, _store, _ha, _clock, _settings = build_engine()
+        engine._device_client_factory = factory  # noqa: SLF001
+        engine._registry_source = lambda: _example_battery_entries()  # noqa: SLF001
+        engine._discover_cache = None  # noqa: SLF001
+        found = engine.discover("battery")
+        assert {row["entity_id"] for row in found} == {
+            "number.example_device_input_limit",
+            "sensor.example_device_electric_level",
+        }, factory
+        for row in found:
+            assert row["device_id"] in ("example_device_1", "example_device_2")
+            assert row["device_name"] is None
+            assert row["manufacturer"] is None
+            assert row["model"] is None
+            assert "mapping_key" in row
+
+
+def test_discover_caches_the_device_registry_between_searches():
+    """Typing in the search box must not hammer Home Assistant: one fetch per TTL window."""
+    client = _FakeDeviceClient(_example_device_rows())
+    engine, _store, _ha, _clock, _settings = build_engine()
+    engine._device_client_factory = lambda: client  # noqa: SLF001
+    engine._registry_source = lambda: _example_battery_entries()  # noqa: SLF001
+    engine._discover_cache = None  # noqa: SLF001
+    for term in ("input", "input_limit", "electric"):
+        found = engine.discover("battery", search=term)
+        assert found
+    assert client.calls == 1
+    _clock.advance(seconds=engine_module.DEVICE_CACHE_S + 1)
+    engine._discover_cache = None  # noqa: SLF001
+    assert engine.discover("battery", search="input")
+    assert client.calls == 2
+
+
+def test_discover_only_battery_rows_carry_the_device_fields():
+    """``device_name``/``manufacturer``/``model`` are battery-only; the other kinds are unchanged."""
+    engine, _store, _ha, _clock, _settings = build_engine()
+    engine._device_client_factory = lambda: _FakeDeviceClient(  # noqa: SLF001
+        _example_device_rows()
+    )
+    engine._registry_source = lambda: [  # noqa: SLF001
+        {
+            "entity_id": "sensor.example_price_now",
+            "platform": "example",
+            "translation_key": "price_now",
+            "device_class": "monetary",
+            "unit_of_measurement": "EUR/kWh",
+            "device_id": "example_device_1",
+        }
+    ]
+    engine._discover_cache = None  # noqa: SLF001
+    rows = engine.discover("price")
+    assert rows and rows[0]["device_id"] == "example_device_1"
+    assert "device_name" not in rows[0] and "manufacturer" not in rows[0] and "model" not in rows[0]
+
+
+
 # ----------------------------------------------------------------------------- degradation
 
 

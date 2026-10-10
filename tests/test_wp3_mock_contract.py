@@ -436,3 +436,72 @@ def test_mock_contains_no_instance_values():
     for pattern in [r"\b192\.168\.", r"\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", r"[\w.+-]+@[\w-]+\.[a-z]{2,}"]:
         assert not re.search(pattern, source), f"mock.js contains instance-looking data matching {pattern}"
     assert "Example Street 1" in source, "the fake address label should be obviously synthetic"
+
+
+def test_mock_battery_discovery_carries_the_picker_fields(fixtures):
+    """?mock=1 must demonstrate the picker: device fields, min/max and a read-only look-alike."""
+    if NODE is None:
+        pytest.skip("node is not installed")
+    rows = fixtures["fixtures"]["discover"]["battery"]["candidates"]
+    for candidate in rows:
+        for field in ["device_id", "device_name", "manufacturer", "model", "min", "max"]:
+            assert field in candidate, f"{candidate['entity_id']} is missing {field} for the picker"
+    device_ids = {row["device_id"] for row in rows}
+    assert len(device_ids) >= 2, "the mock needs more than one device to show the grouping"
+
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "?mock=1", hash: "" };
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    (0, eval)(fs.readFileSync("mock.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    (async function () {
+      const res = await A.get("/discover", { kind: "battery", search: "" });
+      const groups = A.batteryGroupsFromCandidates(res.candidates);
+      console.log(JSON.stringify({
+        groups: groups.map(function (g) {
+          return {
+            label: g.label, deviceId: g.deviceId, manufacturer: g.manufacturer, model: g.model,
+            platform: g.platform, mappable: g.mappable, writableControl: g.writableControl,
+            readOnlyControl: g.readOnlyControl, controlReady: g.controlReady, skipped: g.skipped,
+            selection: A.batterySelection(g, ["battery_1"]),
+            colliding: A.batterySelection(g, ["battery_1", "example_battery_1"])
+          };
+        }),
+        searchByModel: A.batterySearchGroups(res.candidates, "Model Two").groups.map(function (g) { return g.label; }),
+        searchMiss: A.batterySearchGroups(res.candidates, "nothing like this").fromServer
+      }));
+    })().catch(function (err) { console.error(err && err.message ? err.message : err); process.exit(1); });
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+        handle.write(script)
+        script_path = handle.name
+    try:
+        proc = subprocess.run([NODE, script_path], capture_output=True, text=True, cwd=str(WEB))
+    finally:
+        Path(script_path).unlink(missing_ok=True)
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+
+    labels = [group["label"] for group in data["groups"]]
+    assert labels == ["Example Battery 1", "Example Sensor Bank"], labels
+    battery, sensors = data["groups"]
+    assert battery["deviceId"] == "example_dev_battery_1"
+    assert battery["platform"] == "zendure_ha" and battery["writableControl"] is True
+    assert battery["controlReady"] is True, "the mock's zendure battery must be the first picker row"
+    assert battery["selection"]["id"] == "example_battery_1", "the configured mock id does not collide with the slug"
+    assert battery["colliding"]["id"] == "example_battery_1_2", "a colliding id gets _2"
+    assert battery["selection"]["driver"] == "zendure"
+    assert battery["selection"]["mapping"]["power_setpoint_entity"] == "number.example_battery_input_limit"
+    assert battery["selection"]["mapping"]["soc_entity"] == "sensor.example_battery_soc_1"
+    # only numbers discovery states: capacity 12 kWh and the 800 W the signed setpoint allows
+    assert battery["selection"]["numbers"] == {"capacity_kwh": 12.0, "max_charge_w": 800, "max_discharge_w": 800}
+    # the look-alike keeps its measurement roles and gets no control entity at all
+    assert sensors["readOnlyControl"] is True and sensors["controlReady"] is False
+    assert sensors["skipped"] == ["power_setpoint"]
+    assert sensors["selection"]["mapping"] == {
+        "capacity_entity": "sensor.example_sensor_bank_capacity",
+        "soc_entity": "sensor.example_sensor_bank_soc",
+    }
+    assert data["searchByModel"] == ["Example Sensor Bank"], "search reaches the model, not just entity text"
+    assert data["searchMiss"] is True, "a local miss falls back to the server-side search"

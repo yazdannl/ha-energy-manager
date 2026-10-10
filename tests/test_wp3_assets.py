@@ -452,3 +452,380 @@ def test_no_private_or_instance_values_in_web_assets():
         for pattern in forbidden:
             match = pattern.search(text)
             assert match is None, f"{path.name} contains instance-looking data: {match.group(0)}"
+
+
+# --- battery discovery picker (SPEC §5/§10) ------------------------------------------------
+# Every fixture below is synthetic: reserved-namespace entity ids and obviously fake devices.
+
+
+def _picker_rows():
+    """One writable device, one sensor-only device, and three devices that are not batteries."""
+    device_one = {"device_id": "example_dev_one", "device_name": "Example Battery One", "manufacturer": "MakerCo", "model": "Model One"}
+    device_two = {"device_id": "example_dev_two", "device_name": "Example Battery Two", "manufacturer": "MakerCo", "model": "Model Two"}
+
+    def row(entity_id, role, confidence, **extra):
+        base = {
+            "entity_id": entity_id,
+            "name": entity_id.split(".", 1)[1].replace("_", " "),
+            "unit": "W",
+            "device_class": "power",
+            "platform": "example_integration",
+            "suggested_role": role,
+            "confidence": confidence,
+        }
+        base.update(extra)
+        return base
+
+    return [
+        # a device that can be driven and read: charge/discharge limits, manual mode, soc, capacity
+        row("number.example_one_charge_limit", "charge_limit", 0.8, min=0, max=1000, **device_one),
+        row("number.example_one_discharge_limit", "discharge_limit", 0.78, min=0, max=800, **device_one),
+        row("select.example_one_manual_mode", "manual_mode", 0.6, **device_one),
+        row("sensor.example_one_soc", "soc", 0.92, unit="%", device_class="battery", **device_one),
+        row("sensor.example_one_capacity", "capacity", 0.7, unit="kWh", state="10.5", **device_one),
+        # the same roles, but only read-only sensors: it looks like a battery and cannot be driven
+        row("sensor.example_two_power", "power_setpoint", 0.95, **device_two),
+        row("sensor.example_two_charge_limit", "charge_limit", 0.9, **device_two),
+        row("sensor.example_two_soc", "soc", 0.9, unit="%", device_class="battery", **device_two),
+        row("sensor.example_two_capacity", "capacity", 0.88, unit="kWh", state="6", **device_two),
+    ]
+
+
+def _non_battery_rows():
+    device = {"device_id": "example_dev_thermostat", "device_name": "Example Thermostat", "manufacturer": "MakerCo", "model": "Model Thermostat"}
+    bridge = {"device_id": "example_dev_bridge", "device_name": "Example Bridge"}
+    camera = {"device_id": "example_dev_camera", "device_name": "Example Camera"}
+
+    def row(entity_id, role, confidence, **extra):
+        base = {"entity_id": entity_id, "name": entity_id, "platform": "example_integration", "suggested_role": role, "confidence": confidence}
+        base.update(extra)
+        return base
+
+    return [
+        row("sensor.example_thermostat_level", "soc", 0.85, unit="%", **device),          # a battery level, that is all
+        row("sensor.example_bridge_connection", "connection", 0.9, **bridge),             # a bridge's connectivity sensor
+        row("button.example_camera_start", "manual_mode", 0.75, **camera),                # a camera's start button
+    ]
+
+
+def test_battery_picker_groups_rows_per_device_and_labels_them():
+    """Rows group per device_id; a row without one groups by entity id and is never dropped."""
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "", hash: "" };
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    const withDevice = A.batteryGroupsFromCandidates(%s);
+    const noDevice = A.batteryGroupsFromCandidates([
+      { entity_id: "number.example_ha_one_setpoint", suggested_role: "power_setpoint", confidence: 0.9, platform: "zendure_ha" },
+      { entity_id: "number.example_ha_two_setpoint", suggested_role: "power_setpoint", confidence: 0.8, platform: "zendure_ha" },
+      { entity_id: "number.example_ha_dual", suggested_role: "charge_limit", confidence: 0.6, platform: "zendure_ha" },
+      { entity_id: "number.example_ha_dual", suggested_role: "power_setpoint", confidence: 0.9, platform: "zendure_ha" }
+    ]);
+    const labels = A.batteryGroupsFromCandidates([
+      { entity_id: "number.example_l_setpoint", suggested_role: "power_setpoint", confidence: 0.9, device_id: "example_dev_a", device_name: "Device Name Wins", manufacturer: "MakerCo", model: "Model A" },
+      { entity_id: "sensor.example_l_soc", suggested_role: "soc", confidence: 0.8, unit: "%%", device_id: "example_dev_a", device_name: "Device Name Wins", manufacturer: "MakerCo", model: "Model A" },
+      { entity_id: "number.example_m_setpoint", suggested_role: "power_setpoint", confidence: 0.9, device_id: "example_dev_b", manufacturer: "MakerCo", model: "Model B" },
+      { entity_id: "sensor.example_m_soc", suggested_role: "soc", confidence: 0.8, unit: "%%", device_id: "example_dev_b", manufacturer: "MakerCo", model: "Model B" },
+      { entity_id: "number.example_n_setpoint", suggested_role: "power_setpoint", confidence: 0.9, device_id: "example_dev_c", name: "Candidate Name Wins" },
+      { entity_id: "sensor.example_n_soc", suggested_role: "soc", confidence: 0.8, unit: "%%", device_id: "example_dev_c" },
+      { entity_id: "number.example_o_setpoint", suggested_role: "power_setpoint", confidence: 0.9, device_id: "example_dev_d" },
+      { entity_id: "sensor.example_o_soc", suggested_role: "soc", confidence: 0.8, unit: "%%", device_id: "example_dev_d", name: "" }
+    ]);
+    console.log(JSON.stringify({
+      withDevice: withDevice.map(function (g) { return { id: g.deviceId, rows: g.rows.length, label: g.label, manufacturer: g.manufacturer, model: g.model, platform: g.platform }; }),
+      noDevice: noDevice.map(function (g) { return { id: g.deviceId, rows: g.rows.length, roles: g.mappable }; }),
+      labels: labels.map(function (g) { return g.label; })
+    }));
+    """ % json.dumps(_picker_rows())
+    data = json.loads(run_node_script(script))
+    assert [group["id"] for group in data["withDevice"]] == ["example_dev_one", "example_dev_two"]
+    assert [group["rows"] for group in data["withDevice"]] == [5, 4], "every row of a device belongs to its group"
+    assert data["withDevice"][0]["label"] == "Example Battery One"
+    assert data["withDevice"][0]["manufacturer"] == "MakerCo" and data["withDevice"][0]["model"] == "Model One"
+    # no device_id: grouped by entity id (one entity can appear once per role), nothing dropped
+    assert [group["id"] for group in data["noDevice"]] == [None, None, None]
+    assert sorted(group["rows"] for group in data["noDevice"]) == [1, 1, 2]
+    dual = [group for group in data["noDevice"] if group["rows"] == 2][0]
+    assert sorted(dual["roles"]) == ["charge_limit", "power_setpoint"]
+    # label: device_name, else manufacturer + model, else the best candidate's name, else entity id
+    assert sorted(data["labels"]) == sorted(["Device Name Wins", "MakerCo Model B", "Candidate Name Wins", "number.example_o_setpoint"])
+
+
+def test_battery_picker_skips_devices_that_are_not_batteries():
+    """A lone battery-ish role is not a battery: thermostat, bridge and camera must not be listed."""
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "", hash: "" };
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    const pair = A.batteryGroupsFromCandidates(%s);
+    const platform = A.batteryGroupsFromCandidates(%s);
+    console.log(JSON.stringify({
+      pair: pair.map(function (g) { return { label: g.label, viaPlatform: g.viaPlatform, ready: g.controlReady, mappable: g.mappable, missing: g.missing }; }),
+      platform: platform.map(function (g) { return { label: g.label, viaPlatform: g.viaPlatform, ready: g.controlReady, missing: g.missing }; })
+    }));
+    """ % (json.dumps(_non_battery_rows()), json.dumps([
+        {"entity_id": "number.example_zendure_limit", "suggested_role": "charge_limit", "confidence": 0.2, "platform": "zendure_ha"}
+    ]))
+    data = json.loads(run_node_script(script))
+    assert data["pair"] == [], "thermostat / bridge / camera rows must never become picker rows"
+    assert len(data["platform"]) == 1
+    assert data["platform"][0]["viaPlatform"] is True, "a known battery platform qualifies on its own"
+    assert data["platform"][0]["ready"] is False
+    # nothing cleared the confidence floor, so every part of a battery is reported missing
+    assert data["platform"][0]["missing"] == ["a writable control entity", "soc", "capacity"]
+
+
+def test_battery_picker_qualifies_a_generic_control_and_state_pair():
+    """A non-zendure device with a control role and a state role is listed, labelled as role-matched."""
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "", hash: "" };
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    const groups = A.batteryGroupsFromCandidates([
+      { entity_id: "number.example_generic_setpoint", suggested_role: "power_setpoint", confidence: 0.9, platform: "mqtt", device_id: "example_dev_generic", device_name: "Example Generic" },
+      { entity_id: "sensor.example_generic_soc", suggested_role: "soc", confidence: 0.8, unit: "%", platform: "mqtt", device_id: "example_dev_generic", device_name: "Example Generic" }
+    ]);
+    console.log(JSON.stringify(groups.map(function (g) { return { label: g.label, viaPlatform: g.viaPlatform, ready: g.controlReady, mappable: g.mappable }; })));
+    """
+    groups = json.loads(run_node_script(script))
+    assert len(groups) == 1
+    assert groups[0]["label"] == "Example Generic"
+    assert groups[0]["viaPlatform"] is False, "it qualified by role, not by platform"
+    assert groups[0]["ready"] is True, "a writable setpoint plus a soc reading is control-ready"
+    assert groups[0]["mappable"] == ["power_setpoint", "soc"]
+
+
+def test_battery_picker_ranks_writable_control_groups_first():
+    """Read-only control matches rank below writable ones and never take a control role."""
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "", hash: "" };
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    const rows = %s;
+    const groups = A.batteryGroupsFromCandidates(rows);
+    const every = A.batteryGroupsFromCandidates(rows).map(function (g) {
+      return {
+        label: g.label,
+        mappable: g.mappable,
+        skipped: g.skipped,
+        writableControl: g.writableControl,
+        readOnlyControl: g.readOnlyControl,
+        controlReady: g.controlReady,
+        missing: g.missing,
+        mapping: A.batterySelection(g, []).mapping
+      };
+    });
+    // measurement preference: a sensor wins over a higher-confidence number, a number is kept
+    // only when no sensor matches the role
+    const measured = A.batterySelection(A.batteryGroupsFromCandidates([
+      { entity_id: "number.example_pref_soc_number", suggested_role: "soc", confidence: 0.99, unit: "%%", device_id: "example_dev_pref", device_name: "Example Preference" },
+      { entity_id: "sensor.example_pref_soc_sensor", suggested_role: "soc", confidence: 0.6, unit: "%%", device_id: "example_dev_pref", device_name: "Example Preference" },
+      { entity_id: "number.example_pref_output", suggested_role: "output_power", confidence: 0.7, device_id: "example_dev_pref", device_name: "Example Preference" },
+      { entity_id: "number.example_pref_setpoint", suggested_role: "power_setpoint", confidence: 0.9, device_id: "example_dev_pref", device_name: "Example Preference" }
+    ])[0], []).mapping;
+    console.log(JSON.stringify({ every: every, measured: measured }));
+    """ % json.dumps(_picker_rows())
+    data = json.loads(run_node_script(script))
+    assert [group["label"] for group in data["every"]] == ["Example Battery One", "Example Battery Two"]
+    writable, read_only = data["every"]
+    assert writable["writableControl"] is True and writable["controlReady"] is True
+    assert read_only["writableControl"] is False and read_only["controlReady"] is False
+    assert read_only["readOnlyControl"] is True, "a sensor-only control match is reported as read-only"
+    assert sorted(read_only["skipped"]) == ["charge_limit", "power_setpoint"]
+    assert read_only["missing"] == ["a writable control entity"]
+    # the sensor-only device keeps its measurement roles but gets no control entity at all
+    assert read_only["mapping"] == {"capacity_entity": "sensor.example_two_capacity", "soc_entity": "sensor.example_two_soc"}
+    assert not any(key.endswith("_entity") and "setpoint" in key or "limit" in key for key in read_only["mapping"]), \
+        "no sensor may be mapped to a control role"
+    assert data["measured"] == {
+        "power_setpoint_entity": "number.example_pref_setpoint",
+        "soc_entity": "sensor.example_pref_soc_sensor",
+        "output_power_entity": "number.example_pref_output",
+    }, "a sensor is preferred for a measurement role, a number only when no sensor matches"
+
+
+def test_battery_slug_is_unique_against_configured_ids():
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "", hash: "" };
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    console.log(JSON.stringify([
+      A.batterySlugFor("Example Battery One", []),
+      A.batterySlugFor("Example Battery One", ["example_battery_one"]),
+      A.batterySlugFor("Example Battery One", ["example_battery_one", "example_battery_one_2"]),
+      A.batterySlugFor("Example Battery One", ["example_battery_one", "example_battery_one_2", "example_battery_one_3"]),
+      A.batterySlugFor("Example Battery One", ["EXAMPLE_BATTERY_ONE"]),
+      A.batterySlugFor("   ", ["example_thing"])
+    ]));
+    """
+    slugs = json.loads(run_node_script(script))
+    assert slugs == [
+        "example_battery_one",
+        "example_battery_one_2",
+        "example_battery_one_3",
+        "example_battery_one_4",
+        "example_battery_one_2",
+        "battery",
+    ], slugs
+
+
+def test_battery_selection_fills_roles_numbers_and_driver():
+    """One Select fills the mapping, the driver and only the numbers discovery actually states."""
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "", hash: "" };
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    const limits = A.batterySelection(A.batteryGroupsFromCandidates([
+      { entity_id: "number.example_l_charge_limit", suggested_role: "charge_limit", confidence: 0.8, min: 0, max: 1000, device_id: "example_dev_l", device_name: "Example Limits" },
+      { entity_id: "number.example_l_discharge_limit", suggested_role: "discharge_limit", confidence: 0.8, min: 0, max: 800, device_id: "example_dev_l", device_name: "Example Limits" },
+      { entity_id: "sensor.example_l_soc_weak", suggested_role: "soc", confidence: 0.49, unit: "%%", device_id: "example_dev_l", device_name: "Example Limits" },
+      { entity_id: "sensor.example_l_soc_b", suggested_role: "soc", confidence: 0.6, unit: "%%", device_id: "example_dev_l", device_name: "Example Limits" },
+      { entity_id: "sensor.example_l_soc_a", suggested_role: "soc", confidence: 0.6, unit: "%%", device_id: "example_dev_l", device_name: "Example Limits" },
+      { entity_id: "sensor.example_l_capacity", suggested_role: "capacity", confidence: 0.7, unit: " kWh ", state: "12.0", device_id: "example_dev_l", device_name: "Example Limits" }
+    ])[0], ["example_limits"]);
+    const setpoint = A.batterySelection(A.batteryGroupsFromCandidates([
+      { entity_id: "number.example_s_setpoint", suggested_role: "power_setpoint", confidence: 0.9, min: -2400, max: 2400, device_id: "example_dev_s", device_name: "Example Setpoint" },
+      { entity_id: "sensor.example_s_soc", suggested_role: "soc", confidence: 0.8, unit: "%%", device_id: "example_dev_s", device_name: "Example Setpoint" }
+    ])[0], []);
+    const socBounds = A.batterySelection(A.batteryGroupsFromCandidates([
+      { entity_id: "number.example_b_setpoint", suggested_role: "power_setpoint", confidence: 0.9, device_id: "example_dev_b", device_name: "Example Bounds" },
+      { entity_id: "sensor.example_b_soc", suggested_role: "soc", confidence: 0.85, unit: "%%", device_id: "example_dev_b", device_name: "Example Bounds" },
+      { entity_id: "number.example_b_min_soc", suggested_role: "min_soc", confidence: 0.8, unit: "%%", min: 0, max: 100, device_id: "example_dev_b", device_name: "Example Bounds" },
+      { entity_id: "number.example_b_soc_target", suggested_role: "soc_target", confidence: 0.8, unit: "%%", min: 0, max: 100, device_id: "example_dev_b", device_name: "Example Bounds" }
+    ])[0], []);
+    const negativeBound = A.batterySelection(A.batteryGroupsFromCandidates([
+      { entity_id: "number.example_n_charge_limit", suggested_role: "charge_limit", confidence: 0.8, min: -900, max: 900, device_id: "example_dev_n", device_name: "Example Negative" },
+      { entity_id: "sensor.example_n_soc", suggested_role: "soc", confidence: 0.8, unit: "%%", device_id: "example_dev_n", device_name: "Example Negative" }
+    ])[0], []);
+    const noUnit = A.batterySelection(A.batteryGroupsFromCandidates([
+      { entity_id: "number.example_u_setpoint", suggested_role: "power_setpoint", confidence: 0.9, device_id: "example_dev_u", device_name: "Example Unitless" },
+      { entity_id: "sensor.example_u_capacity", suggested_role: "capacity", confidence: 0.9, unit: "Wh", state: "5000", device_id: "example_dev_u", device_name: "Example Unitless" }
+    ])[0], []);
+    console.log(JSON.stringify({ limits: limits, setpoint: setpoint, socBounds: socBounds, negativeBound: negativeBound, noUnit: noUnit }));
+    """
+    data = json.loads(run_node_script(script))
+    limits = data["limits"]
+    # capacity with a unit that needs trimming, power limits read per role, in its own direction
+    assert limits["id"] == "example_limits_2" and limits["name"] == "Example Limits"
+    assert limits["driver"] == "zendure", "charge_limit maps to a zendure-only key"
+    assert limits["mapping"] == {
+        "capacity_entity": "sensor.example_l_capacity",
+        "charge_limit_entity": "number.example_l_charge_limit",
+        "discharge_limit_entity": "number.example_l_discharge_limit",
+        "soc_entity": "sensor.example_l_soc_a",   # tie on confidence -> smallest entity_id
+    }
+    assert limits["numbers"] == {"capacity_kwh": 12.0, "max_charge_w": 1000, "max_discharge_w": 800}, limits["numbers"]
+    # the 0.49 candidate never wins a role
+    assert "sensor.example_l_soc_weak" not in limits["mapping"].values()
+    assert data["setpoint"]["driver"] == "generic" and data["setpoint"]["numbers"] == {"max_charge_w": 2400, "max_discharge_w": 2400}
+    assert data["setpoint"]["mapping"] == {"power_setpoint_entity": "number.example_s_setpoint", "soc_entity": "sensor.example_s_soc"}
+    # min_soc / soc_target state an allowed range: no SoC window and no power limit is invented
+    assert data["socBounds"]["numbers"] == {}
+    assert data["socBounds"]["mapping"] == {
+        "power_setpoint_entity": "number.example_b_setpoint",
+        "min_soc_entity": "number.example_b_min_soc",
+        "soc_entity": "sensor.example_b_soc",
+        "soc_target_entity": "number.example_b_soc_target",
+    }
+    # a negative range start is the absolute charge bound
+    assert data["negativeBound"]["numbers"] == {"max_charge_w": 900}
+    # a capacity in Wh is not a kWh capacity: the role is mapped, the number is left alone
+    assert data["noUnit"]["numbers"] == {}
+    assert data["noUnit"]["mapping"] == {
+        "power_setpoint_entity": "number.example_u_setpoint",
+        "capacity_entity": "sensor.example_u_capacity",
+    }
+
+
+def test_battery_search_matches_device_fields_then_falls_back_to_the_server():
+    """Search covers device label, manufacturer, model and platform; empty results go to the server."""
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "", hash: "" };
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    const rows = %s;
+    const search = function (query) {
+      const plan = A.batterySearchGroups(rows, query);
+      return { labels: plan.groups.map(function (g) { return g.label; }), fromServer: plan.fromServer };
+    };
+    console.log(JSON.stringify({
+      empty: search(""),
+      device: search("Example Battery One"),
+      manufacturer: search("MakerCo"),
+      model: search("Model Two"),
+      platform: search("example_integration"),
+      entity: search("example_two_capacity"),
+      missing: search("nothing matches this"),
+      fromNoRows: A.batterySearchGroups([], "anything").fromServer
+    }));
+    """ % json.dumps(_picker_rows())
+    data = json.loads(run_node_script(script))
+    assert data["empty"]["labels"] == ["Example Battery One", "Example Battery Two"]
+    assert data["empty"]["fromServer"] is False
+    assert data["device"]["labels"] == ["Example Battery One"] and data["device"]["fromServer"] is False
+    assert data["manufacturer"]["labels"] == ["Example Battery One", "Example Battery Two"]
+    assert data["model"]["labels"] == ["Example Battery Two"]
+    assert data["platform"]["labels"] == ["Example Battery One", "Example Battery Two"]
+    assert data["entity"]["labels"] == ["Example Battery Two"], "search also matches the entity id"
+    assert data["missing"]["labels"] == [] and data["missing"]["fromServer"] is True
+    assert data["fromNoRows"] is True, "no local hit means the server-side search is the fallback"
+
+
+def test_battery_dialog_wires_the_picker_into_the_form():
+    """The picker is the first thing in the dialog, and the manual path stays where it was."""
+    app = read(WEB / "app.js")
+    # a new block at the top of the dialog, with its own search input and button
+    picker_at = app.index('el("h3", { text: "Find a battery" })')
+    identity_at = app.index("\n      identity,\n")   # its position in the dialog body itself
+    assert picker_at < identity_at, "the discovery picker must sit above the identity fields"
+    assert 'el("input", { type: "search", placeholder: "device name, model, platform or entity id"' in app
+    assert '"Find batteries"' in app and "runBatterySearch(pickerSearch.value)" in app
+    # it runs once on open with an empty query, and the server is only asked when nothing matches
+    assert "loadBatteryCandidates();" in app, "the picker reads discovery once when the dialog opens"
+    assert app.count('get("/discover", { kind: "battery", search:') == 3, "picker load, picker fallback, entity-candidate table"
+    assert "batterySearchGroups(rows, query)" in app and "plan.fromServer" in app
+    # the id field is only editable while adding; the Assign table stays for fine-tuning
+    assert "textRow(\"id\", \"Battery id (slug)\", fields.id, editing)" in app
+    assert '"Entity candidates"' in app and '"(ignore)"' in app
+    # selecting fills the form and says what was mapped, never silently
+    assert "batterySelection(group, configuredIds)" in app
+    assert "renderMappingRows();" in app
+    assert "This is only a suggestion — confirm every entity belongs to this battery before saving." in app
+    assert "control entities are read-only" in app
+    # the battery ids already configured are what makes a picked id unique
+    assert "openBatteryDialog(record, reload, takenIds)" in app
+    assert "openBatteryDialog(null, data.reload, ids)" in app
+
+
+def test_battery_picker_keeps_usable_energy_out_of_the_capacity_role():
+    """SPEC 10 / appendix A: ``total_kwh`` is the pack, ``available_kwh`` is what is left in it.
+
+    The two arrive as different roles, so one Select must put them in different mapping keys and
+    must prefill the capacity from the pack figure -- never from the usable reading, which on a
+    nearly empty battery is a fraction of the pack (and may be negative).
+    """
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "", hash: "" };
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    const pick = A.batterySelection(A.batteryGroupsFromCandidates([
+      { entity_id: "number.example_e_charge", suggested_role: "charge_limit", confidence: 0.95, min: 0, max: 1000, unit: "W", platform: "zendure_ha", device_id: "example_dev_e", device_name: "Example Energy" },
+      { entity_id: "sensor.example_e_total_kwh", suggested_role: "capacity", confidence: 0.95, mapping_key: "capacity_entity", unit: "kWh", state: "1.92", platform: "zendure_ha", device_id: "example_dev_e", device_name: "Example Energy" },
+      { entity_id: "sensor.example_e_available_kwh", suggested_role: "available_energy", confidence: 0.95, mapping_key: "available_kwh_entity", unit: "kWh", state: "-0.04", platform: "zendure_ha", device_id: "example_dev_e", device_name: "Example Energy" },
+      { entity_id: "sensor.example_e_soc", suggested_role: "soc", confidence: 0.9, platform: "zendure_ha", device_id: "example_dev_e", device_name: "Example Energy" }
+    ])[0], []);
+    console.log(JSON.stringify(pick));
+    """
+    data = json.loads(run_node_script(script))
+    assert data["driver"] == "zendure"
+    assert data["mapping"]["capacity_entity"] == "sensor.example_e_total_kwh"
+    assert data["mapping"]["available_kwh_entity"] == "sensor.example_e_available_kwh"
+    assert data["numbers"]["capacity_kwh"] == 1.92

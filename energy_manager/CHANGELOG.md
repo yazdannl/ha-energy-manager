@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.0
+
+- **Batteries are selected, not typed.** The add-battery dialog lists the batteries discovery can see
+  and filters them as you type. Each row names the device (the name you gave it), its model,
+  manufacturer and platform, how many battery roles it can fill, and whether it can actually be
+  driven. One *Select* fills the id (slug derived from the device name, made unique against the
+  batteries you already have, still editable), the name, the driver, the whole role mapping and the
+  device's own numeric limits: charge and discharge limits from the entities that carry them, and
+  capacity from the pack figure.
+- Read-only look-alikes are never offered as drivable. A device whose only control-role matches are
+  sensors is labelled `control entities are read-only` and ranked below a real battery, and a sensor
+  is never auto-mapped to a setpoint role. Discovery legitimately returns lone `soc`, `connection` or
+  `manual_mode` suggestions for thermostats, bridges, printers and phones; they no longer appear as
+  batteries.
+- **Fixed: usable energy could be mapped as the installed capacity.** `available_kwh` (what is left
+  above `min_soc`) and `total_kwh` (how big the pack is) both matched the single `capacity` role, so
+  the wizard could write a nearly empty battery's reading - negative, on a live install - into
+  `capacity_entity`. Usable energy now has its own role and its own driver key.
+- `GET /api/v1/discover` rows gained the additive `device_id`, `device_name`, `manufacturer`, `model`,
+  `min` and `max` fields (SPEC section 10). Without a reachable device registry they stay null and
+  nothing else changes.
+
 ## 0.1.2
 
 - **Fixed: the add-on still could not start — the Supervisor token never reached the entrypoint.**
