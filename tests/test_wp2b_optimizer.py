@@ -91,7 +91,7 @@ def plan_objective(plan, opts: dp.OptimizerOptions, salvage: float, agg: dp.Batt
     final = dp.next_energy_kwh(energies[-1], plan.slots[-1].power_w / 1000.0, dt, agg)
     for index, energy in enumerate(energies):
         nxt = energies[index + 1] if index + 1 < len(energies) else final
-        total += opts.cycle_cost_eur_per_kwh * abs(nxt - energy)
+        total += dp.wear_cost_eur(opts.wear_eur_per_kwh, agg.eta_discharge, energy, nxt)
     return total - salvage * final
 
 
@@ -108,7 +108,7 @@ def brute_force(slots, agg, start_kwh, opts, salvage) -> float:
         for power in dp._actions(lo, hi, opts.power_steps):
             nxt = dp.next_energy_kwh(energy, power, dt, agg)
             step = dp.slot_cost_eur(power, slots[index], dt, opts)
-            step += opts.cycle_cost_eur_per_kwh * abs(nxt - energy)
+            step += dp.wear_cost_eur(opts.wear_eur_per_kwh, agg.eta_discharge, energy, nxt)
             walk(index + 1, clamp(nxt, agg.e_min_kwh, agg.e_max_kwh), cost + step)
 
     walk(0, start_kwh, 0.0)
@@ -133,7 +133,7 @@ def grid_aligned_instance(rng: random.Random, count: int):
         soc_step_kwh=capacity / 2.0,
         power_steps=3,
         salvage_multiplier=rng.choice([0.0, 1.0]),
-        cycle_cost_eur_per_kwh=rng.choice([0.0, 0.05]),
+        wear_eur_per_kwh=rng.choice([0.0, 0.05]),
     )
     slots = make_slots(
         count,
@@ -179,7 +179,7 @@ def test_dp_is_within_quantisation_bound_of_brute_force_on_random_instances():
             soc_step_kwh=rng.choice([0.1, 0.25]),
             power_steps=rng.choice([3, 5]),
             salvage_multiplier=rng.choice([0.0, 1.0]),
-            cycle_cost_eur_per_kwh=rng.choice([0.0, 0.02]),
+            wear_eur_per_kwh=rng.choice([0.0, 0.02]),
             allow_grid_charge=rng.choice([True, False]),
             allow_export=rng.choice([True, False]),
             max_import_kw=rng.choice([0.0, 2.0]),
@@ -593,7 +593,7 @@ def test_summary_reports_the_dp_objective_with_cycle_and_spread_costs():
         soc_step_kwh=0.25,
         power_steps=2,
         salvage_multiplier=1.0,
-        cycle_cost_eur_per_kwh=0.05,
+        wear_eur_per_kwh=0.05,
         min_spread_eur_per_kwh=0.05,
     )
     slots = make_slots(8, 15, pv=0.0, load=1.2, buy=[0.05] * 4 + [0.40] * 4, sell=0.02)
@@ -610,7 +610,7 @@ def test_summary_reports_the_dp_objective_with_cycle_and_spread_costs():
     for slot in plan.slots:
         power = slot.power_w / 1000.0
         energy = dp.next_energy_kwh(slot.soc_kwh, power, dt, agg)
-        cycle_cost += opts.cycle_cost_eur_per_kwh * abs(energy - slot.soc_kwh)
+        cycle_cost += dp.wear_cost_eur(opts.wear_eur_per_kwh, agg.eta_discharge, slot.soc_kwh, energy)
         surplus = max(0.0, slot.pv_kw - slot.load_kw)
         if power > 0:
             spread_cost += opts.min_spread_eur_per_kwh * max(0.0, power - surplus) * dt
@@ -628,6 +628,10 @@ def test_summary_reports_the_dp_objective_with_cycle_and_spread_costs():
     assert abs(plan.summary.cost_estimate_eur - grid_cost) < 1e-9
     assert abs(plan.summary.saved_eur - (plan.summary.baseline_cost_eur - grid_cost)) < 1e-9
     assert plan.summary.cycle_cost_eur == pytest.approx(cycle_cost, abs=1e-9)
+    # wear is per kWh delivered, so the total is exactly wear x discharged AC energy
+    assert plan.summary.cycle_cost_eur == pytest.approx(
+        opts.wear_eur_per_kwh * plan.summary.discharged_kwh, abs=1e-9
+    )
     assert plan.summary.objective_eur == pytest.approx(expected_objective, abs=1e-6)
     assert abs(plan.summary.saved_eur - plan.summary.objective_eur) > 1e-3  # never conflated
 

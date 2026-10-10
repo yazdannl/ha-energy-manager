@@ -893,6 +893,9 @@
     var efficiency = planEfficiency(plan.summary);
     var buyNow = state.status && isNum(state.status.price_now) ? state.status.price_now : null;
     var s = plan.summary || {};
+    // The plan reports the wear it actually assumed; the configured value is only a fallback for
+    // older payloads (the advanced override is already baked into the reported value).
+    var wear = isNum(s.wear_eur_per_kwh) ? s.wear_eur_per_kwh : cycleCost;
     var stats = [
       ["Estimated cost", fmtEur(s.cost_estimate_eur)],
       ["Baseline (no battery)", fmtEur(s.baseline_cost_eur)],
@@ -901,7 +904,8 @@
       ["Discharged", fmtKwh(s.discharged_kwh)],
       ["Cycles", isNum(s.cycles) ? s.cycles.toFixed(2) + " cycles" : "--"],
       ["Arbitrage energy", fmtKwh(s.arbitrage_kwh)],
-      ["Assumed round trip", efficiency ? fmtPct(efficiency.round_trip_pct) : "not reported"]
+      ["Assumed round trip", efficiency ? fmtPct(efficiency.round_trip_pct) : "not reported"],
+      ["Assumed wear", isNum(wear) ? fmtEur(wear) + "/kWh delivered" : "not reported"]
     ];
     body.appendChild(el("ul", { class: "stat-row" }, stats.map(function (row) {
       return el("li", null, [el("span", { class: "stat-label", text: row[0] }), el("span", { class: "stat-value", text: row[1] })]);
@@ -916,8 +920,8 @@
       }).join(" · ") + "." }));
     }
     if (efficiency) {
-      var example = buyNow != null ? " At the current buy price " + fmtPrice(buyNow) + " that is " + fmtPrice(planBreakEvenEur(buyNow, efficiency, cycleCost)) + " with wear " + fmtEur(cycleCost) + "/kWh." : "";
-      body.appendChild(el("p", { class: "legend-note", text: "The optimiser assumed a " + fmtPct(efficiency.round_trip_pct) + " round trip (charge " + fmtPct(efficiency.eta_charge * 100) + " / discharge " + fmtPct(efficiency.eta_discharge * 100) + "). Break-even after round-trip loss = buy ÷ round trip + wear ÷ discharge efficiency, so a discharge slot only pays when the sale price clears it." + example }));
+      var example = buyNow != null ? " At the current buy price " + fmtPrice(buyNow) + " that is " + fmtPrice(planBreakEvenEur(buyNow, efficiency, wear)) + " with wear " + fmtEur(wear) + "/kWh delivered." : "";
+      body.appendChild(el("p", { class: "legend-note", text: "The optimiser assumed a " + fmtPct(efficiency.round_trip_pct) + " round trip (charge " + fmtPct(efficiency.eta_charge * 100) + " / discharge " + fmtPct(efficiency.eta_discharge * 100) + "). Break-even after round-trip loss = buy ÷ round trip + wear, so a discharge slot only pays when the sale price clears it. Wear is charged per kWh delivered, so charging alone costs none." + example }));
     } else {
       body.appendChild(el("p", { class: "legend-note", text: "The plan summary did not report its aggregate efficiency, so the assumed round trip and the break-even curve are unavailable; the plan was still computed with the stored per-battery efficiencies." }));
     }
@@ -1022,8 +1026,11 @@
         var chart = el("div", { class: "chart chart-md" });
         body.appendChild(chart);
         var efficiency = planEfficiency(plan.summary);
-        root.SEMCharts.plan(chart, plan, { cycleCost: isNum(data.cycleCost) ? data.cycleCost : 0, efficiency: efficiency });
-        body.appendChild(el("p", { class: "legend-note", text: "Top panel: buy price bars (EUR/kWh, left axis), the dashed red break-even after round-trip loss line (buy ÷ assumed round trip + wear ÷ discharge efficiency) and the SoC line (%, right axis); grey bars are stale prices. Bottom panel: PV and load forecast (kW) and battery charging (positive, blue) or discharging (negative, orange) in kW." + (efficiency ? " Slots whose sale price sits below the break-even line would lose money, which is why they stay idle with reason “efficiency_loss”." : " The break-even line is unavailable: the plan summary carries no aggregate efficiency.") }));
+        var planWear = isNum(plan.summary && plan.summary.wear_eur_per_kwh)
+          ? plan.summary.wear_eur_per_kwh
+          : (isNum(data.cycleCost) ? data.cycleCost : 0);
+        root.SEMCharts.plan(chart, plan, { wear: planWear, efficiency: efficiency });
+        body.appendChild(el("p", { class: "legend-note", text: "Top panel: buy price bars (EUR/kWh, left axis), the dashed red break-even after round-trip loss line (buy ÷ assumed round trip + wear per delivered kWh) and the SoC line (%, right axis); grey bars are stale prices. Bottom panel: PV and load forecast (kW) and battery charging (positive, blue) or discharging (negative, orange) in kW." + (efficiency ? " Slots whose sale price sits below the break-even line would lose money, which is why they stay idle with reason “efficiency_loss”." : " The break-even line is unavailable: the plan summary carries no aggregate efficiency.") }));
       }
     });
 
@@ -1635,18 +1642,26 @@
     return eff ? eff.round_trip_pct : null;
   }
 
-  /** All-in cost of one kWh put into the pack: (buy + wear) / eta_charge. */
-  function storedKwhCostEur(buy, config, cycleCost) {
-    var eff = batteryEfficiency(config);
-    if (!eff || !isNum(buy)) return null;
-    return (buy + (isNum(cycleCost) ? cycleCost : 0)) / eff.eta_charge;
+  /** The wear constant a battery is priced with, EUR per kWh delivered (SPEC §5).
+   *  The advanced override wins when it is a positive number; else the server-derived value. */
+  function batteryWear(config, override) {
+    if (isNum(override) && override > 0) return override;
+    var derived = numeric((config || {}).wear_eur_per_kwh);
+    return derived != null && derived >= 0 ? derived : 0;
   }
 
-  /** Lowest sale price that covers buying at `buy`: buy / round_trip + wear / eta_discharge (SPEC §5). */
-  function breakEvenSellEur(buy, config, cycleCost) {
+  /** All-in cost of one kWh put into the pack: buy / eta_charge + wear x eta_discharge. */
+  function storedKwhCostEur(buy, config, wear) {
     var eff = batteryEfficiency(config);
     if (!eff || !isNum(buy)) return null;
-    return buy / eff.round_trip + (isNum(cycleCost) ? cycleCost : 0) / eff.eta_discharge;
+    return buy / eff.eta_charge + (isNum(wear) ? wear : 0) * eff.eta_discharge;
+  }
+
+  /** Lowest sale price that covers buying at `buy`: buy / round_trip + wear (SPEC §5). */
+  function breakEvenSellEur(buy, config, wear) {
+    var eff = batteryEfficiency(config);
+    if (!eff || !isNum(buy)) return null;
+    return buy / eff.round_trip + (isNum(wear) ? wear : 0);
   }
 
   /** Aggregate efficiency the plan assumed (plan.summary), or null when the server omits it. */
@@ -1674,9 +1689,9 @@
     };
   }
 
-  function planBreakEvenEur(buy, efficiency, cycleCost) {
+  function planBreakEvenEur(buy, efficiency, wear) {
     if (!isNum(buy) || !efficiency) return null;
-    return buy / efficiency.round_trip + (isNum(cycleCost) ? cycleCost : 0) / efficiency.eta_discharge;
+    return buy / efficiency.round_trip + (isNum(wear) ? wear : 0);
   }
 
   /** Efficiency form fields -> battery payload (SPEC §5). Returns {error} when invalid. */
@@ -1719,6 +1734,21 @@
       }
     }
     return 0;
+  }
+
+  /** Derived wear of a battery in the dialog: price / (cycle life x usable kWh), or null. */
+  function derivedWearEur(config) {
+    var price = numeric((config || {}).price_eur);
+    var life = numeric((config || {}).cycle_life);
+    var capacity = numeric((config || {}).capacity_kwh);
+    var minSoc = numeric((config || {}).min_soc_pct);
+    var maxSoc = numeric((config || {}).max_soc_pct);
+    if (capacity == null) capacity = 0;
+    if (minSoc == null) minSoc = 0;
+    if (maxSoc == null) maxSoc = 100;
+    var usable = capacity * (maxSoc - minSoc) / 100;
+    if (price == null || life == null || price <= 0 || life <= 0 || usable <= 0) return null;
+    return price / (life * usable);
   }
 
   function batteryCycleCount(state) {
@@ -1800,7 +1830,8 @@
     var capabilities = record.capabilities || {};
     var cycles = batteryCycleCount(st);
     var eff = batteryEfficiency(config);
-    var wear = isNum(cycleCost) ? cycleCost : 0;
+    var wearOverride = isNum(cycleCost) ? cycleCost : 0;
+    var wear = batteryWear(config, wearOverride);
     var buy = isNum(status.price_now) ? status.price_now : null;
     var storedCost = storedKwhCostEur(buy, config, wear);
     var breakEven = breakEvenSellEur(buy, config, wear);
@@ -1871,13 +1902,14 @@
           el("li", null, [el("span", { class: "stat-label", text: "Cycles" }), el("span", { class: "stat-value", text: cycles == null ? "not reported" : cycles.toFixed(1) + " cycles" })]),
           el("li", null, [el("span", { class: "stat-label", text: "Limits" }), el("span", { class: "stat-value", text: fmtPower(config.max_charge_w) + " charge / " + fmtPower(config.max_discharge_w) + " discharge" })]),
           el("li", null, [el("span", { class: "stat-label", text: "SoC window" }), el("span", { class: "stat-value", text: fmtPct(config.min_soc_pct, 0) + " to " + fmtPct(config.max_soc_pct, 0) })]),
+          el("li", null, [el("span", { class: "stat-label", text: "Wear" }), el("span", { class: "stat-value", text: fmtEur(wear) + "/kWh delivered" + (wearOverride > 0 ? " (override)" : "") })]),
           el("li", null, [el("span", { class: "stat-label", text: "Stored kWh, all-in" }), el("span", { class: "stat-value", text: fmtPrice(storedCost) })]),
           el("li", null, [el("span", { class: "stat-label", text: "Break-even sale" }), el("span", { class: "stat-value", text: fmtPrice(breakEven) })])
         ]),
         eff
           ? el("p", { class: "card-sub" }, ["Charge ", fmtPct(eff.eta_charge * 100), " / discharge ", fmtPct(eff.eta_discharge * 100), eff.asymmetric ? " — advanced per-direction override" : " — split evenly from the round trip"])
           : el("p", { class: "field-error", text: "No usable efficiency on this battery: the stored-kWh and break-even maths is unavailable." }),
-        el("p", { class: "legend-note", text: "Stored kWh, all-in = (buy + wear) / charge efficiency: the all-in cost of energy put into the pack. Break-even sale = the lowest sale price that covers the round trip: buy / round trip + wear / discharge efficiency. " + (buy != null ? "At the current buy price " + fmtPrice(buy) + " and wear " + fmtEur(wear) + "/kWh." : "The current buy price is unknown right now, so both show --.") }),
+        el("p", { class: "legend-note", text: "Stored kWh, all-in = buy ÷ charge efficiency + wear × discharge efficiency: the all-in cost of energy put into the pack. Break-even sale = the lowest sale price that covers the round trip: buy ÷ round trip + wear per delivered kWh. Wear is derived per battery from purchase price ÷ (cycle life × usable kWh)" + (isNum(config.price_eur) && config.price_eur > 0 ? " (" + fmtEur(config.price_eur) + " ÷ (" + (isNum(config.cycle_life) ? config.cycle_life : 0) + " cycles × " + fmtKwh(config.capacity_kwh * (config.max_soc_pct - config.min_soc_pct) / 100) + " usable))" : "") + "; the advanced wear override replaces it when set." + (buy != null ? " At the current buy price " + fmtPrice(buy) + " and wear " + fmtEur(wear) + "/kWh." : " The current buy price is unknown right now, so both show --.") }),
         mappingList(config, record.mapping_resolved),
         Object.keys(capabilities).length ? el("p", { class: "legend-note", text: "Driver capabilities: " + Object.keys(capabilities).map(function (k) { return k + "=" + String(capabilities[k]); }).join(", ") }) : null,
         Array.isArray(record.discovery) && record.discovery.length ? el("p", { class: "legend-note", text: record.discovery.length + " entity candidate(s) available for the wizard." }) : null
@@ -1943,6 +1975,8 @@
       max_charge_w: isNum(source.max_charge_w) ? source.max_charge_w : 800.0,
       max_discharge_w: isNum(source.max_discharge_w) ? source.max_discharge_w : 800.0,
       round_trip_efficiency_pct: sourceEfficiency ? Math.round(sourceEfficiency.round_trip_pct * 10) / 10 : 90.0,
+      price_eur: isNum(source.price_eur) ? source.price_eur : 0.0,
+      cycle_life: isNum(source.cycle_life) ? source.cycle_life : 0.0,
       enabled: source.enabled !== false
     };
     var mapping = {};
@@ -2035,6 +2069,52 @@
 
     var enabledInput = el("input", { type: "checkbox", id: "battery-enabled", checked: fields.enabled });
     inputs.enabled = enabledInput;
+
+    // SPEC §5: wear comes from the pack's own price and rated cycle life; the old global
+    // optimizer.cycle_cost_eur_per_kwh stays as an advanced override (server-side).
+    var priceInput = el("input", { type: "number", min: "0", step: "1", value: String(fields.price_eur), id: "battery-price" });
+    var cycleLifeInput = el("input", { type: "number", min: "0", step: "100", value: String(fields.cycle_life), id: "battery-cycle-life" });
+    inputs.price_eur = priceInput;
+    inputs.cycle_life = cycleLifeInput;
+    var wearNote = el("p", { class: "muted" });
+    function economicsInputs() {
+      return {
+        price_eur: numeric(priceInput.value),
+        cycle_life: numeric(cycleLifeInput.value),
+        capacity_kwh: numeric(inputs.capacity_kwh.value),
+        min_soc_pct: numeric(inputs.min_soc_pct.value),
+        max_soc_pct: numeric(inputs.max_soc_pct.value)
+      };
+    }
+    function updateWearNote() {
+      var inputsNow = economicsInputs();
+      var wear = derivedWearEur(inputsNow);
+      if (wear == null) {
+        var oneSided = (inputsNow.price_eur > 0) !== (inputsNow.cycle_life > 0);
+        wearNote.className = "muted";
+        wearNote.textContent = oneSided
+          ? "Fill in both the purchase price and the cycle life to derive wear; until then plans treat this battery as wear-free."
+          : "Optional. With a purchase price and a cycle life the add-on derives wear = price ÷ (cycle life × usable kWh) per kWh delivered — a full cycle costs price ÷ cycle life.";
+        return;
+      }
+      var usable = inputsNow.capacity_kwh * (inputsNow.max_soc_pct - inputsNow.min_soc_pct) / 100;
+      wearNote.className = "muted";
+      wearNote.textContent = "Derived wear " + fmtEur(wear) + "/kWh delivered = " + fmtEur(inputsNow.price_eur) +
+        " ÷ (" + inputsNow.cycle_life + " cycles × " + fmtKwh(usable) + " usable). A full cycle costs " +
+        fmtEur(inputsNow.price_eur / inputsNow.cycle_life) + ". The advanced wear override in All settings replaces this when set.";
+    }
+    [priceInput, cycleLifeInput, inputs.capacity_kwh, inputs.min_soc_pct, inputs.max_soc_pct].forEach(function (input) {
+      input.addEventListener("input", updateWearNote);
+    });
+    updateWearNote();
+    var economicsBlock = el("div", null, [
+      el("h3", { text: "Wear (optional)" }),
+      el("div", { class: "fields" }, [
+        el("label", { class: "field", for: "battery-price" }, [el("span", { text: "Purchase price (EUR)" }), priceInput]),
+        el("label", { class: "field", for: "battery-cycle-life" }, [el("span", { text: "Cycle life (cycles)" }), cycleLifeInput])
+      ]),
+      wearNote
+    ]);
 
     var mappingHost = el("div", { class: "fields" });
     function renderMappingRows() {
@@ -2230,6 +2310,8 @@
         max_soc_pct: Number(inputs.max_soc_pct.value),
         max_charge_w: Number(inputs.max_charge_w.value),
         max_discharge_w: Number(inputs.max_discharge_w.value),
+        price_eur: Number(inputs.price_eur.value),
+        cycle_life: Number(inputs.cycle_life.value),
         mapping: {},
         enabled: !!inputs.enabled.checked
       };
@@ -2252,6 +2334,7 @@
       if (!(config.capacity_kwh > 0)) problems.push("Capacity must be greater than 0 kWh.");
       if (!(config.min_soc_pct >= 0 && config.min_soc_pct < config.max_soc_pct && config.max_soc_pct <= 100)) problems.push("SoC window must satisfy 0 ≤ min < max ≤ 100 %.");
       if (config.__efficiency && config.__efficiency.error) problems.push(config.__efficiency.error);
+      if (!(config.price_eur >= 0) || !(config.cycle_life >= 0)) problems.push("Price and cycle life must be numbers >= 0 (0 = unknown).");
       if (!(config.max_charge_w > 0 || config.max_discharge_w > 0)) problems.push("At least one power limit must be greater than 0 W.");
       if (!Object.keys(config.mapping).length) problems.push("Map at least one entity (or the manual mode value) before saving.");
       if (config.driver === "generic" && !config.mapping.power_setpoint_entity && !(config.mapping.charge_power_entity && config.mapping.discharge_power_entity)) {
@@ -2312,6 +2395,7 @@
       pickerHost,
       identity,
       efficiencyBlock,
+      economicsBlock,
       el("p", null, [enabledInput, el("label", { for: "battery-enabled", text: " Enabled for dispatch" })]),
       el("h3", { text: "Entity mapping" }),
       mappingHost,
@@ -2586,7 +2670,7 @@
   // performance ratio and the optional weather entity for cloud attenuation.
   var SOLAR_FIELDS_CAPACITY = [
     "solar.capacity_wp", "solar.tilt_deg", "solar.azimuth_deg", "solar.performance_ratio",
-    "solar.weather_entity"
+    "solar.weather_entity", "solar.nasa_irradiance"
   ];
   // The one-line note under the source select, so a user who later reads an explained forecast
   // knows which model produced it. Capacity states its assumptions because they are stated (not
@@ -3383,6 +3467,8 @@
     testDischargeOutcome: testDischargeOutcome,
     batteryEfficiency: batteryEfficiency,
     batteryEfficiencyPayload: batteryEfficiencyPayload,
+    batteryWear: batteryWear,
+    derivedWearEur: derivedWearEur,
     roundTripPct: roundTripPct,
     storedKwhCostEur: storedKwhCostEur,
     breakEvenSellEur: breakEvenSellEur,

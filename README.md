@@ -116,7 +116,7 @@ pays back; if your contract works differently, enter an explicit feed-in tariff 
 feed-in cost. `optimizer.allow_export` still defaults to off, so nothing is exported until you ask
 for it.
 
-### Battery round trip (efficiency)
+### Battery round trip (efficiency) and wear
 
 Each battery takes **one** efficiency number: its **round trip**, in percent — how much of the energy
 put in comes back out. The add-on splits it evenly between the two directions
@@ -124,39 +124,51 @@ put in comes back out. The add-on splits it evenly between the two directions
 separately, enter those instead (the *charge/discharge efficiency* override) and the round trip is
 their product. The shipped defaults are 95 % per direction, just over 90 % round trip.
 
+Wear comes from the pack's own economics, not a number you have to look up: enter the **purchase
+price** and the **cycle life** on the battery card and the add-on derives
+
+```
+wear = price / (cycle_life × usable kWh)      # EUR per kWh delivered
+```
+
+For example 3000 EUR over 6000 cycles on 9.6 kWh usable is about 5.2 ct per delivered kWh. A full
+cycle costs `price / cycle_life`; charging alone costs no wear, because wear is charged per kWh
+actually delivered to the house. Leave the fields empty and the battery plans as wear-free. The
+advanced `optimizer.cycle_cost_eur_per_kwh` setting overrides the derived value when you want to
+model something the price/life pair cannot express.
+
 A cycle loses energy, so the buy price is not the break-even price:
 
 ```
-break_even_sell = buy / round_trip + cycle_cost / eta_discharge
+break_even_sell = buy / round_trip + wear
 ```
 
-`round_trip` is `eta_charge × eta_discharge`, and the wear term is charged per kWh *delivered* to the
-house: one delivered kWh cycles `1 / eta_discharge` kWh through the pack, which is why
-`optimizer.cycle_cost_eur_per_kwh` (energy cycled through the pack, default 0) is divided by
-`eta_discharge` rather than by the round trip.
+`round_trip` is `eta_charge × eta_discharge`. The wear term needs no per-direction efficiency because
+it is already stated per delivered kWh.
 
-| Round trip | Break-even at 20 ct/kWh buy, no wear | With a 5 ct/kWh cycle cost |
+| Round trip | Break-even at 20 ct/kWh buy, no wear | With 5.2 ct/kWh derived wear |
 | --- | --- | --- |
-| 75 % | **26.7 ct** | 32.4 ct |
-| 80 % | 25.0 ct | 30.6 ct |
-| 90 % | 22.2 ct | 27.5 ct |
+| 75 % | **26.7 ct** | 31.9 ct |
+| 80 % | 25.0 ct | 30.2 ct |
+| 90 % | 22.2 ct | 27.4 ct |
 
 Buying at 20 ct with a 75 % round trip breaks even at **26.7 ct, not 25 ct** — 25 ct is the 80 % case
-(`20 / 0.8`). With no wear configured it reduces to `buy / round_trip`: 20 ct at 90 % gives 22.2 ct.
+(`20 / 0.8`). With no wear it reduces to `buy / round_trip`: 20 ct at 90 % gives 22.2 ct.
 The common mistake is to compare the sale price with the buy price and book a profit on a cycle that
 actually loses energy; the add-on prices the loss instead.
 
-Where you see it: the battery card shows the round trip, the effective cost of a stored kWh at the
-current buy price (`buy / eta_charge`, i.e. the buy price grossed up for charging losses) and the
-break-even sale price that follows from it, and the Plan view marks the assumed round trip and its
-break-even line against the sell prices. A slot that stays idle because
+Where you see it: the battery card shows the round trip, the derived wear (price ÷ (cycle life ×
+usable kWh)), the effective cost of a stored kWh at the current buy price and the break-even sale
+price that follows from it, and the Plan view marks the assumed round trip, wear and break-even line
+against the sell prices. A slot that stays idle because
 the spread does not cover the loss reports `efficiency_loss` — that is the conversion loss, distinct
 from your own `optimizer.min_spread_eur_per_kwh` floor, which reports `spread_below_threshold`.
 
-With several batteries the plan works on capacity-weighted mean efficiencies (a documented
-approximation when packs differ materially), spends the most efficient battery first, and reports the
-aggregate round trip it assumed. Break-even is still computed per battery from its own values, so a
-cheap old pack and an efficient new one are not averaged into one misleading number.
+With several batteries the plan works on capacity-weighted mean efficiencies and usable-weighted mean
+wear (a documented approximation when packs differ materially), spends the most efficient battery
+first, and reports the aggregate round trip and wear it assumed. Break-even is still computed per
+battery from its own values, so a cheap old pack and an efficient new one are not averaged into one
+misleading number.
 
 ### Data footprint
 
@@ -282,8 +294,8 @@ caused are not part of the number).
 
 ## Privacy: what leaves your system
 
-There are exactly two outbound dependencies. Both are called only while the matching provider is
-enabled, and both are keyless by default:
+There are exactly three outbound dependencies. All are called only while the matching provider is
+enabled, and all three are keyless by default:
 
 - **`api.forecast.solar`** (solar forecast, enabled by default): the request carries your site
   coordinates and the plane geometry you configured (kWp, tilt, azimuth, damping) — that is what the
@@ -291,6 +303,10 @@ enabled, and both are keyless by default:
   account.
 - **`api.energy-charts.info`** (day-ahead prices; `api.energy-charts.info/price?bzn=...`): the
   request carries only the bidding zone code (for example `NL`). No personal data is sent to it.
+- **`power.larc.nasa.gov`** (NASA POWER observed irradiance, on by default for the capacity and
+  meter-derived solar sources): the request carries your site coordinates and a recent date window —
+  that is what a point irradiance lookup needs. No entity data, no consumption data, no identifiers,
+  no account. It is a public NASA service.
 
 The day-ahead price data served by energy-charts is licensed **CC BY 4.0** and is provided by
 **Fraunhofer ISE (Energy-Charts.info)**, with the underlying data from

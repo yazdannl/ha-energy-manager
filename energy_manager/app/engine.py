@@ -2091,6 +2091,8 @@ class Engine:
                 reserve_soc_pct=float(self._settings.get("optimizer.reserve_soc_pct", 0.0) or 0.0),
             )
         }
+        median_buy = dp.median_buy_eur_per_kwh(plan.slots)
+        override = self._wear_override_eur_per_kwh()
         return [
             {
                 "id": config.id,
@@ -2099,17 +2101,20 @@ class Engine:
                 "max_charge_w": config.max_charge_w,
                 "max_discharge_w": config.max_discharge_w,
                 "share_w": shares.get(config.id, 0.0),
-                # SPEC 5/8.1: each battery's own efficiency, with the break-even taken at the
-                # same median buy price the plan's salvage and aggregate use.
+                # SPEC 5/8.1: each battery's own efficiency and wear (the advanced override when
+                # set), with the break-even taken at the same median buy price the plan's salvage
+                # and aggregate use.
                 "round_trip_efficiency": config.round_trip_efficiency,
+                "wear_eur_per_kwh": override if override > 0.0 else config.wear_eur_per_kwh,
                 "break_even_sell_eur_per_kwh": config.break_even_sell_eur_per_kwh(
-                    dp.median_buy_eur_per_kwh(plan.slots), self._cycle_cost_eur_per_kwh()
+                    median_buy, override if override > 0.0 else config.wear_eur_per_kwh
                 ),
             }
             for config in sorted(configs, key=lambda c: c.id)
         ]
 
-    def _cycle_cost_eur_per_kwh(self) -> float:
+    def _wear_override_eur_per_kwh(self) -> float:
+        """The advanced ``optimizer.cycle_cost_eur_per_kwh`` override; 0 = derive per battery."""
         return float(self._settings.get("optimizer.cycle_cost_eur_per_kwh", 0.0) or 0.0)
 
     # ------------------------------------------------------------------ forecasts

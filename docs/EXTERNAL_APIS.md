@@ -575,7 +575,47 @@ Idempotence: the integration skips a write when
 | 23 | Zendure per-model per-firmware limits change at runtime | Clamp to `min(configured max, live entity min/max, observed limit)`; re-read limits periodically; verify read-back power. |
 | 24 | HA location may be unset (`latitude: 0.0`) | `resolve_location` fails loudly; solar disabled with a visible warning; never invent coordinates. |
 | 25 | Full state dump size | Never poll `/api/states` in the tick loop; resolve entity ids once (registry / user mapping) and read only mapped entities. |
-| 26 | External rate budgets | Forecast.Solar keyless 12/h/IP (≤8/h planned); Energy-Charts undocumented -> 1 call per refresh with cache; Zendure no documented budget -> ≤1 write per tick, idempotent. |
+| 26 | External rate budgets | Forecast.Solar keyless 12/h/IP (≤8/h planned); Energy-Charts undocumented -> 1 call per refresh with cache; NASA POWER has no documented keyless budget -> at most one request per location per day (daily-cached profile); Zendure no documented budget -> ≤1 write per tick, idempotent. |
+
+---
+
+## 8. NASA POWER hourly irradiance (`solar.nasa_irradiance`, capacity/derived only)
+
+NASA POWER (Prediction Of Worldwide Energy Resources) publishes satellite/model-derived solar and
+meteorological data. The hourly point API is keyless and returns Analysis Ready Data at the source
+resolution; the two series the add-on uses are all-sky and clear-sky shortwave downward irradiance.
+
+### Endpoint **[V]** (live probe 2026-10-10; a 2024 request parsed, `properties.parameter` keys verified)
+
+```
+GET https://power.larc.nasa.gov/api/temporal/hourly/point
+      ?parameters=ALLSKY_SFC_SW_DWN,CLRSKY_SFC_SW_DWN
+      &community=RE&longitude=<lon>&latitude=<lat>
+      &start=YYYYMMDD&end=YYYYMMDD&format=JSON&time-standard=UTC
+```
+
+| Fact | Value |
+| --- | --- |
+| Parameters | `ALLSKY_SFC_SW_DWN` (all-sky GHI), `CLRSKY_SFC_SW_DWN` (clear-sky GHI), both W/m² hourly averages |
+| Community | `RE` (renewable energy); the wind/agro parameter sets are irrelevant here |
+| Time standard | Default is **LST** (local solar time, 15° swath). Always send `time-standard=UTC`; keys are then `YYYYMMDDHH` in UTC |
+| Response shape | `properties.parameter.<NAME>.<YYYYMMDDHH> = value` (a JSON object, not an array); `header.fill_value`, `header.time_standard`, `header.start/end` |
+| Unit | W/m² (hourly average), never kW or Wh; `-999.0` = fill/missing |
+| Coverage | Hourly from 2001-01-01 to near real time, updated nightly with a **2-3 day latency** |
+| Auth / cost | Keyless, no account, no documented request budget; be polite (one request per location per day) |
+| Privacy | The request contains the array's coordinates, so it is listed in README's "what leaves your system" |
+
+### Required normalisation
+
+* Drop `-999.0` rows; a filled hour is **missing data**, never `0 W/m²` (using it as a
+  measurement would report a clear sky at midnight and a blackout at noon).
+* Clearness `k = ALLSKY / CLRSKY`, only where `CLRSKY >= 20 W/m²` (below that the ratio is twilight
+  noise) and `ALLSKY >= 0`; the add-on takes the median per **local** hour-of-day and clamps it to
+  `[0.05, 1.1]` (a clearness above 1 is cloud enhancement, which the model does not claim).
+* An hour with fewer than 3 usable samples keeps `k = 1.0`: no evidence means no adjustment.
+* NASA publishes **observed/near-real-time** data, not forecasts. It cannot fill a future slot; the add-on
+  uses the profile as a per-hour attenuation where the weather entity has no cloud coverage, and in the
+  derived watt-peak fit. Its failure is a note, never a failed forecast.
 
 ---
 

@@ -141,6 +141,43 @@ def test_statistics_start_end_are_milliseconds():
     assert (end - start) == timedelta(hours=1)
 
 
+# --- NASA POWER hourly irradiance (docs/EXTERNAL_APIS.md section 8) -------------------------
+
+
+def nasa_fill_value() -> float:
+    """The POWER hourly fill value: missing data, never a 0 W/m^2 measurement."""
+    return -999.0
+
+
+def nasa_stamp_to_utc(stamp: str) -> datetime:
+    """Hourly keys are UTC ``YYYYMMDDHH``; reading them as local time shifts the whole profile."""
+    return datetime.strptime(str(stamp), "%Y%m%d%H").replace(tzinfo=timezone.utc)
+
+
+def nasa_clearness(all_sky: float, clear_sky: float) -> float:
+    """Observed clearness index; only daylight (a positive clear-sky value) is usable."""
+    if clear_sky <= 0:
+        raise ValueError("no clear-sky reference: twilight or night")
+    return all_sky / clear_sky
+
+
+def test_nasa_power_stamps_are_utc_hours():
+    assert nasa_stamp_to_utc("2026011500") == datetime(2026, 1, 15, 0, 0, tzinfo=timezone.utc)
+    assert nasa_stamp_to_utc("2026011523").hour == 23
+
+
+def test_nasa_power_fill_is_dropped_and_twilight_has_no_ratio():
+    assert nasa_fill_value() < 0.0
+    assert nasa_clearness(300.0, 600.0) == 0.5
+    assert nasa_clearness(0.0, 600.0) == 0.0
+    raised = False
+    try:
+        nasa_clearness(300.0, 0.0)
+    except ValueError:
+        raised = True
+    assert raised, "a night hour has no clear-sky reference to divide by"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

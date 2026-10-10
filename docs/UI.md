@@ -56,7 +56,7 @@ last setpoint if the stop were skipped. The banner states this explicitly and no
 prices, sources), timeline chart, summary (cost, baseline, saving, charged/discharged, cycles,
 arbitrage, per-battery shares, and the aggregate **round trip** the plan assumed), slot table with
 action, reason and a `stale price` badge. The price chart draws the **break-even line**
-(`buy / round_trip + cycle_cost / eta_discharge`, from the aggregate the plan assumed) across the
+(`buy / round_trip + wear`, from the aggregate the plan assumed) across the
 sell prices, so a sell price that looks profitable but sits below the battery's conversion loss is
 visibly below the line; that slot stays idle and its reason is `efficiency_loss`, which is distinct
 from `spread_below_threshold` (the user's own `optimizer.min_spread_eur_per_kwh` floor). Exports are
@@ -72,11 +72,13 @@ lists active/healthy/freshness per provider.
 (the input: one number, split evenly into `eta_charge`/`eta_discharge`; explicit per-direction values
 override the split and the round trip becomes their product), cycle count (from `state.extra.cycles`,
 "not reported" otherwise), limits, SoC window, mapping list and `mapping resolved` / `needs
-confirmation` badge. Two derived numbers sit beside the round trip, both recomputed from the current
-buy price: the **effective cost of a stored kWh** (`buy / eta_charge`, the buy price plus the
-charging loss) and the **break-even sale price**
-(`buy / round_trip + cycle_cost / eta_discharge`), each with its formula in the field help and the
-wear term shown only when `optimizer.cycle_cost_eur_per_kwh` is non-zero. Actions:
+confirmation` badge. Three derived numbers sit beside the round trip: the **wear** (per kWh delivered,
+`price ÷ (cycle life × usable kWh)`, entered as the optional purchase price and cycle life in the
+edit dialog; 0 when either is unset), and — recomputed from the current
+buy price — the **effective cost of a stored kWh** (`buy / eta_charge + wear × eta_discharge`) and the
+**break-even sale price** (`buy / round_trip + wear`), each with its formula in the field help. The
+advanced `optimizer.cycle_cost_eur_per_kwh` setting replaces the derived wear when non-zero, and the
+card says so. Actions:
 enable/disable (confirm when enabling), `Test discharge` (disabled unless mode is `auto` and dry
 run is off; confirm + checkbox; fails 409 with the server message when not allowed), edit, delete
 (confirm + checkbox). The test-discharge dialog is unambiguous that it writes a **real** setpoint
@@ -221,12 +223,13 @@ if they are absent:
   positive field means discharge) and renders `applied_w`, the exact `seconds`, `ok`, `code` and
   `message` from the response; the server clamps power to `max_discharge_w` and seconds to 1–60.
 - `GET /api/v1/batteries`: `capabilities` as a flat object, and `state.extra.cycles` for the cycle
-  count. For the efficiency block: `round_trip_efficiency_pct` (the stored input), `eta_charge` and
-  `eta_discharge` (the effective values, after the even split or the override) and the derived
-  `round_trip_efficiency` plus `break_even_sell_eur_per_kwh`, recomputed by the server from the
-  current buy price and `optimizer.cycle_cost_eur_per_kwh` so the card never does the maths itself.
-- `GET /api/v1/plan`: the aggregate `eta_charge`/`eta_discharge`/round trip the plan assumed (for the
-  summary and the break-even line) and, in `batteries[]`, each battery's own round trip and
+  count. For the efficiency/wear block: `round_trip_efficiency_pct` (the stored input), `eta_charge`
+  and `eta_discharge` (the effective values, after the even split or the override), `price_eur`,
+  `cycle_life` and the derived `round_trip_efficiency` plus `wear_eur_per_kwh`; the card computes
+  the stored-kWh cost and break-even from those and the current buy price.
+- `GET /api/v1/plan`: the aggregate `eta_charge`/`eta_discharge`/round trip and the per-delivered-kWh
+  `wear_eur_per_kwh` the plan assumed (for the
+  summary and the break-even line) and, in `batteries[]`, each battery's own round trip, wear and
   break-even, because per-battery values are not the aggregate mean. Slot `reason` values include
   `efficiency_loss`, which the table renders like any other reason slug.
 - `GET /api/v1/accuracy`: `series[].{day, mape_pct, bias_pct}`; `null` MAPE means "no data".

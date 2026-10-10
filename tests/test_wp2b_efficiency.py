@@ -333,7 +333,7 @@ def test_the_plan_summary_reports_the_assumed_efficiency():
     config = battery(eta_charge=0.90, eta_discharge=0.94)
     agg = dp.BatteryAggregate.from_configs([config], 0.0)
     opts = dp.OptimizerOptions(
-        slot_minutes=15, soc_step_kwh=0.05, power_steps=8, cycle_cost_eur_per_kwh=0.02, allow_export=True
+        slot_minutes=15, soc_step_kwh=0.05, power_steps=8, wear_eur_per_kwh=0.02, allow_export=True
     )
     slots = make_slots(8, 15, pv=0.0, load=0.0, buy=[0.10, 0.30, 0.20, 0.40, 0.20, 0.30, 0.10, 0.40])
     plan = dp.solve(slots, aggregate=agg, start_kwh=1.0, options=opts, generated_at=T0)
@@ -342,8 +342,9 @@ def test_the_plan_summary_reports_the_assumed_efficiency():
     assert summary.eta_charge == pytest.approx(0.90)
     assert summary.eta_discharge == pytest.approx(0.94)
     assert summary.round_trip_efficiency == pytest.approx(0.90 * 0.94)
+    assert summary.wear_eur_per_kwh == pytest.approx(0.02)
     assert summary.break_even_sell_eur_per_kwh == pytest.approx(
-        config.break_even_sell_eur_per_kwh(median_buy, opts.cycle_cost_eur_per_kwh)
+        config.break_even_sell_eur_per_kwh(median_buy, opts.wear_eur_per_kwh)
     )
 
 
@@ -353,14 +354,28 @@ def test_every_plan_battery_entry_carries_its_own_efficiency():
     plan = engine.plan_now("test")
     assert plan is not None and plan.batteries
     median_buy = dp._median([slot.buy for slot in plan.slots])
-    cycle_cost = float(settings.get("optimizer.cycle_cost_eur_per_kwh", 0.0) or 0.0)
+    override = float(settings.get("optimizer.cycle_cost_eur_per_kwh", 0.0) or 0.0)
     configs = {config.id: config for config in engine.battery_configs()}
     for entry in plan.batteries:
         config = configs[entry["id"]]
+        wear = override if override > 0.0 else config.wear_eur_per_kwh
         assert entry["round_trip_efficiency"] == pytest.approx(config.round_trip_efficiency)
+        assert entry["wear_eur_per_kwh"] == pytest.approx(wear)
         assert entry["break_even_sell_eur_per_kwh"] == pytest.approx(
-            config.break_even_sell_eur_per_kwh(median_buy, cycle_cost)
+            config.break_even_sell_eur_per_kwh(median_buy, wear)
         )
+
+
+def test_the_wear_override_replaces_the_derived_wear_end_to_end():
+    engine, _store, _ha, clock, _settings = build_engine(
+        **{"optimizer.cycle_cost_eur_per_kwh": 0.03}
+    )
+    clock.advance(minutes=7)
+    plan = engine.plan_now("test")
+    assert plan is not None and plan.batteries
+    assert plan.summary.wear_eur_per_kwh == pytest.approx(0.03)
+    for entry in plan.batteries:
+        assert entry["wear_eur_per_kwh"] == pytest.approx(0.03), "the override is what the card shows"
 
 
 def test_the_api_plan_payload_carries_the_efficiency_keys():
@@ -371,12 +386,13 @@ def test_the_api_plan_payload_carries_the_efficiency_keys():
     plan = engine.plan_now("test")
     payload = plan_dict(plan, clock.now)
     summary = payload["summary"]
-    for field in ("eta_charge", "eta_discharge", "round_trip_efficiency", "break_even_sell_eur_per_kwh"):
+    for field in ("eta_charge", "eta_discharge", "round_trip_efficiency", "wear_eur_per_kwh", "break_even_sell_eur_per_kwh"):
         assert field in summary, field
     assert 0 < summary["round_trip_efficiency"] <= 1
     assert summary["break_even_sell_eur_per_kwh"] is not None
     for entry in payload["batteries"]:
         assert "round_trip_efficiency" in entry
+        assert "wear_eur_per_kwh" in entry
         assert "break_even_sell_eur_per_kwh" in entry
     # the existing shape is untouched
     assert {"id", "name", "share_w"} <= set(payload["batteries"][0])
@@ -520,3 +536,63 @@ def test_actuals_are_bucketed_at_the_measurement_resolution():
 
     assert row["ts"] == quarter_floor(clock.now, MEASUREMENT_MINUTES).isoformat()
     assert store.actuals and store.actuals[-1]["ts"] == row["ts"]
+
+
+# --------------------------------------------------------------------------------------
+# 5b. derived wear (SPEC 5): per delivered kWh, fleet average, discharge-only charging
+# --------------------------------------------------------------------------------------
+
+
+def test_wear_cost_is_charged_per_delivered_kwh_on_discharge_only():
+    # 1 stored kWh discharged at eta_dis 0.5 delivers 0.5 AC kWh, so it pays half the constant
+    assert dp.wear_cost_eur(0.1, 0.5, 2.0, 1.0) == pytest.approx(0.05)
+    assert dp.wear_cost_eur(0.1, 0.5, 1.0, 2.0) == 0.0, "charging stores energy; it delivers none"
+    assert dp.wear_cost_eur(0.1, 0.5, 1.0, 1.0) == 0.0
+    assert dp.wear_cost_eur(0.0, 0.5, 2.0, 1.0) == 0.0
+
+
+def test_fleet_wear_is_the_usable_weighted_mean_and_the_override_wins():
+    cheap = battery(
+        id="battery_cheap",
+        capacity_kwh=5.0,
+        price_eur=1000.0,
+        cycle_life=2000,
+    )
+    costly = battery(
+        id="battery_costly",
+        capacity_kwh=15.0,
+        price_eur=9000.0,
+        cycle_life=6000,
+    )
+    assert cheap.wear_eur_per_kwh == pytest.approx(1000.0 / (2000 * 5.0))
+    assert costly.wear_eur_per_kwh == pytest.approx(9000.0 / (6000 * 15.0))
+    agg = dp.BatteryAggregate.from_configs([cheap, costly], 0.0)
+    expected = (5.0 * cheap.wear_eur_per_kwh + 15.0 * costly.wear_eur_per_kwh) / 20.0
+    assert agg.wear_eur_per_kwh == pytest.approx(expected)
+
+    slots = make_slots(8, 15, pv=0.0, load=0.0, buy=[0.10, 0.30, 0.20, 0.40, 0.20, 0.30, 0.10, 0.40])
+    opts = dp.OptimizerOptions(slot_minutes=15, soc_step_kwh=0.5, power_steps=6, allow_export=True)
+    plan = dp.solve(slots, aggregate=agg, start_kwh=10.0, options=opts, generated_at=T0)
+    assert plan.summary.wear_eur_per_kwh == pytest.approx(expected), "the DP falls back to derived wear"
+
+    override = dp.OptimizerOptions(
+        slot_minutes=15, soc_step_kwh=0.5, power_steps=6, allow_export=True, wear_eur_per_kwh=0.07
+    )
+    plan_override = dp.solve(slots, aggregate=agg, start_kwh=10.0, options=override, generated_at=T0)
+    assert plan_override.summary.wear_eur_per_kwh == pytest.approx(0.07)
+    derived_break_even = dp.median_buy_eur_per_kwh(slots) / agg.eta_charge / agg.eta_discharge + expected
+    override_break_even = dp.median_buy_eur_per_kwh(slots) / agg.eta_charge / agg.eta_discharge + 0.07
+    assert plan.summary.break_even_sell_eur_per_kwh == pytest.approx(derived_break_even)
+    assert plan_override.summary.break_even_sell_eur_per_kwh == pytest.approx(override_break_even)
+
+
+def test_a_battery_without_price_or_life_plans_with_no_wear():
+    free = battery(capacity_kwh=2.0, max_charge_w=2000.0, max_discharge_w=2000.0)
+    assert free.wear_eur_per_kwh == 0.0
+    agg = dp.BatteryAggregate.from_configs([free], 0.0)
+    assert agg.wear_eur_per_kwh == 0.0
+    slots = make_slots(8, 15, pv=0.0, load=0.0, buy=[0.10, 0.30, 0.20, 0.40, 0.20, 0.30, 0.10, 0.40])
+    opts = dp.OptimizerOptions(slot_minutes=15, soc_step_kwh=0.5, power_steps=6, allow_export=True)
+    plan = dp.solve(slots, aggregate=agg, start_kwh=1.0, options=opts, generated_at=T0)
+    assert plan.summary.cycle_cost_eur == 0.0
+    assert plan.summary.wear_eur_per_kwh == 0.0

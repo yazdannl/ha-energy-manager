@@ -97,13 +97,17 @@ solarSource})` and `SEM_APP.setupCardKeys({priceProvider, priceContract, solarSo
 - Savings come from the server: `baseline_*` and `savings_eur` may be `null` (no load forecast to
   re-price against) and are rendered as unknown (`--`), never as zero; chart series skip nulls and
   the legend says so. The baseline note is the server's text verbatim.
-- Battery efficiency maths is client-side from values the API already returns (per-battery `eta_*`,
-  `/status` `price_now`, the `optimizer.cycle_cost_eur_per_kwh` setting): round trip is
-  `eta_charge * eta_discharge`, stored kWh all-in is `(buy + wear) / eta_charge`, and break-even is
-  `buy / round_trip + wear / eta_discharge`. The form's primary input is
-  `round_trip_efficiency_pct` (split evenly into both directions); explicit `eta_charge`/
-  `eta_discharge` win and the dialog says so. The plan chart's break-even curve uses the aggregate
-  the summary reports and is omitted (with a note) when the summary omits it.
+- Battery efficiency/wear maths is client-side from values the API already returns (per-battery
+  `eta_*`, `price_eur`, `cycle_life`, `wear_eur_per_kwh`, `/status` `price_now`, and the
+  `optimizer.cycle_cost_eur_per_kwh` setting as the advanced override): round trip is
+  `eta_charge * eta_discharge`, derived wear is `price / (cycle_life × usable kWh)`, stored kWh
+  all-in is `buy / eta_charge + wear × eta_discharge`, and break-even is
+  `buy / round_trip + wear`. The form's primary inputs are
+  `round_trip_efficiency_pct` (split evenly into both directions) and the optional price/cycle life;
+  explicit `eta_charge`/
+  `eta_discharge` win and the dialog says so. The plan chart's break-even curve uses the summary's
+  reported `wear_eur_per_kwh` (the configured value only as a fallback) and is omitted (with a note)
+  when the summary omits the aggregate efficiency.
 - The battery dialog opens with a discovery picker: `/discover?kind=battery` rows are grouped
   per device and only groups that could be a battery are listed (a known battery platform, or a
   *writable* control role plus a state role — discovery also suggests sensors for setpoint roles,

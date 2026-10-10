@@ -460,8 +460,9 @@ def test_plan_route_shape_and_hour_filter():
             "id": "example_battery_1",
             "name": "Example Battery 1",
             "share_w": 500.0,
-            # SPEC 5: additive per-battery efficiency keys (null for a hand-built plan)
+            # SPEC 5: additive per-battery efficiency/wear keys (null for a hand-built plan)
             "round_trip_efficiency": None,
+            "wear_eur_per_kwh": None,
             "break_even_sell_eur_per_kwh": None,
         }
     ]

@@ -15,15 +15,33 @@
   var MAX_KWH = 10.4;
   var MOCK_ROUND_TRIP_PCT = 90.0;
   var MOCK_ETA = Math.sqrt(MOCK_ROUND_TRIP_PCT / 100);
+  // SPEC 5: wear is derived per battery from its own price and cycle life, per kWh delivered.
+  var MOCK_PRICE_EUR = 3000.0;
+  var MOCK_CYCLE_LIFE = 6000;
+  var MOCK_WEAR = round(MOCK_PRICE_EUR / (MOCK_CYCLE_LIFE * CAP_KWH * (90.0 - 10.0) / 100.0), 9);
 
-  /** Mirrors config.py: keep a derived round_trip_efficiency_pct on every read-back config. */
+  /** Mirrors config.py: keep a derived round_trip_efficiency_pct and wear_eur_per_kwh on every
+   *  read-back config. Both are derived, never stored (SPEC 5). */
   function withDerivedEfficiency(config) {
     if (config && typeof config.round_trip_efficiency_pct !== "number") {
       var etaCharge = typeof config.eta_charge === "number" ? config.eta_charge : null;
       var etaDischarge = typeof config.eta_discharge === "number" ? config.eta_discharge : null;
       if (etaCharge && etaDischarge) config.round_trip_efficiency_pct = round(etaCharge * etaDischarge * 100, 6);
     }
+    if (config) config.wear_eur_per_kwh = derivedWearEur(config);
     return config;
+  }
+
+  /** Mirrors BatteryConfig.wear_eur_per_kwh: price / (cycle life x usable kWh); 0 when unknown. */
+  function derivedWearEur(config) {
+    var price = Number((config || {}).price_eur);
+    var life = Number((config || {}).cycle_life);
+    var capacity = Number((config || {}).capacity_kwh);
+    var minSoc = Number((config || {}).min_soc_pct);
+    var maxSoc = Number((config || {}).max_soc_pct);
+    var usable = capacity * (maxSoc - minSoc) / 100;
+    if (!(price > 0) || !(life > 0) || !(usable > 0)) return 0;
+    return round(price / (life * usable), 9);
   }
 
   /** Mirrors config.py: a pct-only payload is split evenly; explicit etas win. */
@@ -137,7 +155,14 @@
     // grid cost + cycle cost - salvage, and the break-even sale price is taken at the same median
     // buy. Both are computed from the rounded grid cost the summary reports so the three numbers
     // stay consistent. The real serializer emits break-even unrounded; so does this mock.
-    var cycleCost = 0.0;
+    // Wear is charged per kWh delivered: the mock computes it from its own slot powers so the
+    // summary's wear total is consistent with the per-kWh constant it reports (SPEC 8.1).
+    var dischargedKwh = 0.0;
+    slots.forEach(function (s) {
+      var power = Number(s.power_w);
+      if (isFinite(power) && power < 0) dischargedKwh += -power / 1000.0 * 0.25;
+    });
+    var cycleCost = round(MOCK_WEAR * dischargedKwh, 6);
     var costs = round(cost, 2);
     var buys = slots.map(function (s) { return s.buy; }).sort(function (a, b) { return a - b; });
     var medianBuy = 0;
@@ -174,10 +199,11 @@
         eta_charge: MOCK_ETA,
         eta_discharge: MOCK_ETA,
         round_trip_efficiency: roundTrip,
-        break_even_sell_eur_per_kwh: medianBuy / roundTrip + cycleCost / MOCK_ETA
+        wear_eur_per_kwh: MOCK_WEAR,
+        break_even_sell_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR
       },
       slots: slots,
-      batteries: [{ id: "battery_1", name: "Example Battery 1", share_w: slots.length ? slots[0].power_w : 0 }]
+      batteries: [{ id: "battery_1", name: "Example Battery 1", share_w: slots.length ? slots[0].power_w : 0, round_trip_efficiency: roundTrip, wear_eur_per_kwh: MOCK_WEAR, break_even_sell_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR }]
     };
   }
 
@@ -243,7 +269,7 @@
 
   function batteryRecord() {
     return {
-      config: {
+      config: withDerivedEfficiency({
         id: "battery_1",
         name: "Example Battery 1",
         driver: "generic",
@@ -255,6 +281,8 @@
         eta_charge: MOCK_ETA,
         eta_discharge: MOCK_ETA,
         round_trip_efficiency_pct: MOCK_ROUND_TRIP_PCT,
+        price_eur: MOCK_PRICE_EUR,
+        cycle_life: MOCK_CYCLE_LIFE,
         mapping: {
           power_setpoint_entity: "number.example_battery_input_limit",
           mode_select_entity: "select.example_battery_mode",
@@ -263,7 +291,7 @@
           capacity_entity: "sensor.example_battery_capacity"
         },
         enabled: db.batteryEnabled
-      },
+      }),
       state: statePayload(),
       capabilities: {
         max_charge_w: 800.0,
@@ -369,6 +397,7 @@
     ["solar.azimuth_deg", "float", null, "Azimuth", "capacity only. Compass direction the panels face: 0 = north, 90 = east, 180 = south, 270 = west. Unset = assume south.", "solar", null],
     ["solar.performance_ratio", "float", 0.85, "Performance ratio", "capacity only. Inverter, temperature and soiling losses applied to the clear-sky estimate.", "solar", null],
     ["solar.weather_entity", "str", "", "Weather entity", "capacity only. HA weather entity whose hourly cloud coverage attenuates the estimate. Unset = clear-sky, refined by the measured-PV correction.", "solar", null],
+    ["solar.nasa_irradiance", "bool", true, "NASA irradiance", "capacity/derived only. NASA POWER's observed hourly irradiance (keyless, 2-3 day latency) adds a per-hour clearness factor where the weather entity has no cloud data, and refines the meter-derived array fit.", "solar", null],
 
     ["load.mode", "str", "auto", "Load source", "auto uses the load entity if mapped, else derived.", "load", ["auto", "entity", "derived"]],
     ["load.entity", "str", "", "Load entity", "Runtime-picked load power sensor.", "load", null],
@@ -384,7 +413,7 @@
     ["optimizer.soc_step_kwh", "float", 0.02, "SoC step", "kWh per DP state.", "optimizer", null],
     ["optimizer.power_steps", "int", 24, "Power steps", "Discrete actions per state.", "optimizer", null],
     ["optimizer.salvage_multiplier", "float", 1.0, "Salvage multiplier", "Terminal SoC valued at multiplier x median buy price.", "optimizer", null],
-    ["optimizer.cycle_cost_eur_per_kwh", "float", 0.0, "Cycle cost", "EUR per kWh cycled.", "optimizer", null],
+    ["optimizer.cycle_cost_eur_per_kwh", "float", 0.0, "Wear override", "Advanced: a non-zero value replaces every battery's derived wear (price / (cycle life x usable kWh)) for planning and break-even. Leave 0 to use the derived per-fleet average wear.", "optimizer", null],
     ["optimizer.allow_grid_charge", "bool", true, "Allow grid charging", "", "optimizer", null],
     ["optimizer.allow_export", "bool", false, "Allow export", "Off until a feed-in tariff is configured; sell is then 0.00.", "optimizer", null],
     ["optimizer.reserve_soc_pct", "float", 0.0, "Reserve SoC", "Extra floor above battery min_soc.", "optimizer", null],
@@ -461,7 +490,8 @@
     "control.stale_state_seconds", "control.tick_seconds", "currency", "grid.export_entity",
     "grid.import_entity", "latitude_override", "load.base_kwh_per_day", "load.entity",
     "load.mode", "load.temperature_entity", "log_level", "longitude_override", "notify.events",
-    "notify.mobile_service", "notify.persistent", "optimizer.power_steps",
+    "notify.mobile_service", "notify.persistent", "optimizer.cycle_cost_eur_per_kwh",
+    "optimizer.power_steps",
     "optimizer.salvage_multiplier", "optimizer.slot_minutes", "optimizer.soc_step_kwh",
     "optimizer.target_soc_pct_end", "price.bzn", "price.contract",
     "price.energy_tax_eur_per_kwh", "price.entity", "price.feed_in_entity",
@@ -470,7 +500,7 @@
     "price.fixed_night_start_hour", "price.fixed_price_entity", "price.import_fee_eur_per_kwh",
     "price.scale_divisor", "price.source", "price.static_schedule", "price.unit",
     "price.vat_pct", "solar.api_key", "solar.azimuth_deg", "solar.bias_correction",
-    "solar.capacity_wp", "solar.performance_ratio", "solar.planes", "solar.tilt_deg",
+    "solar.capacity_wp", "solar.nasa_irradiance", "solar.performance_ratio", "solar.planes", "solar.tilt_deg",
     "solar.weather_entity", "timezone"
   ];
 

@@ -384,6 +384,10 @@ def test_battery_break_even_maths():
       be75Wear: A.breakEvenSellEur(0.2, cfg75, 0.02),
       asymmetric: A.breakEvenSellEur(0.2, asymmetric, 0),
       stored75: A.storedKwhCostEur(0.2, cfg75, 0),
+      wearFromConfig: A.batteryWear({ wear_eur_per_kwh: 0.05 }, 0),
+      wearOverride: A.batteryWear({ wear_eur_per_kwh: 0.05 }, 0.02),
+      derivedWear: A.derivedWearEur({ price_eur: 3000, cycle_life: 6000, capacity_kwh: 10, min_soc_pct: 10, max_soc_pct: 90 }),
+      derivedWearMissing: A.derivedWearEur({ price_eur: 3000, cycle_life: 0, capacity_kwh: 10, min_soc_pct: 10, max_soc_pct: 90 }),
       unknownBuy: A.breakEvenSellEur(null, cfg75, 0),
       etaOnly: A.batteryEfficiency({ eta_charge: 0.9, eta_discharge: 0.9 }).round_trip_pct,
       pctOnlyEta: A.batteryEfficiency(cfg75).eta_charge
@@ -393,9 +397,13 @@ def test_battery_break_even_maths():
     assert round(data["be75"] * 100, 2) == 26.67, "20 ct at 75 % must break even at 26.67 ct"
     assert round(data["be80"] * 100, 2) == 25.0, "25 ct is the 80 % case"
     assert round(data["be90"] * 100, 2) == 22.22
-    assert round(data["be75Wear"] * 100, 2) == 28.98, "wear adds cycle_cost / eta_discharge"
+    assert round(data["be75Wear"] * 100, 2) == 28.67, "wear adds the per-delivered-kWh constant directly"
     assert round(data["asymmetric"] * 100, 2) == 22.88, "advanced override uses eta_charge x eta_discharge"
     assert round(data["stored75"] * 100, 2) == 23.09, "stored kWh all-in = buy / eta_charge at zero wear"
+    assert data["wearFromConfig"] == pytest.approx(0.05), "the derived per-battery wear is used"
+    assert data["wearOverride"] == pytest.approx(0.02), "a positive override wins over derived wear"
+    assert data["derivedWear"] == pytest.approx(3000.0 / (6000 * 8.0)), "price / (cycles x usable kWh)"
+    assert data["derivedWearMissing"] is None, "unknown cycle life means no derived wear"
     assert data["unknownBuy"] is None
     assert abs(data["etaOnly"] - 81.0) < 1e-9
     assert data["pctOnlyEta"] == pytest.approx(math.sqrt(0.75), abs=1e-6), "pct-only payload splits evenly"
@@ -427,8 +435,8 @@ def test_plan_efficiency_and_break_even_helpers():
     assert abs(data["percentAsWhole"]["round_trip"] - 0.9) < 1e-9
     assert abs(data["derived"]["eta_charge"] - 0.9) < 1e-9
     assert data["missing"] is None and data["noSummary"] is None
-    assert round(data["beDerived"] * 100, 2) == 26.91, "0.81 round trip: 0.2/0.81 + 0.02/0.9"
-    assert round(data["beNinety"] * 100, 2) == 24.33, "0.9 round trip: 0.2/0.9 + 0.02/0.9487"
+    assert round(data["beDerived"] * 100, 2) == 26.69, "0.81 round trip: 0.2/0.81 + 0.02"
+    assert round(data["beNinety"] * 100, 2) == 24.22, "0.9 round trip: 0.2/0.9 + 0.02"
     assert data["beNoBuy"] is None
     app = read(WEB / "app.js")
     charts = read(WEB / "charts.js")

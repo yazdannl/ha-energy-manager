@@ -168,6 +168,10 @@ class BatteryConfig:
     eta_discharge: float = 0.95
     mapping: dict[str, str] = field(default_factory=dict)
     enabled: bool = True
+    #: Purchase price of the pack in EUR and its rated full-cycle life (SPEC.md section 5). Both
+    #: are optional: 0 means "not known", never a guess, and the derived wear is then 0.
+    price_eur: float = 0.0
+    cycle_life: float = 0.0
 
     def usable_kwh(self) -> float:
         """Energy between the configured SoC floor and ceiling."""
@@ -184,19 +188,38 @@ class BatteryConfig:
         """AC-to-AC efficiency of a full charge/discharge cycle (``eta_charge * eta_discharge``)."""
         return self.eta_charge * self.eta_discharge
 
+    @property
+    def wear_eur_per_kwh(self) -> float:
+        """Wear cost of one kWh **delivered** (AC): ``price / (cycle_life × usable kWh)``.
+
+        A full cycle spreads the purchase price over its rated cycles, and each cycle delivers the
+        usable capacity, so the per-delivered-kWh figure needs no efficiency term (SPEC.md
+        section 5).
+        Returns 0.0 while either input is unset, which is exactly the old "no wear configured"
+        default; it never guesses a price or a life.
+        """
+        if self.price_eur <= 0.0 or self.cycle_life <= 0.0:
+            return 0.0
+        usable = self.usable_kwh()
+        if usable <= 0.0:
+            return 0.0
+        return self.price_eur / (self.cycle_life * usable)
+
     def break_even_sell_eur_per_kwh(
-        self, buy_eur_per_kwh: float, cycle_cost_eur_per_kwh: float = 0.0
+        self, buy_eur_per_kwh: float, wear_eur_per_kwh: float | None = None
     ) -> float | None:
         """Lowest sale price (EUR per kWh AC delivered) that covers buying at ``buy_eur_per_kwh``.
 
-        Delivering 1 kWh AC costs ``buy / (eta_charge * eta_discharge)`` in energy bought, and cycles
-        ``1 / eta_discharge`` kWh of stored energy, so the wear term is charged per delivered kWh:
-        ``buy / round_trip + cycle_cost / eta_discharge``. At 20 ct and a 75 % round trip that is
-        26.7 ct. Returns ``None`` when the efficiencies make the calculation meaningless.
+        ``buy / round_trip`` is the energy the round trip loses; ``wear`` is the delivered kWh's
+        share of the pack's life. Both terms are per delivered AC kWh, so the formula uses the
+        round trip alone (SPEC.md section 5). ``wear_eur_per_kwh=None`` reads the battery's own
+        derived value; an explicit number (the advanced override) wins. Returns ``None`` when the
+        round trip makes the calculation meaningless.
         """
-        if self.round_trip_efficiency <= 0 or self.eta_discharge <= 0:
+        if self.round_trip_efficiency <= 0:
             return None
-        return buy_eur_per_kwh / self.round_trip_efficiency + cycle_cost_eur_per_kwh / self.eta_discharge
+        wear = self.wear_eur_per_kwh if wear_eur_per_kwh is None else wear_eur_per_kwh
+        return buy_eur_per_kwh / self.round_trip_efficiency + wear
 
     def validate(self) -> list[str]:
         """Return a list of human-readable problems; empty means usable."""
@@ -213,6 +236,10 @@ class BatteryConfig:
             problems.append("at least one of max_charge_w / max_discharge_w must be > 0")
         if not 0 < self.eta_charge <= 1 or not 0 < self.eta_discharge <= 1:
             problems.append("efficiencies must be in (0, 1]")
+        if self.price_eur < 0:
+            problems.append("price_eur must be >= 0")
+        if self.cycle_life < 0:
+            problems.append("cycle_life must be >= 0")
         if not self.mapping:
             problems.append("mapping is empty: confirm the entity mapping in the UI")
         return problems
@@ -380,6 +407,10 @@ class PlanSummary:
     effective_step_kwh: float = 0.0
     solver_iterations: int = 0
     cycle_cost_eur: float = 0.0  # battery-wear term included in the objective
+    #: The wear constant the plan assumed, EUR per kWh delivered. It is the derived fleet value
+    #: (or the advanced override) and is what ``break_even_sell_eur_per_kwh`` adds to
+    #: ``buy / round_trip`` (SPEC.md section 5).
+    wear_eur_per_kwh: float = 0.0
     objective_eur: float = 0.0  # the exact value the optimiser minimised
                               # (grid cost + cycle cost - terminal salvage)
                               # cost_estimate_eur / baseline_cost_eur / saved_eur are grid-only and

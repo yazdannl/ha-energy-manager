@@ -25,8 +25,10 @@ from app.sources.solar import (  # noqa: E402
     _interpolate,
     _parse_watts,
     _plane_irradiance,
+    fetch_nasa_hourly,
     fetch_plane,
     load_solar_forecast,
+    nasa_clearness_profile,
     solar_bias_factors,
     update_solar_bias,
 )
@@ -84,7 +86,12 @@ def store(tmp_path):
 
 
 def solar_settings(store=None, **overrides):
-    options = {"solar.enabled": True, "solar.planes": [PLANE], "solar.bias_correction": False}
+    options = {
+        "solar.enabled": True,
+        "solar.planes": [PLANE],
+        "solar.bias_correction": False,
+        "solar.nasa_irradiance": False,
+    }
     options.update(overrides)
     return Settings(store, options=options)
 
@@ -270,6 +277,8 @@ CAPACITY_DEFAULTS = {
     "solar.planes": [],
     "solar.capacity_wp": 4000.0,
     "solar.bias_correction": False,
+    # NASA POWER is network I/O; only the dedicated NASA tests turn it on, with a stub.
+    "solar.nasa_irradiance": False,
     "optimizer.horizon_hours": 24,
 }
 TEST_LOCATION = (52, 5, "UTC")  # integers: no coordinate shape anywhere in this file
@@ -281,12 +290,12 @@ def capacity_settings(store=None, **overrides):
     return Settings(store, options=options)
 
 
-def load_capacity(settings, store=None, client=None, *, location=TEST_LOCATION, now=NOW):
+def load_capacity(settings, store=None, client=None, *, location=TEST_LOCATION, now=NOW, http=None):
     # Default the store to the one the settings were built with, so a one-argument call still sees
     # whatever bias learning that store holds.
     if store is None:
         store = getattr(settings, "store", None)
-    return load_solar_forecast(settings, store, client, location=location, now=now)
+    return load_solar_forecast(settings, store, client, location=location, now=now, http=http)
 
 
 def slot_at(forecast, moment):
@@ -645,6 +654,8 @@ DERIVED_DEFAULTS = {
     "solar.planes": [],
     "solar.capacity_wp": None,
     "solar.bias_correction": False,
+    # NASA POWER is network I/O; only the dedicated NASA tests turn it on, with a stub.
+    "solar.nasa_irradiance": False,
     "optimizer.horizon_hours": 24,
     "grid.power_entity": "sensor.example_grid_power",
 }
@@ -846,3 +857,167 @@ def test_derived_solar_caches_the_fit_and_does_not_refetch_history(store):
         changed, store, second, location=TEST_LOCATION, now=NOW + timedelta(hours=6)
     )
     assert status.ok is False
+
+
+# -------------------------------------------------------------------- NASA POWER irradiance
+# SPEC.md section 7.1.1a: observed hourly irradiance as an *addition* to the capacity model,
+# applied only where the weather entity gives no cloud coverage, and used in the derived fit.
+# Keyless, W/m^2, UTC stamps ``YYYYMMDDHH``, fill value -999, ~3 day near-real-time latency.
+
+NASA_RATIO = 0.6
+
+
+class NasaStub:
+    """Answers the NASA POWER hourly request without any network, and records the URLs."""
+
+    def __init__(self, payload=None, error=None):
+        self.payload = payload
+        self.error = error
+        self.urls = []
+
+    def __call__(self, url, **kwargs):
+        self.urls.append(url)
+        if self.error is not None:
+            raise self.error
+        return self.payload
+
+
+def nasa_payload(ratio_by_hour, *, days=6, origin=NOW):
+    """Two synthetic irradiance series around ``origin``; clear-sky only during 08:00-15:00."""
+    all_sky, clear_sky = {}, {}
+    base = (origin - timedelta(days=20)).replace(hour=0, minute=0, second=0, microsecond=0)
+    for day in range(days):
+        for hour in range(24):
+            stamp = (base + timedelta(days=day, hours=hour)).strftime("%Y%m%d%H")
+            clear = 600.0 if 8 <= hour <= 15 else 0.0
+            all_sky[stamp] = clear * ratio_by_hour.get(hour, 1.0)
+            clear_sky[stamp] = clear
+    return {"properties": {"parameter": {"ALLSKY_SFC_SW_DWN": all_sky, "CLRSKY_SFC_SW_DWN": clear_sky}}}
+
+
+def nasa_series(payload):
+    """``fetch_nasa_hourly``'s return shape: floats, fill dropped."""
+    return {
+        name: {stamp: float(value) for stamp, value in values.items()}
+        for name, values in payload["properties"]["parameter"].items()
+    }
+
+
+def test_fetch_nasa_hourly_parses_both_series_and_drops_the_fill_value():
+    payload = nasa_payload({12: NASA_RATIO}, days=2)
+    payload["properties"]["parameter"]["ALLSKY_SFC_SW_DWN"]["2025121612"] = -999.0
+    stub = NasaStub(payload)
+    series = fetch_nasa_hourly(52, 5, NOW - timedelta(days=21), NOW, http=stub)
+    assert set(series) == {"ALLSKY_SFC_SW_DWN", "CLRSKY_SFC_SW_DWN"}
+    assert "2025121612" not in series["ALLSKY_SFC_SW_DWN"], "the fill value is missing data, not 0 W"
+    assert "2025121612" in series["CLRSKY_SFC_SW_DWN"]
+    url = stub.urls[0]
+    assert "ALLSKY_SFC_SW_DWN" in url and "CLRSKY_SFC_SW_DWN" in url
+    assert "community=RE" in url and "time-standard=UTC" in url and "format=JSON" in url
+
+
+def test_fetch_nasa_hourly_rejects_a_response_without_a_series():
+    with pytest.raises(ProviderError):
+        fetch_nasa_hourly(52, 5, NOW - timedelta(days=21), NOW, http=NasaStub({"properties": {}}))
+
+
+def test_nasa_clearness_profile_uses_daylight_medians_and_leaves_thin_hours_alone():
+    series = nasa_series(nasa_payload({12: NASA_RATIO}, days=6))
+    factors, fitted, samples = nasa_clearness_profile(series, timezone.utc)
+    assert len(factors) == 24
+    assert factors[12] == pytest.approx(NASA_RATIO)
+    assert factors[0] == 1.0, "a twilight hour has no clear-sky reference: no invented attenuation"
+    assert fitted == 8 and samples == 6 * 8
+
+
+def test_capacity_forecast_applies_nasa_clearness_only_where_cloud_data_is_missing(store):
+    baseline, base_status = load_capacity(capacity_settings(store))
+    assert base_status.ok and base_status.detail["nasa_status"] == "disabled"
+    nasa = NasaStub(nasa_payload({hour: NASA_RATIO for hour in range(8, 16)}))
+    settings = capacity_settings(store, **{"solar.nasa_irradiance": True})
+    forecast, status = load_capacity(settings, store, http=nasa)
+    assert status.ok, status.last_error
+    assert status.detail["nasa_irradiance"] is True and status.detail["nasa_status"] == "fresh fit"
+    assert any("NASA POWER clearness applied" in note for note in forecast.notes)
+    clear_noon = slot_at(baseline, NOW)
+    nasa_noon = slot_at(forecast, NOW)
+    assert clear_noon.pv_kw > 0.0
+    assert nasa_noon.pv_kw == pytest.approx(clear_noon.pv_kw * NASA_RATIO, rel=1e-9)
+    # 30 %: better than astronomy alone, worse than a forecast for the specific slot.
+    assert all(slot.uncertainty_pct == 30.0 for slot in forecast.slots)
+
+    # The daily cache answers the very next refresh: no second request, even with a failing stub.
+    again, status2 = load_capacity(settings, store, http=NasaStub(error=ProviderError("offline")))
+    assert status2.ok and status2.detail["nasa_status"] == "cached daily fit"
+    assert again.slots and nasa.urls and len(nasa.urls) == 1
+
+
+def test_capacity_forecast_stays_clear_sky_when_nasa_fails(store):
+    settings = capacity_settings(store, **{"solar.nasa_irradiance": True})
+    forecast, status = load_capacity(settings, store, http=NasaStub(error=ProviderError("offline")))
+    assert status.ok, "NASA is optional: its failure must never fail the forecast"
+    assert status.detail["nasa_irradiance"] is False and status.detail["nasa_status"] == "failed"
+    assert any("NASA POWER irradiance unavailable" in note for note in forecast.notes)
+    assert all(slot.uncertainty_pct == 35.0 for slot in forecast.slots)
+
+
+def test_capacity_forecast_does_not_ask_nasa_when_the_weather_entity_covers_the_horizon(store):
+    weather = WeatherStub(forecast=hourly_forecast([50] * 25))
+    nasa = NasaStub(error=AssertionError("NASA must not be called when cloud data covers every hour"))
+    settings = capacity_settings(
+        store, **{"solar.nasa_irradiance": True, "solar.weather_entity": WEATHER_ENTITY}
+    )
+    forecast, status = load_capacity(settings, store, weather, http=nasa)
+    assert status.ok, status.last_error
+    assert status.detail["nasa_status"] == "not needed"
+    assert nasa.urls == []
+
+
+def test_implied_capacity_uses_nasa_clearness_to_undo_cloud_bias():
+    clearness = [1.0] * 24
+    for hour in range(8, 16):
+        clearness[hour] = 0.5
+    # Every sample is the clear-sky model attenuated by the measured clearness of its hour.
+    samples = [
+        (stamp, model_kw(stamp) * clearness[stamp.astimezone(timezone.utc).hour])
+        for stamp in daylight_stamps()
+        if clearness[stamp.astimezone(timezone.utc).hour] < 1.0
+    ]
+    without, usable = _implied_capacity_wp(52, 5, timezone.utc, samples, derived_settings())
+    assert usable >= DERIVED_MIN_SAMPLES
+    assert without == pytest.approx(SYNTHETIC_WP * 0.5, rel=0.02), "without clearness the fit halves"
+    with_nasa, _ = _implied_capacity_wp(
+        52, 5, timezone.utc, samples, derived_settings(), clearness=clearness
+    )
+    assert with_nasa == pytest.approx(SYNTHETIC_WP, rel=0.02)
+
+
+def test_derived_source_uses_nasa_clearness_for_fit_and_forecast(store):
+    clearness = [1.0] * 24
+    for hour in range(8, 16):
+        clearness[hour] = 0.5
+    stamps = daylight_stamps()
+    history = HistoryStub(
+        {
+            GRID_ENTITY: [
+                (stamp, 0.2 - model_kw(stamp) * clearness[stamp.astimezone(timezone.utc).hour])
+                for stamp in stamps
+            ],
+            CHARGE_ENTITY: [(stamp, 0.2) for stamp in stamps],
+        }
+    )
+    nasa = NasaStub(nasa_payload({hour: 0.5 for hour in range(8, 16)}))
+    settings = derived_settings(
+        store,
+        **{"solar.nasa_irradiance": True},
+        batteries=battery_mapping_entry(
+            charge_power_entity=CHARGE_ENTITY, discharge_power_entity=DISCHARGE_ENTITY
+        ),
+    )
+    forecast, status = load_solar_forecast(
+        settings, store, history, location=TEST_LOCATION, now=NOW, http=nasa
+    )
+    assert status.ok, status.last_error
+    assert forecast.planes[0]["capacity_wp"] == pytest.approx(SYNTHETIC_WP, rel=0.05)
+    assert any("NASA POWER clearness refined the meter-derived array fit" in note for note in forecast.notes)
+    assert len(nasa.urls) == 1, "the fit and the forecast share one daily profile fetch"

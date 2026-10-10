@@ -46,8 +46,10 @@ __all__ = [
     "CACHE_TTL_S",
     "FORECAST_SOLAR_BASE",
     "MAX_PLANES",
+    "fetch_nasa_hourly",
     "fetch_plane",
     "load_solar_forecast",
+    "nasa_clearness_profile",
     "solar_bias_factors",
     "update_solar_bias",
 ]
@@ -376,6 +378,7 @@ def update_solar_bias(
 
 CAPACITY_UNCERTAINTY_CLEAR_PCT = 35.0  # no cloud data: astronomy alone
 CAPACITY_UNCERTAINTY_CLOUD_PCT = 25.0  # hourly cloud coverage narrows the band
+CAPACITY_UNCERTAINTY_NASA_PCT = 30.0  # observed local clearness narrows it, but it is not a forecast
 #: Beam/diffuse split of the clear-sky global irradiance (SPEC 7.1.1 step 2).
 DIFFUSE_FRACTION = 0.25
 GROUND_ALBEDO = 0.2
@@ -664,6 +667,240 @@ def _slot_cloud_map(
     return None, NO_CLOUD_DATA_NOTE.format(entity=entity_id)
 
 
+# --------------------------------------------------------------------------------------------
+# NASA POWER observed irradiance (SPEC.md section 7.1.1a; docs/EXTERNAL_APIS.md section 8)
+# --------------------------------------------------------------------------------------------
+#
+# An *addition* to the capacity model, never a replacement: weather-entity cloud coverage and the
+# measured-PV bias keep priority. NASA POWER publishes observed hourly all-sky and clear-sky
+# irradiance (W/m^2, keyless), but only after a near-real-time processing latency of a few days, so
+# it cannot fill future slots. What it does provide is a local, current clearness profile: the
+# median all-sky/clear-sky ratio per hour-of-day over the last weeks, used where the weather
+# forecast has no cloud coverage (today those slots assume a cloudless sky) and when fitting the
+# meter-derived watt peak. A keyless request per location per day; the fit is cached daily.
+
+NASA_POWER_BASE = "https://power.larc.nasa.gov/api/temporal/hourly/point"
+NASA_PARAMS = ("ALLSKY_SFC_SW_DWN", "CLRSKY_SFC_SW_DWN")
+NASA_FILL = -999.0
+#: The archive lags real time by a few days, so the window ends before the documented latency.
+NASA_LATENCY_DAYS = 3.0
+#: Three weeks of hourly samples give every hour-of-day about 21 chances to appear.
+NASA_WINDOW_DAYS = 21.0
+#: Below this clear-sky value the all-sky/clear-sky ratio is twilight noise, not cloudiness.
+NASA_MIN_CLEARSKY_WM2 = 20.0
+#: An hour bucket with fewer daylight samples than this keeps 1.0: no evidence, no adjustment.
+NASA_MIN_HOUR_SAMPLES = 3
+#: Clearness bounds: below NASA_CLEARNESS_MIN the sun would be almost erased; above the maximum is
+#: cloud enhancement, which the model does not claim.
+NASA_CLEARNESS_MIN = 0.05
+NASA_CLEARNESS_MAX = 1.1
+#: learning_profiles keys and the refit window (the archive advances nightly).
+NASA_KIND = "solar_nasa"
+NASA_PROFILE_KEY = "hourly"
+NASA_REFIT_HOURS = 24.0
+NASA_APPLIED_NOTE = (
+    "NASA POWER clearness applied where no cloud coverage is forecast"
+    " ({hours} of 24 hours fitted, {samples} daylight samples over {days:.0f} days)"
+)
+NASA_FIT_NOTE = "NASA POWER clearness refined the meter-derived array fit (it no longer assumes a cloudless sky)"
+NASA_ERROR_NOTE = (
+    "NASA POWER irradiance unavailable ({error}); slots without cloud data stay clear-sky"
+)
+NASA_NO_DATA_NOTE = (
+    "NASA POWER returned no usable daylight samples; slots without cloud data stay clear-sky"
+)
+
+
+def _nasa_stamp(stamp: str) -> datetime | None:
+    """Parse NASA POWER's ``YYYYMMDDHH`` UTC key."""
+    try:
+        return datetime.strptime(str(stamp), "%Y%m%d%H").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _nasa_median(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _nasa_url(latitude: float, longitude: float, start: datetime, end: datetime) -> str:
+    """The hourly point request: both series, UTC stamps, community "renewable energy"."""
+    params = {
+        "parameters": ",".join(NASA_PARAMS),
+        "community": "RE",
+        "longitude": f"{longitude:.4f}",
+        "latitude": f"{latitude:.4f}",
+        "start": start.strftime("%Y%m%d"),
+        "end": end.strftime("%Y%m%d"),
+        "format": "JSON",
+        "time-standard": "UTC",
+    }
+    return f"{NASA_POWER_BASE}?{urllib.parse.urlencode(params)}"
+
+
+def fetch_nasa_hourly(
+    latitude: float,
+    longitude: float,
+    start: datetime,
+    end: datetime,
+    *,
+    http: Callable[..., Any] | None = None,
+    timeout: float = 20.0,
+) -> dict[str, dict[str, float]]:
+    """Fetch both irradiance series, keyed by their raw UTC stamps.
+
+    The fill value is dropped rather than normalised, because a filled hour carries no
+    information; a response missing either series raises :class:`ProviderError`, which the caller
+    turns into "no NASA data" (never a failed forecast).
+    """
+    getter = http or http_get_json
+    payload = getter(_nasa_url(latitude, longitude, start, end), timeout=timeout)
+    if not isinstance(payload, Mapping):
+        raise ProviderError("nasa_power: unexpected response shape")
+    parameter = (payload.get("properties") or {}).get("parameter") or {}
+    series: dict[str, dict[str, float]] = {}
+    for name in NASA_PARAMS:
+        raw = parameter.get(name)
+        if not isinstance(raw, Mapping):
+            raise ProviderError(f"nasa_power: response has no properties.parameter.{name}")
+        cleaned: dict[str, float] = {}
+        for stamp, value in raw.items():
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number) and number != NASA_FILL:
+                cleaned[str(stamp)] = number
+        series[name] = cleaned
+    return series
+
+
+def nasa_clearness_profile(
+    payload: Mapping[str, Mapping[str, float]], zone: timezone | ZoneInfo
+) -> tuple[list[float], int, int]:
+    """``(per-hour clearness, fitted hours, daylight samples)`` from the two series.
+
+    ``clearness[h]`` is the median all-sky/clear-sky ratio for local hour ``h`` (0..23), clamped;
+    an hour with fewer than :data:`NASA_MIN_HOUR_SAMPLES` daylight samples keeps 1.0, so missing
+    evidence never becomes an invented attenuation.
+    """
+    all_sky = (payload.get("ALLSKY_SFC_SW_DWN") or {})
+    clear_sky = (payload.get("CLRSKY_SFC_SW_DWN") or {})
+    samples: dict[int, list[float]] = {}
+    total = 0
+    for stamp, observed in all_sky.items():
+        reference = clear_sky.get(stamp)
+        if reference is None or reference < NASA_MIN_CLEARSKY_WM2 or observed < 0.0:
+            continue
+        moment = _nasa_stamp(stamp)
+        if moment is None:
+            continue
+        samples.setdefault(moment.astimezone(zone).hour, []).append(observed / reference)
+        total += 1
+    factors = [1.0] * 24
+    fitted = 0
+    for hour, ratios in samples.items():
+        if len(ratios) < NASA_MIN_HOUR_SAMPLES:
+            continue
+        factors[hour] = clamp(_nasa_median(ratios), NASA_CLEARNESS_MIN, NASA_CLEARNESS_MAX)
+        fitted += 1
+    return factors, fitted, total
+
+
+def _nasa_cache(
+    store: Any, fingerprint: str, moment: datetime
+) -> tuple[list[float], int, int] | None:
+    """The cached daily profile ``(factors, hours, samples)``, when it is fresh and local."""
+    if store is None:
+        return None
+    got = store.profile_get(NASA_KIND, NASA_PROFILE_KEY)
+    if not got or not isinstance(got[1], Mapping):
+        return None
+    updated_at, payload = got
+    if payload.get("fingerprint") != fingerprint:
+        return None
+    if updated_at is not None:
+        try:
+            age_hours = (moment - updated_at).total_seconds() / 3600.0
+        except TypeError:  # a naive timestamp cannot be trusted: refit instead of crashing
+            age_hours = NASA_REFIT_HOURS + 1.0
+        if age_hours > NASA_REFIT_HOURS:
+            return None
+    factors = payload.get("factors")
+    if not isinstance(factors, list) or len(factors) != 24:
+        return None
+    try:
+        clean = [clamp(float(value), NASA_CLEARNESS_MIN, NASA_CLEARNESS_MAX) for value in factors]
+        return clean, int(payload.get("hours") or 0), int(payload.get("samples") or 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _store_nasa_profile(
+    store: Any,
+    fingerprint: str,
+    factors: Sequence[float],
+    hours: int,
+    samples: int,
+    moment: datetime,
+) -> None:
+    if store is None:
+        return
+    store.profile_put(
+        NASA_KIND,
+        NASA_PROFILE_KEY,
+        {
+            "factors": [round(float(value), 6) for value in factors],
+            "hours": hours,
+            "samples": samples,
+            "fingerprint": fingerprint,
+            "updated_at": to_iso(moment),
+        },
+        moment,
+    )
+
+
+def _nasa_profile(
+    settings: Any,
+    store: Any,
+    moment: datetime,
+    *,
+    latitude: float,
+    longitude: float,
+    zone: timezone | ZoneInfo,
+    http: Callable[..., Any] | None = None,
+) -> tuple[list[float] | None, str, int, int]:
+    """``(clearness, status, hours, samples)``; ``None`` when off, failed or without daylight.
+
+    Never raises: NASA is an accuracy refinement on top of the model, not a dependency. A cached
+    daily fit is reused; otherwise the window ending before the near-real-time latency is fetched
+    once and stored.
+    """
+    if not bool(settings.get("solar.nasa_irradiance", True)):
+        return None, "disabled", 0, 0
+    fingerprint = f"{latitude:.4f}|{longitude:.4f}"
+    cached = _nasa_cache(store, fingerprint, moment)
+    if cached is not None:
+        factors, hours, samples = cached
+        return factors, "cached daily fit", hours, samples
+    end = moment - timedelta(days=NASA_LATENCY_DAYS)
+    start = end - timedelta(days=NASA_WINDOW_DAYS)
+    try:
+        payload = fetch_nasa_hourly(latitude, longitude, start, end, http=http)
+        factors, hours, samples = nasa_clearness_profile(payload, zone)
+    except Exception as err:  # noqa: BLE001 - optional refinement; a failure is a note, not an error
+        log.warning("NASA POWER irradiance unavailable: %s", err)
+        return None, "failed", 0, 0
+    if not hours:
+        return None, "no daylight samples", 0, samples
+    _store_nasa_profile(store, fingerprint, factors, hours, samples, moment)
+    return factors, "fresh fit", hours, samples
+
+
 def _capacity_geometry(settings: Any) -> tuple[float, float, bool, bool]:
     """``(tilt, azimuth, tilt_assumed, azimuth_assumed)``; an unset value is an assumption."""
     tilt = settings.get("solar.tilt_deg")
@@ -727,6 +964,7 @@ def _capacity_forecast(
     moment: datetime,
     location: tuple[float, float, str] | None,
     origin: str = "solar.capacity_wp",
+    http: Callable[..., Any] | None = None,
 ) -> tuple[SolarForecast, ProviderStatus]:
     """Estimate production from ``solar.capacity_wp`` (SPEC.md section 7.1.1).
 
@@ -765,6 +1003,36 @@ def _capacity_forecast(
         performance_ratio = 0.85
     weather_entity = str(settings.get("solar.weather_entity", "") or "").strip()
     cloud_map, cloud_note = _slot_cloud_map(client, weather_entity, zone, grid)
+    # NASA POWER is an addition, not a replacement: it is only consulted when the weather
+    # forecast does not already cover every hour of the horizon, and it never overrides cloud
+    # coverage. One keyless request per location per day (daily-cached).
+    covered_hours = (
+        {slot.replace(minute=0, second=0, microsecond=0) for slot in cloud_map} if cloud_map else set()
+    )
+    grid_hours = {
+        slot.astimezone(zone).replace(minute=0, second=0, microsecond=0) for slot in grid
+    }
+    nasa_factors: list[float] | None = None
+    nasa_status = "not needed"
+    nasa_note: str | None = None
+    if grid_hours - covered_hours:
+        nasa_factors, nasa_status, nasa_hours, nasa_samples = _nasa_profile(
+            settings,
+            store,
+            moment,
+            latitude=latitude,
+            longitude=longitude,
+            zone=zone,
+            http=http,
+        )
+        if nasa_factors is not None:
+            nasa_note = NASA_APPLIED_NOTE.format(
+                hours=nasa_hours, samples=nasa_samples, days=NASA_WINDOW_DAYS
+            )
+        elif nasa_status == "failed":
+            nasa_note = NASA_ERROR_NOTE.format(error="the request failed")
+        elif nasa_status == "no daylight samples":
+            nasa_note = NASA_NO_DATA_NOTE
 
     forecast.notes.append(f"capacity estimate: {capacity_wp:g} Wp from {origin}")
     if tilt_assumed and azimuth_assumed:
@@ -778,6 +1046,8 @@ def _capacity_forecast(
     )
     if cloud_note:
         forecast.notes.append(cloud_note)
+    if nasa_note:
+        forecast.notes.append(nasa_note)
     measured_entity = str(settings.get("solar.measured_entity", "") or "").strip()
     forecast.notes.append(MEASURED_NOTE if measured_entity else MISSING_MEASURED_NOTE)
 
@@ -788,15 +1058,25 @@ def _capacity_forecast(
         if bias_enabled
         else [1.0] * 24
     )
-    uncertainty = CAPACITY_UNCERTAINTY_CLOUD_PCT if cloud_map else CAPACITY_UNCERTAINTY_CLEAR_PCT
+    if cloud_map:
+        uncertainty = CAPACITY_UNCERTAINTY_CLOUD_PCT
+    elif nasa_factors is not None:
+        uncertainty = CAPACITY_UNCERTAINTY_NASA_PCT
+    else:
+        uncertainty = CAPACITY_UNCERTAINTY_CLEAR_PCT
     applied: list[float] = []
     slots: list[SolarSlot] = []
     for slot_time in grid:
         hour_key = slot_time.astimezone(zone).replace(minute=0, second=0, microsecond=0)
         coverage = cloud_map.get(hour_key) if cloud_map else None
-        cloud_k = 1.0 if coverage is None else _cloud_factor(coverage)
+        if coverage is not None:
+            attenuation = _cloud_factor(coverage)
+        elif nasa_factors is not None:
+            attenuation = nasa_factors[slot_time.astimezone(zone).hour]
+        else:
+            attenuation = 1.0
         poa = _plane_irradiance(latitude, longitude, slot_time, zone, tilt_deg, azimuth_deg)
-        pv_kw = (capacity_wp / 1000.0) * (poa * cloud_k / 1000.0) * performance_ratio
+        pv_kw = (capacity_wp / 1000.0) * (poa * attenuation / 1000.0) * performance_ratio
         factor = factors[slot_time.astimezone(zone).hour] if bias_enabled else 1.0
         applied.append(factor)
         slots.append(
@@ -830,6 +1110,8 @@ def _capacity_forecast(
             "assumed_azimuth": azimuth_assumed,
             "performance_ratio": performance_ratio,
             "cloud_attenuation": bool(cloud_map),
+            "nasa_irradiance": bool(nasa_factors),
+            "nasa_status": nasa_status,
             "weather_entity": weather_entity or None,
             "bias_correction": bias_enabled,
             "correction_applied": round(forecast.correction_applied, 4),
@@ -865,14 +1147,16 @@ def _implied_capacity_wp(
     zone: timezone | ZoneInfo,
     samples: Sequence[tuple[datetime, float]],
     settings: Any,
+    clearness: Sequence[float] | None = None,
 ) -> tuple[float, int]:
     """Array size (Wp) implied by meter-derived PV samples: the upper envelope of pv / model.
 
     Every sample is divided by the clear-sky model's output *per installed watt* at that moment,
     with the same tilt/azimuth assumptions and performance ratio the forecast uses, and the
     ``DERIVED_ENVELOPE_QUANTILE`` of those ratios is the array size: overcast hours pull the ratio
-    down, so the top of the distribution is the cloudless estimate. Returns ``(0.0, usable)`` when
-    there is not enough daylight to fit.
+    down, so the top of the distribution is the cloudless estimate. ``clearness`` (NASA POWER's
+    per-hour observed ratio) removes some of that bias first, so a partly cloudy window no longer
+    has to look cloudless to fit. Returns ``(0.0, usable)`` when there is not enough daylight.
     """
     tilt_deg, azimuth_deg, _, _ = _capacity_geometry(settings)
     try:
@@ -882,7 +1166,8 @@ def _implied_capacity_wp(
     ratios: list[float] = []
     for stamp, pv_kw in samples:
         poa = _plane_irradiance(latitude, longitude, stamp, zone, tilt_deg, azimuth_deg)
-        per_wp_kw = (poa / 1000.0) * performance_ratio / 1000.0
+        observed = clearness[stamp.astimezone(zone).hour] if clearness else 1.0
+        per_wp_kw = (poa / 1000.0) * observed * performance_ratio / 1000.0
         if per_wp_kw <= DERIVED_MIN_MODEL_KW_PER_WP:
             continue
         ratios.append(float(pv_kw) / per_wp_kw)
@@ -949,6 +1234,7 @@ def _derived_forecast(
     forecast: SolarForecast,
     moment: datetime,
     location: tuple[float, float, str] | None,
+    http: Callable[..., Any] | None = None,
 ) -> tuple[SolarForecast, ProviderStatus]:
     """Learn the array from the meter, then forecast with the capacity model (SPEC.md 7.1.2).
 
@@ -984,6 +1270,7 @@ def _derived_forecast(
             forecast=forecast,
             moment=moment,
             location=location,
+            http=http,
         )
     roles, refusal = pv_export_roles(settings)
     if refusal:
@@ -1014,7 +1301,20 @@ def _derived_forecast(
                 return forecast, status
         latitude, longitude, timezone_name = location
         zone = _zone(timezone_name)
-        capacity_wp, usable = _implied_capacity_wp(latitude, longitude, zone, samples, settings)
+        # NASA POWER's observed clearness removes part of the overcast bias from the fit, so a
+        # partly cloudy window does not have to look cloudless to size the array (SPEC 7.1.1a).
+        nasa_factors, nasa_status, nasa_hours, nasa_samples = _nasa_profile(
+            settings,
+            store,
+            moment,
+            latitude=latitude,
+            longitude=longitude,
+            zone=zone,
+            http=http,
+        )
+        capacity_wp, usable = _implied_capacity_wp(
+            latitude, longitude, zone, samples, settings, clearness=nasa_factors
+        )
         if capacity_wp <= 0.0 or usable < DERIVED_MIN_SAMPLES:
             status.ok = False
             status.detail["reason"] = "not enough daylight export samples"
@@ -1025,6 +1325,10 @@ def _derived_forecast(
             forecast.notes.append(status.last_error)
             return forecast, status
         _store_derived_capacity(store, fingerprint, capacity_wp, usable, moment)
+        status.detail["nasa_irradiance"] = bool(nasa_factors)
+        status.detail["nasa_status"] = nasa_status
+        if nasa_factors is not None:
+            forecast.notes.append(NASA_FIT_NOTE)
         origin_note = "fresh fit"
     if location is None:
         location = _location_or_error(settings, client, status=status, forecast=forecast)
@@ -1040,6 +1344,7 @@ def _derived_forecast(
         moment=moment,
         location=location,
         origin=f"the meter's export moments ({usable} samples, {origin_note})",
+        http=http,
     )
     if status.ok:
         forecast.notes.append(DERIVED_PV_NOTE)
@@ -1082,6 +1387,7 @@ def load_solar_forecast(
                 forecast=forecast,
                 moment=moment,
                 location=location,
+                http=http,
             )
         return _capacity_forecast(
             settings,
@@ -1091,6 +1397,7 @@ def load_solar_forecast(
             forecast=forecast,
             moment=moment,
             location=location,
+            http=http,
         )
     if source != "forecast_solar":
         raise ConfigError(f"unknown solar source: {source}")

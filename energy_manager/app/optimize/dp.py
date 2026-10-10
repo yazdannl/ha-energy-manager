@@ -5,9 +5,11 @@ byte-identical plans, so the solver never iterates a dict/set when producing out
 
 Model (SPEC 8.1): AC-side battery power ``p`` in kW, positive = charging.
 ``grid = load - pv + p`` and ``cost = dt * (buy*max(grid,0) - sell*max(-grid,0))``.
-Objective: ``sum(cost) + cycle_cost*|de_i| - salvage*e_N`` with
+Objective: ``sum(cost) + wear*discharged_kwh - salvage*e_N`` with
 ``salvage = salvage_multiplier * median(buy) * eta_dis`` — a stored kWh only ever delivers
 ``eta_dis`` AC kWh, so valuing it at the full buy price would over-charge the pack (SPEC 8.1).
+``wear`` is EUR per kWh **delivered**, charged on the discharge leg only (delivered AC kWh is
+stored decrease times ``eta_dis``).
 
 Sign note (resolved): SPEC 8.1 originally wrote ``grid_i = load_i - pv_i - p_i`` while also defining
 positive ``p`` as charging; the two cannot both hold (subtracting a charging load would make every
@@ -22,7 +24,8 @@ the path from the stored per-(slot, state) argmin.
 Ponytail: the reported ``cost_estimate_eur`` is the realised grid cost of the reconstructed
 schedule, not the DP objective value (which also contains salvage/cycle costs that are not money
 in the bank); ``summary.objective_eur`` reports that objective separately (with
-``summary.cycle_cost_eur`` as its wear part) so a saving is never inflated by ignoring wear.  The state grid is anchored on the current and target energy, so those two points
+``summary.cycle_cost_eur`` as its wear part, now charged per kWh delivered) so a saving is never
+inflated by ignoring wear.  The state grid is anchored on the current and target energy, so those two points
 are exact while everything else is quantised; upgrade path is a finer grid plus local refinement.
 """
 
@@ -86,13 +89,13 @@ def aggregate_break_even_sell_eur_per_kwh(
     eta_charge: float,
     eta_discharge: float,
     buy_eur_per_kwh: float,
-    cycle_cost_eur_per_kwh: float = 0.0,
+    wear_eur_per_kwh: float = 0.0,
 ) -> float | None:
-    """The frozen break-even helper applied to a pair of etas (the aggregate, or one battery)."""
+    """The frozen break-even helper applied to a pair of etas and a per-delivered-kWh wear."""
     host = replace(
         _AGGREGATE_ETA_HOST, eta_charge=eta_charge, eta_discharge=eta_discharge
     )
-    return host.break_even_sell_eur_per_kwh(buy_eur_per_kwh, cycle_cost_eur_per_kwh)
+    return host.break_even_sell_eur_per_kwh(buy_eur_per_kwh, wear_eur_per_kwh)
 
 
 @dataclass(frozen=True)
@@ -104,7 +107,9 @@ class OptimizerOptions:
     soc_step_kwh: float = 0.02
     power_steps: int = 24
     salvage_multiplier: float = 1.0
-    cycle_cost_eur_per_kwh: float = 0.0
+    #: EUR per kWh delivered: the fleet's derived wear, or the advanced override from
+    #: ``optimizer.cycle_cost_eur_per_kwh`` (SPEC 5). Charged on the discharge leg only.
+    wear_eur_per_kwh: float = 0.0
     allow_grid_charge: bool = True
     allow_export: bool = True
     max_import_kw: float = 0.0
@@ -121,7 +126,7 @@ class OptimizerOptions:
             soc_step_kwh=float(get("optimizer.soc_step_kwh", 0.02) or 0.02),
             power_steps=int(get("optimizer.power_steps", 24) or 24),
             salvage_multiplier=float(get("optimizer.salvage_multiplier", 1.0)),
-            cycle_cost_eur_per_kwh=float(get("optimizer.cycle_cost_eur_per_kwh", 0.0) or 0.0),
+            wear_eur_per_kwh=float(get("optimizer.cycle_cost_eur_per_kwh", 0.0) or 0.0),
             allow_grid_charge=bool(get("optimizer.allow_grid_charge", True)),
             allow_export=bool(get("optimizer.allow_export", True)),
             max_import_kw=float(get("optimizer.max_grid_import_w", 0) or 0) / 1000.0,
@@ -144,6 +149,9 @@ class BatteryAggregate:
     eta_discharge: float
     usable_kwh: float
     batteries: int = 0
+    #: Capacity/usable-weighted mean of the fleet's per-battery derived wear, EUR per delivered
+    #: kWh (SPEC 5). The DP plans one aggregated pack, so one wear constant represents it.
+    wear_eur_per_kwh: float = 0.0
 
     def soc_pct_for(self, energy_kwh: float) -> float | None:
         """Capacity-weighted mean SoC of the aggregate at ``energy_kwh`` (SPEC 10 `/plan`)."""
@@ -175,6 +183,12 @@ class BatteryAggregate:
             c.capacity_kwh * max(c.min_soc_pct, reserve_soc_pct) / 100.0 for c in enabled
         )
         e_max = sum(c.capacity_kwh * c.max_soc_pct / 100.0 for c in enabled)
+        wear_weight_kwh = sum(c.usable_kwh() for c in enabled)
+        wear = (
+            sum(c.usable_kwh() * c.wear_eur_per_kwh for c in enabled) / wear_weight_kwh
+            if wear_weight_kwh > 0
+            else 0.0
+        )
         return cls(
             capacity_kwh=capacity,
             e_min_kwh=e_min,
@@ -185,6 +199,7 @@ class BatteryAggregate:
             eta_discharge=weighted("eta_discharge"),
             usable_kwh=max(0.0, e_max - e_min),
             batteries=len(enabled),
+            wear_eur_per_kwh=wear,
         )
 
     def soc_pct(self, energy_kwh: float) -> float:
@@ -346,6 +361,17 @@ def next_energy_kwh(e_kwh: float, p_kw: float, dt_hours: float, agg: BatteryAggr
     if p_kw >= 0:
         return e_kwh + dt_hours * p_kw * agg.eta_charge
     return e_kwh + dt_hours * p_kw / agg.eta_discharge
+
+
+def wear_cost_eur(
+    wear_eur_per_kwh: float, eta_discharge: float, e_from: float, e_to: float
+) -> float:
+    """Wear of one transition: charged per kWh **delivered**, so only the discharge leg pays.
+
+    A discharge from ``e_from`` to ``e_to`` moves ``e_from - e_to`` stored kWh and delivers
+    ``(e_from - e_to) * eta_discharge`` AC kWh; charging and holding cost no wear (SPEC 8.1).
+    """
+    return wear_eur_per_kwh * eta_discharge * max(0.0, e_from - e_to)
 
 
 def exact_power_kw(
@@ -528,7 +554,7 @@ def _solve_once(
             for p in _actions(lo, hi, opts.power_steps, extra):
                 e_next = next_energy_kwh(e, p, dt, agg)
                 cost = slot_cost_eur(p, slot, dt, opts)
-                cost += opts.cycle_cost_eur_per_kwh * abs(e_next - e)
+                cost += wear_cost_eur(opts.wear_eur_per_kwh, agg.eta_discharge, e, e_next)
                 cost += _interp(next_value, grid, e_next)
                 iterations += 1
                 if cost < best:  # strict: ties resolve to the lowest power (deterministic)
@@ -552,7 +578,7 @@ def _solve_once(
         for p in _actions(lo, hi, opts.power_steps, extra):
             e_next = next_energy_kwh(e, p, dt, agg)
             cost = slot_cost_eur(p, slots[i], dt, opts)
-            cost += opts.cycle_cost_eur_per_kwh * abs(e_next - e)
+            cost += wear_cost_eur(opts.wear_eur_per_kwh, agg.eta_discharge, e, e_next)
             cost += _interp(value[i + 1], grid, e_next)
             if cost < best:
                 best = cost
@@ -572,7 +598,7 @@ def _solve_once(
         powers.append(p)
         bounds.append((lo, hi, binding))
         e_next = next_energy_kwh(e_now, p, dt, agg)
-        cycle_cost += opts.cycle_cost_eur_per_kwh * abs(e_next - e_now)
+        cycle_cost += wear_cost_eur(opts.wear_eur_per_kwh, agg.eta_discharge, e_now, e_next)
         objective += slot_cost_eur(p, slot, dt, opts)
         e_now = clamp(e_next, agg.e_min_kwh, agg.e_max_kwh)
     objective += cycle_cost - salvage * e_now
@@ -640,7 +666,7 @@ def _round_trip_blocks_arbitrage(
     if opts.min_spread_eur_per_kwh > 0.0 and raw_spread <= opts.min_spread_eur_per_kwh:
         return False  # the user's floor is the binding reason
     break_even = aggregate_break_even_sell_eur_per_kwh(
-        agg.eta_charge, agg.eta_discharge, cheapest_buy, opts.cycle_cost_eur_per_kwh
+        agg.eta_charge, agg.eta_discharge, cheapest_buy, opts.wear_eur_per_kwh
     )
     if break_even is None:
         return False
@@ -739,7 +765,7 @@ def _summary(
     *,
     cycle_cost_eur: float = 0.0,
     objective_eur: float = 0.0,
-    cycle_cost_eur_per_kwh: float = 0.0,
+    wear_eur_per_kwh: float = 0.0,
 ) -> PlanSummary:
     cost = 0.0
     for s in plan_slots:
@@ -782,8 +808,9 @@ def _summary(
     summary.eta_charge = agg.eta_charge
     summary.eta_discharge = agg.eta_discharge
     summary.round_trip_efficiency = agg.eta_charge * agg.eta_discharge
+    summary.wear_eur_per_kwh = wear_eur_per_kwh
     summary.break_even_sell_eur_per_kwh = aggregate_break_even_sell_eur_per_kwh(
-        agg.eta_charge, agg.eta_discharge, median_buy_eur_per_kwh(plan_slots), cycle_cost_eur_per_kwh
+        agg.eta_charge, agg.eta_discharge, median_buy_eur_per_kwh(plan_slots), wear_eur_per_kwh
     )
     return summary
 
@@ -815,6 +842,11 @@ def solve(
     """Solve the horizon and return a ``Plan`` (SPEC 8.2).  Deterministic."""
     now = generated_at or utcnow()
     sources = dict(source_names or {})
+    if options.wear_eur_per_kwh <= 0.0 and aggregate.wear_eur_per_kwh > 0.0:
+        # Zero means "derive it": the aggregate already carries the fleet's usable-weighted mean
+        # of the per-battery derived wear (SPEC 5). A non-zero setting is the advanced override
+        # and wins. Resolved here so every caller (API recompute, tests, selfcheck) agrees.
+        options = replace(options, wear_eur_per_kwh=aggregate.wear_eur_per_kwh)
     horizon_start = slots[0].t if slots else quarter_floor(now, options.slot_minutes)
     horizon_end = (
         slots[-1].t + timedelta(minutes=options.slot_minutes)
@@ -902,7 +934,7 @@ def solve(
             result.effective_step_kwh,
             cycle_cost_eur=result.cycle_cost_eur,
             objective_eur=result.objective_eur,
-            cycle_cost_eur_per_kwh=options.cycle_cost_eur_per_kwh,
+            wear_eur_per_kwh=options.wear_eur_per_kwh,
         ),
     )
     if infeasible is not None:

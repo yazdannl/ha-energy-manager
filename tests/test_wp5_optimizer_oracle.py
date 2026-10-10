@@ -236,7 +236,7 @@ def oracle_optimum(inst: Instance) -> tuple[float, tuple[float, ...]]:
                 actions = sorted(set(actions) | {round(clamp(extra, lo, hi), 10)})
         for power in actions:
             e_next = next_energy(inst, energy, power)
-            cost = slot_cost(inst, index, power) + inst.cycle_cost * abs(e_next - energy)
+            cost = slot_cost(inst, index, power) + inst.cycle_cost * inst.eta_discharge * max(0.0, energy - e_next)
             walk(index + 1, e_next, objective + cost, powers + (power,))
 
     walk(0, inst.start_kwh, 0.0, ())
@@ -300,7 +300,7 @@ def plan_objective(inst: Instance, plan) -> float:
         total += slot_cost(inst, index, power)
         energy = slot.soc_kwh
         e_next = next_energy(inst, energy, power)
-        total += inst.cycle_cost * abs(e_next - energy)
+        total += inst.cycle_cost * inst.eta_discharge * max(0.0, energy - e_next)
         energy = e_next
     assert energy is not None
     return total - inst.salvage * energy
@@ -312,7 +312,7 @@ def solve(inst: Instance, options: shipped_dp.OptimizerOptions | None = None):
         soc_step_kwh=inst.soc_step_kwh,
         power_steps=inst.power_steps,
         salvage_multiplier=inst.salvage_multiplier,
-        cycle_cost_eur_per_kwh=inst.cycle_cost,
+        wear_eur_per_kwh=inst.cycle_cost,
         allow_grid_charge=inst.allow_grid_charge,
         allow_export=inst.allow_export,
         max_import_kw=inst.max_import_kw,

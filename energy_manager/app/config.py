@@ -96,6 +96,9 @@ DEFAULTS: dict[str, Any] = {
     "solar.azimuth_deg": None,
     "solar.performance_ratio": 0.85,
     "solar.weather_entity": "",
+    # NASA POWER observed irradiance (keyless, near-real-time): a per-hour clearness factor that
+    # fills in for slots without weather-entity cloud data and refines the derived watt-peak fit.
+    "solar.nasa_irradiance": True,
     # -- load ---------------------------------------------------------------------------
     "load.mode": "auto",
     "load.entity": "",
@@ -241,6 +244,7 @@ SETTINGS_META: dict[str, _Meta] = {
     "solar.azimuth_deg": _Meta("float", "solar", "Azimuth", "Compass direction the panels face: 0 = north, 90 = east, 180 = south, 270 = west. Unset = assume south.", minimum=0.0, maximum=360.0, nullable=True, advanced=True),
     "solar.performance_ratio": _Meta("float", "solar", "Performance ratio", "Inverter, temperature and soiling losses applied to the clear-sky estimate.", minimum=0.5, maximum=1.1, advanced=True),
     "solar.weather_entity": _Meta("str", "solar", "Weather entity", "Optional HA weather entity; its hourly cloud coverage attenuates the capacity estimate. Unset = clear-sky, refined by the measured-PV correction.", advanced=True),
+    "solar.nasa_irradiance": _Meta("bool", "solar", "NASA irradiance", "Refine the capacity/derived estimate with NASA POWER's observed hourly irradiance (keyless, 2-3 day latency): a per-hour clearness factor for slots without weather-entity cloud data, also used when fitting the meter-derived array. Weather-entity cloud and the measured-PV correction still win where they apply. Only the array's location is sent.", advanced=True),
     "load.mode": _Meta("choice", "load", "Load source", "auto uses the load entity if mapped, else derived.", _LOAD_MODE_CHOICES, advanced=True),
     "load.entity": _Meta("str", "load", "Load entity", "Runtime-picked load power sensor.", advanced=True),
     "load.temperature_entity": _Meta("str", "load", "Outdoor temperature entity", "Optional regression term.", advanced=True),
@@ -253,7 +257,7 @@ SETTINGS_META: dict[str, _Meta] = {
     "optimizer.soc_step_kwh": _Meta("float", "optimizer", "SoC step", "kWh per DP state.", minimum=0.001, maximum=5.0, advanced=True),
     "optimizer.power_steps": _Meta("int", "optimizer", "Power steps", "Discrete actions per state.", minimum=3, maximum=200, advanced=True),
     "optimizer.salvage_multiplier": _Meta("float", "optimizer", "Salvage multiplier", "Terminal SoC valued at multiplier x median buy price.", minimum=0.0, maximum=3.0, advanced=True),
-    "optimizer.cycle_cost_eur_per_kwh": _Meta("float", "optimizer", "Cycle cost", "EUR per kWh cycled.", minimum=0.0, maximum=1.0),
+    "optimizer.cycle_cost_eur_per_kwh": _Meta("float", "optimizer", "Wear override", "Advanced: a non-zero value replaces every battery's derived wear (price / (cycle life x usable kWh)) for planning and break-even. Leave 0 to use the derived per-fleet average wear.", minimum=0.0, maximum=1.0, advanced=True),
     "optimizer.allow_grid_charge": _Meta("bool", "optimizer", "Allow grid charging", ""),
     "optimizer.allow_export": _Meta("bool", "optimizer", "Allow export", "Off = never export on purpose. The feed-in price comes from the Price card."),
     "optimizer.reserve_soc_pct": _Meta("float", "optimizer", "Reserve SoC", "Extra floor above battery min_soc.", minimum=0.0, maximum=100.0),
@@ -648,8 +652,9 @@ def _copy_value(value: Any) -> Any:
     return value
 
 
-#: Convenience inputs accepted from the UI/API but never persisted as settings keys (SPEC.md §5).
-_CONVENIENCE_BATTERY_FIELDS = ("round_trip_efficiency_pct",)
+#: Convenience/derived inputs accepted from the UI/API but never persisted as settings keys
+#: (SPEC.md §5): the requested round trip and the wear the server derives from price/cycle life.
+_CONVENIENCE_BATTERY_FIELDS = ("round_trip_efficiency_pct", "wear_eur_per_kwh")
 
 
 def _coerce_round_trip_pct(value: Any) -> float:
@@ -690,10 +695,11 @@ def _split_round_trip(pct: float) -> tuple[float, float]:
 
 def battery_payload(config: BatteryConfig) -> dict[str, Any]:
     """Serializable battery view for the UI/API: the stored fields plus the derived
-    ``round_trip_efficiency_pct`` (SPEC.md section 5), which is a convenience input and is
-    never persisted as a settings key."""
+    ``round_trip_efficiency_pct`` and ``wear_eur_per_kwh`` (SPEC.md section 5). Both are
+    convenience/derived values and are never persisted as settings keys."""
     payload = asdict(config)
     payload["round_trip_efficiency_pct"] = round(config.round_trip_efficiency * 100.0, 6)
+    payload["wear_eur_per_kwh"] = round(config.wear_eur_per_kwh, 9)
     return payload
 
 

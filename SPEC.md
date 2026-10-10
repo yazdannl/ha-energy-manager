@@ -203,6 +203,7 @@ solar.planes             []   # [{kwp, tilt_deg, azimuth_deg, damping}]
 solar.api_key            ""   # optional forecast.solar personal key (raises rate limits, enables multi-plane)
 solar.bias_correction    true # learn multiplicative correction from measured PV
 solar.measured_entity    ""   # runtime-picked PV power sensor for bias learning
+solar.nasa_irradiance    true # capacity/derived only: observed NASA POWER clearness per hour-of-day
 load.mode                auto|entity|derived   # auto uses load entity if mapped else derived
 load.entity              ""   # runtime-picked load power sensor
 load.temperature_entity  ""   # optional outdoor temperature for the regression term
@@ -215,7 +216,7 @@ optimizer.horizon_hours  30   # matches the ~+30 h price feed
 optimizer.soc_step_kwh   0.02
 optimizer.power_steps    24
 optimizer.salvage_multiplier 1.0   # terminal SoC valued at multiplier x median buy price
-optimizer.cycle_cost_eur_per_kwh 0.0
+optimizer.cycle_cost_eur_per_kwh 0.0   # advanced override; 0 = derive wear per battery (price/cycle life)
 optimizer.allow_grid_charge  true
 optimizer.allow_export       false  # off until a feed-in tariff is configured; sell is 0.00
 optimizer.reserve_soc_pct    0.0   # extra floor above battery min_soc
@@ -364,16 +365,28 @@ class BatteryConfig:
     max_discharge_w: float
     eta_charge: float       # 0<eta<=1, AC->cell
     eta_discharge: float    # 0<eta<=1, cell->AC
+    price_eur: float = 0.0  # purchase price (EUR); 0 = unknown, no derived wear
+    cycle_life: float = 0.0 # rated full cycles; 0 = unknown, no derived wear
     mapping: dict[str, str] # driver-specific entity mapping, resolved at runtime
     enabled: bool = True
 ```
 
 Efficiency is entered per battery as a **round trip**: the UI/API field `round_trip_efficiency_pct` is
 split evenly into `eta_charge = eta_discharge = sqrt(pct/100)`, and explicit per-direction values (when
-given) override the split, after which the round trip is their product. The cost model uses
-`round_trip = eta_charge * eta_discharge`, so the break-even sale price for energy bought at `buy`
-EUR/kWh is `buy / round_trip` plus the wear per delivered kWh (`cycle_cost / eta_discharge`): buying at
-20 ct with a 75 % round trip breaks even at **26.7 ct**, not 25 ct.
+given) override the split, after which the round trip is their product.
+
+Wear is **derived per battery**, never typed in as a global number:
+`wear_eur_per_kwh = price_eur / (cycle_life × usable_kwh)` (0.0 while either input is unset; the UI
+states the derived value and a full cycle's cost). It is the cost of one kWh **delivered** to the
+house, so the plan uses the usable-weighted mean over the enabled fleet and the DP charges it on the
+discharge leg only. `optimizer.cycle_cost_eur_per_kwh` remains as an advanced **override**: a
+non-zero value replaces the derived wear for planning and break-even. `usable_kwh` is
+`capacity_kwh × (max_soc_pct − min_soc_pct)/100`, the same window the planner cycles.
+
+The cost model uses `round_trip = eta_charge * eta_discharge`, so the break-even sale price for energy
+bought at `buy` EUR/kWh is `buy / round_trip + wear_eur_per_kwh`: only the round trip appears because
+the wear term is already per delivered kWh. Buying at 20 ct with a 75 % round trip breaks even at
+**26.7 ct** before wear, not 25 ct (the 80 % case).
 
 Runtime discovery is mandatory for `driver: zendure`: find candidate entities by asking HA for the
 entity registry entries whose `platform` is `zendure_ha` (or `unique_id` prefix `zendure_ha.`) and
@@ -409,7 +422,8 @@ Dataclasses: BatteryConfig, BatteryState, SystemState, PriceSlot, PriceForecast,
 Helpers:     to_iso(dt) / from_iso(s), quarter_floor(dt), slot_range(start, end, minutes),
              eur_per_kwh_from_raw(value, unit)  (documented, unit-tested conversions)
 Constants:   PRICE_UNITS = {"auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh"}
-Helpers:     BatteryConfig.round_trip_efficiency, BatteryConfig.break_even_sell_eur_per_kwh(buy, cycle_cost);
+Helpers:     BatteryConfig.round_trip_efficiency, BatteryConfig.wear_eur_per_kwh,
+             BatteryConfig.break_even_sell_eur_per_kwh(buy, wear=None);
              Reason.EFFICIENCY_LOSS (a slot is idle because the spread does not cover the round-trip loss)
 ```
 
@@ -464,10 +478,18 @@ Per 15-minute slot, with latitude/longitude and timezone from Home Assistant:
 3. **Cloud attenuation** when the weather entity yields cloud coverage for the slot, Kasten-Czeplak:
    `k = 1 - 0.75·(cc/100)^3.4`. Hourly forecast values cover the four slots of their hour. Without
    cloud data the estimate is clear-sky and the forecast says so.
+3b. **NASA POWER observed clearness** (`solar.nasa_irradiance`, default on; capacity and derived
+   sources only): observed hourly all-sky and clear-sky irradiance (W/m², keyless, ~2-3 days
+   near-real-time latency) over the last 21 days ending before that latency are reduced to a median
+   all-sky/clear-sky ratio per local hour-of-day — daylight samples only, at least 3 samples per
+   hour, clamped to `0.05…1.1`, cached daily per location. That ratio is applied to slots the weather
+   entity does not cover (step 3 wins where it does), and it refines the derived fit (7.1.2). It is
+   an addition to the model, never a replacement: a failure is a note and the slot stays clear-sky.
 4. **Power**: `pv_kw = (capacity_wp/1000)·(POA/1000)·performance_ratio`.
 
-Uncertainty is higher than an API forecast because the model is coarse: `35%` without cloud data and
-`25%` with it, and the learned per-hour correction narrows it in practice. The forecast **always**
+Uncertainty is higher than an API forecast because the model is coarse: `35%` without cloud data,
+`30%` with the NASA clearness and `25%` with hourly cloud coverage, and the learned per-hour
+correction narrows it in practice. The forecast **always**
 carries notes stating the capacity used, the tilt/azimuth actually assumed when they were left unset,
 the performance ratio, whether cloud attenuation was applied and from which entity, and that a
 measured PV entity will refine the curve.
@@ -481,7 +503,6 @@ A missing capacity is a failure with a hint naming `solar.capacity_wp`, never a 
 history: the bias correction may only adjust a forecast that already exists.
 
 #### 7.1.2 Meter-derived estimate (`solar.source = derived`, 0.6.0)
-
 An AC-coupled array with no inverter sensor and no geometry to enter can still be estimated, because
 the meter already sees it: whenever the signed grid power is negative the house is exporting, which
 means production exceeds the house load. With the project's sign convention `grid = load − pv + p`
@@ -496,8 +517,10 @@ subtracted (that load is what the PV forecast is needed to learn), so every samp
 
 `solar.capacity_wp` then learns itself: each sample is divided by the clear-sky model's output per
 installed watt at that timestamp (the §7.1.1 model, with the same tilt/azimuth assumptions and
-performance ratio), and the 90th percentile of those ratios is the array size — overcast hours pull
-the ratio down, so the top of the distribution is the cloudless envelope. At least 24 usable daylight
+performance ratio), **multiplied by the NASA POWER clearness of that sample's local hour** when
+`solar.nasa_irradiance` is on, and the 90th percentile of those ratios is the array size — overcast
+hours pull the ratio down, so the top of the distribution is the cloudless envelope, and the
+clearness term stops a partly cloudy window from halving the learned size. At least 24 usable daylight
 samples are required; fewer is a status naming the meter, never a crash. The learned value is stated
 in the notes and in the status detail (`capacity_source`, `derived_samples`); it is not written back
 to the settings, and an explicit `solar.capacity_wp > 0` wins over it (the same "explicit beats
@@ -558,13 +581,15 @@ Subject to
 `e_{i+1} = e_i + dt*(p_i*eta_chg)` for `p_i ≥ 0`, `e_i + dt*(p_i/eta_dis)` for `p_i < 0`
 (single-expression form allowed but must be exact at `p=0`).
 
-Objective: minimise `Σ cost_i + cycle_cost*|Δe_i| − salvage * e_N`, where
+Objective: minimise `Σ cost_i + wear_eur_per_kwh * delivered_kwh_i − salvage * e_N`, where
+`delivered_kwh_i = max(0, e_i − e_{i+1}) · eta_dis` (wear is charged on the discharge leg only: a
+charge-only schedule pays none, and a full cycle pays `price / cycle_life`) and
 `salvage = optimizer.salvage_multiplier * median(buy over horizon) * eta_dis` — stored energy delivers
 only `eta_dis` AC per stored kWh, so valuing it at the full buy price would over-charge the pack —
 exists so the schedule does not dump the pack for a trivial gain.
 
 Arbitrage is only planned when the sale price clears the round-trip break-even
-(`sell_j > buy_i / round_trip + cycle_cost / eta_dis`, with `buy_i` the charge slot's price); a slot
+(`sell_j > buy_i / round_trip + wear_eur_per_kwh`, with `buy_i` the charge slot's price); a slot
 left idle for that reason reports `Reason.EFFICIENCY_LOSS`, which is distinct from the user's own
 `optimizer.min_spread_eur_per_kwh` floor (`Reason.SPREAD_BELOW_THRESHOLD`). `optimizer.target_soc_pct_end` adds a hard terminal constraint when set
 (infeasible target ⇒ drop to a soft penalty and raise an alert, never crash).
@@ -704,12 +729,12 @@ GET  /api/v1/health            -> {status:"ok", version, uptime_s, commit}
 GET  /api/v1/status            -> SystemState (§6) serialised
 GET  /api/v1/plan?hours=36     -> {generated_at, horizon_start, horizon_end, feasible,
                                    summary:{…, eta_charge, eta_discharge, round_trip_efficiency,
-                                            break_even_sell_eur_per_kwh},
+                                            wear_eur_per_kwh, break_even_sell_eur_per_kwh},
                                    slots:[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90,
                                            soc_kwh, soc_pct, power_w, action, reason,
                                            price_stale, pv_source, price_source}],
                                    batteries:[{id, name, share_w, round_trip_efficiency,
-                                               break_even_sell_eur_per_kwh}]}
+                                               wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}
                                `reason` is a stable `Reason` slug; a slot that stays idle because the
                                sale price does not cover the round-trip loss reports `efficiency_loss`,
                                which is distinct from the user's own spread floor
@@ -960,10 +985,12 @@ keys are now only the ones the setup cards and the safety group need:
 `price.feed_in_energy_tax_refund`, the fixed rates (`price.fixed_price_eur_per_kwh`,
 `price.fixed_day_price_eur_per_kwh`, `price.fixed_night_price_eur_per_kwh`), `grid.power_entity`,
 `solar.enabled`, `solar.source`, `solar.measured_entity`, `optimizer.horizon_hours`,
-`optimizer.cycle_cost_eur_per_kwh`, `optimizer.allow_grid_charge`, `optimizer.min_spread_eur_per_kwh`,
+`optimizer.allow_grid_charge`, `optimizer.min_spread_eur_per_kwh`,
 plus the Safety keys (`optimizer.reserve_soc_pct`, `optimizer.max_grid_import_w`,
-`optimizer.max_grid_export_w`, `optimizer.allow_export`). Everything else is advanced; the `Safety`
-group is always visible regardless of the flag, and a label never carries a manual "(advanced)"
+`optimizer.max_grid_export_w`, `optimizer.allow_export`). Everything else is advanced, including the
+wear override `optimizer.cycle_cost_eur_per_kwh` (a non-zero value replaces each battery's derived
+wear; 0 = derive it) and `solar.nasa_irradiance`; the `Safety` group is always visible regardless of
+the flag, and a label never carries a manual "(advanced)"
 suffix - folding is the only signal.
 
 `control.*` split in two: the control-loop tuning knobs (`control.tick_seconds`,
@@ -1207,6 +1234,29 @@ round, with the reason:
 - **§10 (discovery `setting_key` for every kind)** — the setup-card pickers need to know which
   settings key a confirmed candidate is saved to, so `price`, `solar` and `load` rows now carry
   `setting_key` alongside `grid` and `battery` (additive; null when a role has no key).
+
+- **§5/§6/§7.1.1/§7.1.2/§8.1/§10 (wear from battery price, NASA clearness; requested
+  2026-10-10, "the pricing model uses both discharge efficiency and round-trip efficiency", "let the
+  user put in the cycle life of the battery and price and calculate the wear from that", "does the
+  solar capacity calculation take into account the solar irradiation data … at the specific
+  time")** — the user reviewed the cost model and the forecast and asked for three changes.
+  (a) Wear is no longer a global number typed into a settings field: each battery gains `price_eur`
+  and `cycle_life`, and `wear_eur_per_kwh = price / (cycle life × usable kWh)` is the cost of one
+  kWh **delivered**; the fleet plans with the usable-weighted mean, and `optimizer.cycle_cost_eur_per_kwh`
+  stays as an advanced override (user chose "keep as an advanced override" over removing it).
+  (b) Because the wear term is now per delivered kWh, the break-even no longer needs a per-direction
+  efficiency: `break_even_sell = buy / round_trip + wear` (the user's request: "we should just use
+  roundtrip efficiency"). The DP objective charges wear on the discharge leg only (the user chose
+  "on delivered kWh only" over splitting it across both legs), so a charge-only schedule pays none
+  and a full cycle costs exactly `price / cycle_life`. (c) The capacity/derived solar model already
+  uses the home's location and the exact slot time for its clear-sky irradiance, but no observed or
+  forecast irradiance data; the user asked to add NASA POWER as an accuracy addition (not a
+  replacement), so `solar.nasa_irradiance` (default on) learns a per-hour-of-day clearness index from
+  the last 21 days of observed all-sky/clear-sky irradiance and applies it where the weather entity
+  has no cloud coverage, and uses it in the derived watt-peak fit. Weather-entity cloud attenuation
+  and the measured-PV bias keep priority; `forecast_solar` is unchanged. The user's other choices
+  from the three options offered: per-battery fields with a fleet average, and keeping the global
+  setting as an override.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

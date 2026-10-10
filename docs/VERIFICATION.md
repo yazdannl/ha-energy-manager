@@ -15,15 +15,15 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **609 passed** (two consecutive runs) |
-| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 89 files scanned`, exit 0 |
+| Test suite | `python3 -m pytest tests -q` | **625 passed** (two consecutive runs) |
+| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 90 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
 
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (77 files, documentation excluded)**:
-  `e548801650cd421be1235381a0a91ae1eba8996fcf29f29938b829bbd2ea86f9`
+  `3b23073b3d1288f9efcfe1397b8e88462981dcd06b160a9315dc6054e9bfdbbc`
 * **path list of the same 77 files** (detects an added, removed or renamed file):
   `63e3910878cca4ec6ac8802e98b49448c7d6655eab98076ddfcf1d0140adf88b`
 
@@ -34,10 +34,11 @@ defect in the record, not in the tree: the file lists were verified byte-identic
 so no source file had changed. Those values (`8f83a0a6…` all files, `c58e912c…` code + tests) are
 superseded by the digest above.
 
-The all-files digest (90 files) is deliberately **not** recorded here: this document is one of the 90,
+The all-files digest (91 files) is deliberately **not** recorded here: this document is one of the 91,
 so every documentation edit would change it while the verified code stayed identical. Compute it with
-the same recipe over the full file list if you want it; the file count printed by the pipeline (90) is
-the quick cross-check.
+the same recipe over the full file list if you want it; the file count printed by the pipeline (91) is
+the quick cross-check. (`tools/audit.sh` prints 90 because it removes the sha-verified vendored
+stylesheet from its scan list before scanning.)
 
 ---
 
@@ -158,8 +159,9 @@ regressions; it proves these specific, previously demonstrated defects cannot re
 
 * `round_trip_efficiency_pct` is the input; the split is exact — `sqrt` with a 1-ULP correction so
   that the product of the two directions is exactly the requested round trip.
-* The break-even sale price is `buy / round_trip + cycle_cost / eta_discharge`; 20 ct at a 75 %
-  round trip gives 26.666… ct exactly (not 25 ct, which would be the 80 % case).
+* The break-even sale price is `buy / round_trip + wear`, with wear derived per battery from
+  `price_eur / (cycle_life × usable_kwh)`; 20 ct at a 75 % round trip gives 26.666… ct exactly (not
+  25 ct, which would be the 80 % case).
 * The planner holds when the sale price is below break-even and cycles above it
   (`test_a_round_trip_loss_labels_the_idle_slot_efficiency_loss` and its counterpart
   `test_the_same_slot_with_a_full_round_trip_is_not_an_efficiency_loss`).
@@ -468,6 +470,37 @@ owner's session, and there is no browser on this machine), and the derived solar
 compared against a full season of a real array - only the synthetic model-recovery tests and the
 existing live-instance history captured in §7.
 
+### 8.2 Derived wear, discharge-only charging and NASA POWER clearness (0.7.0)
+
+The review that triggered this wave came from the owner: "the pricing model uses both discharge
+efficiency and round-trip efficiency", "let the user put in the cycle life of the battery and price
+and calculate the wear from that", and "does the solar capacity calculation take into account the
+solar irradiation data … at the specific time". The answers and the changes, in order:
+
+* **Solar.** The capacity model already used the home's coordinates and the exact 15-minute slot time
+  for its clear-sky irradiance (sun position, Haurwitz GHI, transposition) plus cloud coverage from
+  `solar.weather_entity`, but no measured or forecast irradiance data. NASA POWER's observed hourly
+  all-sky/clear-sky irradiance (keyless, W/m², ~2-3 day latency) is now reduced to a per-hour-of-day
+  clearness index over 21 days and applied where no cloud coverage exists, and in the derived
+  watt-peak fit. It is additive: cloud coverage and the measured-PV bias keep priority, and
+  `forecast_solar` is untouched.
+* **Wear.** `BatteryConfig` gained `price_eur` and `cycle_life`; `wear_eur_per_kwh =
+  price / (cycle_life × usable_kwh)` per delivered kWh, usable-weighted across the fleet, with
+  `optimizer.cycle_cost_eur_per_kwh` kept as an advanced override (the owner chose those two options
+  explicitly).
+* **Break-even.** `buy / round_trip + wear`, no per-direction term, and the DP charges wear on the
+  discharge leg only (`wear × eta_dis × max(0, e_i − e_{i+1})`).
+
+What the gates prove: `test_wp2a_solar.py` covers the NASA fetch shape, the fill value, the
+per-hour medians (including the no-evidence default of 1.0), the weather-coverage skip, the failure
+path and the derived fit with and without clearness; `test_wp1_external_contracts.py` pins the UTC
+stamp shape and the clearness definition; `test_wp2a_config.py` covers the derivation, the zero-input
+cases and validation; `test_wp2b_efficiency.py` and `test_wp5_optimizer_oracle.py` recompute the
+discharge-only objective independently and assert DP == brute force; `test_wp3_assets.py` and
+`test_wp3_mock_contract.py` pin the UI maths and the mock contract. Two adversarial checks were not
+run this wave (no independent audit), and the NASA clearness has not been compared against a
+pyranometer: the synthetic recovery tests and the live probe of the API shape are what exists.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
@@ -557,11 +590,11 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 609 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 625 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 
-# 3. R1 tripwire (expect: "audit: clean — 89 files scanned", exit 0)
+# 3. R1 tripwire (expect: "audit: clean — 90 files scanned", exit 0)
 sh tools/audit.sh
 
 # 4. End-to-end selfcheck (expect: 31/31 checks passed, exit 0)
@@ -574,10 +607,10 @@ node tools/ui_render_check.js
 
 Frozen digests — manifest digests over the file sets the two recipes select. Both stages are sorted
 under `LC_ALL=C`, which makes the value independent of `find` order and of the locale (a single `sort`
-produces a different value). The `wc -l` count is the cross-check (90 and 77).
+produces a different value). The `wc -l` count is the cross-check (91 and 77).
 
 ```sh
-# all files (90)
+# all files (91)
 find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache \
         -o -name node_modules -o -name .mypy_cache \) -prune -o -type f -print \
   | LC_ALL=C sort | xargs sha256sum | LC_ALL=C sort | sha256sum
@@ -596,4 +629,4 @@ find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name 
 ```
 
 To check the selected file count on its own, run the same `find … -print | LC_ALL=C sort | wc -l`
-part of either recipe: it must print 84 (all files) or 72 (code + tests only).
+part of either recipe: it must print 91 (all files) or 77 (code + tests only).

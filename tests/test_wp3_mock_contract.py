@@ -40,7 +40,7 @@ FROZEN_SETTING_KEYS = [
     # capacity source (SPEC §7.1.1): the array's watt peak, the geometry it assumes when unset,
     # the performance ratio and the optional weather entity for cloud attenuation
     "solar.capacity_wp", "solar.tilt_deg", "solar.azimuth_deg", "solar.performance_ratio",
-    "solar.weather_entity",
+    "solar.weather_entity", "solar.nasa_irradiance",
     "load.mode", "load.entity", "load.temperature_entity",
     "load.base_kwh_per_day", "grid.power_entity", "grid.import_entity", "grid.export_entity",
     # optimizer
@@ -307,9 +307,12 @@ def test_plan_summary_matches_the_api_serializer(fixtures):
     mid = len(buys) // 2
     median_buy = buys[mid] if len(buys) % 2 else (buys[mid - 1] + buys[mid]) / 2
     assert summary["break_even_sell_eur_per_kwh"] == pytest.approx(
-        median_buy / summary["round_trip_efficiency"] + summary["cycle_cost_eur"] / summary["eta_discharge"],
+        median_buy / summary["round_trip_efficiency"] + summary["wear_eur_per_kwh"],
         rel=1e-12,
     )
+    # The mock battery derives its wear from its own price and cycle life (SPEC 5):
+    # 3000 / (6000 cycles x 12 kWh x 80 % usable window).
+    assert summary["wear_eur_per_kwh"] == pytest.approx(3000.0 / (6000 * 12.0 * 0.8), abs=1e-9)
     # objective = grid cost + cycle cost - salvage x terminal stored energy, rounded to cents
     expected_objective = round(
         summary["cost_estimate_eur"] + summary["cycle_cost_eur"]

@@ -362,6 +362,54 @@ def test_break_even_uses_the_requested_round_trip(store):
     assert seventy_five.break_even_sell_eur_per_kwh(0.20) == pytest.approx(0.2 / 0.75)
 
 
+def test_wear_is_derived_from_price_and_cycle_life(store):
+    settings = Settings(store, options={})
+    plain = settings.add_battery(_battery_payload(round_trip_efficiency_pct=90))
+    assert plain.wear_eur_per_kwh == 0.0, "no price/life means no wear, never a guess"
+    assert plain.break_even_sell_eur_per_kwh(0.20) == pytest.approx(0.2 / 0.9)
+
+    # 5 kWh x (100 - 10) % = 4.5 kWh usable; 2700 / (6000 x 4.5) = 0.1 EUR per delivered kWh
+    priced = settings.add_battery(
+        _battery_payload(
+            id="battery_2",
+            round_trip_efficiency_pct=90,
+            price_eur=2700.0,
+            cycle_life=6000,
+        )
+    )
+    assert priced.wear_eur_per_kwh == pytest.approx(0.1)
+    assert priced.break_even_sell_eur_per_kwh(0.20) == pytest.approx(0.2 / 0.9 + 0.1)
+    assert battery_payload(priced)["wear_eur_per_kwh"] == pytest.approx(0.1)
+
+    # an explicit number is the advanced override; the derived value is the default
+    assert priced.break_even_sell_eur_per_kwh(0.20, 0.0) == pytest.approx(0.2 / 0.9)
+    assert priced.break_even_sell_eur_per_kwh(0.20, 0.25) == pytest.approx(0.2 / 0.9 + 0.25)
+
+    # one input alone is still no wear; the UI says so rather than guessing the other side
+    half = settings.add_battery(_battery_payload(id="battery_3", price_eur=2700.0))
+    assert half.wear_eur_per_kwh == 0.0
+
+
+def test_wear_fields_round_trip_and_validate(store):
+    settings = Settings(store, options={})
+    created = settings.add_battery(_battery_payload(price_eur=1200.0, cycle_life=3000))
+    assert (created.price_eur, created.cycle_life) == (1200.0, 3000.0)
+    stored = store.get_setting("batteries")[0]
+    assert stored["price_eur"] == 1200.0 and stored["cycle_life"] == 3000.0
+
+    # the derived wear is a read-only convenience: a PATCH accepting it must not persist it
+    updated = settings.update_battery("battery_1", {"wear_eur_per_kwh": 0.5})
+    assert battery_payload(updated)["wear_eur_per_kwh"] == pytest.approx(1200.0 / (3000 * 4.5))
+    assert "wear_eur_per_kwh" not in store.get_setting("batteries")[0]
+
+    with pytest.raises(ConfigError):
+        settings.update_battery("battery_1", {"price_eur": -1})
+    with pytest.raises(ConfigError):
+        settings.update_battery("battery_1", {"cycle_life": -1})
+    reloaded = Settings(store, options={}).battery("battery_1")
+    assert (reloaded.price_eur, reloaded.cycle_life) == (1200.0, 3000.0)
+
+
 def test_battery_crud(store):
     settings = Settings(store, options={})
     created = settings.add_battery(_battery())
@@ -511,6 +559,7 @@ ADVANCED_KEYS = {
     "solar.azimuth_deg",
     "solar.performance_ratio",
     "solar.weather_entity",
+    "solar.nasa_irradiance",
     "solar.planes",
     "solar.api_key",
     "load.mode",
@@ -534,6 +583,7 @@ ADVANCED_KEYS = {
     "optimizer.power_steps",
     "optimizer.soc_step_kwh",
     "optimizer.salvage_multiplier",
+    "optimizer.cycle_cost_eur_per_kwh",
     "optimizer.target_soc_pct_end",
 }
 

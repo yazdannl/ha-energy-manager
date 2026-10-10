@@ -237,9 +237,9 @@
     host.textContent = "";
     var p = palette();
     options = options || {};
-    var cycleCost = num(options.cycleCost) != null ? num(options.cycleCost) : 0;
+    var wear = num(options.wear) != null ? num(options.wear) : 0;
     var eff = options.efficiency;
-    var showBreakEven = !!(eff && eff.round_trip > 0 && eff.eta_discharge > 0);
+    var showBreakEven = !!(eff && eff.round_trip > 0);
     var xs = [], buy = [], sell = [], soc = [], pv = [], load = [], charge = [], discharge = [], staleBuy = [], breakEven = [];
     var staleCount = 0;
     slots.forEach(function (s) {
@@ -255,7 +255,7 @@
       staleBuy.push(s.price_stale ? num(s.buy) : null);
       if (s.price_stale) staleCount++;
       var slotBuy = num(s.buy);
-      breakEven.push(showBreakEven && slotBuy != null ? slotBuy / eff.round_trip + cycleCost / eff.eta_discharge : null);
+      breakEven.push(showBreakEven && slotBuy != null ? slotBuy / eff.round_trip + wear : null);
     });
 
     var unitFmt = function (digits, unit) {

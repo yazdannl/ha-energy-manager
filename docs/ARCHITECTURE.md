@@ -18,7 +18,7 @@ next to it.
 | `app/haws.py` | Minimal home-grown WebSocket client (handshake, framing) for liveness/session probes and APIs that only exist over the socket. |
 | `app/store.py` | SQLite persistence: schema migrations, plans, measurements, actuals, dispatch log, events, settings, learned profiles. |
 | `app/sources/price.py` | Price forecast providers (`zonneplan_entity`, `energy_charts`, `entity_forecast`, `static`), unit normalisation and the fallback chain. |
-| `app/sources/solar.py` | PV forecast provider (Forecast.Solar, keyless or with a personal key), plane summation, cache and bias correction. |
+| `app/sources/solar.py` | PV forecast provider (Forecast.Solar, keyless or with a personal key; capacity/derived model with NASA POWER observed clearness), plane summation, cache and bias correction. |
 | `app/sources/load.py` | Load forecast: long-term statistics profile, level scaling, EWMA bias, optional temperature regression, flat fallback. |
 | `app/sources/measure.py` | Sampling of grid/PV/load/battery measurements into 5-minute `actuals` rows. |
 | `app/optimize/dp.py` | SoC dynamic program over 15-minute slots; deterministic, with a bounded state/action grid. |
@@ -115,22 +115,27 @@ next to it.
 the round trip is then the product, `BatteryConfig.round_trip_efficiency = eta_charge ×
 eta_discharge` — not the input field. Both directions are validated to `0 < eta <= 1`.
 
-**Cost model.** `BatteryConfig.break_even_sell_eur_per_kwh(buy, cycle_cost)` answers "what sale price
+**Cost model.** `BatteryConfig.break_even_sell_eur_per_kwh(buy, wear=None)` answers "what sale price
 covers buying at `buy`?":
 
 ```
-break_even_sell = buy / round_trip + cycle_cost / eta_discharge
+break_even_sell = buy / round_trip + wear_eur_per_kwh
 ```
 
-The wear term is charged per kWh **delivered** to the house: one delivered AC kWh cycles
-`1 / eta_discharge` kWh through the pack, which is why `optimizer.cycle_cost_eur_per_kwh` is divided
-by `eta_discharge` and not by the round trip. At a 20 ct buy price a 75 % round trip breaks even at
-26.7 ct — not 25 ct, which is the 80 % case — and with `cycle_cost = 0` it collapses to
-`buy / round_trip` (22.2 ct at 90 %). A degenerate efficiency returns `None` rather than raising.
+Wear is **derived per battery**, not typed in: `wear_eur_per_kwh = price_eur /
+(cycle_life × usable_kwh)` (`BatteryConfig.wear_eur_per_kwh`, 0.0 while either input is unset), the
+cost of one kWh **delivered** to the house. That unit is why the formula needs no per-direction
+efficiency: the energy term uses the round trip, the wear term is already per delivered kWh. The
+advanced `optimizer.cycle_cost_eur_per_kwh` override, when non-zero, replaces the derived value and
+is passed as the explicit `wear` argument. At a 20 ct buy price a 75 % round trip breaks even at
+26.7 ct — not 25 ct, which is the 80 % case — before wear. A degenerate efficiency returns `None`
+rather than raising.
 
 **Planner.** The DP's energy balance already carries `eta_charge`/`eta_discharge`, so the conversion
-loss is priced in the transition rather than ignored. On top of that, an arbitrage charge/discharge
-pair is only planned when `sell_j > buy_i / round_trip + cycle_cost / eta_discharge`, and a slot that
+loss is priced in the transition rather than ignored. Wear is charged on the **discharge leg only**,
+per delivered AC kWh (`wear × eta_discharge × max(0, e_i − e_{i+1})`), so a charge-only schedule pays
+no wear and a full cycle costs exactly `price / cycle_life`. An arbitrage charge/discharge pair is
+only planned when `sell_j > buy_i / round_trip + wear_eur_per_kwh`, and a slot that
 stays idle for exactly that reason reports `Reason.EFFICIENCY_LOSS` (`efficiency_loss`). That reason
 is deliberately distinct from the user's own `optimizer.min_spread_eur_per_kwh` floor
 (`spread_below_threshold`): one is the physics of the battery, the other is the user asking for a
@@ -143,10 +148,11 @@ dumps it for a trivial gain.
 strictest SoC window and uses the **capacity-weighted mean** of `eta_charge`/`eta_discharge` for the
 plan, capped at 400 DP states. The mean is a documented approximation when the packs differ
 materially, so the plan reports the aggregate round trip it assumed instead of one silently invented
-number. Allocation (`optimize/allocate.py`) then spends the **most efficient battery first** (ties by
+number. Wear is averaged over the fleet by **usable kWh**, the quantity it is charged per. Allocation
+(`optimize/allocate.py`) then spends the **most efficient battery first** (ties by
 battery id, deterministic) while honouring each battery's own limits. Every per-battery break-even —
-the battery card, the plan's battery rows — is computed from that battery's own efficiencies, so a
-cheap old pack and an efficient new one are never averaged into one misleading figure.
+the battery card, the plan's battery rows — is computed from that battery's own efficiency and wear,
+so a cheap old pack and an efficient new one are never averaged into one misleading figure.
 
 ## Threads and shared state
 

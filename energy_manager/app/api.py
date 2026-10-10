@@ -264,6 +264,7 @@ def plan_summary_dict(summary: PlanSummary) -> dict[str, Any]:
         "solver_iterations": summary.solver_iterations,
         "cycle_cost_eur": summary.cycle_cost_eur,
         "objective_eur": summary.objective_eur,
+        "wear_eur_per_kwh": getattr(summary, "wear_eur_per_kwh", None),
     }
     # The efficiency the plan assumed (SPEC 5/8.1): the aggregate etas and the break-even sale price
     # at the plan's median buy.  Additive keys, read with ``getattr`` so a summary restored from
@@ -324,9 +325,10 @@ def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dic
                 "id": entry.get("id"),
                 "name": entry.get("name"),
                 "share_w": entry.get("share_w"),
-                # SPEC 5: this battery's own round trip and break-even (its own etas, the plan's
-                # reference price).  Additive; the UI computes the rest itself.
+                # SPEC 5: this battery's own round trip, wear and break-even (its own etas/wear,
+                # the plan's reference price).  Additive; the UI computes the rest itself.
                 "round_trip_efficiency": entry.get("round_trip_efficiency"),
+                "wear_eur_per_kwh": entry.get("wear_eur_per_kwh"),
                 "break_even_sell_eur_per_kwh": entry.get("break_even_sell_eur_per_kwh"),
             }
             for entry in plan.batteries

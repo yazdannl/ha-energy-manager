@@ -27,7 +27,7 @@ The full documentation lives in the [repository README](https://github.com/yazda
 5. Watch *Plan* and *Log* to see what the add-on would have done, then enable `auto` (with
    `dry_run` still on) when you trust it.
 
-## Battery efficiency (round trip)
+## Battery efficiency and wear
 
 You enter **one** efficiency number per battery: the **round trip**, i.e. how much of the energy put
 in comes back out. The add-on splits it evenly between the two directions — the default 95 % in and
@@ -35,36 +35,41 @@ in comes back out. The add-on splits it evenly between the two directions — th
 know the charger and inverter figures separately, use the *charge/discharge efficiency* override
 instead and the round trip becomes their product.
 
-That number is what decides whether a cycle is worth doing, because the battery keeps part of the
-energy:
+Wear is derived from the pack's own price and cycle life (both optional fields on the battery card),
+not typed in as a global number:
 
 ```
-break_even_sell = buy / round_trip + cycle_cost / eta_discharge
+wear = price / (cycle_life × usable kWh)          # EUR per kWh delivered
+break_even_sell = buy / round_trip + wear
 ```
 
 Buying at 20 ct/kWh with a **75 %** round trip breaks even at **26.7 ct, not 25 ct** — 25 ct would be
-the 80 % case. With no cycle cost configured (`optimizer.cycle_cost_eur_per_kwh`, default 0) it
-reduces to `buy / round_trip`: 20 ct at 90 % breaks even at 22.2 ct.
+the 80 % case — plus the derived wear (for example 3000 EUR over 6000 cycles on 9.6 kWh usable is
+about 5.2 ct/kWh delivered). With no price or cycle life entered the wear is 0 and the formula
+reduces to `buy / round_trip`: 20 ct at 90 % breaks even at 22.2 ct. The advanced
+`optimizer.cycle_cost_eur_per_kwh` setting overrides the derived wear when non-zero.
 
 The add-on plans an arbitrage cycle only when the sell price clears that figure, values stored energy
 at `eta_discharge` (a stored kWh returns only part of itself to the house as AC, so it is not worth
 face value), and reports a slot left idle because the spread does not cover the loss as
 `efficiency_loss` — the conversion loss, which is not the same as your own
-`optimizer.min_spread_eur_per_kwh` floor (`spread_below_threshold`).
+`optimizer.min_spread_eur_per_kwh` floor (`spread_below_threshold`). Wear is charged per kWh
+delivered, so charging alone costs none.
 
-With several batteries the plan uses capacity-weighted mean efficiencies (an approximation when the
-packs differ materially), spends the most efficient battery first, reports the aggregate round trip
-it assumed, and computes each battery's break-even from that battery's own values.
+With several batteries the plan uses capacity-weighted mean efficiencies and usable-weighted mean
+wear (an approximation when the packs differ materially), spends the most efficient battery first,
+reports the aggregate round trip and wear it assumed, and computes each battery's break-even from
+that battery's own values.
 
-Where to look: the battery card shows the round trip, the effective cost of a stored kWh at the
-current buy price (`buy / eta_charge`, the buy price plus the charging loss) and the break-even sale
-price that follows from it; the Plan view shows the assumed round trip and draws its break-even line
-against the sell prices.
+Where to look: the battery card shows the round trip, the derived wear and the break-even sale price
+that follows from it; the Plan view shows the assumed round trip and wear and draws the break-even
+line against the sell prices.
 
 ## Safety and privacy in one paragraph
 
-Nothing leaves your system except the forecast requests (Forecast.Solar and, if used, the
-energy-charts day-ahead price API), and no location or entity mapping is stored in this
+Nothing leaves your system except the forecast requests (Forecast.Solar, NASA POWER irradiance for
+the capacity/derived solar sources, and — if used — the energy-charts day-ahead price API), and no
+location or entity mapping is stored in this
 repository or in its logs. Hard SoC, power, grid and ramp limits are enforced in front of every
 write, every rejection is logged with its reason, and `mode: off` is the kill switch.
 
