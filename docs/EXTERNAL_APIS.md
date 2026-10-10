@@ -304,6 +304,18 @@ private (never log/store); `latitude: 0.0` means unset — refuse to plan rather
 * Driver rule: after every write, read the entity back and treat a mismatch as a driver error. Keep
   payloads minimal; never send `return_response` for `number.set_value` / `select.select_option`.
 
+### `POST /api/services/weather/get_forecasts?return_response` — **[V]** live (2026-10-10)
+
+Body `{"entity_id": "weather.x", "type": "hourly"}`; the forecast comes back inside the documented
+`service_response` wrapper (`{"service_response": {"weather.x": {"forecast": [{"datetime": ...,
+"cloud_coverage": n, ...}]}}}`). Not every weather entity implements the action: the instance's
+`weather.openweathermap` answers **HTTP 400 `Entity ... does not support action weather.get_forecasts`**
+for `hourly`, `daily` and `twice_daily`, and exposes no `supported_features` attribute — it publishes
+only a current `cloud_coverage`. That is not an error for us: the capacity-based solar estimate holds
+the current cloud cover flat across the horizon and says so in the forecast notes, and falls back to
+clear-sky (also stated) when there is no coverage at all. Met.no's forecast entity does support hourly
+forecasts. **[V]** (live 400 on the owner's instance; wrapper shape from the REST docs + source above)
+
 ### `GET /api/history/period/<timestamp>`
 
 * `filter_entity_id` is **required** (comma-separated); optional `end_time`, `minimal_response`,

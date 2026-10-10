@@ -933,3 +933,41 @@ def test_price_field_visibility_per_provider_and_contract():
 
     # contract is what switches the fixed fields: the same provider, a different contract
     assert keys("fixedSingle") != keys("fixedDayNight")
+
+
+def test_solar_field_visibility_per_source():
+    """solarFieldVisibility (SPEC §7.1.1) shows only the fields the chosen solar source uses."""
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "", hash: "" };
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    console.log(JSON.stringify({
+      api: A.solarFieldVisibility("forecast_solar"),
+      capacity: A.solarFieldVisibility("capacity"),
+      unknown: A.solarFieldVisibility("")
+    }));
+    """
+    data = json.loads(run_node_script(script))
+
+    def keys(name):
+        return set(data[name]["fields"])
+
+    always = {"solar.source", "solar.enabled", "solar.bias_correction", "solar.measured_entity"}
+    for name in ("api", "capacity", "unknown"):
+        assert always <= keys(name), f"{name} dropped an always-visible field: {sorted(always - keys(name))}"
+
+    # forecast_solar: per-plane geometry plus the optional personal key, and nothing capacity-shaped
+    assert {"solar.planes", "solar.api_key"} <= keys("api")
+    assert not any(k in keys("api") for k in ("solar.capacity_wp", "solar.tilt_deg", "solar.azimuth_deg",
+                                              "solar.performance_ratio", "solar.weather_entity"))
+
+    # capacity: the watt peak, the optional geometry and the optional weather entity; no planes
+    assert {"solar.capacity_wp", "solar.tilt_deg", "solar.azimuth_deg", "solar.performance_ratio",
+            "solar.weather_entity"} <= keys("capacity")
+    assert "solar.planes" not in keys("capacity") and "solar.api_key" not in keys("capacity")
+    # the note must say the estimate comes from the watt peak, so the field is understood
+    assert "watt peak" in (data["capacity"]["note"] or "").lower()
+
+    # an empty/unknown source must not make fields vanish: fall back to the API source's set
+    assert keys("unknown") == keys("api")

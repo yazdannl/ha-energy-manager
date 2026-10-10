@@ -2425,6 +2425,51 @@
     return { fields: keys, note: note || null };
   }
 
+  /* ---- solar source field visibility (SPEC §7.1.1) --------------------------------------------
+   * solar.source picks the estimation model: forecast_solar is the Forecast.Solar API and needs
+   * per-plane geometry, capacity estimates from the array's watt peak alone (AC-coupled arrays whose
+   * geometry the user does not want to model). Which solar.* keys the form reveals follows from it,
+   * with the same two rules the price group uses: the selector and everything both sources need
+   * stay visible, and renderSettings still surfaces any hidden field that holds a non-default
+   * value, so a value this source ignores can never act invisibly. */
+
+  // Meaningful for both sources: the on/off switch, the selector itself, the bias learning and the
+  // measured PV entity that learning is fitted to (the accuracy of both sources improves with it).
+  var SOLAR_FIELDS_ALWAYS = ["solar.source", "solar.enabled", "solar.bias_correction", "solar.measured_entity"];
+  // forecast_solar: the API call — per-plane geometry, plus the optional own key (keyless is
+  // single-plane hourly, which is why planes is the field that really matters).
+  var SOLAR_FIELDS_FORECAST_SOLAR = ["solar.planes", "solar.api_key"];
+  // capacity: the array's total watt peak, the geometry the model assumes while it is unset, the
+  // performance ratio and the optional weather entity for cloud attenuation.
+  var SOLAR_FIELDS_CAPACITY = [
+    "solar.capacity_wp", "solar.tilt_deg", "solar.azimuth_deg", "solar.performance_ratio",
+    "solar.weather_entity"
+  ];
+  // The one-line note under the source select, so a user who later reads an explained forecast
+  // knows which model produced it. Capacity states its assumptions because they are stated (not
+  // silent) in the forecast notes too (SPEC §7.1.1).
+  var SOLAR_SOURCE_NOTES = {
+    forecast_solar: "Per-plane geometry (kWp, tilt, azimuth): the Forecast.Solar API is asked per plane, so each plane is modelled on its own tilt and direction.",
+    capacity: "Estimate from the array's total watt peak: enter the Wp and the add-on models production from the sun's position, optionally attenuated by a weather entity's cloud cover; leave tilt/azimuth unset and it assumes south-facing at 35 degrees and says so in the forecast notes."
+  };
+
+  /** Visible solar.* keys for a source, plus the note to show.
+   *  Pure (no DOM) so node tests can assert the table. */
+  function solarFieldVisibility(source) {
+    var s = String(source || "forecast_solar");
+    var keys = SOLAR_FIELDS_ALWAYS.concat(s === "capacity" ? SOLAR_FIELDS_CAPACITY : SOLAR_FIELDS_FORECAST_SOLAR);
+    // An unknown source keeps the forecast_solar fields (never an empty group), the same fallback
+    // the price table uses, so a newer backend value cannot hide every field.
+    var note = SOLAR_SOURCE_NOTES[s] != null ? SOLAR_SOURCE_NOTES[s] : null;
+    return { fields: keys, note: note || null };
+  }
+
+  // Two guidance lines that live under the Solar group instead of in a field's help text, because
+  // they are about the entity itself rather than the typed value: what the measured-PV learning is
+  // fitted to, and what the weather entity has to support for cloud attenuation to work at all.
+  var SOLAR_MEASURED_NOTE = "solar.measured_entity must be the inverter's AC output: a meter's export register under-reports, because self-consumed energy never reaches the meter, so the learned per-hour correction would come out low. It is what makes the forecast more accurate over time.";
+  var SOLAR_WEATHER_NOTE = "solar.weather_entity must support the weather.get_forecasts action (Met.no's forecast entity does; some integrations, including the OpenWeatherMap entity on this install, only publish a current cloud_coverage and support no forecast type) — without a forecast type the add-on holds the current cloud cover flat and says so in the forecast notes, so the field is still worth setting.";
+
   function settingsField(descriptor, dirty) {
     var key = descriptor.key;
     var type = descriptor.type || "str";
@@ -2523,9 +2568,10 @@
       wrap.classList.add("field-dirty");
       dirtyCount = Object.keys(dirtyValues).length;
       saveButtons.forEach(function (b) { b.textContent = "Save changes (" + dirtyCount + ")"; b.disabled = dirtyCount === 0; });
-      // Changing the price provider or contract changes which price fields make sense, so re-render
-      // the group now (the new value is already in dirtyValues, so the preview updates immediately).
-      if (key === "price.provider" || key === "price.contract") draw();
+      // Changing the price provider/contract or the solar source changes which fields make sense,
+      // so re-render the group now (the new value is already in dirtyValues, so the preview updates
+      // immediately).
+      if (key === "price.provider" || key === "price.contract" || key === "solar.source") draw();
     }
 
     function descriptorByKey(key) {
@@ -2537,9 +2583,10 @@
       if (Object.prototype.hasOwnProperty.call(dirtyValues, descriptor.key)) return dirtyValues[descriptor.key].value;
       return descriptor.value === undefined ? descriptor.default : descriptor.value;
     }
-    // The provider/contract values that drive visibility; read off the full descriptor list (not the
-    // search-filtered group), so the preview reacts even when the selectors themselves are filtered.
-    function priceSettingValue(key) {
+    // The visibility-relevant key values (price.provider/contract, solar.source); read off the full
+    // descriptor list (not the search-filtered group), so the preview reacts even when the
+    // selectors themselves are filtered.
+    function settingValue(key) {
       if (Object.prototype.hasOwnProperty.call(dirtyValues, key)) return dirtyValues[key].value;
       var d = descriptorByKey(key);
       return d ? (d.value === undefined ? d.default : d.value) : undefined;
@@ -2582,7 +2629,7 @@
           " — " + String(w.message || "")
         ]));
       });
-      var vis = priceFieldVisibility(priceSettingValue("price.provider"), priceSettingValue("price.contract"));
+      var vis = priceFieldVisibility(settingValue("price.provider"), settingValue("price.contract"));
       var visible = {};
       vis.fields.forEach(function (k) { visible[k] = true; });
       if (vis.note) section.appendChild(el("p", { class: "field-help", text: vis.note }));
@@ -2599,6 +2646,40 @@
         if (Object.prototype.hasOwnProperty.call(visible, d.key)) return;
         if (settingValueEqual(effectiveValue(d), d.default)) return;
         section.appendChild(el("p", { class: "muted", text: "Hidden " + d.key + " = " + settingValueText(effectiveValue(d)) + " — not used by the current provider/contract above, but still set." }));
+      });
+      return section;
+    }
+
+    // The Solar group is the same shape for solar.source: the source note, the fields that apply to
+    // the chosen source, the two guidance lines (measured PV entity, weather entity support), then a
+    // muted line for every hidden field that still holds a non-default value. The forecast view shows
+    // `source` and the source's notes, so this is the half of the story a user reads before saving.
+    function renderSolarGroup(items) {
+      var section = el("section", { class: "group" }, [el("h3", { text: "Solar" })]);
+      var vis = solarFieldVisibility(settingValue("solar.source"));
+      var visible = {};
+      vis.fields.forEach(function (k) { visible[k] = true; });
+      var fields = el("div", { class: "fields" });
+      items.forEach(function (d) {
+        if (!Object.prototype.hasOwnProperty.call(visible, d.key)) return; // hidden by this source
+        fields.appendChild(renderField(d));
+      });
+      section.appendChild(fields);
+      // Under the selector (and the fields it reveals), not above them: pick a source first, then
+      // read what it means — the note explains the visible set, so it belongs next to it.
+      if (vis.note) section.appendChild(el("p", { class: "field-help", text: vis.note }));
+      section.appendChild(el("p", { class: "field-help", text: SOLAR_MEASURED_NOTE }));
+      // Only useful when the source can actually use it: capacity is the one with cloud attenuation.
+      if (Object.prototype.hasOwnProperty.call(visible, "solar.weather_entity")) {
+        section.appendChild(el("p", { class: "field-help", text: SOLAR_WEATHER_NOTE }));
+      }
+      // Hidden-but-set, computed over every solar descriptor (never the search-filtered subset), so
+      // planes set for forecast_solar while capacity runs (or the other way round) stay visible.
+      descriptors.forEach(function (d) {
+        if (d.group !== "Solar") return;
+        if (Object.prototype.hasOwnProperty.call(visible, d.key)) return;
+        if (settingValueEqual(effectiveValue(d), d.default)) return;
+        section.appendChild(el("p", { class: "muted", text: "Hidden " + d.key + " = " + settingValueText(effectiveValue(d)) + " — not used by the current solar source above, but still set." }));
       });
       return section;
     }
@@ -2641,6 +2722,8 @@
         var section;
         if (group.name === "Price") {
           section = renderPriceGroup(group.items);
+        } else if (group.name === "Solar") {
+          section = renderSolarGroup(group.items);
         } else {
           section = el("section", { class: "group" + (groups.length && /safety|limit/i.test(group.name) ? " group-safety" : "") }, [
             el("h3", { text: group.name })
@@ -2826,6 +2909,7 @@
     actionText: actionText,
     forecastEmptyState: forecastEmptyState,
     priceFieldVisibility: priceFieldVisibility,
+    solarFieldVisibility: solarFieldVisibility,
     fmtPower: fmtPower,
     fmtKwh: fmtKwh,
     fmtPrice: fmtPrice,

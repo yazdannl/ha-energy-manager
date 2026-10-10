@@ -109,7 +109,7 @@
         action: action,
         reason: reason,
         price_stale: stale,
-        pv_source: "forecast_solar",
+        pv_source: "capacity",
         price_source: "zonneplan_entity"
       });
     }
@@ -156,7 +156,7 @@
       infeasible_reason: null,
       mode: db.mode,
       dry_run: db.dry_run,
-      sources: { price: "zonneplan_entity", solar: "forecast_solar", load: "statistics" },
+      sources: { price: "zonneplan_entity", solar: "capacity", load: "statistics" },
       summary: {
         cost_estimate_eur: costs,
         baseline_cost_eur: round(baseline, 2),
@@ -191,6 +191,29 @@
     return windowSlots(hours).map(function (s) {
       return { t: s.t, pv_kw: s.pv_kw, uncertainty_pct: 25.0 };
     });
+  }
+
+  // The capacity source (SPEC §7.1.1): a stated watt peak and no plane geometry at all, so
+  // `planes` stays empty (the tester's four per-plane keys describe a Forecast.Solar plane) and the
+  // notes carry every assumption instead. The wording mirrors sources/solar.py so the demo cannot
+  // drift from what the backend actually emits.
+  function capacitySolarPayload(hours) {
+    return {
+      kind: "solar", generated_at: iso(startMs), source: "capacity", stale: false,
+      provider: "capacity", contract: null, reason: null, hint: null,
+      planes: [],
+      correction_applied: 1.06,
+      notes: [
+        "capacity estimate: 5800 Wp from solar.capacity_wp",
+        "assumed south-facing, 35 degree tilt; set solar.tilt_deg / solar.azimuth_deg to refine",
+        "performance ratio 0.85 (solar.performance_ratio)",
+        "weather.example_home does not support weather.get_forecasts; current cloud cover held flat",
+        "a measured PV entity refines this curve with a learned per-hour correction (solar.measured_entity; use the inverter's AC output, not a meter's export register)",
+        MOCK_NOTE
+      ],
+      // Cloud cover held flat narrows the band to 25% (25.0 without, 35.0 with no cloud data).
+      slots: solarSlots(hours)
+    };
   }
 
   function loadSlots(hours) {
@@ -331,11 +354,18 @@
     ["price.feed_in_tax_inclusive", "bool", true, "Feed-in incl. VAT", "Off = add price.vat_pct to the feed-in price.", "price", null],
 
     ["solar.enabled", "bool", true, "Solar forecast", "Enable the PV forecast.", "solar", null],
-    ["solar.source", "str", "forecast_solar", "Solar source", "", "solar", ["forecast_solar"]],
-    ["solar.planes", "json", [], "PV planes", "List of {kwp, tilt_deg, azimuth_deg (compass: 0=north), damping}.", "solar", null],
-    ["solar.api_key", "password", "", "Forecast.Solar key", "Optional personal key; keyless is single-plane hourly.", "solar", null],
+    ["solar.source", "str", "forecast_solar", "Solar source", "forecast_solar = the Forecast.Solar API (needs planes); capacity = estimate from the array's watt peak, for AC-coupled arrays whose geometry you do not want to model.", "solar", ["forecast_solar", "capacity"]],
+    ["solar.planes", "json", [], "PV planes", "forecast_solar only. List of {kwp, tilt_deg, azimuth_deg (compass: 0=north), damping}.", "solar", null],
+    ["solar.api_key", "password", "", "Forecast.Solar key", "forecast_solar only. Optional personal key; keyless is single-plane hourly.", "solar", null],
     ["solar.bias_correction", "bool", true, "Bias correction", "Learn a multiplicative correction from measured PV.", "solar", null],
-    ["solar.measured_entity", "str", "", "Measured PV entity", "Runtime-picked PV power sensor.", "solar", null],
+    ["solar.measured_entity", "str", "", "Measured PV entity", "Runtime-picked PV generation sensor. Use the inverter's AC output; a meter's export register under-reports because self-consumed energy never reaches the meter.", "solar", null],
+    // capacity only (SPEC 7.1.1): the array's watt peak plus the geometry the model assumes while
+    // it is unset, the performance ratio and the optional weather entity for cloud attenuation.
+    ["solar.capacity_wp", "float", null, "Array watt peak", "capacity only. Total Wp of the array (all panels added). Unset = no capacity estimate, never a guess from history.", "solar", null],
+    ["solar.tilt_deg", "float", null, "Tilt", "capacity only. Panel tilt from horizontal. Unset = assume 35 degrees, stated in the forecast notes.", "solar", null],
+    ["solar.azimuth_deg", "float", null, "Azimuth", "capacity only. Compass direction the panels face: 0 = north, 90 = east, 180 = south, 270 = west. Unset = assume south.", "solar", null],
+    ["solar.performance_ratio", "float", 0.85, "Performance ratio", "capacity only. Inverter, temperature and soiling losses applied to the clear-sky estimate.", "solar", null],
+    ["solar.weather_entity", "str", "", "Weather entity", "capacity only. HA weather entity whose hourly cloud coverage attenuates the estimate. Unset = clear-sky, refined by the measured-PV correction.", "solar", null],
 
     ["load.mode", "str", "auto", "Load source", "auto uses the load entity if mapped, else derived.", "load", ["auto", "entity", "derived"]],
     ["load.entity", "str", "", "Load entity", "Runtime-picked load power sensor.", "load", null],
@@ -389,7 +419,15 @@
       // also shows the hidden-but-set warning. DEFAULTS still apply to every unset key.
       "price.provider": "day_ahead",
       "price.contract": "fixed_single",
-      "price.entity": "sensor.example_legacy_price"
+      "price.entity": "sensor.example_legacy_price",
+      // ...and the 0.4.0 solar.source choice (SPEC §7.1.1): the capacity estimate runs, while the
+      // Forecast.Solar-only keys stay set but hidden by the source, so the Solar group shows the
+      // same hidden-but-set line the Price group demonstrates.
+      "solar.source": "capacity",
+      "solar.capacity_wp": 5800,
+      "solar.measured_entity": "sensor.example_pv_power",
+      "solar.planes": [{ kwp: 4.0, tilt_deg: 35, azimuth_deg: 180, damping: 0.0 }],
+      "solar.api_key": "example-personal-key"
     },
     batteries: null,
     pendingHolds: [],
@@ -604,7 +642,7 @@
 
   function providersPayload() {
     return {
-      solar: [{ kind: "solar", name: "forecast_solar", active: true, ok: true, last_success: iso(Date.now() - 600000), last_error: null, stale: false, detail: { planes: 1, refresh_minutes: 30 } },
+      solar: [{ kind: "solar", name: "capacity", active: true, ok: true, last_success: iso(Date.now() - 600000), last_error: null, stale: false, detail: { capacity_wp: 5800, tilt_deg: 35, azimuth_deg: 180, assumed_tilt: true, assumed_azimuth: true, performance_ratio: 0.85, cloud_attenuation: true, weather_entity: "weather.example_home", bias_correction: true, correction_applied: 1.06 } },
               { kind: "solar", name: "cache", active: false, ok: true, last_success: iso(Date.now() - 600000), last_error: null, stale: false, detail: {} }],
       price: [{ kind: "price", name: "zonneplan_entity", active: true, ok: true, last_success: iso(Date.now() - 300000), last_error: null, stale: false, detail: { raw_unit: "eur_per_kwh" } },
               { kind: "price", name: "static", active: false, ok: true, last_success: null, last_error: null, stale: false, detail: {} }],
@@ -643,7 +681,7 @@
       pending_holds: db.pendingHolds.slice(),
       mode_persisted: db.modePersisted,
       alerts: [
-        { ts: iso(Date.now() - 600000), level: "warning", code: "forecast_unavailable", message: "Example alert: solar forecast provider returned no slots; using cache.", detail: { source: "forecast_solar" }, acknowledged: false },
+        { ts: iso(Date.now() - 600000), level: "warning", code: "forecast_unavailable", message: "Example alert: solar forecast provider returned no slots; using cache.", detail: { source: "capacity" }, acknowledged: false },
         { ts: iso(Date.now() - 3600000), level: "info", code: "plan_changed", message: "Example alert: a new plan was published.", detail: {}, acknowledged: false }
       ],
       provider_status: providers.solar.concat(providers.price, providers.load),
@@ -676,7 +714,12 @@
         };
       }
       if (kind === "solar") {
-        return { kind: "solar", generated_at: iso(startMs), source: "forecast_solar", stale: false, provider: "forecast_solar", contract: null, reason: null, hint: null, planes: [{ kwp: 4.0, tilt_deg: 35, azimuth_deg: 180, damping: 0.0 }], correction_applied: 1.05, notes: [MOCK_NOTE], slots: solarSlots(hours) };
+        // ?mock=1 shows the 0.4.0 capacity source by default (SPEC §7.1.1): an AC-coupled array
+        // whose geometry is not modelled. Append `source=forecast_solar` for the per-plane API path.
+        if (ctx.params.source === "forecast_solar") {
+          return { kind: "solar", generated_at: iso(startMs), source: "forecast_solar", stale: false, provider: "forecast_solar", contract: null, reason: null, hint: null, planes: [{ kwp: 4.0, tilt_deg: 35, azimuth_deg: 180, damping: 0.0 }], correction_applied: 1.05, notes: [MOCK_NOTE], slots: solarSlots(hours) };
+        }
+        return capacitySolarPayload(hours);
       }
       if (kind === "load") {
         return { kind: "load", generated_at: iso(startMs), source: "statistics", confidence: "medium", stale: false, provider: "statistics", contract: null, reason: null, hint: null, notes: [MOCK_NOTE], slots: loadSlots(hours) };

@@ -1,7 +1,7 @@
 # Verification record — Smart Energy Manager add-on
 
 Authoritative verification record for the tree published from this repository. Every number below
-was produced by a gate named in §9 on the frozen tree; nothing here is a projection. This record
+was produced by a gate named in §10 on the frozen tree; nothing here is a projection. This record
 supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figures in previous
 revisions described pre-audit trees and are obsolete.
 
@@ -15,15 +15,15 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **562 passed** (two consecutive runs) |
+| Test suite | `python3 -m pytest tests -q` | **581 passed** (two consecutive runs) |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 85 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
 
-Frozen digest of the verified artifact (recipe in §9, normative):
+Frozen digest of the verified artifact (recipe in §10, normative):
 
 * **code + tests (73 files, documentation excluded)**:
-  `03e63243939b516f313dc77ba169e688fbe1553556189d3614ac0f5c372285f1`
+  `f37e1ee052c52975322cd925616afa8e958f4a4ba07340cf7b27a9911c497748`
 * **path list of the same 73 files** (detects an added, removed or renamed file):
   `553c23454f8aa5a3efbac4a327d1341f4b4b61211871ab1d28ec8fbdfb2d6216`
 
@@ -275,7 +275,71 @@ The mutation table in §3 is unchanged; the flakiness note there still applies t
 
 ---
 
-## 7. R1 scanner (`tools/audit.sh`)
+## 7. The capacity-based solar estimate (0.4.0), checked against a real array
+
+The instance's PV is AC-coupled: the battery's own PV input has never produced anything, the house
+meter is where production appears, and no planes are configured - so the Forecast.Solar path could not
+fill the solar panel at all. The request was to let the user state a watt peak and have the add-on
+estimate production, with real production making it more accurate.
+
+**Two independent implementations agree.** The model in SPEC 7.1.1 was implemented twice: once by the
+worker, once by the orchestrator from the frozen spec text alone. On the instance's own coordinates
+for 2026-10-08 both produce the *same numbers to the digit* - clear-sky peaks of 1823 W, 2025 W and
+2228 W at 13:30 local (solar noon with DST) and 12.51, 13.90 and 15.29 kWh for 2700, 3000 and 3300 Wp.
+Agreement between two implementations of the same text is evidence that the model was built as
+specified, which "the tests pass" alone cannot give.
+
+**Against the array's own history** (3 days of the AC-coupled production sensor, 5-minute samples):
+
+* the measured day peaked at **1875 W at 12:45**; the model puts a 3000 Wp array at **2025 W at
+  13:30** on that day - 8% above, which is what a clear-sky model must be on a partly cloudy day
+  (an upper bound, never a lower one), and the peak hour is correct rather than fitted to the data;
+* the measured peak implies an array of roughly **2777 Wp**, a plausible size for a residential
+  string, so the model's magnitude is not off by a factor;
+* the hourly profile of the clear-sky model correlates **0.903** with the measured production of that
+  day over the eight hours they share.
+
+**37 harness checks** against the shipped code (fixtures: the instance's `/api/config` and its
+production history): night slots exactly zero; the peak lands near local solar noon; the model is an
+upper bound on a cloudy measured day and within the same-window energy ballpark; south-facing beats
+north-facing at the same capacity; explicit tilt/azimuth remove the assumption note; the cloud paths
+(service response, flat current cover, clear-sky) each attenuate correctly and carry the note that
+says which one applied; the learned per-hour correction from measured production scales the capacity
+forecast while untouched hours stay at 1.0; a missing capacity yields an empty, explained panel rather
+than a guess; and the HTTP payload carries the notes and a hint naming `solar.capacity_wp`.
+
+**What only the live instance showed:** its weather entity supports *no* forecast type - all three
+`weather.get_forecasts` types answer HTTP 400 "does not support action" - so cloud attenuation cannot
+use a forecast there. That is not treated as an error: the current `cloud_coverage` is held flat with a
+note, and clear-sky is the stated fallback when there is no coverage either. The service response
+wrapper (`service_response`) and that 400 behaviour are recorded in `docs/EXTERNAL_APIS.md`.
+
+**Mutation check on the new model** (throwaway copy, mutation applied, solar tests run, reverted):
+
+| Mutation | Result |
+| --- | --- |
+| cloud attenuation ignored | **caught** |
+| performance ratio ignored | **caught** |
+| compass azimuth passed straight into a formula that measures from due south | **caught** |
+| the "assumed south-facing, 35 degree tilt" note reworded to claim no assumption | **caught** |
+| the missing-capacity error replaced by a guess | **caught** |
+| the night gate removed (`elevation <= 0`) | **not caught - equivalent mutant**: two further guards already return 0 (a non-positive `cos_zenith`, and a `max(0.0, poa)` clamp), so no input distinguishes it |
+
+Two defects were found by review rather than by a test, and both are recorded because they are the
+kind that hides behind a green suite:
+
+* **The whole capacity constant block was defined twice** in `sources/solar.py`. Python takes the last
+  definition, so behaviour was correct and every test passed - but the dead copy masked a mutation
+  (the reworded-assumption mutant initially survived because it edited the copy that had no effect).
+  The duplicate was removed and the mutation re-run: it is now caught.
+* **The frontend's mock fixture put capacity fields inside a `planes` entry**, which the frozen
+  contract test correctly rejects (a plane has `kwp`/`tilt_deg`/`azimuth_deg`/`damping`). The mock was
+  wrong, not the test: a capacity estimate models no planes, so the fixture now ships `planes: []` with
+  the assumptions in its notes, and the contract test was *strengthened* to pin exactly that.
+
+---
+
+## 8. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:
 
@@ -298,7 +362,7 @@ value that may be sensitive.
 
 ---
 
-## 8. What is not verified
+## 9. What is not verified
 
 * **No real battery or Zendure hardware.** Driver behaviour is asserted against the documented
   integration semantics and a fake over loopback, not observed on a device.
@@ -319,6 +383,11 @@ value that may be sensitive.
 * **Saving a battery after a *Select*** (`POST /api/v1/batteries`) is covered by the API contract
   tests but has not been exercised against the live instance; nothing was added to the running
   add-on's configuration during this work.
+* **No clear-day validation of the capacity model.** Its clear-sky peak was checked against an almanac
+  (sunrise/sunset and peak heights are physical) and against a *partly cloudy* measured day, where it
+  correctly sits above the measurement; no measured clear day was available in the three days of
+  history on the instance, so the model's absolute calibration rests on the model itself plus whatever
+  the learned per-hour correction absorbs.
 * **No real energy-charts payload was parsed.** The provider path is covered by tests, and the live
   endpoint was probed for its status codes (200/400/404), but no successful response body was seen
   from this environment: the covered zones answered 429 (rate limited) during the probe and the
@@ -341,7 +410,7 @@ Known behaviour, accepted and deliberate:
 
 ---
 
-## 9. How to reproduce
+## 10. How to reproduce
 
 No network access and no hardware are needed for any command below.
 
@@ -349,7 +418,7 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 562 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 581 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 

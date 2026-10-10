@@ -417,6 +417,44 @@ Measured bias learning: when `solar.bias_correction` and a measured PV entity ar
 "slot-of-day bucket" (24 hourly buckets) multiplicative factor as an EWMA with `alpha=0.2`, clamped
 to `[0.3, 1.8]`, stored in `learning_profiles`. Factors older than 14 days decay toward 1.0.
 
+#### 7.1.1 Capacity-based estimate (`solar.source = capacity`, 0.4.0)
+
+An AC-coupled array whose geometry is not worth modelling needs no API and no planes: the user states
+the array's watt peak and the add-on estimates production from astronomy, then refines it with the
+same measured-PV bias learning above. This is deliberately a *simple, documented* model whose
+errors are meant to be corrected by measurement, not a solar simulator.
+
+Settings: `solar.capacity_wp` (required for this source, total Wp), `solar.tilt_deg` /
+`solar.azimuth_deg` (optional; compass azimuth, 0 = north, 180 = south), `solar.performance_ratio`
+(default 0.85) and `solar.weather_entity` (optional HA weather entity for cloud attenuation).
+
+Per 15-minute slot, with latitude/longitude and timezone from Home Assistant:
+
+1. **Solar position** from the standard declination/hour-angle equations (day-of-year declination,
+   equation of time, longitude correction): elevation and compass azimuth. Elevation ≤ 0 → `pv_kw = 0`.
+2. **Clear-sky global horizontal irradiance**, Haurwitz: `GHI = 1098·cos(z)·exp(-0.059/cos(z))` W/m²
+   with `z` the zenith angle. Split beam/diffuse with a documented constant diffuse fraction
+   (`0.25`), then transpose to the plane with the isotropic-sky model
+   (`POA = DNI·max(0, cos(AOI)) + DHI·(1+cos β)/2 + GHI·ρ·(1-cos β)/2`, ground albedo `ρ = 0.2`).
+3. **Cloud attenuation** when the weather entity yields cloud coverage for the slot, Kasten-Czeplak:
+   `k = 1 - 0.75·(cc/100)^3.4`. Hourly forecast values cover the four slots of their hour. Without
+   cloud data the estimate is clear-sky and the forecast says so.
+4. **Power**: `pv_kw = (capacity_wp/1000)·(POA/1000)·performance_ratio`.
+
+Uncertainty is higher than an API forecast because the model is coarse: `35%` without cloud data and
+`25%` with it, and the learned per-hour correction narrows it in practice. The forecast **always**
+carries notes stating the capacity used, the tilt/azimuth actually assumed when they were left unset,
+the performance ratio, whether cloud attenuation was applied and from which entity, and that a
+measured PV entity will refine the curve.
+
+Assumed tilt/azimuth are stated, never silent: an unset value is reported as an assumption. The
+measured entity for an AC-coupled array is its **inverter's AC output**, not a meter's export
+register, because self-consumed energy never reaches the meter and would bias the learned factor
+low - the setting's help text and the forecast note both say so.
+
+A missing capacity is a failure with a hint naming `solar.capacity_wp`, never a guess from the array's
+history: the bias correction may only adjust a forecast that already exists.
+
 ### 7.2 Load (`sources/load.py`)
 Sources in priority order, all producing 15-minute `LoadForecast` slots with `p10/p50/p90`:
 
@@ -983,6 +1021,18 @@ round, with the reason:
   in HA, day-ahead via energy_charts, fixed tariffs, and the untouched explicit entity path),
   `price_warnings`, and the forecast `reason`/`hint`/`notes`/`provider`/`contract` fields were added.
   A fixed tariff deliberately has **no** market fallback, and no price is inferred from an entity name.
+
+- **§7.1.1 (capacity-based solar estimate; requested after the live install, "support ac coupled solar
+  as well for forecast")** — the instance's PV is AC-coupled and measured at the meter (peaked at
+  1875 W and roughly 3.3 kWh on 2026-10-08, hourly means from 73 W to 1022 W), the battery's own PV
+  input has never produced anything, and no planes are configured, so the Forecast.Solar path cannot
+  fill the solar panel at all. The request was to let the user state a watt peak and have the add-on
+  estimate production, with real production sources refining it. §7.1.1 adds the `capacity` source
+  (solar position, Haurwitz clear-sky irradiance, isotropic transposition, Kasten-Czeplak cloud
+  attenuation from an optional weather entity) and relies on the existing measured-PV bias learning
+  (per-hour EWMA, clamped, decaying) for the refinement. No optimizer change: PV is modelled as
+  generation, which is exactly what an AC-coupled array is, and assumed tilt/azimuth are stated in the
+  notes rather than silently defaulted.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

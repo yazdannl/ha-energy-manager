@@ -83,6 +83,15 @@ DEFAULTS: dict[str, Any] = {
     "solar.api_key": "",
     "solar.bias_correction": True,
     "solar.measured_entity": "",
+    # Capacity-based estimate (solar.source=capacity), for AC-coupled arrays whose geometry is not
+    # worth modelling: the user states the array's watt peak and the add-on estimates the rest from
+    # astronomy plus, when available, cloud cover. Unset tilt/azimuth = the documented assumption
+    # (south-facing, 35 degrees) and the forecast says so.
+    "solar.capacity_wp": None,
+    "solar.tilt_deg": None,
+    "solar.azimuth_deg": None,
+    "solar.performance_ratio": 0.85,
+    "solar.weather_entity": "",
     # -- load ---------------------------------------------------------------------------
     "load.mode": "auto",
     "load.entity": "",
@@ -144,6 +153,7 @@ _PRICE_SOURCE_CHOICES = ("zonneplan_entity", "energy_charts", "entity_forecast",
 _PRICE_PROVIDER_CHOICES = ("entity", "zonneplan", "day_ahead", "fixed")
 _PRICE_CONTRACT_CHOICES = ("dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night")
 _PRICE_UNIT_CHOICES = ("auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh")
+_SOLAR_SOURCE_CHOICES = ("forecast_solar", "capacity")
 _LOAD_MODE_CHOICES = ("auto", "entity", "derived")
 _NOTIFY_EVENT_CHOICES = (
     "plan_changed",
@@ -212,11 +222,16 @@ SETTINGS_META: dict[str, _Meta] = {
     "price.feed_in_entity": _Meta("str", "price", "Feed-in price entity", "HA sensor with the current feed-in price; overrides the flat tariff."),
     "price.feed_in_tax_inclusive": _Meta("bool", "price", "Feed-in incl. VAT", "Off = add price.vat_pct to the feed-in price."),
     "solar.enabled": _Meta("bool", "solar", "Solar forecast", "Enable the PV forecast."),
-    "solar.source": _Meta("choice", "solar", "Solar source", "", ("forecast_solar",)),
-    "solar.planes": _Meta("json", "solar", "PV planes", "List of {kwp, tilt_deg, azimuth_deg (compass: 0=north), damping}."),
+    "solar.source": _Meta("choice", "solar", "Solar source", "forecast_solar = the Forecast.Solar API (needs planes); capacity = estimate from the array's watt peak, for AC-coupled arrays whose geometry you do not want to model.", _SOLAR_SOURCE_CHOICES),
+    "solar.planes": _Meta("json", "solar", "PV planes", "forecast_solar only. List of {kwp, tilt_deg, azimuth_deg (compass: 0=north), damping}."),
     "solar.api_key": _Meta("str", "solar", "Forecast.Solar key", "Optional personal key; keyless is single-plane hourly.", nullable=True),
     "solar.bias_correction": _Meta("bool", "solar", "Bias correction", "Learn a multiplicative correction from measured PV."),
-    "solar.measured_entity": _Meta("str", "solar", "Measured PV entity", "Runtime-picked PV power sensor."),
+    "solar.measured_entity": _Meta("str", "solar", "Measured PV entity", "Runtime-picked PV generation sensor. Use the inverter's AC output; a meter's export register under-reports because self-consumed energy never reaches the meter."),
+    "solar.capacity_wp": _Meta("float", "solar", "Array watt peak", "Total Wp of the array (all panels added). Used by the capacity source. Unset = no capacity estimate.", minimum=0.0, maximum=200000.0, nullable=True),
+    "solar.tilt_deg": _Meta("float", "solar", "Tilt", "Panel tilt from horizontal. Unset = assume 35 degrees (stated in the forecast notes).", minimum=0.0, maximum=90.0, nullable=True),
+    "solar.azimuth_deg": _Meta("float", "solar", "Azimuth", "Compass direction the panels face: 0 = north, 90 = east, 180 = south, 270 = west. Unset = assume south.", minimum=0.0, maximum=360.0, nullable=True),
+    "solar.performance_ratio": _Meta("float", "solar", "Performance ratio", "Inverter, temperature and soiling losses applied to the clear-sky estimate.", minimum=0.5, maximum=1.1),
+    "solar.weather_entity": _Meta("str", "solar", "Weather entity", "Optional HA weather entity; its hourly cloud coverage attenuates the capacity estimate. Unset = clear-sky, refined by the measured-PV correction."),
     "load.mode": _Meta("choice", "load", "Load source", "auto uses the load entity if mapped, else derived.", _LOAD_MODE_CHOICES),
     "load.entity": _Meta("str", "load", "Load entity", "Runtime-picked load power sensor."),
     "load.temperature_entity": _Meta("str", "load", "Outdoor temperature entity", "Optional regression term."),

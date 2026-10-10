@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.0
+
+- **AC-coupled solar, estimated from the array's watt peak.** `solar.source` now has two modes:
+  `forecast_solar` (the API, per-plane geometry) and `capacity` (new) - state the array's total Wp and
+  the add-on estimates production itself. No API key, no plane geometry, and it fits an AC-coupled
+  array whose production reaches the house through the meter rather than through the battery.
+- **A documented model, not a black box.** Solar elevation and azimuth from the standard declination
+  and equation-of-time equations, Haurwitz clear-sky irradiance, isotropic transposition onto the
+  plane, optional Kasten-Czeplak cloud attenuation from a Home Assistant weather entity, and a
+  performance ratio (default 0.85). Tilt and azimuth are optional: left unset, the forecast *states*
+  that it assumed south-facing at 35 degrees instead of implying geometry you never entered.
+  Uncertainty is 35% without cloud data and 25% with it.
+- **Your real production makes it more accurate.** Point `solar.measured_entity` at the inverter's AC
+  output and the per-hour learned correction (EWMA, clamped, decaying after 14 days) narrows the
+  estimate from what actually happened. Use the inverter's AC output, not a meter's export register:
+  self-consumed energy never reaches the meter, which would bias the correction low.
+- Cloud attenuation uses `weather.get_forecasts`. An entity that supports no forecast type at all
+  (some integrations publish only a current `cloud_coverage`) is not a failure - the current cover is
+  held flat and the note says so; with no cloud data the estimate is clear-sky and says that too.
+  Weather never fails the forecast.
+- A missing `solar.capacity_wp` fails with a hint naming the setting; a capacity is never guessed from
+  history, and an empty solar panel now names whichever setting its configured source is missing.
+- The settings form shows only the fields the chosen source uses (planes and API key for
+  `forecast_solar`, watt peak, tilt, azimuth, performance ratio and weather entity for `capacity`),
+  and names any hidden field that still holds a value.
+
 ## 0.3.0
 
 - **You choose where prices come from, and what your contract looks like.** Two settings replace the

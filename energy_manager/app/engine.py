@@ -522,7 +522,16 @@ class Engine:
                 "reason": "not_configured",
                 "hint": "enable solar forecasting (solar.enabled) and add a PV plane (solar.planes)",
             }
-        if not (self._settings.get("solar.planes") or []):
+        # The hint names the setting that is actually missing for the *configured* source: the
+        # capacity estimate states a watt peak, Forecast.Solar states planes (SPEC 7.1.1).
+        source = str(self._settings.get("solar.source", "forecast_solar") or "forecast_solar")
+        if source == "capacity":
+            if self._settings.get("solar.capacity_wp") is None:
+                return {
+                    "reason": "no_pv_source",
+                    "hint": "set solar.capacity_wp (the array's total watt peak) for the capacity solar source",
+                }
+        elif not (self._settings.get("solar.planes") or []):
             return {"reason": "no_pv_source", "hint": "add a PV plane under solar.planes"}
         statuses = {
             status.name: status
@@ -530,6 +539,15 @@ class Engine:
             if status_kind == "solar"
         }
         failing = sorted(name for name, status in statuses.items() if status.last_error)
+        if any("location unavailable" in (statuses[name].last_error or "") for name in failing):
+            return {
+                "reason": "provider_failed",
+                "hint": (
+                    "location unavailable: set latitude_override / longitude_override or expose"
+                    " /api/config - the estimate needs the latitude, longitude and timezone to place"
+                    " the sun"
+                ),
+            }
         if failing:
             return {
                 "reason": "provider_failed",

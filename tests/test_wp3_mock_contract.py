@@ -33,7 +33,12 @@ FROZEN_SETTING_KEYS = [
     "price.feed_in_tax_inclusive",
     # solar / load / grid
     "solar.enabled", "solar.source", "solar.planes", "solar.api_key", "solar.bias_correction",
-    "solar.measured_entity", "load.mode", "load.entity", "load.temperature_entity",
+    "solar.measured_entity",
+    # capacity source (SPEC §7.1.1): the array's watt peak, the geometry it assumes when unset,
+    # the performance ratio and the optional weather entity for cloud attenuation
+    "solar.capacity_wp", "solar.tilt_deg", "solar.azimuth_deg", "solar.performance_ratio",
+    "solar.weather_entity",
+    "load.mode", "load.entity", "load.temperature_entity",
     "load.base_kwh_per_day", "grid.power_entity", "grid.import_entity", "grid.export_entity",
     # optimizer
     "optimizer.slot_minutes", "optimizer.horizon_hours", "optimizer.soc_step_kwh",
@@ -99,6 +104,21 @@ def fixtures() -> dict:
 def assert_fields(payload: dict, fields: list[str], where: str) -> None:
     missing = [field for field in fields if field not in payload]
     assert not missing, f"{where} is missing {missing}"
+
+
+def run_node_script(script: str) -> dict:
+    """Run a snippet against web/mock.js the way test_wp3_assets.py does, returning its JSON."""
+    if NODE is None:
+        pytest.skip("node is not installed")
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+        handle.write(script)
+        script_path = handle.name
+    try:
+        proc = subprocess.run([NODE, script_path], capture_output=True, text=True, cwd=str(WEB))
+    finally:
+        Path(script_path).unlink(missing_ok=True)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
 
 
 def test_stop_payload_matches_section_10(fixtures):
@@ -312,10 +332,54 @@ def test_forecast_payloads(fixtures):
 
     solar = fixtures["fixtures"]["solar"]
     assert_fields(solar, ["kind", "generated_at", "source", "stale", "slots", "provider", "contract", "planes", "correction_applied", "notes"], "GET /forecast?kind=solar")
+    # The solar fixture is the 0.4.0 capacity source (SPEC §7.1.1): a stated watt peak, no plane
+    # geometry at all, a learned correction that is not the identity, and notes that state every
+    # assumption the estimate makes instead of implying one.
+    assert solar["source"] == "capacity" and solar["provider"] == "capacity"
+    assert solar["planes"] == [], "a capacity estimate models no planes"
+    assert solar["correction_applied"] != 1.0, "the demo must show a learned correction"
+    assert solar["reason"] is None and solar["hint"] is None
+    joined = " ".join(solar["notes"]).lower()
+    for phrase in (
+        "5800 wp", "assumed south-facing, 35 degree tilt", "performance ratio 0.85",
+        "weather.example_home", "measured pv entity", "inverter's ac output",
+    ):
+        assert phrase in joined, f"the capacity notes must state {phrase}"
     for slot in solar["slots"]:
         assert_fields(slot, ["t", "pv_kw", "uncertainty_pct"], "SolarSlot")
-    for plane in solar["planes"]:
+        # Cloud cover held flat narrows the band; clear-sky (no weather entity) would be 35%.
+        assert slot["uncertainty_pct"] == 25.0
+
+
+def test_solar_forecast_capacity_and_planes_sources(fixtures):
+    """solar.source is a choice: the capacity estimate vs the per-plane Forecast.Solar example.
+
+    The UI shows `source`, `notes` and `correction_applied` for both, so the mock must serve a
+    realistic payload per source. `planes` carries the four per-plane keys for forecast_solar and
+    is empty for capacity, which models no geometry."""
+    script = """
+    const fs = require("fs");
+    (0, eval)(fs.readFileSync("mock.js", "utf8"));
+    (async function () {
+      const planes = await SEM_MOCK.handle("GET", "/api/v1/forecast?kind=solar&source=forecast_solar", {});
+      console.log(JSON.stringify({ planes: planes }));
+    })().catch(function (err) { console.error(err && err.message ? err.message : err); process.exit(1); });
+    """
+    data = run_node_script(script)
+    planes = data["planes"]
+    assert_fields(planes, ["source", "provider", "planes", "correction_applied", "notes"], "solar source=forecast_solar")
+    assert planes["source"] == "forecast_solar" and planes["provider"] == "forecast_solar"
+    assert planes["planes"], "the Forecast.Solar fixture must demo a plane"
+    for plane in planes["planes"]:
         assert_fields(plane, ["kwp", "tilt_deg", "azimuth_deg", "damping"], "SolarForecast.planes")
+
+    # The configured source in the settings fixture is the capacity one, matching the forecast.
+    by_key = {s["key"]: s["value"] for s in fixtures["fixtures"]["config"]["settings"]}
+    assert by_key["solar.source"] == "capacity"
+    assert by_key["solar.capacity_wp"] == 5800
+    assert by_key["solar.measured_entity"] == "sensor.example_pv_power"
+    # The Forecast.Solar-only keys stay set but hidden by the source: the settings view must say so.
+    assert by_key["solar.planes"] and by_key["solar.api_key"]
 
     load = fixtures["fixtures"]["load"]
     assert_fields(load, ["kind", "generated_at", "source", "stale", "slots", "confidence", "provider", "contract", "notes"], "GET /forecast?kind=load")
@@ -409,6 +473,22 @@ def test_config_payload_exposes_every_frozen_setting(fixtures):
         assert by_key[key]["default"] == default, key
     assert by_key["price.provider"]["choices"] == ["entity", "zonneplan", "day_ahead", "fixed"]
     assert by_key["price.contract"]["choices"] == ["dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night"]
+    # solar.source is a choice too (SPEC §7.1.1): the Forecast.Solar API or the capacity estimate,
+    # with the capacity-only keys shipped at their frozen defaults.
+    assert by_key["solar.source"]["choices"] == ["forecast_solar", "capacity"]
+    for key, kind, default in [
+        ("solar.capacity_wp", "float", None),
+        ("solar.tilt_deg", "float", None),
+        ("solar.azimuth_deg", "float", None),
+        ("solar.performance_ratio", "float", 0.85),
+        ("solar.weather_entity", "str", ""),
+    ]:
+        assert by_key[key]["type"] == kind, key
+        assert by_key[key]["default"] == default, key
+    # The measured entity is what makes the forecast more accurate over time, and the help says
+    # which entity it must be (a meter's export register under-reports self-consumption).
+    assert "inverter's AC output" in by_key["solar.measured_entity"]["help"]
+    assert "export register" in by_key["solar.measured_entity"]["help"]
     # price_warnings (SPEC §4.1): [{key, message}]; the mock ships a stated mismatch so the UI path
     # is exercised (day_ahead provider + fixed_single contract keeps the provider, it is a warning).
     warnings = config["price_warnings"]
