@@ -38,7 +38,7 @@ from .notify import Notifier
 
 log = logging.getLogger("app.main")
 
-APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.5.1"
+APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.6.0"
 COMMIT = os.environ.get("SEM_COMMIT") or os.environ.get("GITHUB_SHA") or ""
 DEFAULT_PORT = 8099
 DEFAULT_OPTIONS = "/data/options.json"
@@ -806,7 +806,8 @@ def _selfcheck_http(api: ApiServer, engine: Any) -> list[tuple[str, bool, str]]:
             )
         )
         groups = {row["group"] for row in (config or {}).get("settings", []) if row["key"].startswith("control.")}
-        results.append(("safety group present", groups == {"Safety"}, str(sorted(groups))))
+        # SPEC 13.3 (0.6.0): the tuning knobs are foldable (Control); only the fail-safe is Safety.
+        results.append(("safety group present", groups == {"Control", "Safety"}, str(sorted(groups))))
 
         status, plan = request("GET", "/api/v1/plan")
         slots = (plan or {}).get("slots") or []

@@ -18,7 +18,6 @@ from app.models import PriceForecast, PriceSlot  # noqa: E402
 from app.sources import ProviderError  # noqa: E402
 from app.sources.price import (  # noqa: E402
     PROVIDERS,
-    SELL_UNKNOWN_NOTE,
     PriceUnavailable,
     ZONNEPLAN_SCALE_DIVISOR,
     _locate_zonneplan_entity,
@@ -105,18 +104,53 @@ def slot_provider(buy=0.2, sell=0.0, slots=4):
     return provider
 
 
-def test_never_derives_sell_from_buy_without_a_feed_in_tariff():
+def test_derived_feed_in_is_the_buy_price_minus_the_feed_in_cost():
     configured = settings(**{"price.export_fee_eur_per_kwh": 0.005})
     forecast, statuses = load_price_forecast(
         configured,
         None,
         now=NOW,
-        providers={"zonneplan_entity": slot_provider(sell=0.05), "static": slot_provider(sell=0.05)},
+        providers={"zonneplan_entity": slot_provider(), "static": slot_provider()},
     )
-    assert forecast.slots[0].sell == 0.05  # untouched: this provider states its own sell series
+    # SPEC 4 (amended): with no explicit tariff or entity the feed-in price is the consumer price
+    # you pay minus the feed-in cost; the energy tax is paid back by default.
+    assert all(slot.sell == pytest.approx(slot.buy - 0.005) for slot in forecast.slots)
     by_name = {status.name: status for status in statuses}
-    assert by_name["zonneplan_entity"].detail["sell_known"] is False
-    assert SELL_UNKNOWN_NOTE in forecast.notes
+    assert by_name["zonneplan_entity"].detail["sell_known"] is True
+    assert any("derived feed-in price" in note for note in forecast.notes)
+
+
+def test_derived_feed_in_subtracts_the_slot_energy_tax_when_it_is_not_refunded():
+    def taxed_provider(buy=0.25, tax=0.11):
+        def provider(client, settings, now=None, http=None, tz=None):
+            start = (now or NOW).replace(minute=0, second=0, microsecond=0)
+            return PriceForecast(
+                slots=[PriceSlot(t=start, buy=buy, sell=0.0, energy_tax=tax)],
+                generated_at=now or NOW,
+                source="taxed",
+            )
+
+        return provider
+
+    configured = settings(**{"price.feed_in_energy_tax_refund": False})
+    forecast, statuses = load_price_forecast(
+        configured, None, now=NOW, providers={"zonneplan_entity": taxed_provider()}
+    )
+    assert forecast.slots[0].sell == pytest.approx(0.25 - 0.11)
+    assert any("minus the slot energy tax" in note for note in forecast.notes)
+    by_name = {status.name: status for status in statuses}
+    assert by_name["zonneplan_entity"].detail["sell_known"] is True
+
+
+def test_zonneplan_payload_gives_the_per_slot_energy_tax_component():
+    entries = zonneplan_entries(NOW - timedelta(minutes=15), 8)
+    client = FakeClient(sensor_state(entries, state="0.1"))
+    configured = settings(**{"price.entity": "sensor.example_price_now"})
+    forecast = fetch_zonneplan_entity(client, configured, now=NOW)
+    # entry at NOW is index 1: included 1_010_000/1e7 = 0.101, excluded 505_000/1e7 = 0.0505
+    assert forecast.slots[0].energy_tax == pytest.approx(0.0505)
+    assert forecast.slots[0].buy == pytest.approx(0.101)
+    assert forecast.slots[0].sell == 0.0  # fetch_* leaves sell to _apply_feed_in
 
 
 def test_flat_feed_in_tariff_fills_sell_net_of_the_export_fee():
@@ -135,7 +169,6 @@ def test_flat_feed_in_tariff_fills_sell_net_of_the_export_fee():
     assert all(slot.buy == pytest.approx(0.2) for slot in forecast.slots)  # buy untouched
     by_name = {status.name: status for status in statuses}
     assert by_name["zonneplan_entity"].detail["sell_known"] is True
-    assert SELL_UNKNOWN_NOTE not in forecast.notes
     assert any("0.0450 EUR/kWh received" in note for note in forecast.notes)
 
 
@@ -171,20 +204,22 @@ def test_broken_feed_in_sensor_does_not_fail_the_buy_forecast():
 
     configured = settings(**{"price.feed_in_entity": "sensor.example_feed_in"})
     forecast, statuses = load_price_forecast(
-        configured, BrokenClient(), now=NOW, providers={"zonneplan_entity": slot_provider(sell=0.0)}
+        configured, BrokenClient(), now=NOW, providers={"zonneplan_entity": slot_provider()}
     )
     assert forecast.slots and forecast.slots[0].buy == pytest.approx(0.2)
-    assert forecast.slots[0].sell == 0.0
+    # The broken feed-in sensor degrades to the derived price instead of failing the forecast.
+    assert forecast.slots[0].sell == pytest.approx(0.2)
     by_name = {status.name: status for status in statuses}
-    assert by_name["zonneplan_entity"].detail["sell_known"] is False
-    assert any("sell price unavailable" in note for note in forecast.notes)
-    assert SELL_UNKNOWN_NOTE not in forecast.notes
+    assert by_name["zonneplan_entity"].detail["sell_known"] is True
+    assert any("configured feed-in source unavailable" in note for note in forecast.notes)
 
 
 def test_default_allow_export_is_off_until_a_feed_in_is_confirmed():
     assert DEFAULTS["optimizer.allow_export"] is False
     assert DEFAULTS["price.feed_in_eur_per_kwh"] is None
     assert DEFAULTS["price.feed_in_entity"] == "" and DEFAULTS["price.feed_in_tax_inclusive"] is True
+    assert DEFAULTS["price.feed_in_energy_tax_refund"] is True
+    assert DEFAULTS["price.export_fee_eur_per_kwh"] == 0.0
 
 
 def test_zonneplan_entity_divides_by_1e7_drops_past_and_forward_fills():
@@ -206,7 +241,8 @@ def test_zonneplan_entity_divides_by_1e7_drops_past_and_forward_fills():
     assert forecast.slots[0].t == NOW
     # entry at NOW is index 4: (1_000_000 + 4*10_000) / 1e7 = 0.104 EUR/kWh; no VAT/tax adders.
     assert forecast.slots[0].buy == pytest.approx(0.114)
-    # SPEC 4: sell is EUR/kWh *received*; a provider with no feed-in series never guesses one
+    # SPEC 4: sell is EUR/kWh *received*; the provider itself never guesses one (the load path
+    # fills it from the feed-in price)
     assert forecast.slots[0].sell == 0.0
     assert forecast.slots[0].stale is False
     # ~24 h of real coverage < the 30 h horizon: the tail is stale/degraded, not a failure.

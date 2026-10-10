@@ -72,7 +72,9 @@ no MQTT, no cloud account, and no YAML to install by hand.
   sale price that follows from it.
 - **Savings** — today, week, month, year and all time against the baseline, with import/export kWh
   and a plain-language explanation of what the baseline means.
-- **Settings** — a grouped, searchable form generated from the server, including the safety limits.
+- **Settings** — four setup cards (Price, Meter, Solar, Battery) with searchable entity pickers for
+  the primary choices, plus an **All settings** drawer holding the grouped, searchable form generated
+  from the server, including the safety limits.
 - **Log** — every dispatch attempt with requested versus applied power and the blocking reason,
   plus alerts and events.
 
@@ -94,17 +96,25 @@ survives restarts and never appears in this repository.
 
 ### Notable settings (UI → Settings)
 
+The Settings page opens on four cards — Price, Meter, Solar and Battery — and everything else lives in
+one collapsed **All settings** drawer (same fields, grouped by topic, with an `Advanced (n)`
+disclosure per group).
+
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `price.feed_in_eur_per_kwh` | unset | Flat feed-in tariff: EUR/kWh *received* for export, net of the export fee. |
-| `price.feed_in_entity` | unset | Home Assistant sensor publishing the current feed-in price; overrides the flat tariff. |
-| `price.feed_in_tax_inclusive` | `true` | Off = add `price.vat_pct` to the feed-in price. |
-| `optimizer.allow_export` | `false` | Export scheduling stays off until a feed-in tariff or entity is configured. |
+| `price.provider` | `entity` | Where prices come from: `entity` (pick a sensor), `zonneplan` (found automatically), `day_ahead` (energy-charts wholesale) or `fixed`. |
+| `price.export_fee_eur_per_kwh` | `0.0` | Feed-in cost, deducted per kWh from the sell price. |
+| `price.feed_in_energy_tax_refund` | `true` | On: the sell price is the buy price minus the feed-in cost. Off: the energy-tax component is not paid back and is subtracted too. |
+| `price.feed_in_eur_per_kwh` / `price.feed_in_entity` | unset | Optional explicit feed-in tariff or live sensor; either one overrides the derived price. |
+| `grid.power_entity` | unset | Signed grid power sensor (positive = import). Enables the load forecast and the meter-derived solar estimate. |
+| `solar.source` | `forecast_solar` | `forecast_solar` (per-plane API), `capacity` (enter the array's Wp) or `derived` (learn the array from the meter's export moments). |
+| `optimizer.allow_export` | `false` | Export scheduling stays off until you enable it. |
 
-**The sell price is never inferred from the buy price.** With no feed-in tariff or entity the export
-price is unknown, `optimizer.allow_export` stays off, and the optimizer cannot plan to export at a
-revenue figure that does not exist — a guessed sell price would silently over-export. Enter your
-tariff (or a feed-in sensor) to enable export arbitrage.
+**The sell price is derived from the buy price by default**: `sell = buy − feed-in cost`, minus the
+energy-tax component when `price.feed_in_energy_tax_refund` is off. That is what a saldering contract
+pays back; if your contract works differently, enter an explicit feed-in tariff or sensor, or set the
+feed-in cost. `optimizer.allow_export` still defaults to off, so nothing is exported until you ask
+for it.
 
 ### Battery round trip (efficiency)
 

@@ -476,9 +476,9 @@ def test_config_payload_exposes_every_frozen_setting(fixtures):
         assert by_key[key]["default"] == default, key
     assert by_key["price.provider"]["choices"] == ["entity", "zonneplan", "day_ahead", "fixed"]
     assert by_key["price.contract"]["choices"] == ["dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night"]
-    # solar.source is a choice too (SPEC §7.1.1): the Forecast.Solar API or the capacity estimate,
-    # with the capacity-only keys shipped at their frozen defaults.
-    assert by_key["solar.source"]["choices"] == ["forecast_solar", "capacity"]
+    # solar.source is a choice too (SPEC §7.1.1): the Forecast.Solar API, the capacity estimate or
+    # the meter-derived array, with the capacity-only keys shipped at their frozen defaults.
+    assert by_key["solar.source"]["choices"] == ["forecast_solar", "capacity", "derived"]
     for key, kind, default in [
         ("solar.capacity_wp", "float", None),
         ("solar.tilt_deg", "float", None),
@@ -500,10 +500,13 @@ def test_config_payload_exposes_every_frozen_setting(fixtures):
         assert_fields(warning, ["key", "message"], "price_warnings[]")
         assert isinstance(warning["key"], str) and isinstance(warning["message"], str)
     assert warnings[0]["key"] == "price.contract"
-    # all control.* keys are flagged as Safety by the backend rule
-    assert all(s["group"] in {"Safety", "General"} for s in config["settings"] if s["key"].startswith("control."))
+    # control.* keys: the control-loop tuning lives in the foldable Control group, the fail-safe in
+    # the never-folding Safety group (backend rule mirrored by the mock)
+    control_groups = {s["group"] for s in config["settings"] if s["key"].startswith("control.")}
+    assert control_groups == {"Control", "Safety"}, control_groups
+    assert next(s for s in config["settings"] if s["key"] == "control.failsafe_on_error")["group"] == "Safety"
     assert by_key["price.feed_in_eur_per_kwh"]["help"], "empty feed-in path needs explanatory help"
-    assert "sell price unknown" in by_key["price.feed_in_eur_per_kwh"]["help"].lower()
+    assert "overrides the derived" in by_key["price.feed_in_eur_per_kwh"]["help"].lower()
 
 
 def test_savings_and_accuracy_payloads(fixtures):

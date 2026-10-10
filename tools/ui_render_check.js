@@ -68,11 +68,13 @@ const byClass = (node, cls) => node.querySelectorAll("." + cls);
 // "present" is not "visible": advanced rows live inside a closed <details> until the user unfolds it.
 function shownLabels(node, rows) {
   const found = new Set();
-  // one row container per key: match the label inside the row itself, never an ancestor's blob
-  node.querySelectorAll(".field").forEach((field) => {
+  // one row container per key: match the row's own data-key, never a label substring ("Energy tax"
+  // would otherwise match the visible "Energy tax refunded" row).
+  const wanted = new Set(rows.map((row) => row.key));
+  node.querySelectorAll("[data-key]").forEach((field) => {
     if (!dom.shown(field)) return;
-    const text = field.textContent;
-    rows.forEach((row) => { if (text.includes(row.label)) found.add(row.key); });
+    const key = field.dataset && field.dataset.key;
+    if (key && wanted.has(key)) found.add(key);
   });
   return found;
 }
@@ -137,6 +139,11 @@ function classTokens(text) {
   const cfg = await M.handle("GET", "/api/v1/config");
   const settings = cfg.settings || [];
   const html = view().outerHTML;
+  // The settings page opens on the four setup cards; the rail and the groups live inside the "All
+  // settings" drawer, so the structural checks unfold it first.
+  const drawer = view().querySelector(".all-settings");
+  check("the all-settings drawer holds the full form", !!drawer, "no .all-settings");
+  if (drawer) { drawer.open = true; await sleep(20); }
 
   const railOf = () => (byClass(view(), "settings-rail")[0] || view()).querySelectorAll("button");
   const value = (key) => { const row = settings.find((r) => r.key === key); return row ? row.value : null; };
@@ -188,7 +195,32 @@ function classTokens(text) {
   );
 
   const advancedRows = settings.filter((r) => r.advanced && r.group !== "Safety");
+  // Keys the setup cards own are the primary surface: they are meant to be visible outside any
+  // disclosure, and the groups skip them (exactly once). Folding is asserted for the rest.
+  const cardKeys = new Set(typeof A.setupCardKeys === "function" ? A.setupCardKeys(selection) : []);
+  const foldedRows = advancedRows.filter((r) => !cardKeys.has(r.key));
   check(`payload classifies ${advancedRows.length} foldable advanced keys`, advancedRows.length > 0);
+  check("the setup cards own the primary keys", cardKeys.size >= 6 && cardKeys.has("price.provider") && cardKeys.has("grid.power_entity"), [...cardKeys].join(", "));
+  const cardFields = [...byClass(view(), "setup-cards")[0]?.querySelectorAll("[data-key]") || []].map((f) => f.dataset.key);
+  check("every card key is rendered on a card", [...cardKeys].every((key) => cardFields.includes(key)), `cards render ${cardFields.join(", ")}`);
+
+  // The pickers must really work against /discover: Find lists candidates, Use marks the key dirty.
+  const picker = byClass(view(), "picker")[0];
+  check("the meter/solar cards render searchable pickers", byClass(view(), "picker").length >= 2, `${byClass(view(), "picker").length} pickers`);
+  if (picker) {
+    const find = picker.querySelector("button");
+    find.dispatchEvent({ type: "click" });
+    await sleep(260); // the mock answers after a 150 ms simulated latency
+    const rows = picker.querySelectorAll(".picker-row");
+    check("a picker search lists discovery candidates", rows.length > 0, `${rows.length} rows`);
+    const use = rows.length ? rows[rows.length - 1].querySelector("button") : null;
+    if (use) {
+      use.dispatchEvent({ type: "click" });
+      await sleep(40);
+      const note = view().querySelector(".save-bar .muted");
+      check("using a candidate marks the setting dirty", !!note && /changed, not saved yet/.test(note.textContent), note ? note.textContent : "no save note");
+    }
+  }
   check("advanced rows sit in a disclosure container", byClass(view(), "disclosure").length > 0 || view().querySelectorAll("details").length > 0);
 
   // distinct advanced keys visible per state, walking every group
@@ -197,7 +229,7 @@ function classTokens(text) {
     for (const button of railOf()) {
       button.dispatchEvent({ type: "click" });
       await sleep(25);
-      shownLabels(view(), advancedRows).forEach((key) => found.add(key));
+      shownLabels(view(), foldedRows).forEach((key) => found.add(key));
     }
     return found;
   }
@@ -211,7 +243,7 @@ function classTokens(text) {
         Object.assign({ showAdvanced: true, showAll: true, query: "" }, selection))
     : true);
   const notApplicableButSet = (row) => !applicable(row) && row.value !== row.default;
-  const expectedWithShowAll = advancedRows.filter((row) => applicable(row));
+  const expectedWithShowAll = foldedRows.filter((row) => applicable(row));
 
   const folded = await advancedVisible();
   const wronglyShown = [...folded].filter((key) => applicable(rowByKey[key]));
@@ -220,12 +252,12 @@ function classTokens(text) {
 
   // unfolding: the folded rows must really live inside the disclosure container, since opening it
   // is what reveals them (a click on <summary> is native browser behaviour, not app logic)
-  const disclosure = byClass(view(), "disclosure")[0] || view().querySelector("details");
+  const disclosure = view().querySelector(".settings-group .disclosure") || byClass(view(), "disclosure")[0];
   if (disclosure) {
-    const inside = [[...shownLabels(disclosure, advancedRows)].length, disclosure.querySelectorAll(".field").length];
+    const inside = [[...shownLabels(disclosure, foldedRows)].length, disclosure.querySelectorAll(".field").length];
     disclosure.open = true;
     await sleep(20);
-    const revealed = [...shownLabels(view(), advancedRows)].length;
+    const revealed = [...shownLabels(view(), foldedRows)].length;
     check("opening the disclosure reveals its advanced rows", revealed > 0,
       `fields inside the disclosure: ${inside[1]}, shown after opening: ${revealed}`);
   } else {

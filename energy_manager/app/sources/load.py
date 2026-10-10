@@ -49,9 +49,11 @@ __all__ = [
     "LoadSamples",
     "build_profile",
     "collect_history",
+    "collect_pv_export_samples",
     "collect_temperatures",
     "load_forecast",
     "load_profile",
+    "pv_export_roles",
     "save_profile",
     "update_load_profile",
 ]
@@ -360,6 +362,100 @@ def _derived_samples(
             load += (discharge or {}).get(stamp, 0.0) - (charge or {}).get(stamp, 0.0)
         out.append((stamp, max(0.0, load)))
     return out, "" if out else "derived series is empty"
+
+
+def pv_export_roles(settings: Any) -> tuple[dict[str, str], str]:
+    """Resolve the entities the meter-derived PV tier reads: ``(role -> entity, refusal reason)``.
+
+    The grid role comes from ``grid.power_entity`` (or the import/export pair) and the battery's AC
+    flow from its own mapping (``charge_power_entity``/``discharge_power_entity``, else the signed
+    ``power_setpoint_entity``). A configured battery whose flow cannot be read is a refusal, never a
+    silent omission: its discharge would be read as PV.
+    """
+    roles: dict[str, str] = {}
+    for role, key in (
+        ("grid_power", "grid.power_entity"),
+        ("grid_import", "grid.import_entity"),
+        ("grid_export", "grid.export_entity"),
+    ):
+        mapped = str(settings.get(key, "") or "")
+        if mapped:
+            roles[role] = mapped
+    if not any(role in roles for role in ("grid_power", "grid_import", "grid_export")):
+        return {}, (
+            "the derived solar source needs grid.power_entity (or the import/export pair): "
+            "the meter's export is the only place the array is visible"
+        )
+    refusal = _map_battery_flows(settings, roles)
+    if refusal:
+        return {}, refusal
+    return roles, ""
+
+
+def collect_pv_export_samples(
+    settings: Any,
+    client: Any,
+    *,
+    now: datetime | None = None,
+    days: int = WINDOW_DAYS,
+    roles: Mapping[str, str] | None = None,
+) -> tuple[list[tuple[datetime, float]], str]:
+    """PV power (kW) seen through the meter's export moments (SPEC.md 7.1.2).
+
+    The sign convention is ``grid = load - pv + p`` (SPEC.md 8.1, ``p > 0`` = charging), so at a
+    stamp whose signed grid power is negative the array must be producing at least
+    ``-grid + p``. The house load at that moment is *not* subtracted (a PV forecast is exactly what
+    is missing to know it), which makes every sample a lower bound and the learned array size
+    conservative. Stamps without export carry no information and are skipped, as are stamps where
+    the battery flow is unknown. Returns ``(samples, reason)``; an empty list always carries a
+    reason a status can show.
+    """
+    moment = now or utcnow()
+    if roles is None:
+        roles, refusal = pv_export_roles(settings)
+        if refusal:
+            return [], refusal
+    series: dict[str, dict[datetime, float]] = {}
+    for role, entity_id in roles.items():
+        samples, _ = _recorder_samples(client, entity_id, moment, days)
+        if samples:
+            series[role] = dict(samples)
+    grid: dict[datetime, float] = {}
+    if "grid_power" in series:
+        grid = dict(series["grid_power"])
+    elif "grid_import" in series or "grid_export" in series:
+        stamps = set(series.get("grid_import", {})) | set(series.get("grid_export", {}))
+        grid = {
+            stamp: series.get("grid_import", {}).get(stamp, 0.0)
+            - series.get("grid_export", {}).get(stamp, 0.0)
+            for stamp in stamps
+        }
+    if not grid:
+        return [], "no grid power history for the learning window"
+    battery = series.get("battery")
+    charge, discharge = series.get("charge"), series.get("discharge")
+    has_flow = battery is not None or charge is not None or discharge is not None
+    out: list[tuple[datetime, float]] = []
+    for stamp, grid_kw in sorted(grid.items()):
+        if grid_kw >= 0.0:
+            continue  # importing: the array is hidden behind the house load
+        if has_flow and not (
+            (battery is not None and stamp in battery)
+            or (charge is not None and stamp in charge)
+            or (discharge is not None and stamp in discharge)
+        ):
+            continue  # unknown battery flow: its discharge would read as PV
+        net_charge = (
+            battery[stamp]
+            if battery is not None
+            else (charge or {}).get(stamp, 0.0) - (discharge or {}).get(stamp, 0.0)
+        )
+        pv_kw = -grid_kw + net_charge
+        if pv_kw > 0.0:
+            out.append((stamp, pv_kw))
+    if not out:
+        return [], "no export samples in the learning window (the meter never went negative)"
+    return out, ""
 
 
 def _temperature_samples(

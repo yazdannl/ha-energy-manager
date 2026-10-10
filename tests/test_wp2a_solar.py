@@ -19,8 +19,12 @@ from app.sources import ProviderError, RateLimited  # noqa: E402
 from app.sources.solar import (  # noqa: E402
     BACKOFF_KEY,
     BACKOFF_KIND,
+    DERIVED_MIN_SAMPLES,
+    _capacity_geometry,
+    _implied_capacity_wp,
     _interpolate,
     _parse_watts,
+    _plane_irradiance,
     fetch_plane,
     load_solar_forecast,
     solar_bias_factors,
@@ -629,3 +633,216 @@ def test_capacity_slots_follow_the_configured_zone_across_dst(store):
         per_local_hour[hour] = per_local_hour.get(hour, 0.0) + slot.pv_kw
     assert 12 <= max(per_local_hour, key=lambda hour: per_local_hour[hour]) <= 14
     assert {slot.t.astimezone(zone).hour for slot in forecast.slots} == set(range(24))
+
+
+# ----------------------------------------------------------------------------------- derived source
+# SPEC.md section 7.1.2: ``solar.source=derived`` learns the array from the meter's export moments
+# (pv = export + battery net charge, house load not subtracted) and then uses the capacity model, so
+# an AC-coupled array needs no watt peak, no planes and no geometry.
+
+DERIVED_DEFAULTS = {
+    "solar.source": "derived",
+    "solar.planes": [],
+    "solar.capacity_wp": None,
+    "solar.bias_correction": False,
+    "optimizer.horizon_hours": 24,
+    "grid.power_entity": "sensor.example_grid_power",
+}
+SYNTHETIC_WP = 3000.0
+GRID_ENTITY = "sensor.example_grid_power"
+CHARGE_ENTITY = "sensor.example_battery_charge"
+DISCHARGE_ENTITY = "sensor.example_battery_discharge"
+
+
+def derived_settings(store=None, **overrides):
+    options = dict(DERIVED_DEFAULTS)
+    options.update(overrides)
+    return Settings(store, options=options)
+
+
+def battery_mapping_entry(**mapping):
+    return [
+        {
+            "id": "home",
+            "name": "Home battery",
+            "driver": "generic",
+            "capacity_kwh": 10.0,
+            "enabled": True,
+            "mapping": mapping,
+        }
+    ]
+
+
+def model_kw(moment, wp=SYNTHETIC_WP, settings=None):
+    """The clear-sky model's output for ``wp`` at ``moment``, with the shipped assumptions."""
+    tilt, azimuth, _, _ = _capacity_geometry(settings or derived_settings())
+    poa = _plane_irradiance(52, 5, moment, timezone.utc, tilt, azimuth)
+    return (wp / 1000.0) * (poa / 1000.0) * 0.85
+
+
+def daylight_stamps(days=5):
+    out = []
+    for day_index in range(days):
+        day = datetime(2025, 12, 29, tzinfo=timezone.utc) + timedelta(days=day_index)
+        for hour in range(8, 17):
+            out.append(day.replace(hour=hour))
+    return out
+
+
+class HistoryStub:
+    """Answers ``get_history`` for the meter and the battery flow entities, with no network."""
+
+    def __init__(self, series, zone="UTC"):
+        self.series = series
+        self.zone = zone
+        self.calls = []
+
+    def get_config(self):
+        return {"latitude": 52, "longitude": 5, "time_zone": self.zone}
+
+    def get_history(self, entity_id, start, end):
+        self.calls.append(entity_id)
+        rows = [
+            {"state": str(value), "attributes": {"unit_of_measurement": "kW"}, "last_changed": stamp.isoformat()}
+            for stamp, value in self.series.get(entity_id, [])
+            if start <= stamp <= end
+        ]
+        return [rows]
+
+
+def test_implied_capacity_recovers_a_synthetic_clear_sky_array():
+    samples = [(stamp, model_kw(stamp)) for stamp in daylight_stamps()]
+    learned, usable = _implied_capacity_wp(52, 5, timezone.utc, samples, derived_settings())
+    assert usable >= DERIVED_MIN_SAMPLES
+    assert learned == pytest.approx(SYNTHETIC_WP, rel=0.02)
+
+
+def test_implied_capacity_uses_the_upper_envelope_when_clouds_lower_some_hours():
+    samples = []
+    for index, stamp in enumerate(daylight_stamps()):
+        clear = model_kw(stamp)
+        samples.append((stamp, clear if index % 2 else clear * 0.25))  # half the hours overcast
+    learned, _ = _implied_capacity_wp(52, 5, timezone.utc, samples, derived_settings())
+    assert learned == pytest.approx(SYNTHETIC_WP, rel=0.05)
+
+
+def test_implied_capacity_needs_enough_daylight_samples():
+    samples = [(stamp, model_kw(stamp)) for stamp in daylight_stamps(days=1)[:5]]
+    learned, usable = _implied_capacity_wp(52, 5, timezone.utc, samples, derived_settings())
+    assert learned == 0.0 and 0 < usable < DERIVED_MIN_SAMPLES
+
+
+def test_derived_solar_learns_the_array_from_export_and_battery_flow(store):
+    stamps = daylight_stamps()
+    # The battery charges 0.5 kW while the meter exports the rest: grid = charge - pv.
+    stub = HistoryStub(
+        {
+            GRID_ENTITY: [(stamp, 0.5 - model_kw(stamp)) for stamp in stamps],
+            CHARGE_ENTITY: [(stamp, 0.5) for stamp in stamps],
+        }
+    )
+    settings = derived_settings(
+        store,
+        batteries=battery_mapping_entry(
+            charge_power_entity=CHARGE_ENTITY, discharge_power_entity=DISCHARGE_ENTITY
+        ),
+    )
+    forecast, status = load_solar_forecast(settings, store, stub, location=TEST_LOCATION, now=NOW)
+    assert status.ok, status.last_error
+    assert status.detail["capacity_source"].startswith("the meter's export moments")
+    assert status.detail["derived_samples"] >= DERIVED_MIN_SAMPLES
+    assert forecast.planes[0]["capacity_wp"] == pytest.approx(SYNTHETIC_WP, rel=0.02)
+    assert any("meter-derived array" in note for note in forecast.notes)
+    assert any("capacity estimate:" in note for note in forecast.notes)
+
+
+def test_derived_solar_without_export_history_is_a_status_not_a_crash(store):
+    stamps = daylight_stamps()
+    stub = HistoryStub({GRID_ENTITY: [(stamp, 1.5) for stamp in stamps]})  # always importing
+    forecast, status = load_solar_forecast(
+        derived_settings(store), store, stub, location=TEST_LOCATION, now=NOW
+    )
+    assert status.ok is False
+    assert "never went negative" in status.last_error
+    assert forecast.slots == []
+
+
+def test_derived_solar_needs_a_grid_mapping(store):
+    stub = HistoryStub({})
+    settings = derived_settings(store, **{"grid.power_entity": ""})
+    forecast, status = load_solar_forecast(settings, store, stub, location=TEST_LOCATION, now=NOW)
+    assert status.ok is False
+    assert "grid.power_entity" in status.last_error
+    assert forecast.slots == []
+
+
+def test_derived_solar_refuses_when_the_battery_flow_is_unmapped(store):
+    # A configured battery with no AC flow mapping: its discharge would read as PV, so refuse.
+    settings = derived_settings(store, batteries=battery_mapping_entry(soc_entity="sensor.example_soc"))
+    stub = HistoryStub({GRID_ENTITY: [(stamp, -1.0) for stamp in daylight_stamps()]})
+    forecast, status = load_solar_forecast(settings, store, stub, location=TEST_LOCATION, now=NOW)
+    assert status.ok is False
+    assert "no AC flow mapping" in status.last_error
+    assert forecast.slots == []
+
+
+def test_derived_solar_needs_the_home_assistant_connection(store):
+    forecast, status = load_solar_forecast(
+        derived_settings(store), store, None, location=TEST_LOCATION, now=NOW
+    )
+    assert status.ok is False
+    assert "Home Assistant connection" in status.last_error
+
+
+def test_derived_solar_lets_an_explicit_watt_peak_win(store):
+    """An explicit solar.capacity_wp beats the learned one (explicit beats derived)."""
+    stub = HistoryStub({})  # no history needed: the explicit value short-circuits
+    settings = derived_settings(store, **{"solar.capacity_wp": 2500.0})
+    forecast, status = load_solar_forecast(settings, store, stub, location=TEST_LOCATION, now=NOW)
+    assert status.ok, status.last_error
+    assert forecast.planes[0]["capacity_wp"] == 2500.0
+    assert any("solar.capacity_wp is set" in note for note in forecast.notes)
+    assert stub.calls == []
+
+
+def test_derived_solar_caches_the_fit_and_does_not_refetch_history(store):
+    """The fit reads weeks of history, so it is cached per mapping and refit at most daily."""
+    stamps = daylight_stamps()
+    settings = derived_settings(
+        store,
+        batteries=battery_mapping_entry(
+            charge_power_entity=CHARGE_ENTITY, discharge_power_entity=DISCHARGE_ENTITY
+        ),
+    )
+    first = HistoryStub(
+        {
+            GRID_ENTITY: [(stamp, 0.5 - model_kw(stamp)) for stamp in stamps],
+            CHARGE_ENTITY: [(stamp, 0.5) for stamp in stamps],
+        }
+    )
+    forecast, status = load_solar_forecast(settings, store, first, location=TEST_LOCATION, now=NOW)
+    assert status.ok and any("fresh fit" in note for note in forecast.notes)
+    learned = forecast.planes[0]["capacity_wp"]
+
+    # A second refresh with a client that has no history at all: the cache answers, no fetch happens.
+    second = HistoryStub({})
+    forecast, status = load_solar_forecast(
+        settings, store, second, location=TEST_LOCATION, now=NOW + timedelta(hours=6)
+    )
+    assert status.ok, status.last_error
+    assert second.calls == [], "the cached fit must not refetch 56 days of history"
+    assert forecast.planes[0]["capacity_wp"] == pytest.approx(learned)
+    assert any("cached daily fit" in note for note in forecast.notes)
+
+    # Changing the mapping invalidates the cache: the new grid entity has no history -> a status.
+    changed = derived_settings(
+        store,
+        batteries=battery_mapping_entry(
+            charge_power_entity=CHARGE_ENTITY, discharge_power_entity=DISCHARGE_ENTITY
+        ),
+        **{"grid.power_entity": "sensor.example_other_meter"},
+    )
+    forecast, status = load_solar_forecast(
+        changed, store, second, location=TEST_LOCATION, now=NOW + timedelta(hours=6)
+    )
+    assert status.ok is False

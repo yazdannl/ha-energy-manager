@@ -43,6 +43,9 @@ def test_ui_renders_and_settings_ia_holds():
     for needle in (
         "every view renders from mock data",
         "settingsVisible is exported for offline testing",
+        "the all-settings drawer holds the full form",
+        "the setup cards own the primary keys",
+        "every card key is rendered on a card",
         "every settings key that applies here is reachable",
         "advanced rows are folded by default",
         "opening the disclosure reveals its advanced rows",

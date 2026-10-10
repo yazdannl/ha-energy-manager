@@ -42,7 +42,6 @@ log = logging.getLogger(__name__)
 __all__ = [
     "ENERGY_CHARTS_URL",
     "PROVIDERS",
-    "SELL_UNKNOWN_NOTE",
     "PriceUnavailable",
     "clear_zonneplan_cache",
     "effective_price_source",
@@ -69,11 +68,8 @@ PRICE_KEYS = ("electricity_price", "price_tax_included", "price", "buy", "tariff
 #: carries ``electricity_price``/``electricity_price_excl_tax`` as plain ints. Candidate detection
 #: accepts only these, so a generic ``price`` key alone never masquerades as a Zonneplan tariff.
 ZONNEPLAN_PRICE_KEYS = ("price_tax_included", "electricity_price")
-#: Set when no feed-in tariff is configured; the loader appends it to the forecast notes.
-SELL_UNKNOWN_NOTE = (
-    "sell/export price unknown: set price.feed_in_eur_per_kwh or price.feed_in_entity; "
-    "slots report sell = 0.00 EUR/kWh received"
-)
+#: Energy-tax-excluded counterparts in the same two shapes; their difference is the per-slot tax.
+TAX_EXCLUDED_KEYS = ("electricity_price_excl_tax", "price_tax_excluded")
 #: Zonneplan publishes fixed-point integers with ``value_factor = 1e-7`` (docs/EXTERNAL_APIS.md section 3).
 ZONNEPLAN_SCALE_DIVISOR = 1e7
 #: Overall staleness floor: less than this much fresh coverage means the payload is stale.
@@ -177,28 +173,62 @@ def _normalise_pairs(
     divisor: float,
     settings: Any,
     apply_tax: bool,
-) -> list[tuple[datetime, float]]:
-    """Convert raw provider buy values to ``(t, buy EUR/kWh)`` with the import fee applied.
+    taxes: Mapping[datetime, float] | None = None,
+) -> list[tuple[datetime, float, float]]:
+    """Convert raw provider buy values to ``(t, buy EUR/kWh, energy_tax EUR/kWh)``.
 
-    Providers never supply a sell price: SPEC.md section 4 defines ``sell`` as EUR/kWh *received*,
-    which is filled in once by :func:`_apply_feed_in` from the configured feed-in tariff.
+    The consumer price carries VAT, the energy tax and the import fee. ``taxes`` may supply a
+    per-slot energy-tax component for providers that publish a tax-excluded price next to the
+    included one (Zonneplan); otherwise the component is the configured
+    ``price.energy_tax_eur_per_kwh`` for wholesale sources (exactly the adder applied here) and 0.0
+    for consumer sources, where the tax is already inside the published number. The derived feed-in
+    price uses the component when the contract does not pay the energy tax back (SPEC.md section 4).
     """
     if unit not in PRICE_UNITS or unit == "auto":
         raise ProviderError(f"provider declared an unusable unit: {unit!r}")
     vat = float(settings.get("price.vat_pct", 0.0) or 0.0) if apply_tax else 0.0
     tax = float(settings.get("price.energy_tax_eur_per_kwh", 0.0) or 0.0) if apply_tax else 0.0
     import_fee, _ = _fees(settings)
-    out: list[tuple[datetime, float]] = []
+    out: list[tuple[datetime, float, float]] = []
     for moment, raw_buy in pairs:
         if raw_buy is None:
             continue
         buy = eur_per_kwh_from_raw(_to_float(raw_buy), unit, divisor, vat, tax) + import_fee
-        out.append((moment, buy))
+        slot_tax = tax
+        if taxes is not None and moment in taxes:
+            slot_tax = float(taxes[moment])
+        out.append((moment, buy, slot_tax))
     return out
 
 
+def _entry_tax_component(
+    entry: Mapping[str, Any], unit: str, divisor: float
+) -> float | None:
+    """Per-slot energy tax = (tax-included - tax-excluded price) in EUR/kWh, else None.
+
+    Both Zonneplan shapes publish both sides (``price_tax_included``/``price_tax_excluded`` and
+    ``electricity_price``/``electricity_price_excl_tax``); a generic consumer sensor publishes only
+    one, and the derived feed-in price then falls back to ``price.energy_tax_eur_per_kwh``.
+    """
+    try:
+        included = _entry_price(entry, ZONNEPLAN_PRICE_KEYS)
+        excluded = _entry_price(entry, TAX_EXCLUDED_KEYS)
+    except ValueError:
+        return None
+    try:
+        # A negative component would mean the excluded price is above the included one (bad data);
+        # clamping keeps it from *adding* to the sell price when the tax is not refunded.
+        return max(
+            0.0,
+            eur_per_kwh_from_raw(_to_float(included), unit, divisor)
+            - eur_per_kwh_from_raw(_to_float(excluded), unit, divisor),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def _build_forecast(
-    pairs: Iterable[tuple[datetime, float]],
+    pairs: Iterable[tuple],
     *,
     source: str,
     settings: Any,
@@ -207,23 +237,26 @@ def _build_forecast(
 ) -> PriceForecast:
     """Resample normalised buy prices onto the 15-minute grid with forward/backward fill.
 
-    Slots start with ``sell = 0.0`` (received nothing); :func:`_apply_feed_in` fills the real
-    feed-in tariff on the load path. Provider lists contain past slots
-    (docs/EXTERNAL_APIS.md section 3); everything before the current quarter is dropped.
+    Pairs are ``(t, buy)`` or ``(t, buy, energy_tax)``; slots start with ``sell = 0.0`` (received
+    nothing) and :func:`_apply_feed_in` fills the feed-in price on the load path. Provider lists
+    contain past slots (docs/EXTERNAL_APIS.md section 3); everything before the current quarter is
+    dropped.
     """
     horizon = _horizon_hours(settings)
     start = quarter_floor(now, SLOT_MINUTES)
     end = start + timedelta(hours=horizon)
     grid = slot_range(start, end, SLOT_MINUTES)
 
-    table: dict[datetime, float] = {}
+    table: dict[datetime, tuple[float, float]] = {}
     saw_entries = False
-    for moment, buy in pairs:
+    for pair in pairs:
         saw_entries = True
+        moment, buy = pair[0], pair[1]
+        slot_tax = float(pair[2]) if len(pair) > 2 else 0.0
         slot = quarter_floor(moment, SLOT_MINUTES)
         if slot < start:
             continue
-        table[slot] = buy
+        table[slot] = (buy, slot_tax)
     if not table:
         if saw_entries:
             raise ProviderError(f"{source}: no future price slots (all entries are in the past)")
@@ -236,13 +269,13 @@ def _build_forecast(
     for slot_time in grid:
         position = bisect.bisect_right(times, slot_time)
         if position and times[position - 1] == slot_time:
-            buy = table[slot_time]
+            buy, slot_tax = table[slot_time]
             stale = False
         elif position:
-            buy = table[times[position - 1]]
+            buy, slot_tax = table[times[position - 1]]
             stale = True
         else:
-            buy = table[times[0]]
+            buy, slot_tax = table[times[0]]
             stale = True
         slots.append(
             PriceSlot(
@@ -252,6 +285,7 @@ def _build_forecast(
                 source=source,
                 is_actual=slot_time <= now < slot_time + timedelta(minutes=SLOT_MINUTES),
                 stale=stale,
+                energy_tax=slot_tax,
             )
         )
     future = [slot for slot in slots if slot.t >= start]
@@ -304,14 +338,22 @@ def _apply_coverage(
 def _apply_feed_in(
     forecast: PriceForecast, settings: Any, client: Any, tz: Any = None
 ) -> bool:
-    """Fill ``slot.sell`` from the configured feed-in tariff (SPEC.md section 4).
+    """Fill ``slot.sell`` (SPEC.md section 4).
 
-    ``sell`` is EUR/kWh *received*, so it is never derived from the buy price. Resolution order:
-    ``price.feed_in_entity`` (current HA sensor state, its declared unit) then a flat
-    ``price.feed_in_eur_per_kwh``; both are net of ``price.export_fee_eur_per_kwh`` and get
-    ``price.vat_pct`` added when ``price.feed_in_tax_inclusive`` is off. Returns False (and leaves
-    every slot at sell = 0.00) when no tariff is configured or it cannot be read; failing to price
-    export must never fail the buy forecast.
+    ``sell`` is EUR/kWh *received*. Resolution order:
+
+    1. ``price.feed_in_entity`` (current HA sensor state, its declared unit).
+    2. ``price.feed_in_eur_per_kwh`` (flat tariff).
+       Both are net of ``price.export_fee_eur_per_kwh`` and get ``price.vat_pct`` added when
+       ``price.feed_in_tax_inclusive`` is off.
+    3. Derived, when neither is configured: the consumer buy price you pay minus
+       ``price.export_fee_eur_per_kwh`` (the feed-in cost, default 0), and minus the slot's
+       energy-tax component when ``price.feed_in_energy_tax_refund`` is off (a contract that does
+       not pay the energy tax back on redelivery).
+
+    A configured feed-in source that cannot be read degrades to the derived price with a note:
+    failing to price export must never fail the buy forecast. Returns False only when there is
+    nothing to price (no slots).
     """
     entity = str(settings.get("price.feed_in_entity", "") or "")
     tariff: float | None = None
@@ -333,22 +375,42 @@ def _apply_feed_in(
             origin = "price.feed_in_eur_per_kwh"
     except Exception as err:  # noqa: BLE001 - a broken feed-in sensor must not break the buy price
         forecast.notes.append(
-            f"sell price unavailable ({type(err).__name__}: {err}); slots report sell = 0.00 EUR/kWh"
+            f"configured feed-in source unavailable ({type(err).__name__}: {err}); "
+            "using the derived feed-in price"
         )
-        return False
-    if tariff is None:
-        forecast.notes.append(SELL_UNKNOWN_NOTE)
-        return False
-    if not bool(settings.get("price.feed_in_tax_inclusive", True)):
-        tariff *= 1.0 + float(settings.get("price.vat_pct", 0.0) or 0.0) / 100.0
     export_fee = _fees(settings)[1]
-    net = tariff - export_fee
+    if tariff is not None:
+        if not bool(settings.get("price.feed_in_tax_inclusive", True)):
+            tariff *= 1.0 + float(settings.get("price.vat_pct", 0.0) or 0.0) / 100.0
+        net = tariff - export_fee
+        for slot in forecast.slots:
+            slot.sell = net
+        forecast.notes.append(
+            f"sell price {net:.4f} EUR/kWh received ({origin}; feed-in cost {export_fee:.4f} EUR/kWh)"
+        )
+        return bool(forecast.slots)
+
+    # Derived: the consumer price you pay, minus the feed-in cost, minus the energy-tax component
+    # when the contract does not pay it back. The component is per-slot where the provider publishes
+    # a tax-excluded price and otherwise the configured wholesale adder (0.0 when unknown).
+    refund = bool(settings.get("price.feed_in_energy_tax_refund", True))
+    taxed = 0
     for slot in forecast.slots:
-        slot.sell = net
-    forecast.notes.append(
-        f"sell price {net:.4f} EUR/kWh received ({origin}; export fee {export_fee:.4f} EUR/kWh)"
-    )
-    return True
+        component = float(getattr(slot, "energy_tax", 0.0) or 0.0)
+        if not refund and component:
+            taxed += 1
+        slot.sell = slot.buy - export_fee - (0.0 if refund else component)
+    detail = f"derived feed-in price: buy price minus feed-in cost {export_fee:.4f} EUR/kWh"
+    if not refund:
+        if taxed:
+            detail += f" minus the slot energy tax (known for {taxed}/{len(forecast.slots)} slots)"
+        else:
+            detail += (
+                "; no energy-tax component is known for this source, so none was subtracted "
+                "(set price.energy_tax_eur_per_kwh to state it)"
+            )
+    forecast.notes.append(detail)
+    return bool(forecast.slots)
 
 
 def _declared_unit(
@@ -501,6 +563,14 @@ def _entity_provider(
             raise ProviderError(f"{source}: {err}") from None
         parsed.append((moment, buy, entry))
     parsed.sort(key=lambda item: item[0])
+    # Sources that publish a tax-excluded price next to the included one give the energy-tax
+    # component per slot (Zonneplan); the derived feed-in price needs it when the contract does not
+    # pay the energy tax back.
+    taxes = {
+        moment: component
+        for moment, _buy, entry in parsed
+        if (component := _entry_tax_component(entry, unit, divisor)) is not None
+    }
     if scale_check:
         _scale_check(
             source,
@@ -519,6 +589,7 @@ def _entity_provider(
             divisor=divisor,
             settings=settings,
             apply_tax=False,
+            taxes=taxes or None,
         ),
         source=source,
         settings=settings,

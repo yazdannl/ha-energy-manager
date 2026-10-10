@@ -1425,6 +1425,31 @@ def test_discover_grid_rows_point_at_the_settings_key():
     assert "setting_key" not in battery_rows[0]
 
 
+def test_discover_price_solar_and_load_rows_point_at_their_settings_key():
+    """SPEC 10 (additive): the setup pickers write one settings key per role."""
+    engine, _store, _ha, _clock, _settings = build_engine()
+    cases = {
+        "solar": (
+            {"entity_id": "sensor.example_pv_power", "platform": "example_inverter", "translation_key": "pv_power", "name": "PV power"},
+            "solar.measured_entity",
+        ),
+        "load": (
+            {"entity_id": "sensor.example_load_power", "platform": "example_meter", "translation_key": "load_power", "name": "Load power"},
+            "load.entity",
+        ),
+        "price": (
+            {"entity_id": "sensor.example_price_now", "platform": "example_tariff", "translation_key": "electricity_price", "name": "Price now"},
+            "price.entity",
+        ),
+    }
+    for kind, (entry, expected_key) in cases.items():
+        engine._registry_source = lambda entry=entry: [entry]  # noqa: SLF001
+        engine._discover_cache = None  # noqa: SLF001
+        rows = engine.discover(kind)
+        assert rows, kind
+        assert rows[0]["setting_key"] == expected_key, kind
+
+
 # ----------------------------------------------------------------------------------- forecast explanation
 
 

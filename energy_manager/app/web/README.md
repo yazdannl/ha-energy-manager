@@ -47,21 +47,33 @@ The `--chart-*` custom properties are a frozen interface - `charts.js` reads the
 `getComputedStyle` - so keep the names. Class vocabulary is fixed: the existing names (`panel`,
 `now-card`, `chip`, `badge`, `field`, `grid`, `row`, `muted`, `stale`, `btn`, `dialog`) plus
 `settings-rail`, `settings-group`, `settings-group-body`, `disclosure`, `disclosure-body`, `save-bar`,
-`save-bar-actions`, `segmented`, `switch`, `unit-input`, `theme-state`. The theme control cycles
-auto -> dark -> light and persists the choice in `localStorage`.
+`save-bar-actions`, `segmented`, `switch`, `unit-input`, `theme-state`, plus the setup-card and picker
+vocabulary `setup-cards`, `setup-card`, `setup-list`, `picker`, `picker-current`, `picker-search`,
+`picker-results`, `picker-row`, `picker-text`, `picker-name`, `picker-meta`, `all-settings`. The theme
+control cycles auto -> dark -> light and persists the choice in `localStorage`.
 
 ## Settings information architecture (SPEC 13.2)
 
-`renderSettings` renders **every** setting the API sends, exactly once, inside its server group. A
-row whose payload says `advanced: true` sits behind that group's `Advanced (n)` disclosure (state
-remembered per group; `Show all advanced` opens them all). Rows in the `Safety` group never fold,
-even though the wider `isSafetySetting()` (which also drives the confirmation step for money-moving
-keys) would otherwise exempt them - folding follows the *server* group. A field that cannot apply to
-the selected price/solar source is hidden only while it still equals its default; once it holds a
-value it stays listed as a muted "not used by the current selection" line, and a search match always
-wins over both rules. Two pure helpers carry this logic and are tested without a browser:
-`SEM_APP.settingsGroups(items)` and `SEM_APP.settingsVisible(item, {showAdvanced, showAll, query,
-priceProvider, priceContract, solarSource})`.
+The Settings page opens on **four setup cards** - Price, Meter, Solar, Battery - carrying only the
+primary choice of each topic, with the full form in one collapsed **All settings** drawer below
+(`.all-settings`; open state in `sem.settings.allOpen`). The cards own their keys for the current
+selection (`SEM_APP.setupCardKeys({priceProvider, priceContract, solarSource})`, the pure table the
+render check asserts) and the groups skip exactly those keys, so every setting the API sends is
+rendered **exactly once**. While a search query is active the cards are hidden and the drawer lists
+every match. The Meter/Solar/Price cards use `entityPicker` (a searchable `/discover` picker that
+writes the candidate row's `setting_key`, falling back to the card's key) and a typed entity id can
+always be used directly.
+
+Inside the drawer, a row whose payload says `advanced: true` sits behind that group's
+`Advanced (n)` disclosure (state remembered per group; `Show all advanced` opens them all). Rows in
+the `Safety` group never fold, even though the wider `isSafetySetting()` (which also drives the
+confirmation step for money-moving keys) would otherwise exempt them - folding follows the *server*
+group. A field that cannot apply to the selected price/solar source is hidden only while it still
+equals its default; once it holds a value it stays listed as a muted "not used by the current
+selection" line, and a search match always wins over both rules. Three pure helpers carry this logic
+and are tested without a browser: `SEM_APP.settingsGroups(items)`,
+`SEM_APP.settingsVisible(item, {showAdvanced, showAll, query, priceProvider, priceContract,
+solarSource})` and `SEM_APP.setupCardKeys({priceProvider, priceContract, solarSource})`.
 
 ## Conventions
 

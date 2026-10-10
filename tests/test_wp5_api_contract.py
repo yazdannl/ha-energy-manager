@@ -471,9 +471,9 @@ def test_config_contract_types_choices_and_safety_group(wired):
     assert rows["mode"]["choices"] == ["off", "advisory", "auto"]
     assert rows["price.source"]["choices"], "price.source needs choices"
     control_groups = {rows[key]["group"] for key in rows if key.startswith("control.")}
-    assert control_groups == {"Safety"}, control_groups
+    assert control_groups == {"Control", "Safety"}, control_groups
+    assert rows["control.failsafe_on_error"]["group"] == "Safety"
     assert rows["optimizer.max_grid_import_w"]["group"] == "Safety"
-    assert rows["optimizer.target_soc_pct_end"]["group"] == "Safety"
     # exactly the shipped defaults are advertised
     from app.api import default_settings
 

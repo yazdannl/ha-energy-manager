@@ -22,7 +22,7 @@ Hash routing (`app.js: splitHash()`), seven views, all rendered client-side:
 | `#/forecasts` | `viewForecasts` | Price / solar / load panels, per-day totals, accuracy trend, provider health |
 | `#/batteries` | `viewBatteries` | Battery cards, discovery-based add/edit wizard, bounded test discharge |
 | `#/savings` | `viewSavings` | Range totals, savings vs baseline chart, per-bucket table, baseline definition |
-| `#/settings` | `viewSettings` | Form generated from `GET /api/v1/config` descriptors, grouped and searchable |
+| `#/settings` | `viewSettings` | Four setup cards (Price, Meter, Solar, Battery) with entity pickers, plus an **All settings** drawer holding the grouped, searchable form |
 | `#/log` | `viewLog` | Filterable dispatch/event log with requested vs applied power |
 
 Unknown routes fall back to `#/dashboard`. Query options: `#/plan?hours=12|24|36|48`,
@@ -119,25 +119,33 @@ forecast for that interval — is rendered as unknown (`--`), including its savi
 zero. When every bucket is unknown the totals show `--` and the chart shows a plain-text fallback;
 chart series skip nulls instead of plotting them as 0, and the legend says so.
 
-**Settings** — the form is generated from the `settings` array of `GET /api/v1/config`
-(`key, value, type, default, label, help, group, choices`). Types: `bool`, `int`, `float`, `str`,
-`password`, `json`, `list` (+ `choices` for enums and multi-selects). Search filters by
-key/label/help/group. Changes are collected and sent as one `PATCH /api/v1/config`; the response
-`{applied, errors}` is displayed verbatim and the form reloads from the server on success (no
-optimistic UI). Groups are shown in a stable reading order (General, Price, Solar, Load, Grid,
-Optimizer, Safety, Notify, Batteries) even though the API sorts rows by key. Groups whose name
+**Settings** — the page opens on four setup cards, each carrying only the primary choice of its
+topic: **Price** (`price.provider`, the provider-specific fields, the feed-in cost and the energy-tax
+refund toggle), **Meter** (`grid.power_entity`, a searchable picker), **Solar** (`solar.source` plus a
+measured-PV picker unless the source is `derived`) and **Battery** (the configured batteries plus a
+link into the wizard). The pickers ask `GET /api/v1/discover` and write the candidate row's
+`setting_key`, falling back to the card's own key; a typed entity id can always be used directly.
+`SEM_APP.setupCardKeys({priceProvider, priceContract, solarSource})` is the pure table of which keys
+the cards own, and the groups below skip exactly those keys, so every key is rendered once. While a
+search query is active the cards are hidden and the drawer lists every match.
+
+Everything else lives in the collapsed **All settings** drawer, generated from the `settings` array of
+`GET /api/v1/config` (`key, value, type, default, label, help, group, choices, advanced`). Types:
+`bool`, `int`, `float`, `str`, `password`, `json`, `list` (+ `choices` for enums and multi-selects).
+Search filters by key/label/help/group. Changes are collected and sent as one `PATCH /api/v1/config`;
+the response `{applied, errors}` is displayed verbatim and the form reloads from the server on success
+(no optimistic UI). Groups are shown in a stable reading order (General, Price, Solar, Load, Grid,
+Optimizer, Control, Safety, Notify, Batteries) even though the API sorts rows by key. Groups whose name
 matches `safety`/`limit`, and keys matching
-`reserve_soc_pct|max_grid_import_w|max_grid_export_w|target_soc_pct_end|allow_grid_charge|allow_export|min_spread_eur_per_kwh|grid_follow_max_w|control.*|price.feed_in_*`,
+`reserve_soc_pct|max_grid_import_w|max_grid_export_w|allow_export|control.failsafe_on_error`,
 are rendered in a highlighted section (or carry a visible `money/safety` badge when the server puts
-them elsewhere) and require a confirmation dialog before saving. New schema in this round:
-`price.feed_in_eur_per_kwh` (nullable), `price.feed_in_entity`, `price.feed_in_tax_inclusive` and
-`control.grid_follow_max_w`; `optimizer.allow_export` defaults to **off** until a feed-in tariff is
-configured. When the flat feed-in value and entity are both empty the form states in plain words
-that the sell price is unknown (0.00 EUR/kWh) and export earns nothing, and it warns if export was
-turned on anyway. Password fields are never echoed: an existing value shows as "(a value is set;
-leave empty to keep it)" and is only sent when the user types a new one. `batteries` is edited in
-the Batteries view via a link. An `Add-on options` panel shows the read-only option layer (UI
-settings win).
+them elsewhere) and require a confirmation dialog before saving. New schema in the 0.6.0 round:
+`price.feed_in_energy_tax_refund` and `solar.source=derived`; `control.*` tuning moved to the foldable
+`Control` group; `price.export_fee_eur_per_kwh` is presented as the **feed-in cost**. When export is
+enabled the drawer states which basis prices the sell side (explicit tariff/entity, or the derived
+`buy − feed-in cost`). Password fields are never echoed: an existing value shows as "(a value is set;
+leave empty to keep it)" and is only sent when the user types a new one. `batteries` is edited in the
+Batteries view via a link. An `Add-on options` panel shows the read-only option layer (UI settings win).
 
 **Log** — level filter, free-text `kind` filter (e.g. `dispatch`, `event`, `alert`), row limit,
 manual refresh and an auto-refresh checkbox (15 s). Rows show local time + relative age, kind,
@@ -188,7 +196,10 @@ and a missing `uPlot` global produces "Chart library unavailable" rather than a 
   `scales: {y, y2, y3, y4}` when the layout gains width. Marked with a `ponytail:` comment in
   `charts.js`.
 - **Settings safety detection is a name/key heuristic** because the contract only gives `group`.
-  The backend can make it exact by naming the group `Safety` (the mock does this).
+  Folding follows the server group (`Safety` never folds); the wider key regex only decides the
+  confirmation badge and the save confirmation, so a money-moving key the server groups elsewhere is
+  still flagged. The backend can make the group exact by naming it `Safety` (the mock mirrors the
+  backend regex).
 - **Savings arbitrage/self-consumption split is conditional** on `totals.arbitrage_kwh` /
   `totals.self_consumption_kwh`; the UI shows a note when the backend does not report them.
 - **Battery cycle count** is read from `state.extra.cycles` and shows "not reported" otherwise.

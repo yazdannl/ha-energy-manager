@@ -15,7 +15,7 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **595 passed** (two consecutive runs) |
+| Test suite | `python3 -m pytest tests -q` | **609 passed** (two consecutive runs) |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 89 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
@@ -23,7 +23,7 @@ loopback addresses and placeholder coordinates.
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (77 files, documentation excluded)**:
-  `2209d590a2f4047bf48cf8c3f6953b5d6aa2ec69b7d1dc65fd9ca217a90af133`
+  `e548801650cd421be1235381a0a91ae1eba8996fcf29f29938b829bbd2ea86f9`
 * **path list of the same 77 files** (detects an added, removed or renamed file):
   `63e3910878cca4ec6ac8802e98b49448c7d6655eab98076ddfcf1d0140adf88b`
 
@@ -355,18 +355,21 @@ independently re-downloaded and compared, not just recorded).
 **What the redesign guarantees, and the gate that holds it.** `tools/ui_render_check.js` (run by
 `tests/test_wp3_ui_render.py`, skipped when node is absent) renders the real `app.js` and `mock.js`
 through a dependency-free DOM shim (`tools/ui_dom_shim.js`, ~300 lines: elements, attributes,
-`classList`, `dataset`, `isConnected`, closed-`<details>` semantics) and asserts **36** properties of
+`classList`, `dataset`, `isConnected`, closed-`<details>` semantics) and asserts **42** properties of
 the result. The load-bearing ones:
 
 * all seven views render from mock data with no `undefined` or `NaN` in the output;
 * every setting the API sends is reachable: selecting each group through the rail and scanning the
-  rendered rows finds all **75** keys (the **65** that apply to the current price/solar selection, plus
+  rendered rows finds all **76** keys (the **66** that apply to the current price/solar selection, plus
   the ten that are hidden-but-set and therefore still listed, muted, as "not used by the current
   selection");
 * advanced rows are **not** shown by default, opening the disclosure shows them, and `Show all
-  advanced` shows every applicable advanced key (**33** exist, **23** apply to the mock's selection);
-* the 16 Safety rows are visible **without** unfolding anything;
-* the rail lists exactly the server's nine groups, the save bar exists, every class the front-end
+  advanced` shows every applicable advanced key (**54** foldable keys exist);
+* the 5 Safety rows are visible **without** unfolding anything;
+* the four setup cards own the primary keys and render every one of them (the folding assertions run
+  on the keys the cards do *not* own, since a card key is visible by design);
+* a picker search lists discovery candidates and using one marks the setting dirty;
+* the rail lists exactly the server's ten groups, the save bar exists, every class the front-end
   emits has a CSS rule, the `--chart-*` interface survived, no inline `style=` is emitted, no asset is
   external, Bootstrap loads before the design layer and the theme control pins and persists an
   explicit theme.
@@ -413,6 +416,57 @@ worker while writing the palette (>= 4.5:1 body text, >= 3:1 large text and UI),
 accessibility rules are intact in source and asserted, and the layout is responsive by construction -
 but spacing, the light palette in practice and the breakpoints have not been eyeballed here. The
 click-through is the owner's, and it is the honest last step of this wave.
+
+### 8.1 The setup cards, derived feed-in and meter-derived solar (0.6.0)
+
+The 0.5.0 rebuild made every option reachable, but the default surface was still a rail of nine groups
+with **55** always-visible rows (nine of them `control.*` tuning knobs that could never fold, because
+they were grouped as Safety). The request was to *reduce* what a user has to decide: select a price
+provider and fetch prices automatically, search and select the meter, optionally select a solar power
+entity or estimate it from the meter, and search and add batteries - with everything else hidden but
+still configurable.
+
+The chosen shape (the user picked it from three options) is **four setup cards plus one "All settings"
+drawer**: Price, Meter, Solar and Battery, each carrying only its primary choice, with the existing
+rail, search, per-group `Advanced (n)` disclosures and save bar inside a collapsed drawer. Every key
+is still rendered exactly once - a card key is skipped by its group, and while a search query is active
+the cards are hidden so matches are listed once in the drawer. The essential set shrank from 55 rows to
+**21**, and the `control.*` knobs moved to a foldable `Control` group (only `control.failsafe_on_error`
+stays in `Safety`, which is now the five keys that can move hardware or change a hard limit).
+
+Two behaviours were added to make the cards real rather than decorative:
+
+* **Entity pickers** ask `/discover` and write the candidate row's `setting_key`, so picking an
+  export-only grid sensor stores it in `grid.export_entity` instead of the card's `grid.power_entity`;
+  `price`, `solar` and `load` discovery rows gained that key (additive) alongside `grid`/`battery`.
+  A typed entity id can always be used directly, so a poorly ranked sensor is still reachable.
+* **The sell price is derived now** (`sell = buy − price.export_fee_eur_per_kwh`, minus the slot's
+  energy-tax component when `price.feed_in_energy_tax_refund` is off), because the user's contract
+  pays the buy price back minus a feed-in cost. `PriceSlot` gained the additive `energy_tax` field:
+  the Zonneplan payload publishes both sides per slot (their difference is the tax), wholesale sources
+  carry the configured adder, and a consumer sensor carries 0.0 (unknown, stated in the note). An
+  explicit flat tariff or feed-in entity still wins, and `optimizer.allow_export` still defaults to
+  off. The user corrected an early misreading of this request - the toggle is the **energy tax**, not
+  VAT - which is why the field is named `price.feed_in_energy_tax_refund`.
+* **`solar.source = derived`** learns the array from the meter's export moments
+  (`pv = export + battery net charge`), takes the 90th percentile of `pv / model-per-watt` as the
+  cloudless envelope, and then runs the existing capacity model. The house load at those moments is not
+  subtracted (that load is what the PV forecast is for), so the learned size is a conservative lower
+  bound and the forecast says so. An explicit `solar.capacity_wp` wins; no export history, fewer than
+  24 usable daylight samples or an unmappable battery flow is a status, never a crash.
+
+What the gates prove here: the render check (42 properties) asserts the cards, their key ownership and
+a real picker round-trip against the mock; `test_setup_card_keys_are_the_primary_surface` pins the pure
+key table per provider/contract/solar source; `test_wp2a_price.py` covers the derived sell price, the
+tax-refund switch and the per-slot tax extraction; `test_wp2a_solar.py` covers the envelope fit, the
+export-derived samples, the explicit-watt-peak override and each refusal path; and the frozen
+classification tests (`test_wp2a_config`, `test_wp2b_api`, `test_wp3_mock_contract`, `test_wp5_api_contract`,
+`app.main --selfcheck`) were updated in both directions so the new list cannot drift.
+
+Not verified: the pickers have never been clicked in a real browser (the ingress panel needs the
+owner's session, and there is no browser on this machine), and the derived solar fit has not been
+compared against a full season of a real array - only the synthetic model-recovery tests and the
+existing live-instance history captured in §7.
 
 ---
 
@@ -503,7 +557,7 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 595 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 609 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 
@@ -528,7 +582,7 @@ find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name 
         -o -name node_modules -o -name .mypy_cache \) -prune -o -type f -print \
   | LC_ALL=C sort | xargs sha256sum | LC_ALL=C sort | sha256sum
 
-# code + tests only (73), documentation excluded
+# code + tests only (77), documentation excluded
 find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache \
         -o -name node_modules -o -name .mypy_cache -o -name '*.md' -o -name 'LICENSE*' \) -prune \
      -o -type f -print \

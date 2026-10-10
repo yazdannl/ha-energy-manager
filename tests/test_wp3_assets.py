@@ -287,8 +287,11 @@ def test_settings_flags_money_and_safety_keys():
     assert re.search(r"price\.feed_in_", app), "feed-in keys must be highlighted as money/safety settings"
     assert "grid_follow_max_w" in app
     assert "money/safety" in app, "safety fields need a visible (not colour-only) marker"
-    assert "No export revenue configured" in app, "an empty feed-in path must read as no export revenue"
-    assert "Export is enabled without a feed-in tariff" in app
+    # SPEC 4 (amended): with no explicit tariff the sell price is derived (buy minus feed-in cost),
+    # so the old "no export revenue" warning is gone; enabling export states the basis instead.
+    assert "Export is enabled" in app
+    assert "the sell price is the buy price minus the feed-in cost" in app
+    assert "price.feed_in_eur_per_kwh / price.feed_in_entity" in app
 
 
 def test_dashboard_surfaces_pending_holds_and_mode_persistence():
@@ -1093,3 +1096,44 @@ def test_settings_groups_and_visibility_helpers():
     assert data["queryWins"] is True, "a search match must reveal a hidden field"
     assert data["safetyAlwaysVisible"] is True, "safety settings are never hidden by a source table"
     assert data["unknownGroupStable"] is True
+
+
+def test_setup_card_keys_are_the_primary_surface():
+    """SPEC 13.2 (amended): the four setup cards own the primary keys, per provider/solar source.
+
+    Pure helper (no DOM), so the table is asserted without a browser: the cards must carry the
+    provider selector, the meter picker, the solar selector and the feed-in controls, and must not
+    offer an entity picker where the provider is found automatically or the solar estimate comes
+    from the meter.
+    """
+    script = """
+        const fs = require("fs");
+        globalThis.location = { pathname: "/x/", search: "?mock=1", hash: "#/settings" };
+        (0, eval)(fs.readFileSync("mock.js", "utf8"));
+        (0, eval)(fs.readFileSync("app.js", "utf8"));
+        (() => {
+          const A = globalThis.SEM_APP;
+          const keys = (opts) => A.setupCardKeys(opts);
+          console.log(JSON.stringify({
+            entity: keys({ priceProvider: "entity", solarSource: "forecast_solar" }),
+            zonneplan: keys({ priceProvider: "zonneplan", solarSource: "capacity" }),
+            dayAhead: keys({ priceProvider: "day_ahead", solarSource: "derived" }),
+            fixedSingle: keys({ priceProvider: "fixed", priceContract: "fixed_single", solarSource: "forecast_solar" }),
+            fixedDayNight: keys({ priceProvider: "fixed", priceContract: "fixed_day_night", solarSource: "forecast_solar" })
+          }));
+        })();
+    """
+    data = json.loads(run_node_script(script))
+    for name, keys in data.items():
+        for required in ("price.provider", "price.export_fee_eur_per_kwh", "price.feed_in_energy_tax_refund", "grid.power_entity", "solar.enabled", "solar.source"):
+            assert required in keys, f"{name} card set is missing {required}: {keys}"
+    assert "price.entity" in data["entity"]
+    assert "price.entity" not in data["zonneplan"], "the zonneplan tariff sensor is found automatically"
+    assert "price.bzn" in data["dayAhead"]
+    assert "price.bzn" not in data["entity"]
+    assert "price.contract" in data["fixedSingle"] and "price.fixed_price_eur_per_kwh" in data["fixedSingle"]
+    assert "price.fixed_day_price_eur_per_kwh" in data["fixedDayNight"]
+    assert "price.fixed_night_price_eur_per_kwh" in data["fixedDayNight"]
+    # derived reads the meter, so there is no measured-PV entity to pick; the other sources have one
+    assert "solar.measured_entity" not in data["dayAhead"]
+    assert "solar.measured_entity" in data["entity"] and "solar.measured_entity" in data["zonneplan"]

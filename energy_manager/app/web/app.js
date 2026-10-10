@@ -2415,7 +2415,7 @@
 
   // The API returns settings sorted by key, which interleaves groups; present them in a stable
   // reading order instead (unknown groups go last, alphabetically).
-  var GROUP_ORDER = ["General", "Price", "Solar", "Load", "Grid", "Optimizer", "Safety", "Notify", "Batteries"];
+  var GROUP_ORDER = ["General", "Price", "Solar", "Load", "Grid", "Optimizer", "Control", "Safety", "Notify", "Batteries"];
 
   function isSafetySetting(descriptor) {
     return /safety|limit/i.test(String(descriptor.group || "")) || SAFETY_KEY_RE.test(descriptor.key);
@@ -2495,7 +2495,8 @@
       if (!byName[name]) { byName[name] = { name: name, rows: [], advancedRows: [], changedCount: 0 }; groups.push(byName[name]); }
       var group = byName[name];
       group.rows.push(item);
-      if (item.advanced === true) group.advancedRows.push(item);
+      // Safety rows never fold (SPEC 13.2), so they are not part of any disclosure's count.
+      if (item.advanced === true && (item.group || "") !== "Safety") group.advancedRows.push(item);
       if (!settingValueEqual(settingEffectiveValue(item), item.default)) group.changedCount++;
     });
     groups.sort(function (a, b) {
@@ -2592,18 +2593,52 @@
   // silent) in the forecast notes too (SPEC §7.1.1).
   var SOLAR_SOURCE_NOTES = {
     forecast_solar: "Per-plane geometry (kWp, tilt, azimuth): the Forecast.Solar API is asked per plane, so each plane is modelled on its own tilt and direction.",
-    capacity: "Estimate from the array's total watt peak: enter the Wp and the add-on models production from the sun's position, optionally attenuated by a weather entity's cloud cover; leave tilt/azimuth unset and it assumes south-facing at 35 degrees and says so in the forecast notes."
+    capacity: "Estimate from the array's total watt peak: enter the Wp and the add-on models production from the sun's position, optionally attenuated by a weather entity's cloud cover; leave tilt/azimuth unset and it assumes south-facing at 35 degrees and says so in the forecast notes.",
+    derived: "Estimate from the meter: at every moment the meter exports, the array is producing at least the exported power plus whatever the battery is charging (pv = export + battery charge). The add-on learns the array's watt peak from those moments and then models it like the capacity source. Nothing to enter — it needs the Meter card and a battery whose charge/discharge power is mapped. The house load at those moments is not subtracted, so the learned size is a conservative lower bound."
   };
 
   /** Visible solar.* keys for a source, plus the note to show.
    *  Pure (no DOM) so node tests can assert the table. */
   function solarFieldVisibility(source) {
     var s = String(source || "forecast_solar");
-    var keys = SOLAR_FIELDS_ALWAYS.concat(s === "capacity" ? SOLAR_FIELDS_CAPACITY : SOLAR_FIELDS_FORECAST_SOLAR);
+    // derived runs the capacity model on a watt peak learned from the meter, so the geometry,
+    // performance ratio and weather fields apply there too (an explicit solar.capacity_wp wins).
+    var keys = SOLAR_FIELDS_ALWAYS.concat(
+      s === "forecast_solar" ? SOLAR_FIELDS_FORECAST_SOLAR : SOLAR_FIELDS_CAPACITY
+    );
     // An unknown source keeps the forecast_solar fields (never an empty group), the same fallback
     // the price table uses, so a newer backend value cannot hide every field.
     var note = SOLAR_SOURCE_NOTES[s] != null ? SOLAR_SOURCE_NOTES[s] : null;
     return { fields: keys, note: note || null };
+  }
+
+  /* ---- setup cards (SPEC 13.2, amended) -------------------------------------------------------
+   * The settings page opens on four setup cards — Price, Meter, Solar, Battery — that carry only
+   * the primary choice each; every other key (including the rest of a card's own group) lives in
+   * the "All settings" drawer behind the existing rail. A key rendered on a card is *not* rendered
+   * again in its group, so every key still appears exactly once. Pure (no DOM): the tested surface
+   * for which keys the cards own at the current provider/contract/solar-source selection. */
+  function setupCardKeys(opts) {
+    opts = opts || {};
+    var provider = String(opts.priceProvider || "entity");
+    var contract = String(opts.priceContract || "dynamic_hourly");
+    var source = String(opts.solarSource || "forecast_solar");
+    var keys = [
+      "price.provider", "price.export_fee_eur_per_kwh", "price.feed_in_energy_tax_refund",
+      "grid.power_entity", "solar.enabled", "solar.source"
+    ];
+    if (provider === "entity") keys.push("price.entity");
+    if (provider === "day_ahead") keys.push("price.bzn");
+    if (provider === "fixed") {
+      keys.push("price.contract");
+      if (contract === "fixed_day_night") {
+        keys.push("price.fixed_day_price_eur_per_kwh", "price.fixed_night_price_eur_per_kwh");
+      } else {
+        keys.push("price.fixed_price_eur_per_kwh");
+      }
+    }
+    if (source !== "derived") keys.push("solar.measured_entity");
+    return keys;
   }
 
   // Two guidance lines that live under the Solar group instead of in a field's help text, because
@@ -2701,17 +2736,94 @@
     wrap.appendChild(el("p", { class: "field-error", text: message }));
   }
 
+  /* ---- entity picker (SPEC 10 discovery, used by the setup cards) -----------------------------
+   * One reusable searchable picker: it asks GET /discover for the kind's candidates and writes the
+   * entity id into a settings key through the card's dirty() callback. A candidate row's own
+   * setting_key wins (an export-only grid sensor is saved to grid.export_entity, not to the card's
+   * grid.power_entity), and a typed entity id can always be used directly, so a sensor discovery
+   * ranks poorly is still reachable. */
+  function entityPicker(options) {
+    var kind = options.kind;
+    var key = options.key;
+    var label = options.label || key;
+    var wrap = el("div", { class: "picker" });
+    wrap.appendChild(el("p", { class: "picker-current" }, [
+      el("span", { class: "field-key", text: key }), " ",
+      el("span", { text: options.value ? String(options.value) : "not set" })
+    ]));
+    var input = el("input", { type: "search", placeholder: options.placeholder || "name, platform or entity id", "aria-label": "Search " + label });
+    var find = button("Find", "");
+    var results = el("div", { class: "picker-results" });
+
+    function pick(row) {
+      options.onPick(row.setting_key || key, String(row.entity_id));
+    }
+
+    function typedRow() {
+      var typed = String(input.value || "").trim();
+      if (!typed || typed.indexOf(".") < 0) return null;
+      return el("div", { class: "picker-row" }, [
+        el("div", { class: "picker-text" }, [el("div", { class: "picker-name", text: typed })]),
+        button("Use typed id", "", function () { pick({ entity_id: typed }); })
+      ]);
+    }
+
+    function rowFor(candidate) {
+      var confidence = isNum(candidate.confidence) ? Math.round(candidate.confidence * 100) + "%" : null;
+      var meta = [candidate.entity_id, candidate.platform, candidate.suggested_role, confidence].filter(Boolean).join(" · ");
+      return el("div", { class: "picker-row" }, [
+        el("div", { class: "picker-text" }, [
+          el("div", { class: "picker-name", text: String(candidate.name || candidate.entity_id) }),
+          el("div", { class: "picker-meta", text: meta })
+        ]),
+        button("Use", "", function () { pick(candidate); })
+      ]);
+    }
+
+    function load() {
+      clear(results);
+      results.appendChild(el("p", { class: "muted", text: "Searching…" }));
+      find.disabled = true;
+      get("/discover", { kind: kind, search: String(input.value || "").trim() }).then(function (payload) {
+        find.disabled = false;
+        var rows = payload && Array.isArray(payload.candidates) ? payload.candidates : [];
+        clear(results);
+        if (!rows.length) results.appendChild(el("p", { class: "muted", text: "No candidates matched. Type a full entity id and use it directly if you know it." }));
+        rows.slice(0, 12).forEach(function (candidate) { results.appendChild(rowFor(candidate)); });
+        var typed = typedRow();
+        if (typed) results.appendChild(typed);
+      }).catch(function (err) {
+        find.disabled = false;
+        clear(results);
+        results.appendChild(el("p", { class: "muted", text: "Discovery failed: " + (err && err.message ? err.message : err) }));
+        var typed = typedRow();
+        if (typed) results.appendChild(typed);
+      });
+    }
+
+    find.addEventListener("click", load);
+    input.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") { event.preventDefault(); load(); }
+    });
+    wrap.appendChild(el("div", { class: "picker-search" }, [input, find]));
+    wrap.appendChild(results);
+    return wrap;
+  }
+
   function renderSettings(body, config) {
     var descriptors = Array.isArray(config.settings) ? config.settings : [];
     if (!descriptors.length) { body.appendChild(el("p", { class: "muted", text: "The server sent no setting descriptors." })); return; }
     var dirtyValues = {};
     var dirtyCount = 0;
+    // Keys the four setup cards render this draw; their groups skip them so a key appears once.
+    var cardKeys = {};
 
     // Remembered UI state (SPEC 13.2): active rail group, each group's disclosure, "show all
     // advanced". localStorage is the only store — the server payload is untouched by folding.
     var STORE_GROUP = "sem.settings.group";
     var STORE_ADVANCED = "sem.settings.advanced";
     var STORE_SHOW_ALL = "sem.settings.showAllAdvanced";
+    var STORE_ALL_OPEN = "sem.settings.allOpen";
     var advancedOpen = readStored(STORE_ADVANCED, {});
     if (!advancedOpen || typeof advancedOpen !== "object") advancedOpen = {};
     var showAllAdvanced = readStored(STORE_SHOW_ALL, false) === true;
@@ -2818,6 +2930,8 @@
     // otherwise they sit behind a disclosure whose open state is remembered per group.
     function renderGroup(group, rows, searching) {
       var opts = currentOpts();
+      // A key rendered on a setup card is not rendered again here (SPEC 13.2: exactly once).
+      rows = rows.filter(function (r) { return !cardKeys[r.key]; });
       var section = el("section", { class: "settings-group", dataset: { group: group.name } });
       section.appendChild(el("h3", { text: group.name }));
       var groupBody = el("div", { class: "settings-group-body" });
@@ -2852,6 +2966,119 @@
       section.appendChild(groupBody);
       return section;
     }
+    // ---- setup cards (SPEC 13.2 amended) ------------------------------------------------------
+    // Four cards carry the primary choice each; their keys are skipped by the groups below. A key
+    // the card does not render (its source does not apply) falls back to the group, so nothing is
+    // lost and nothing is rendered twice.
+    function cardField(key) {
+      var descriptor = descriptorByKey(key);
+      if (!descriptor) return null;
+      var item = mergeItem(descriptor);
+      if (settingHiddenBySource(item, currentOpts())) return null;
+      cardKeys[key] = true;
+      return settingsField(item, dirty);
+    }
+
+    function cardPicker(key, kind, placeholder) {
+      var descriptor = descriptorByKey(key);
+      if (!descriptor) return null;
+      var item = mergeItem(descriptor);
+      if (settingHiddenBySource(item, currentOpts())) return null;
+      cardKeys[key] = true;
+      var wrap = el("div", { class: "field", dataset: { key: key } });
+      wrap.appendChild(el("label", { text: descriptor.label || key }));
+      wrap.appendChild(el("span", { class: "field-key", text: key }));
+      wrap.appendChild(entityPicker({
+        kind: kind,
+        key: key,
+        label: descriptor.label || key,
+        placeholder: placeholder,
+        value: settingValue(key),
+        onPick: function (target, entityId) {
+          dirty(target, entityId, wrap);
+          draw();
+        }
+      }));
+      if (descriptor.help) wrap.appendChild(el("p", { class: "field-help", text: descriptor.help }));
+      return wrap;
+    }
+
+    function setupCard(title, help, children) {
+      var card = el("section", { class: "setup-card" });
+      card.appendChild(el("h3", { text: title }));
+      if (help) card.appendChild(el("p", { class: "field-help", text: help }));
+      children.forEach(function (child) { if (child) card.appendChild(child); });
+      return card;
+    }
+
+    function priceCard() {
+      var provider = String(settingValue("price.provider") || "entity");
+      var contract = String(settingValue("price.contract") || "dynamic_hourly");
+      var children = [cardField("price.provider")];
+      if (provider === "entity") children.push(cardPicker("price.entity", "price", "price sensor name or entity id"));
+      if (provider === "day_ahead") children.push(cardField("price.bzn"));
+      if (provider === "fixed") {
+        children.push(cardField("price.contract"));
+        if (contract === "fixed_day_night") {
+          children.push(cardField("price.fixed_day_price_eur_per_kwh"));
+          children.push(cardField("price.fixed_night_price_eur_per_kwh"));
+        } else {
+          children.push(cardField("price.fixed_price_eur_per_kwh"));
+        }
+      }
+      children.push(cardField("price.export_fee_eur_per_kwh"));
+      children.push(cardField("price.feed_in_energy_tax_refund"));
+      var note = priceFieldVisibility(provider, contract).note;
+      if (note) children.push(el("p", { class: "field-help", text: note }));
+      return setupCard(
+        "Price",
+        "Pick where prices come from; the add-on fetches the slots itself. The sell price is the buy price minus the feed-in cost.",
+        children
+      );
+    }
+
+    function meterCard() {
+      return setupCard(
+        "Meter",
+        "The live power the add-on follows. The load forecast, and the meter-derived solar estimate, read this meter.",
+        [cardPicker("grid.power_entity", "grid", "grid power sensor name or entity id")]
+      );
+    }
+
+    function solarCard() {
+      var source = String(settingValue("solar.source") || "forecast_solar");
+      var children = [cardField("solar.enabled"), cardField("solar.source")];
+      if (source === "derived") {
+        children.push(el("p", { class: "field-help", text: "Uses the Meter card and the battery's charge/discharge power; nothing to enter here." }));
+      } else {
+        children.push(cardPicker("solar.measured_entity", "solar", "PV power sensor name or entity id"));
+      }
+      var note = solarFieldVisibility(source).note;
+      if (note) children.push(el("p", { class: "field-help", text: note }));
+      return setupCard("Solar", "Optional. How the add-on should know your production.", children);
+    }
+
+    function batteryCard() {
+      var list = settingValue("batteries");
+      var children = [];
+      if (Array.isArray(list) && list.length) {
+        children.push(el("ul", { class: "setup-list" }, list.map(function (battery) {
+          var parts = [String((battery && battery.name) || (battery && battery.id) || "battery")];
+          if (battery && isNum(battery.capacity_kwh)) parts.push(fmtKwh(battery.capacity_kwh));
+          if (battery && battery.enabled === false) parts.push("disabled");
+          return el("li", { text: parts.join(" · ") });
+        })));
+      } else {
+        children.push(el("p", { class: "muted", text: "No battery configured yet." }));
+      }
+      children.push(el("p", {}, [
+        el("a", { class: "btn btn-primary", href: "#/batteries", text: list && list.length ? "Manage batteries" : "Add a battery" }),
+        " ",
+        el("span", { class: "muted", text: "Batteries are searched, picked and confirmed in the Batteries view." })
+      ]));
+      return setupCard("Battery", "Which battery the plan may drive; the wizard finds the device and fills in the entities.", children);
+    }
+
     function renderRail(groups, active) {
       clear(railHost);
       railEntries = {};
@@ -2885,6 +3112,7 @@
     var showAllBox = el("input", { type: "checkbox", id: "settings-show-advanced", checked: showAllAdvanced });
     var railHost = el("nav", { class: "settings-rail", "aria-label": "Settings groups" });
     var listHost = el("div");
+    var cardsHost = el("div", { class: "setup-cards" });
     var saveNote = el("span", { class: "muted", text: "No unsaved changes" });
     var saveButtons = [];
     function saveButton() {
@@ -2897,12 +3125,21 @@
 
     function draw() {
       clear(listHost);
+      clear(cardsHost);
+      cardKeys = {};
       var opts = currentOpts();
       var query = String(opts.query || "").trim();
       var groups = settingsGroups(mergedItems());
       var active = null;
       groups.forEach(function (g) { if (g.name === activeGroup) active = g; });
       if (!active && groups.length) { active = groups[0]; activeGroup = active.name; writeStored(STORE_GROUP, activeGroup); }
+      // The cards are the default surface. A search hides them, so every match is listed exactly
+      // once in the drawer below (the cards own their keys and the groups skip them).
+      if (!query) {
+        [priceCard(), meterCard(), solarCard(), batteryCard()].forEach(function (card) {
+          if (card) cardsHost.appendChild(card);
+        });
+      }
       renderRail(groups, activeGroup);
       var note = feedInNote(mergedItems());
       if (note) listHost.appendChild(note);
@@ -2926,21 +3163,19 @@
     function feedInNote(shown) {
       var byKey = {};
       shown.forEach(function (d) { byKey[d.key] = d; });
-      if (!byKey["price.feed_in_eur_per_kwh"] && !byKey["price.feed_in_entity"]) return null;
+      var exportOn = byKey["optimizer.allow_export"] && settingEffectiveValue(byKey["optimizer.allow_export"]) === true;
+      if (!exportOn) return null;
       var flat = byKey["price.feed_in_eur_per_kwh"];
       var entity = byKey["price.feed_in_entity"];
-      var configured = (flat && isNum(flat.value)) || (entity && String(entity.value === undefined ? "" : entity.value).length > 0);
-      var exportOn = byKey["optimizer.allow_export"] && byKey["optimizer.allow_export"].value === true;
-      if (configured) return null;
-      if (exportOn) {
-        return el("div", { class: "banner banner-warn" }, [
-          el("p", { class: "banner-title", text: "Export is enabled without a feed-in tariff" }),
-          el("p", { text: "price.feed_in_eur_per_kwh is unset and no feed-in entity is mapped, while optimizer.allow_export is on: exported energy would earn 0.00 EUR/kWh. Set a feed-in tariff or entity before exporting." })
-        ]);
-      }
+      var flatSet = flat && settingEffectiveValue(flat) !== null && settingEffectiveValue(flat) !== undefined;
+      var entitySet = entity && String(settingEffectiveValue(entity) || "").length > 0;
+      var refunded = !byKey["price.feed_in_energy_tax_refund"] || settingEffectiveValue(byKey["price.feed_in_energy_tax_refund"]) !== false;
+      var text = flatSet || entitySet
+        ? "Export is enabled: the sell price comes from price.feed_in_eur_per_kwh / price.feed_in_entity, not from the derived formula."
+        : "Export is enabled: the sell price is the buy price minus the feed-in cost, with the energy tax " + (refunded ? "refunded." : "not refunded.");
       return el("div", { class: "banner banner-info" }, [
-        el("p", { class: "banner-title", text: "No export revenue configured" }),
-        el("p", { text: "price.feed_in_eur_per_kwh is unset and no feed-in entity is mapped, so the sell price is unknown (0.00 EUR/kWh) and optimizer.allow_export stays off until you configure one. Exporting without a feed-in tariff earns nothing." })
+        el("p", { class: "banner-title", text: "Export is enabled" }),
+        el("p", { text: text })
       ]);
     }
 
@@ -3003,12 +3238,22 @@
       writeStored(STORE_SHOW_ALL, showAllAdvanced);
       draw();
     });
-    body.appendChild(el("div", { class: "toolbar" }, [
-      el("label", { for: "settings-search" }, [el("span", { text: "Search" }), search]),
-      el("label", { class: "switch", for: "settings-show-advanced" }, [showAllBox, " Show all advanced"])
-    ]));
-    body.appendChild(railHost);
-    body.appendChild(listHost);
+    var drawerBody = el("div", { class: "disclosure-body" }, [
+      el("div", { class: "toolbar" }, [
+        el("label", { for: "settings-search" }, [el("span", { text: "Search" }), search]),
+        el("label", { class: "switch", for: "settings-show-advanced" }, [showAllBox, " Show all advanced"])
+      ]),
+      railHost,
+      listHost
+    ]);
+    var drawer = el("details", { class: "disclosure all-settings" }, [
+      el("summary", { text: "All settings (" + descriptors.length + ")" }),
+      drawerBody
+    ]);
+    if (readStored(STORE_ALL_OPEN, false) === true) drawer.open = true;
+    drawer.addEventListener("toggle", function () { writeStored(STORE_ALL_OPEN, drawer.open); });
+    body.appendChild(cardsHost);
+    body.appendChild(drawer);
     var saveBar = el("div", { class: "save-bar" }, [
       saveNote,
       el("div", { class: "save-bar-actions" }, [
@@ -3127,6 +3372,7 @@
     solarFieldVisibility: solarFieldVisibility,
     settingsGroups: settingsGroups,
     settingsVisible: settingsVisible,
+    setupCardKeys: setupCardKeys,
     fmtPower: fmtPower,
     fmtKwh: fmtKwh,
     fmtPrice: fmtPrice,

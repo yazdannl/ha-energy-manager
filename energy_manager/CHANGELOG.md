@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.6.0
+
+- **Four setup cards instead of a wall of options.** Settings now opens on **Price**, **Meter**,
+  **Solar** and **Battery** cards, each with only the primary choice of its topic, and one collapsed
+  **All settings** drawer holding the full grouped form. The always-visible set dropped from 55 rows
+  to 21, and the `control.*` tuning knobs moved out of the never-folding *Safety* group into a
+  foldable *Control* group.
+- **Searchable entity pickers.** The Meter card and the Solar card search your Home Assistant
+  entities (`/discover`) and save the entity you pick; a typed entity id can always be used directly.
+  An export-only grid sensor is saved to `grid.export_entity` rather than to the card's key, because
+  the candidate row says which setting it belongs to.
+- **Solar from the meter, with nothing to enter.** `solar.source = derived` learns your array from
+  the moments your meter exports: `pv = export + battery charge`. It takes the cloudless envelope of
+  those samples to size the array and then runs the same sun model as the watt-peak source. The house
+  load at those moments is not subtracted, so the learned size is deliberately conservative; an
+  explicit `solar.capacity_wp` overrides it.
+- **Feed-in price is derived now.** The sell price is `buy − feed-in cost` (the new name for
+  `price.export_fee_eur_per_kwh`, default 0), minus the energy-tax component when
+  `price.feed_in_energy_tax_refund` is off — the two cases a saldering contract can have. A flat
+  tariff or a feed-in sensor still wins if you set one, and `optimizer.allow_export` still defaults
+  to off.
+- `PriceSlot` gained an additive `energy_tax` field (per slot from the Zonneplan included/excluded
+  pair, otherwise the configured wholesale adder), and discovery rows for price/solar/load now carry
+  the `setting_key` the pickers write.
+
+
 ## 0.5.1
 
 - **Fixed: an update could take an hour to appear.** The add-on served its own assets - `style.css`,

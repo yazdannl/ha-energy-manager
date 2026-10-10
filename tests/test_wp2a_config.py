@@ -486,34 +486,55 @@ ADVANCED_KEYS = {
     "latitude_override",
     "longitude_override",
     "batteries",
+    "log_level",
     "price.source",
     "price.entity",
+    "price.contract",
+    "price.bzn",
     "price.unit",
     "price.scale_divisor",
     "price.vat_pct",
     "price.energy_tax_eur_per_kwh",
     "price.import_fee_eur_per_kwh",
-    "price.export_fee_eur_per_kwh",
     "price.fixed_price_entity",
     "price.fixed_day_price_entity",
     "price.fixed_night_price_entity",
     "price.fixed_day_start_hour",
     "price.fixed_night_start_hour",
     "price.static_schedule",
+    "price.feed_in_eur_per_kwh",
     "price.feed_in_entity",
+    "price.feed_in_tax_inclusive",
+    "solar.bias_correction",
+    "solar.capacity_wp",
+    "solar.tilt_deg",
+    "solar.azimuth_deg",
     "solar.performance_ratio",
     "solar.weather_entity",
     "solar.planes",
     "solar.api_key",
+    "load.mode",
+    "load.entity",
     "load.temperature_entity",
+    "load.base_kwh_per_day",
     "grid.import_entity",
     "grid.export_entity",
+    "control.tick_seconds",
+    "control.replan_minutes",
+    "control.grid_follow",
+    "control.grid_follow_deadband_w",
+    "control.grid_follow_max_ratio",
+    "control.grid_follow_max_w",
+    "control.stale_state_seconds",
+    "control.stale_plan_seconds",
     "notify.events",
     "notify.persistent",
+    "notify.mobile_service",
     "optimizer.slot_minutes",
     "optimizer.power_steps",
     "optimizer.soc_step_kwh",
     "optimizer.salvage_multiplier",
+    "optimizer.target_soc_pct_end",
 }
 
 
@@ -536,10 +557,10 @@ def test_advanced_classification_is_exactly_the_frozen_list():
     assert from_meta == ADVANCED_KEYS
     assert from_payload == ADVANCED_KEYS
     # a handful of keys that must stay essential, on both sides of the folding line
-    for essential in ("mode", "dry_run", "price.provider", "price.contract", "load.entity"):
+    for essential in ("mode", "dry_run", "price.provider", "solar.source", "grid.power_entity"):
         assert essential not in ADVANCED_KEYS, essential
         assert next(row for row in setting_descriptors() if row["key"] == essential)["advanced"] is False
-    for advanced in ("price.source", "batteries", "optimizer.salvage_multiplier"):
+    for advanced in ("price.source", "batteries", "optimizer.salvage_multiplier", "price.contract"):
         assert next(row for row in setting_descriptors() if row["key"] == advanced)["advanced"] is True
 
 

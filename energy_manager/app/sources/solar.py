@@ -411,6 +411,27 @@ MISSING_CAPACITY_ERROR = (
     "solar.capacity_wp is not set; the capacity source needs the array's total watt peak"
     " and never guesses one from history"
 )
+#: Meter-derived source (SPEC.md 7.1.2, ``solar.source=derived``): the array size is learned from
+#: the export moments the meter can see, then the capacity model produces the forecast.
+DERIVED_MIN_SAMPLES = 24
+#: Ratios above this quantile are the cloudless envelope; overcast hours pull the ratio down.
+DERIVED_ENVELOPE_QUANTILE = 0.9
+#: Ignore samples whose model output per watt is this small (twilight noise, not daylight).
+DERIVED_MIN_MODEL_KW_PER_WP = 1e-5
+DERIVED_PV_NOTE = (
+    "meter-derived array: pv = export + battery charge at the meter's negative (export) moments; "
+    "the house load at those moments is not subtracted, so the learned watt peak is a conservative "
+    "lower bound (set solar.capacity_wp to override the learned value)"
+)
+DERIVED_NO_HISTORY_ERROR = (
+    "meter-derived solar needs the meter's export history and the battery's AC flow; "
+    "map grid.power_entity and a battery flow role, or set solar.capacity_wp explicitly"
+)
+#: The learned array size is cached (refit at most daily): 56 days of recorder history for the meter
+#: and the battery is not something to fetch on every 30-minute forecast refresh.
+DERIVED_KIND = "solar_derived"
+DERIVED_PROFILE_KEY = "capacity"
+DERIVED_REFIT_HOURS = 24.0
 
 
 def _declination_rad(day_of_year: int) -> float:
@@ -662,6 +683,40 @@ def _capacity_geometry(settings: Any) -> tuple[float, float, bool, bool]:
     return tilt_deg, azimuth_deg, tilt_assumed, azimuth_assumed
 
 
+def _location_or_error(
+    settings: Any,
+    client: Any,
+    *,
+    status: ProviderStatus,
+    forecast: SolarForecast,
+) -> tuple[float, float, str] | None:
+    """Resolve ``(lat, lon, tz)`` or record a status/note and return None (never raises)."""
+    if client is not None:
+        from ..config import resolve_location
+        from ..harest import HAError
+
+        options = {
+            "latitude_override": settings.get("latitude_override"),
+            "longitude_override": settings.get("longitude_override"),
+            "timezone": settings.get("timezone"),
+        }
+        try:
+            return resolve_location(client.get_config(), options)
+        except HAError as err:
+            status.ok = False
+            status.last_error = f"Home Assistant unreachable: {err}"
+            forecast.stale = True
+            forecast.notes.append(status.last_error)
+            return None
+        except ConfigError:
+            pass
+    status.ok = False
+    status.last_error = "location unavailable: set the overrides or expose /api/config"
+    forecast.stale = True
+    forecast.notes.append(status.last_error)
+    return None
+
+
 def _capacity_forecast(
     settings: Any,
     store: Any,
@@ -671,12 +726,15 @@ def _capacity_forecast(
     forecast: SolarForecast,
     moment: datetime,
     location: tuple[float, float, str] | None,
+    origin: str = "solar.capacity_wp",
 ) -> tuple[SolarForecast, ProviderStatus]:
     """Estimate production from ``solar.capacity_wp`` (SPEC.md section 7.1.1).
 
     Never raises and never guesses a capacity: a missing one is an empty forecast plus a status
     that names ``solar.capacity_wp``, because the bias correction may only adjust a forecast that
-    already exists.
+    already exists. ``origin`` names where the watt peak came from in the notes and the status
+    detail; the derived source (SPEC.md 7.1.2) passes its learned value through
+    :class:`_CapacityOverlay`.
     """
     try:
         capacity_wp = float(settings.get("solar.capacity_wp") or 0.0)
@@ -689,31 +747,10 @@ def _capacity_forecast(
         forecast.notes.append(status.last_error)
         return forecast, status
 
-    if location is None and client is not None:
-        from ..config import resolve_location
-        from ..harest import HAError
-
-        options = {
-            "latitude_override": settings.get("latitude_override"),
-            "longitude_override": settings.get("longitude_override"),
-            "timezone": settings.get("timezone"),
-        }
-        try:
-            location = resolve_location(client.get_config(), options)
-        except HAError as err:
-            status.ok = False
-            status.last_error = f"Home Assistant unreachable: {err}"
-            forecast.stale = True
-            forecast.notes.append(status.last_error)
-            return forecast, status
-        except ConfigError:
-            location = None
     if location is None:
-        status.ok = False
-        status.last_error = "location unavailable: set the overrides or expose /api/config"
-        forecast.stale = True
-        forecast.notes.append(status.last_error)
-        return forecast, status
+        location = _location_or_error(settings, client, status=status, forecast=forecast)
+        if location is None:
+            return forecast, status
 
     latitude, longitude, timezone_name = location
     zone = _zone(timezone_name)
@@ -729,7 +766,7 @@ def _capacity_forecast(
     weather_entity = str(settings.get("solar.weather_entity", "") or "").strip()
     cloud_map, cloud_note = _slot_cloud_map(client, weather_entity, zone, grid)
 
-    forecast.notes.append(f"capacity estimate: {capacity_wp:g} Wp from solar.capacity_wp")
+    forecast.notes.append(f"capacity estimate: {capacity_wp:g} Wp from {origin}")
     if tilt_assumed and azimuth_assumed:
         forecast.notes.append(ASSUMED_GEOMETRY_NOTE)
     elif tilt_assumed:
@@ -786,6 +823,7 @@ def _capacity_forecast(
     status.detail.update(
         {
             "capacity_wp": capacity_wp,
+            "capacity_source": origin,
             "tilt_deg": tilt_deg,
             "azimuth_deg": azimuth_deg,
             "assumed_tilt": tilt_assumed,
@@ -805,6 +843,210 @@ def _capacity_forecast(
 # --------------------------------------------------------------------------------------------
 
 
+class _CapacityOverlay:
+    """Settings proxy that pins ``solar.capacity_wp`` to the derived source's learned value."""
+
+    def __init__(self, settings: Any, capacity_wp: float) -> None:
+        self._settings = settings
+        self._overrides = {"solar.capacity_wp": capacity_wp}
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._overrides:
+            return self._overrides[key]
+        return self._settings.get(key, default)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._settings, name)
+
+
+def _implied_capacity_wp(
+    latitude: float,
+    longitude: float,
+    zone: timezone | ZoneInfo,
+    samples: Sequence[tuple[datetime, float]],
+    settings: Any,
+) -> tuple[float, int]:
+    """Array size (Wp) implied by meter-derived PV samples: the upper envelope of pv / model.
+
+    Every sample is divided by the clear-sky model's output *per installed watt* at that moment,
+    with the same tilt/azimuth assumptions and performance ratio the forecast uses, and the
+    ``DERIVED_ENVELOPE_QUANTILE`` of those ratios is the array size: overcast hours pull the ratio
+    down, so the top of the distribution is the cloudless estimate. Returns ``(0.0, usable)`` when
+    there is not enough daylight to fit.
+    """
+    tilt_deg, azimuth_deg, _, _ = _capacity_geometry(settings)
+    try:
+        performance_ratio = float(settings.get("solar.performance_ratio", 0.85) or 0.85)
+    except (TypeError, ValueError):
+        performance_ratio = 0.85
+    ratios: list[float] = []
+    for stamp, pv_kw in samples:
+        poa = _plane_irradiance(latitude, longitude, stamp, zone, tilt_deg, azimuth_deg)
+        per_wp_kw = (poa / 1000.0) * performance_ratio / 1000.0
+        if per_wp_kw <= DERIVED_MIN_MODEL_KW_PER_WP:
+            continue
+        ratios.append(float(pv_kw) / per_wp_kw)
+    if len(ratios) < DERIVED_MIN_SAMPLES:
+        return 0.0, len(ratios)
+    ratios.sort()
+    index = min(len(ratios) - 1, int(round(DERIVED_ENVELOPE_QUANTILE * (len(ratios) - 1))))
+    return max(0.0, ratios[index]), len(ratios)
+
+
+def _derived_cache(
+    store: Any, fingerprint: str, moment: datetime
+) -> dict[str, Any] | None:
+    """The cached learned watt peak, when it is fresh and was fitted from the same entity mapping."""
+    if store is None:
+        return None
+    got = store.profile_get(DERIVED_KIND, DERIVED_PROFILE_KEY)
+    if not got or not isinstance(got[1], Mapping):
+        return None
+    updated_at, payload = got
+    if payload.get("fingerprint") != fingerprint:
+        return None
+    if updated_at is not None:
+        try:
+            age_hours = (moment - updated_at).total_seconds() / 3600.0
+        except TypeError:  # a naive timestamp cannot be trusted: refit instead of crashing
+            age_hours = DERIVED_REFIT_HOURS + 1.0
+        if age_hours > DERIVED_REFIT_HOURS:
+            return None
+    try:
+        capacity_wp = float(payload["capacity_wp"])
+        samples = int(payload["samples"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if capacity_wp <= 0.0 or samples < DERIVED_MIN_SAMPLES:
+        return None
+    return {"capacity_wp": capacity_wp, "samples": samples, "updated_at": payload.get("updated_at")}
+
+
+def _store_derived_capacity(
+    store: Any, fingerprint: str, capacity_wp: float, samples: int, moment: datetime
+) -> None:
+    if store is None:
+        return
+    store.profile_put(
+        DERIVED_KIND,
+        DERIVED_PROFILE_KEY,
+        {
+            "capacity_wp": round(capacity_wp, 1),
+            "samples": samples,
+            "fingerprint": fingerprint,
+            "updated_at": to_iso(moment),
+        },
+        moment,
+    )
+
+
+def _derived_forecast(
+    settings: Any,
+    store: Any,
+    client: Any,
+    *,
+    status: ProviderStatus,
+    forecast: SolarForecast,
+    moment: datetime,
+    location: tuple[float, float, str] | None,
+) -> tuple[SolarForecast, ProviderStatus]:
+    """Learn the array from the meter, then forecast with the capacity model (SPEC.md 7.1.2).
+
+    Nothing is written back to the settings: the learned watt peak is stated in the notes and the
+    status detail (``capacity_source``, ``derived_samples``), and ``solar.capacity_wp`` overrides
+    it. The fit itself is cached per entity mapping and refit at most daily, because it reads weeks
+    of recorder history. A meter that never exports, or a battery whose flow cannot be read, is a
+    status, not a crash.
+    """
+    from .load import collect_pv_export_samples, pv_export_roles
+
+    if client is None:
+        status.ok = False
+        status.detail["reason"] = "no Home Assistant client"
+        status.last_error = "the derived solar source needs the Home Assistant connection for history"
+        forecast.notes.append(status.last_error)
+        return forecast, status
+    # An explicit watt peak wins over the learned one (the same "explicit beats derived" rule the
+    # load tier follows): the meter then only has to be right about the export moments.
+    try:
+        explicit_wp = float(settings.get("solar.capacity_wp") or 0.0)
+    except (TypeError, ValueError):
+        explicit_wp = 0.0
+    if explicit_wp > 0.0:
+        forecast.notes.append(
+            f"solar.capacity_wp is set ({explicit_wp:g} Wp), so the meter-derived estimate is not used"
+        )
+        return _capacity_forecast(
+            settings,
+            store,
+            client,
+            status=status,
+            forecast=forecast,
+            moment=moment,
+            location=location,
+        )
+    roles, refusal = pv_export_roles(settings)
+    if refusal:
+        status.ok = False
+        status.detail["reason"] = "no usable meter/battery mapping"
+        status.last_error = f"meter-derived solar: {refusal}"
+        forecast.notes.append(status.last_error)
+        return forecast, status
+    fingerprint = "|".join(f"{role}={roles[role]}" for role in sorted(roles))
+    cached = _derived_cache(store, fingerprint, moment)
+    if cached is not None:
+        capacity_wp, usable, origin_note = (
+            float(cached["capacity_wp"]),
+            int(cached["samples"]),
+            "cached daily fit",
+        )
+    else:
+        samples, reason = collect_pv_export_samples(settings, client, now=moment, roles=roles)
+        if not samples:
+            status.ok = False
+            status.detail["reason"] = "no export samples"
+            status.last_error = f"meter-derived solar: {reason or DERIVED_NO_HISTORY_ERROR}"
+            forecast.notes.append(status.last_error)
+            return forecast, status
+        if location is None:
+            location = _location_or_error(settings, client, status=status, forecast=forecast)
+            if location is None:
+                return forecast, status
+        latitude, longitude, timezone_name = location
+        zone = _zone(timezone_name)
+        capacity_wp, usable = _implied_capacity_wp(latitude, longitude, zone, samples, settings)
+        if capacity_wp <= 0.0 or usable < DERIVED_MIN_SAMPLES:
+            status.ok = False
+            status.detail["reason"] = "not enough daylight export samples"
+            status.last_error = (
+                f"meter-derived solar: only {usable} usable daylight export samples in the window "
+                f"(need {DERIVED_MIN_SAMPLES}); the meter has to export for the array to be visible"
+            )
+            forecast.notes.append(status.last_error)
+            return forecast, status
+        _store_derived_capacity(store, fingerprint, capacity_wp, usable, moment)
+        origin_note = "fresh fit"
+    if location is None:
+        location = _location_or_error(settings, client, status=status, forecast=forecast)
+        if location is None:
+            return forecast, status
+    overlay = _CapacityOverlay(settings, capacity_wp)
+    forecast, status = _capacity_forecast(
+        overlay,
+        store,
+        client,
+        status=status,
+        forecast=forecast,
+        moment=moment,
+        location=location,
+        origin=f"the meter's export moments ({usable} samples, {origin_note})",
+    )
+    if status.ok:
+        forecast.notes.append(DERIVED_PV_NOTE)
+        status.detail.update({"derived_samples": usable, "derived_from": "meter export"})
+    return forecast, status
+
+
 def _plane_cache_key(latitude: float, longitude: float, tilt: float, azimuth: float, plane: Mapping[str, Any]) -> str:
     raw = f"{latitude:.4f}|{longitude:.4f}|{tilt:g}|{azimuth:g}|{float(plane['kwp']):g}|{plane.get('damping')}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -822,7 +1064,7 @@ def load_solar_forecast(
     """Build the PV forecast, or an empty forecast plus a status explaining why not."""
     moment = now or utcnow()
     source = str(settings.get("solar.source", "forecast_solar") or "forecast_solar")
-    if source == "capacity":
+    if source in ("capacity", "derived"):
         status = ProviderStatus(kind="solar", name=source, active=True)
         forecast = SolarForecast(generated_at=moment, source=source)
         if not bool(settings.get("solar.enabled", True)):
@@ -831,6 +1073,16 @@ def load_solar_forecast(
             status.detail["reason"] = "disabled"
             forecast.notes.append("solar forecasting is disabled")
             return forecast, status
+        if source == "derived":
+            return _derived_forecast(
+                settings,
+                store,
+                client,
+                status=status,
+                forecast=forecast,
+                moment=moment,
+                location=location,
+            )
         return _capacity_forecast(
             settings,
             store,

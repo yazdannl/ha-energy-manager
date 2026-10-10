@@ -639,16 +639,19 @@ def test_config_get_masks_secrets_and_publishes_metadata():
     # the enumerated settings carry their choices
     assert "off" in next(r for r in body["settings"] if r["key"] == "mode")["choices"]
     assert next(r for r in body["settings"] if r["key"] == "notify.events")["type"] == "list"
-    # hardware-moving keys are grouped for the confirmation step (SPEC 10)
+    # hardware-moving keys are grouped for the confirmation step (SPEC 10); the control-loop tuning
+    # knobs live in the foldable Control group, the fail-safe stays in the never-folding Safety group
     security_group = {
         r["key"]: r["group"] for r in body["settings"] if r["key"].startswith("control.")
     }
-    assert set(security_group.values()) == {"Safety"}
+    assert set(security_group.values()) == {"Control", "Safety"}
+    assert security_group["control.failsafe_on_error"] == "Safety"
+    assert security_group["control.tick_seconds"] == "Control"
     for key in (
         "optimizer.max_grid_import_w",
+        "optimizer.max_grid_export_w",
         "optimizer.reserve_soc_pct",
         "optimizer.allow_export",
-        "optimizer.target_soc_pct_end",
     ):
         assert next(r for r in body["settings"] if r["key"] == key)["group"] == "Safety"
 
@@ -661,13 +664,19 @@ def test_config_rows_carry_the_advanced_folding_flag():
     assert rows["price.source"]["advanced"] is True
     assert rows["batteries"]["advanced"] is True
     assert rows["grid.import_entity"]["advanced"] is True
+    assert rows["price.contract"]["advanced"] is True
     assert rows["mode"]["advanced"] is False
     assert rows["price.provider"]["advanced"] is False
     assert rows["grid.power_entity"]["advanced"] is False
+    assert rows["price.feed_in_energy_tax_refund"]["advanced"] is False
     # every row is classified and the group override is untouched by the flag
     assert all(isinstance(row["advanced"], bool) for row in rows.values())
     assert rows["price.source"]["group"] == "Price" and rows["price.source"]["label"] == "Price source"
-    assert all(row["group"] == "Safety" for row in rows.values() if row["key"].startswith("control."))
+    assert rows["control.failsafe_on_error"]["group"] == "Safety"
+    assert all(
+        row["group"] == "Control" for row in rows.values()
+        if row["key"].startswith("control.") and row["key"] != "control.failsafe_on_error"
+    )
 
 
 def test_config_catalogue_matches_defaults_exactly():

@@ -298,17 +298,19 @@
         Object.assign({ entity_id: "sensor.example_sensor_bank_capacity", name: "Example sensor bank capacity", unit: "kWh", device_class: "energy_storage", state: "5.0", platform: "example_integration", suggested_role: "capacity", confidence: 0.8, min: null, max: null }, DEVICE_SENSORS)
       ],
       price: [
-        { entity_id: "sensor.example_price_now", name: "Example dynamic price forecast", unit: "EUR/kWh", device_class: "monetary", state: "0.2140", platform: "example_integration", suggested_role: "price.entity", confidence: 0.81 }
+        { entity_id: "sensor.example_price_now", name: "Example dynamic price forecast", unit: "EUR/kWh", device_class: "monetary", state: "0.2140", platform: "example_integration", suggested_role: "price_now", confidence: 0.81, setting_key: "price.entity" }
       ],
       solar: [
-        { entity_id: "sensor.example_pv_power", name: "Example PV power", unit: "W", device_class: "power", state: "2450", platform: "example_integration", suggested_role: "solar.measured_entity", confidence: 0.88 }
+        { entity_id: "sensor.example_pv_power", name: "Example PV power", unit: "W", device_class: "power", state: "2450", platform: "example_integration", suggested_role: "pv_power", confidence: 0.88, setting_key: "solar.measured_entity" },
+        { entity_id: "sensor.example_pv_energy_today", name: "Example PV energy today", unit: "kWh", device_class: "energy", state: "7.4", platform: "example_integration", suggested_role: "pv_energy", confidence: 0.7, setting_key: "solar.measured_entity" }
       ],
       load: [
-        { entity_id: "sensor.example_load_power", name: "Example household load power", unit: "W", device_class: "power", state: "810", platform: "example_integration", suggested_role: "load.entity", confidence: 0.9 },
-        { entity_id: "sensor.example_outdoor_temperature", name: "Example outdoor temperature", unit: "°C", device_class: "temperature", state: "11.5", platform: "example_integration", suggested_role: "load.temperature_entity", confidence: 0.62 }
+        { entity_id: "sensor.example_load_power", name: "Example household load power", unit: "W", device_class: "power", state: "810", platform: "example_integration", suggested_role: "load_power", confidence: 0.9, setting_key: "load.entity" },
+        { entity_id: "sensor.example_outdoor_temperature", name: "Example outdoor temperature", unit: "°C", device_class: "temperature", state: "11.5", platform: "example_integration", suggested_role: "temperature", confidence: 0.62, setting_key: "load.temperature_entity" }
       ],
       grid: [
-        { entity_id: "sensor.example_grid_power", name: "Example grid power", unit: "W", device_class: "power", state: "-1640", platform: "example_integration", suggested_role: "grid.entity", confidence: 0.85 }
+        { entity_id: "sensor.example_grid_power", name: "Example grid power", unit: "W", device_class: "power", state: "-1640", platform: "example_integration", suggested_role: "grid_power", confidence: 0.85, setting_key: "grid.power_entity" },
+        { entity_id: "sensor.example_export_power", name: "Example grid export power", unit: "W", device_class: "power", state: "1640", platform: "example_integration", suggested_role: "grid_export", confidence: 0.72, setting_key: "grid.export_entity" }
       ]
     };
     return all[kind] || [];
@@ -330,7 +332,7 @@
     ["longitude_override", "str", null, "Longitude override", "Unset = read from HA.", "general", null],
 
     ["price.provider", "str", "entity", "Price provider", "Where prices come from. entity = a sensor you pick (advanced); zonneplan = the Zonneplan integration's tariff sensor found in Home Assistant; day_ahead = energy_charts wholesale day-ahead prices for the bidding zone; fixed = a flat or day/night tariff.", "price", ["entity", "zonneplan", "day_ahead", "fixed"]],
-    ["price.contract", "str", "dynamic_hourly", "Contract type", "dynamic_quarter_hourly / dynamic_hourly = market prices per quarter hour or per hour; fixed_single = one rate all day; fixed_day_night = two rates split by the day window below. Wholesale providers need the VAT, energy tax and fee fields to become consumer prices.", "price", ["dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night"]],
+    ["price.contract", "str", "dynamic_hourly", "Contract type", "dynamic_quarter_hourly / dynamic_hourly = market prices per quarter hour or per hour; fixed_single = one rate all day; fixed_day_night = two rates split by the day window below. Dynamic providers pick their own grid, so this only matters for a fixed tariff.", "price", ["dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night"]],
     ["price.source", "str", "zonneplan_entity", "Price source", "Only used by the entity provider: configured source with fallback to energy_charts then static.", "price", ["zonneplan_entity", "energy_charts", "entity_forecast", "static"]],
     ["price.entity", "str", "", "Price entity", "Runtime-picked HA sensor entity id.", "price", null],
     ["price.fixed_price_eur_per_kwh", "float", null, "Fixed rate", "Consumer price incl. VAT and tax, EUR/kWh. Unset = read the entity below.", "price", null],
@@ -343,18 +345,19 @@
     ["price.fixed_night_start_hour", "int", 23, "Night starts at", "Local hour the night rate starts, 0-23.", "price", null],
     ["price.static_schedule", "json", [], "Static price schedule", "List of {from_hour,to_hour,price_eur_per_kwh,days}.", "price", null],
     ["price.import_fee_eur_per_kwh", "float", 0.0, "Import fee", "Supplier markup on buy, EUR/kWh.", "price", null],
-    ["price.export_fee_eur_per_kwh", "float", 0.0, "Export fee", "Deduction on sell, EUR/kWh.", "price", null],
+    ["price.export_fee_eur_per_kwh", "float", 0.0, "Feed-in cost", "Deducted per kWh from the feed-in price; default 0.", "price", null],
     ["price.vat_pct", "float", 21.0, "VAT %", "Applied when a source publishes ex-VAT prices.", "price", null],
     ["price.energy_tax_eur_per_kwh", "float", 0.0, "Energy tax", "Applied when a source publishes ex-tax prices.", "price", null],
     ["price.unit", "str", "auto", "Declared unit", "auto = use the provider's declared unit.", "price", ["auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh"]],
     ["price.scale_divisor", "float", 1.0, "Scale divisor", "For providers publishing fixed-point integers.", "price", null],
     ["price.bzn", "str", "NL", "Bidding zone", "energy_charts zone, e.g. NL, DE-LU.", "price", null],
-    ["price.feed_in_eur_per_kwh", "float", null, "Feed-in tariff", "EUR/kWh received for export, net of the export fee. Unset = sell price unknown.", "price", null],
-    ["price.feed_in_entity", "str", "", "Feed-in price entity", "HA sensor with the current feed-in price; overrides the flat tariff.", "price", null],
-    ["price.feed_in_tax_inclusive", "bool", true, "Feed-in incl. VAT", "Off = add price.vat_pct to the feed-in price.", "price", null],
+    ["price.feed_in_eur_per_kwh", "float", null, "Flat feed-in price", "Explicit EUR/kWh received; overrides the derived feed-in price.", "price", null],
+    ["price.feed_in_entity", "str", "", "Feed-in price entity", "HA sensor with the current feed-in price; overrides the derived and flat feed-in prices.", "price", null],
+    ["price.feed_in_tax_inclusive", "bool", true, "Feed-in incl. VAT", "For the flat tariff/entity only: off = add price.vat_pct to the value.", "price", null],
+    ["price.feed_in_energy_tax_refund", "bool", true, "Energy tax refunded", "On = feed-in pays the same consumer price you buy at, minus the feed-in cost. Off = the energy-tax component is not paid back and is subtracted too.", "price", null],
 
     ["solar.enabled", "bool", true, "Solar forecast", "Enable the PV forecast.", "solar", null],
-    ["solar.source", "str", "forecast_solar", "Solar source", "forecast_solar = the Forecast.Solar API (needs planes); capacity = estimate from the array's watt peak, for AC-coupled arrays whose geometry you do not want to model.", "solar", ["forecast_solar", "capacity"]],
+    ["solar.source", "str", "forecast_solar", "Solar source", "forecast_solar = the Forecast.Solar API (needs planes); capacity = estimate from the array's watt peak; derived = learn the array from the meter's export moments minus what the battery was charging, no numbers to enter.", "solar", ["forecast_solar", "capacity", "derived"]],
     ["solar.planes", "json", [], "PV planes", "forecast_solar only. List of {kwp, tilt_deg, azimuth_deg (compass: 0=north), damping}.", "solar", null],
     ["solar.api_key", "password", "", "Forecast.Solar key", "forecast_solar only. Optional personal key; keyless is single-plane hourly.", "solar", null],
     ["solar.bias_correction", "bool", true, "Bias correction", "Learn a multiplicative correction from measured PV.", "solar", null],
@@ -441,7 +444,7 @@
 
   // Mirrors api.py `_descriptor_row`: keys flagged by the backend's own safety regex land in a
   // dedicated "Safety" group; the rest are Title-cased topic names.
-  var MOCK_BACKEND_SAFETY_RE = /(reserve_soc_pct|max_grid_import_w|max_grid_export_w|target_soc_pct_end|allow_grid_charge|allow_export|min_spread_eur_per_kwh|^control\.)/;
+  var MOCK_BACKEND_SAFETY_RE = /^(optimizer\.(reserve_soc_pct|max_grid_import_w|max_grid_export_w|allow_export)|control\.failsafe_on_error)$/;
   function descriptorGroup(key, group) {
     if (MOCK_BACKEND_SAFETY_RE.test(key)) return "Safety";
     return group.charAt(0).toUpperCase() + group.slice(1);
@@ -452,15 +455,23 @@
   // group is visible regardless of the flag, and a label never carries a manual "(advanced)"
   // suffix — folding is the only signal.
   var ADVANCED_KEYS = [
-    "currency", "timezone", "latitude_override", "longitude_override", "batteries",
-    "price.source", "price.entity", "price.unit", "price.scale_divisor", "price.vat_pct",
-    "price.energy_tax_eur_per_kwh", "price.import_fee_eur_per_kwh", "price.export_fee_eur_per_kwh",
-    "price.fixed_price_entity", "price.fixed_day_price_entity", "price.fixed_night_price_entity",
-    "price.fixed_day_start_hour", "price.fixed_night_start_hour", "price.static_schedule",
-    "price.feed_in_entity", "solar.performance_ratio", "solar.weather_entity", "solar.planes",
-    "solar.api_key", "load.temperature_entity", "grid.import_entity", "grid.export_entity",
-    "notify.events", "notify.persistent", "optimizer.slot_minutes", "optimizer.power_steps",
-    "optimizer.soc_step_kwh", "optimizer.salvage_multiplier"
+    "batteries", "control.grid_follow",
+    "control.grid_follow_deadband_w", "control.grid_follow_max_ratio",
+    "control.grid_follow_max_w", "control.replan_minutes", "control.stale_plan_seconds",
+    "control.stale_state_seconds", "control.tick_seconds", "currency", "grid.export_entity",
+    "grid.import_entity", "latitude_override", "load.base_kwh_per_day", "load.entity",
+    "load.mode", "load.temperature_entity", "log_level", "longitude_override", "notify.events",
+    "notify.mobile_service", "notify.persistent", "optimizer.power_steps",
+    "optimizer.salvage_multiplier", "optimizer.slot_minutes", "optimizer.soc_step_kwh",
+    "optimizer.target_soc_pct_end", "price.bzn", "price.contract",
+    "price.energy_tax_eur_per_kwh", "price.entity", "price.feed_in_entity",
+    "price.feed_in_eur_per_kwh", "price.feed_in_tax_inclusive", "price.fixed_day_price_entity",
+    "price.fixed_day_start_hour", "price.fixed_night_price_entity",
+    "price.fixed_night_start_hour", "price.fixed_price_entity", "price.import_fee_eur_per_kwh",
+    "price.scale_divisor", "price.source", "price.static_schedule", "price.unit",
+    "price.vat_pct", "solar.api_key", "solar.azimuth_deg", "solar.bias_correction",
+    "solar.capacity_wp", "solar.performance_ratio", "solar.planes", "solar.tilt_deg",
+    "solar.weather_entity", "timezone"
   ];
 
   function settingDescriptors() {
@@ -808,7 +819,14 @@
       };
     },
     "GET /api/v1/discover": function (ctx) {
-      return { candidates: discoveryCandidates(ctx.params.kind || "battery").slice(0, 50) };
+      var rows = discoveryCandidates(ctx.params.kind || "battery");
+      var needle = String(ctx.params.search || "").trim().toLowerCase();
+      if (needle) {
+        rows = rows.filter(function (row) {
+          return (row.entity_id + " " + (row.name || "") + " " + (row.platform || "") + " " + (row.suggested_role || "")).toLowerCase().indexOf(needle) >= 0;
+        });
+      }
+      return { candidates: rows.slice(0, 50) };
     },
     "GET /api/v1/config": function () {
       return {

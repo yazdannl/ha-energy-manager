@@ -254,6 +254,10 @@ class PriceSlot:
     source: str = "unknown"
     is_actual: bool = False
     stale: bool = False
+    # Energy-tax component of ``buy`` in EUR/kWh, when the provider publishes a tax-excluded price
+    # next to it (Zonneplan does; wholesale sources get the configured adder). The derived feed-in
+    # price subtracts it when the contract does not pay the energy tax back (SPEC.md section 4).
+    energy_tax: float = 0.0
 
 
 @dataclass

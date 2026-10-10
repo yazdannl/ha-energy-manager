@@ -187,17 +187,18 @@ price.source              zonneplan_entity | energy_charts | entity_forecast | s
 price.entity              entity id of the price sensor (runtime-picked, stored in DB only)
 price.static_schedule     list of {from_hour, to_hour, price_eur_per_kwh, days}
 price.import_fee_eur_per_kwh   0.0   # supplier markup added on buy
-price.export_fee_eur_per_kwh   0.0   # deduction applied on sell
+price.export_fee_eur_per_kwh   0.0   # feed-in cost: deducted from the sell price (derived feed-in)
 price.vat_pct             21.0       # applied when a source yields ex-VAT prices
 price.energy_tax_eur_per_kwh   0.0   # applied when a source yields ex-tax prices
-price.feed_in_eur_per_kwh  null  # flat feed-in tariff received, net of the export fee; null = sell unknown
+price.feed_in_eur_per_kwh  null  # explicit flat feed-in tariff; null = derive it from the buy price
 price.feed_in_entity       ""    # optional HA sensor with the live feed-in price (overrides the flat tariff)
-price.feed_in_tax_inclusive true  # false = add price.vat_pct to the feed-in price
+price.feed_in_tax_inclusive true  # false = add price.vat_pct to the flat tariff/entity value
+price.feed_in_energy_tax_refund true  # false = the energy-tax component is not paid back on feed-in
 price.unit               auto|eur_per_kwh|eur_per_mwh|micro_eur_per_kwh
 price.scale_divisor      1.0   # fixed-point divisor for providers publishing integers (per source)
 price.bzn                NL    # bidding zone for the energy_charts day-ahead source
 solar.enabled            true
-solar.source             forecast_solar
+solar.source             forecast_solar|capacity|derived   # derived = learn the array from the meter (§7.1.2)
 solar.planes             []   # [{kwp, tilt_deg, azimuth_deg, damping}]
 solar.api_key            ""   # optional forecast.solar personal key (raises rate limits, enables multi-plane)
 solar.bias_correction    true # learn multiplicative correction from measured PV
@@ -263,9 +264,9 @@ All internal prices are **EUR/kWh, tax included, buy side**; sell prices are **E
 (feed-in compensation net of fees). Providers normalise into that shape and record `raw_unit` plus
 the normalisation applied in the plan payload so the UI can explain a number.
 
-`PriceForecast` = ordered list of `PriceSlot(t, buy, sell, source, is_actual)`, 15-minute resolution,
-covering at least `now` → `now + horizon_hours`; slots are gap-free and future-filled by the last
-known value with `is_actual=False` and a `stale` flag so the UI can grey it out.
+`PriceForecast` = ordered list of `PriceSlot(t, buy, sell, source, is_actual, energy_tax)`, 15-minute
+resolution, covering at least `now` → `now + horizon_hours`; slots are gap-free and future-filled by
+the last known value with `is_actual=False` and a `stale` flag so the UI can grey it out.
 
 Unit handling: providers declare their own unit and, when they publish fixed-point integers, their
 `scale_divisor`; `models.eur_per_kwh_from_raw` does the conversion. Magnitude-based guessing is
@@ -321,6 +322,30 @@ the UI must be able to say so.
 A provider/contract combination outside the table above is a **warning, not a failure**: it is
 reported as `price_warnings` in `/api/v1/config` and the engine keeps the configured provider, because
 refusing to plan is worse than planning with a stated mismatch.
+
+### 4.2 Feed-in price (0.6.0)
+
+The sell price is **EUR/kWh received**. It resolves in this order, once per forecast, in
+`_apply_feed_in`:
+
+1. `price.feed_in_entity` — a live HA sensor (its declared unit), plus `price.vat_pct` when
+   `price.feed_in_tax_inclusive` is off.
+2. `price.feed_in_eur_per_kwh` — a flat tariff, same VAT rule.
+3. **Derived** (the default, and what the setup card shows): `sell = buy − price.export_fee_eur_per_kwh`
+   (the feed-in cost, default 0), and additionally `− slot.energy_tax` when
+   `price.feed_in_energy_tax_refund` is off (a contract that does not pay the energy tax back on
+   redelivery). This replaces the pre-0.6.0 rule that a sell price is never inferred from the buy
+   price: the Zonneplan consumer price *is* what a saldering contract pays back, and the user states
+   the exceptions (feed-in cost, energy tax not refunded) instead of re-entering a tariff.
+
+`slot.energy_tax` is the energy-tax component of `buy`, filled where the provider publishes both
+sides (Zonneplan's `price_tax_included`/`price_tax_excluded` and
+`electricity_price`/`electricity_price_excl_tax`; the difference is the tax), the configured
+`price.energy_tax_eur_per_kwh` for wholesale sources (exactly the adder the normaliser applied), and
+`0.0` for consumer sensors, where the tax is embedded and unknown. A configured feed-in source that
+cannot be read degrades to the derived price with a note — pricing export must never fail the buy
+forecast — and only an explicit `price.feed_in_eur_per_kwh = 0` forces a zero sell price.
+`optimizer.allow_export` still defaults to off, so nothing exports until the user asks for it.
 
 ---
 
@@ -454,6 +479,34 @@ low - the setting's help text and the forecast note both say so.
 
 A missing capacity is a failure with a hint naming `solar.capacity_wp`, never a guess from the array's
 history: the bias correction may only adjust a forecast that already exists.
+
+#### 7.1.2 Meter-derived estimate (`solar.source = derived`, 0.6.0)
+
+An AC-coupled array with no inverter sensor and no geometry to enter can still be estimated, because
+the meter already sees it: whenever the signed grid power is negative the house is exporting, which
+means production exceeds the house load. With the project's sign convention `grid = load − pv + p`
+(§8.1, `p > 0` = charging), the array is producing at least `pv = −grid + p` at that moment.
+
+`load.collect_pv_export_samples` assembles those samples from the same roles the derived load tier
+uses: `grid.power_entity` (or the import/export pair) and, when a battery is configured, its AC flow
+(`charge_power_entity`/`discharge_power_entity`, else the signed `power_setpoint_entity`; a battery
+whose flow cannot be read refuses the tier rather than letting its discharge read as PV). Stamps
+without export carry no information and are skipped; the house load at export moments is *not*
+subtracted (that load is what the PV forecast is needed to learn), so every sample is a lower bound.
+
+`solar.capacity_wp` then learns itself: each sample is divided by the clear-sky model's output per
+installed watt at that timestamp (the §7.1.1 model, with the same tilt/azimuth assumptions and
+performance ratio), and the 90th percentile of those ratios is the array size — overcast hours pull
+the ratio down, so the top of the distribution is the cloudless envelope. At least 24 usable daylight
+samples are required; fewer is a status naming the meter, never a crash. The learned value is stated
+in the notes and in the status detail (`capacity_source`, `derived_samples`); it is not written back
+to the settings, and an explicit `solar.capacity_wp > 0` wins over it (the same "explicit beats
+derived" rule the load tier follows). The fit itself is cached in `learning_profiles`
+(`solar_derived`/`capacity`) with the entity mapping it was fitted from and is refit at most once a
+day, because it reads weeks of recorder history and the array size does not change between refreshes.
+The forecast itself is then the §7.1.1 capacity model, so
+`solar.tilt_deg`, `solar.azimuth_deg`, `solar.performance_ratio` and `solar.weather_entity` apply
+unchanged, and the forecast carries a note that the learned size is a conservative lower bound.
 
 ### 7.2 Load (`sources/load.py`)
 Sources in priority order, all producing 15-minute `LoadForecast` slots with `p10/p50/p90`:
@@ -714,7 +767,11 @@ translation key) plus state attributes. It must never leak the whole entity list
 Candidate rows of every kind carry `entity_id`, `name`, `unit`, `device_class`, `state`, `platform`,
 `suggested_role` and `confidence`. They additionally carry the state attributes `min` and `max` when
 those are finite numbers, and `kind=battery` rows carry the entity's `device_id` plus, when the device
-registry is reachable, `device_name`, `manufacturer` and `model` (all nullable). A battery is a
+registry is reachable, `device_name`, `manufacturer` and `model` (all nullable). Every kind's rows
+also carry `setting_key`: the settings key a confirmed role is saved to (`grid.*` for `grid`,
+`price.entity` for `price`, `solar.measured_entity` for `solar`, `load.entity`/`load.temperature_entity`
+for `load`; null when the role has no settings key). The setup-card pickers use it, so an export-only
+grid sensor is saved to `grid.export_entity` rather than to the card's `grid.power_entity`. A battery is a
 *device*, so these fields are what let the wizard offer a searchable list of batteries instead of
 asking for a hand-typed slug, and prefill real device limits instead of invented ones. These keys are
 additive: a missing device registry, an absent attribute or an older consumer must leave every
@@ -855,7 +912,10 @@ default look. Bootstrap's JavaScript is **not** vendored: interactions stay in `
 
 - Component vocabulary is fixed: existing names (`panel`, `now-card`, `chip`, `badge`, `field`,
   `grid`, `row`, `muted`, `stale`, `btn`, `dialog`) stay in use and are restyled, plus new
-  `settings-rail`, `settings-group`, `disclosure`, `save-bar`, `segmented`, `switch`, `unit-input`.
+  `settings-rail`, `settings-group`, `disclosure`, `save-bar`, `segmented`, `switch`, `unit-input`,
+  and - for the setup cards and their entity pickers - `setup-cards`, `setup-card`, `setup-list`,
+  `picker`, `picker-current`, `picker-search`, `picker-results`, `picker-row`, `picker-text`,
+  `picker-name`, `picker-meta` and `all-settings`.
 - Tokens: the colour-blind-safe palette stays; the `--chart-*` custom properties are a frozen
   interface (`charts.js` reads them through `getComputedStyle`). Dark and light are both first class
   via `data-bs-theme` plus `prefers-color-scheme`, with an explicit user override that persists.
@@ -864,39 +924,53 @@ default look. Bootstrap's JavaScript is **not** vendored: interactions stay in `
 - Accessibility is unchanged and normative: keyboard reachable, visible `:focus-visible` ring,
   `prefers-reduced-motion` honoured, contrast >= 4.5:1, never colour-only, skip link kept.
 
-### 13.2 Progressive disclosure in Settings (frozen)
+### 13.2 Setup cards and the All settings drawer (frozen; amended 0.6.0)
 
-The settings form was a single wall of ~75 fields, and fields that did not apply to the chosen
-source were not rendered at all. It is now grouped and folded instead of truncated:
+The settings form was first a single wall of ~75 fields, then a rail of groups that still showed 55
+essential rows. It now opens on **four setup cards** — Price, Meter, Solar, Battery — each carrying
+only the primary choice of its topic, with everything else one disclosure below in the **All settings
+drawer**:
 
-- **Every** key of `GET /api/v1/config` is rendered exactly once, inside its server-provided group;
-  nothing is dropped because it has its default value.
-- Groups are chosen from a `settings-rail` (one group visible at a time; a horizontal chip strip on
-  narrow screens), with the change count per group so folded edits stay visible.
-- A row whose payload has `advanced: true` sits behind its group's `Advanced (n)` disclosure, which
-  is collapsed by default, remembers its state per group, and can be revealed for every group at once
+- The cards are the default surface. `SEM_APP.setupCardKeys({priceProvider, priceContract,
+  solarSource})` is the pure table of the keys the cards own for the current selection; a card renders
+  only keys that apply (an entity picker for `price.provider=entity`, the bidding zone for `day_ahead`,
+  the fixed rates for a fixed contract, no measured-PV picker when `solar.source=derived`).
+- The drawer holds the existing rail (one group at a time, with the change count per group), the
+  search box, the per-group `Advanced (n)` disclosures and the `Show all advanced` switch, all
+  remembered in localStorage. It is collapsed by default (`sem.settings.allOpen`).
+- **Every** key of `GET /api/v1/config` is rendered exactly once: on a card while the card shows it,
+  otherwise inside its server-provided group. While a search query is active the cards are hidden, so
+  every match is listed once in the drawer.
+- A row whose payload has `advanced: true` sits behind its group's `Advanced (n)` disclosure, which is
+  collapsed by default, remembers its state per group, and can be revealed for every group at once
   with the `Show all advanced` switch (also remembered). Rows in the `Safety` group are never folded.
-- The price/solar visibility tables (source-dependent relevance) still hide fields that cannot apply
-  to the current selection, but a hidden field holding a non-default value is still listed, muted, as
-  "not used by the current selection".
-- Search matches all keys, including folded and hidden ones, and shows the group each match is in.
-- A `save-bar` (sticky) shows how many keys are changed with Save and Revert; navigating away with
-  unsaved changes asks first.
+- Entity pickers ask `GET /api/v1/discover`, list the candidates with a `Use` action and write the
+  row's `setting_key` (falling back to the card's own key); a typed entity id can always be used
+  directly, so a sensor discovery ranks poorly is still reachable.
+- A `save-bar` (sticky, outside the drawer) shows how many keys are changed with Save and Revert;
+  navigating away with unsaved changes asks first.
 
-### 13.3 `advanced` classification (frozen)
+### 13.3 `advanced` classification (frozen; amended 0.6.0)
 
-`_Meta.advanced` (default `False`) travels to the UI as the `advanced` row field. Frozen as advanced:
-`currency`, `timezone`, `latitude_override`, `longitude_override`, `batteries`,
-`price.source`, `price.entity`, `price.unit`, `price.scale_divisor`, `price.vat_pct`,
-`price.energy_tax_eur_per_kwh`, `price.import_fee_eur_per_kwh`, `price.export_fee_eur_per_kwh`,
-`price.fixed_price_entity`, `price.fixed_day_price_entity`, `price.fixed_night_price_entity`,
-`price.fixed_day_start_hour`, `price.fixed_night_start_hour`, `price.static_schedule`,
-`price.feed_in_entity`, `solar.performance_ratio`, `solar.weather_entity`, `solar.planes`,
-`solar.api_key`, `load.temperature_entity`, `grid.import_entity`, `grid.export_entity`,
-`notify.events`, `notify.persistent`, `optimizer.slot_minutes`, `optimizer.power_steps`,
-`optimizer.soc_step_kwh`, `optimizer.salvage_multiplier`. Everything else is essential; the
-`Safety` group is always visible regardless of the flag, and a label never carries a manual
-"(advanced)" suffix - folding is the only signal.
+`_Meta.advanced` (default `False`) travels to the UI as the `advanced` row field, and `config.py` is
+the authority: the test suite asserts the exact set in both directions. The essential (never folded)
+keys are now only the ones the setup cards and the safety group need:
+
+`mode`, `dry_run`, `notify.enabled`, `price.provider`, `price.export_fee_eur_per_kwh`,
+`price.feed_in_energy_tax_refund`, the fixed rates (`price.fixed_price_eur_per_kwh`,
+`price.fixed_day_price_eur_per_kwh`, `price.fixed_night_price_eur_per_kwh`), `grid.power_entity`,
+`solar.enabled`, `solar.source`, `solar.measured_entity`, `optimizer.horizon_hours`,
+`optimizer.cycle_cost_eur_per_kwh`, `optimizer.allow_grid_charge`, `optimizer.min_spread_eur_per_kwh`,
+plus the Safety keys (`optimizer.reserve_soc_pct`, `optimizer.max_grid_import_w`,
+`optimizer.max_grid_export_w`, `optimizer.allow_export`). Everything else is advanced; the `Safety`
+group is always visible regardless of the flag, and a label never carries a manual "(advanced)"
+suffix - folding is the only signal.
+
+`control.*` split in two: the control-loop tuning knobs (`control.tick_seconds`,
+`control.replan_minutes`, `control.grid_follow*`, `control.stale_*`) moved out of the never-folding
+Safety group into a foldable `Control` group, while `control.failsafe_on_error` stays in `Safety`.
+The Safety group is now the five keys that can move hardware or change a hard limit, so "never folded"
+still means what it says.
 
 ### 13.4 UI tests
 
@@ -1103,6 +1177,36 @@ round, with the reason:
   (per-hour EWMA, clamped, decaying) for the refinement. No optimizer change: PV is modelled as
   generation, which is exactly what an AC-coupled array is, and assumed tilt/azimuth are stated in the
   notes rather than silently defaulted.
+
+- **§13.1/§13.2/§13.3 (setup cards; requested 2026-10-11, "the ux is cluttered, we have too many
+  options")** — the settings page opened on a 10-group rail with 55 always-visible rows and nine
+  never-folding `control.*` tuning knobs. It now opens on four setup cards (Price, Meter, Solar,
+  Battery) whose primary choices are a provider select, two searchable entity pickers and a link into
+  the battery wizard, with everything else in a collapsed "All settings" drawer. The essential set
+  shrank from 55 rows to 21 (the card keys, the safety keys and four optimizer policy rows), the
+  `control.*` tuning moved out of `Safety` into a foldable `Control` group, and `SEM_APP.setupCardKeys`
+  is the pure table the render check asserts. The user explicitly chose "4 cards + one All settings
+  drawer" over a setup group in the rail or a separate view, and "fit the existing sun model" over a
+  learned daily shape for the derived solar source below.
+- **§4.2 (derived feed-in price; requested 2026-10-11, "the feed in price is market price + energy
+  tax - feed in cost")** — a sell price had to be entered as a flat tariff or a sensor, otherwise
+  export was worth 0.00 and `optimizer.allow_export` stayed off. The sell price is now derived from
+  the buy price (`sell = buy − price.export_fee_eur_per_kwh`, minus the slot's energy-tax component
+  when `price.feed_in_energy_tax_refund` is off), with the explicit tariff/entity still winning. The
+  user corrected an early misreading of this request: the toggle is about the **energy tax**, not VAT,
+  and the feed-in cost defaults to 0. `PriceSlot` gained the additive `energy_tax` field, filled
+  per slot from the Zonneplan payload's included/excluded pair and otherwise from the configured
+  wholesale adder.
+- **§7.1.2 (meter-derived solar; same request, "we could also estimate from the negative values of
+  our meter minus the battery output")** — `solar.source=derived` learns the array's watt peak from
+  the meter's export moments (`pv = export + battery net charge`, the house load not subtracted, so
+  the sample is a lower bound), takes the 90th percentile of `pv / model-per-watt` as the cloudless
+  envelope, and then runs the existing §7.1.1 capacity model. An explicit `solar.capacity_wp` wins;
+  fewer than 24 usable daylight samples, no export history or an unmappable battery flow is a status,
+  never a crash.
+- **§10 (discovery `setting_key` for every kind)** — the setup-card pickers need to know which
+  settings key a confirmed candidate is saved to, so `price`, `solar` and `load` rows now carry
+  `setting_key` alongside `grid` and `battery` (additive; null when a role has no key).
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

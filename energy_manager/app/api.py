@@ -71,9 +71,12 @@ class ApiError(Exception):
 # outside DEFAULTS ever is (a regression test pins both directions, the UI form depends on it).
 # ---------------------------------------------------------------------------------------------
 
+#: Rows that can move hardware or change a hard limit stay in the never-folding Safety group (SPEC
+#: 13.2). The control-loop tuning knobs live in the foldable Control group instead, so the settings
+#: page can hide them like any other advanced row.
 SAFETY_KEY_RE = re.compile(
-    r"(reserve_soc_pct|max_grid_import_w|max_grid_export_w|target_soc_pct_end|allow_grid_charge"
-    r"|allow_export|min_spread_eur_per_kwh|^control\.)"
+    r"^(optimizer\.(reserve_soc_pct|max_grid_import_w|max_grid_export_w|allow_export)"
+    r"|control\.failsafe_on_error)$"
 )
 UI_TYPES = {
     "choice": "str",

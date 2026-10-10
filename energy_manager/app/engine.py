@@ -98,6 +98,19 @@ GRID_ROLE_SETTINGS: dict[str, str] = {
     "grid_export": "grid.export_entity",
 }
 
+#: Discovery kind -> role -> the settings key the setup picker writes (SPEC 10, additive). The grid
+#: roles keep their own map because the sampler reads it; price/solar/load all feed one key each.
+DISCOVER_ROLE_SETTINGS: dict[str, dict[str, str]] = {
+    "grid": GRID_ROLE_SETTINGS,
+    "price": {"price_now": "price.entity", "price_forecast": "price.entity"},
+    "solar": {"pv_power": "solar.measured_entity", "pv_energy": "solar.measured_entity"},
+    "load": {
+        "load_power": "load.entity",
+        "load_energy": "load.entity",
+        "temperature": "load.temperature_entity",
+    },
+}
+
 
 try:  # WP2A supplies the registry scorer; the engine still loads (with discovery disabled) without it
     from . import haws
@@ -1257,9 +1270,9 @@ class Engine:
                 row["mapping_key"] = driver_registry.role_to_mapping(
                     "zendure", role
                 ) or driver_registry.role_to_mapping("generic", role)
-            elif kind == "grid":
-                # The wizard saves a confirmed grid role into the settings key /config edits.
-                row["setting_key"] = GRID_ROLE_SETTINGS.get(role)
+            elif kind in DISCOVER_ROLE_SETTINGS:
+                # The setup picker saves a confirmed role into this settings key (/config edits).
+                row["setting_key"] = DISCOVER_ROLE_SETTINGS[kind].get(role)
         return found
 
     def _states_map(self) -> dict[str, Any]:

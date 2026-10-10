@@ -916,3 +916,50 @@ tbody tr:hover { background: var(--panel-2); }
 @media print {
   #nav, .topbar, .footer, .btn, .save-bar { display: none; }
 }
+
+/* ---------- setup cards & entity pickers (SPEC 13.2, amended) ---------- */
+/* The settings page opens on four cards; everything else lives in the "All settings" drawer. */
+
+.setup-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--sp-3);
+  align-items: start;
+}
+.setup-card {
+  display: grid;
+  gap: var(--sp-3);
+  align-content: start;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--sp-3);
+}
+.setup-card > h3 { margin: 0; font-size: 0.95rem; }
+.setup-card > .field-help { margin: 0; }
+.setup-list { margin: 0; padding-left: var(--sp-3); display: grid; gap: var(--sp-1); font-size: 0.88rem; }
+.all-settings { margin-top: var(--sp-3); }
+
+.picker { display: grid; gap: var(--sp-2); }
+.picker-current { margin: 0; color: var(--text-muted); font-size: 0.85rem; overflow-wrap: anywhere; }
+.picker-search { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.picker-search input { flex: 1 1 12rem; min-width: 0; }
+.picker-results { display: grid; gap: var(--sp-1); }
+.picker-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.picker-text { min-width: 0; }
+.picker-name { font-size: 0.85rem; }
+.picker-meta {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}

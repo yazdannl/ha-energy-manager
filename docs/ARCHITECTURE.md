@@ -63,10 +63,11 @@ next to it.
 1. **Inputs.** Price, solar and load providers each produce gap-free, 15-minute forecasts covering
    at least the optimizer horizon. A provider that returns no future slots is a failure, not an
    empty forecast; the price chain falls back (configured → energy-charts → static) and raises a
-   visible event naming the source that failed. On the sell side, `price.feed_in_eur_per_kwh` or a
-   `price.feed_in_entity` sensor is the only source of an export price: the buy price is never
-   reused as the sell price, so an install without a feed-in tariff has an unknown sell price and
-   `optimizer.allow_export` stays `false`.
+   visible event naming the source that failed. On the sell side the price is derived by default
+   (`sell = buy − price.export_fee_eur_per_kwh`, minus the slot's energy-tax component when
+   `price.feed_in_energy_tax_refund` is off); an explicit `price.feed_in_eur_per_kwh` or
+   `price.feed_in_entity` sensor wins, and `optimizer.allow_export` stays `false` until the user
+   turns it on.
 2. **Plan.** The optimizer aggregates the enabled batteries into one AC-side store (capacity-weighted
    mean efficiencies, see [Round-trip efficiency](#round-trip-efficiency-input-cost-model-and-plan-reporting))
    and runs a dynamic program over discretised energy for the horizon. The result is a `Plan` with
