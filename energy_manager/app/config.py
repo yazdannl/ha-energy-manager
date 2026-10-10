@@ -47,6 +47,10 @@ DEFAULTS: dict[str, Any] = {
     "latitude_override": None,  # None = read from HA /api/config
     "longitude_override": None,
     # -- price ------------------------------------------------------------------------
+    # Where prices come from and what shape the contract has (SPEC.md 4.1). The add-on resolves the
+    # concrete source from these two; `entity` keeps the pre-0.3.0 explicit path.
+    "price.provider": "entity",
+    "price.contract": "dynamic_hourly",
     "price.source": "zonneplan_entity",
     "price.entity": "",
     "price.static_schedule": [],
@@ -57,6 +61,16 @@ DEFAULTS: dict[str, Any] = {
     "price.unit": "auto",
     "price.scale_divisor": 1.0,
     "price.bzn": "NL",
+    # Fixed tariff (provider=fixed): consumer prices incl. VAT/tax, EUR/kWh. An entity, when set,
+    # wins over the typed value. Unset price = failure, never a guessed or market-derived number.
+    "price.fixed_price_eur_per_kwh": None,
+    "price.fixed_day_price_eur_per_kwh": None,
+    "price.fixed_night_price_eur_per_kwh": None,
+    "price.fixed_price_entity": "",
+    "price.fixed_day_price_entity": "",
+    "price.fixed_night_price_entity": "",
+    "price.fixed_day_start_hour": 7,
+    "price.fixed_night_start_hour": 23,
     # Export tariff (SPEC.md section 4): slot.sell is EUR/kWh *received*, net of fees. Unset
     # feed-in = unknown -> sell 0.00 and no export value, never the buy price.
     "price.feed_in_eur_per_kwh": None,  # None = no flat feed-in tariff configured
@@ -127,6 +141,8 @@ OPTION_OVERRIDE_KEYS = ("mode", "dry_run")
 _MODE_CHOICES = ("off", "advisory", "auto")
 _LOG_CHOICES = ("debug", "info", "warning", "error")
 _PRICE_SOURCE_CHOICES = ("zonneplan_entity", "energy_charts", "entity_forecast", "static")
+_PRICE_PROVIDER_CHOICES = ("entity", "zonneplan", "day_ahead", "fixed")
+_PRICE_CONTRACT_CHOICES = ("dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night")
 _PRICE_UNIT_CHOICES = ("auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh")
 _LOAD_MODE_CHOICES = ("auto", "entity", "derived")
 _NOTIFY_EVENT_CHOICES = (
@@ -172,8 +188,18 @@ SETTINGS_META: dict[str, _Meta] = {
     "timezone": _Meta("str", "general", "Timezone", "Unset = read from HA.", nullable=True),
     "latitude_override": _Meta("float", "general", "Latitude override", "Unset = read from HA.", minimum=-90.0, maximum=90.0, nullable=True),
     "longitude_override": _Meta("float", "general", "Longitude override", "Unset = read from HA.", minimum=-180.0, maximum=180.0, nullable=True),
-    "price.source": _Meta("choice", "price", "Price source", "Configured source with fallback to energy_charts then static.", _PRICE_SOURCE_CHOICES),
-    "price.entity": _Meta("str", "price", "Price entity", "Runtime-picked HA sensor entity id."),
+    "price.provider": _Meta("choice", "price", "Price provider", "Where prices come from. entity = a sensor you pick (advanced); zonneplan = the Zonneplan integration's tariff sensor found in Home Assistant; day_ahead = energy_charts wholesale day-ahead prices for the bidding zone; fixed = a flat or day/night tariff.", _PRICE_PROVIDER_CHOICES),
+    "price.contract": _Meta("choice", "price", "Contract type", "dynamic_quarter_hourly / dynamic_hourly = market prices per quarter hour or per hour; fixed_single = one rate all day; fixed_day_night = two rates split by the day window below. Wholesale providers need the VAT, energy tax and fee fields to become consumer prices.", _PRICE_CONTRACT_CHOICES),
+    "price.source": _Meta("choice", "price", "Price source (advanced)", "Only used by the entity provider: configured source with fallback to energy_charts then static.", _PRICE_SOURCE_CHOICES),
+    "price.entity": _Meta("str", "price", "Price entity (advanced)", "Runtime-picked HA sensor entity id."),
+    "price.fixed_price_eur_per_kwh": _Meta("float", "price", "Fixed rate", "Consumer price incl. VAT and tax, EUR/kWh. Unset = read the entity below.", minimum=-1.0, maximum=5.0, nullable=True),
+    "price.fixed_day_price_eur_per_kwh": _Meta("float", "price", "Day rate", "Consumer price incl. VAT and tax for the day window, EUR/kWh.", minimum=-1.0, maximum=5.0, nullable=True),
+    "price.fixed_night_price_eur_per_kwh": _Meta("float", "price", "Night rate", "Consumer price incl. VAT and tax outside the day window, EUR/kWh.", minimum=-1.0, maximum=5.0, nullable=True),
+    "price.fixed_price_entity": _Meta("str", "price", "Fixed rate entity", "HA sensor holding the consumer price; overrides the typed fixed rate."),
+    "price.fixed_day_price_entity": _Meta("str", "price", "Day rate entity", "HA sensor holding the day rate; overrides the typed day rate."),
+    "price.fixed_night_price_entity": _Meta("str", "price", "Night rate entity", "HA sensor holding the night rate; overrides the typed night rate."),
+    "price.fixed_day_start_hour": _Meta("int", "price", "Day starts at", "Local hour the day rate starts, 0-23.", minimum=0, maximum=23),
+    "price.fixed_night_start_hour": _Meta("int", "price", "Night starts at", "Local hour the night rate starts, 0-23.", minimum=0, maximum=23),
     "price.static_schedule": _Meta("json", "price", "Static price schedule", "List of {from_hour,to_hour,price_eur_per_kwh,days}."),
     "price.import_fee_eur_per_kwh": _Meta("float", "price", "Import fee", "Supplier markup on buy, EUR/kWh.", minimum=-10.0, maximum=10.0),
     "price.export_fee_eur_per_kwh": _Meta("float", "price", "Export fee", "Deduction on sell, EUR/kWh.", minimum=-10.0, maximum=10.0),
@@ -342,6 +368,124 @@ class Settings:
     def _warn_option_conflicts(self) -> None:
         for conflict in self.option_conflicts():
             log.warning("%s", conflict["message"])
+
+    def price_warnings(self) -> list[dict[str, str]]:
+        """Price provider/contract problems for the settings UI (SPEC.md 4.1, GET /api/v1/config).
+
+        Returns a list of ``{"key", "message"}``. A mismatch is a **warning, never a failure**: the
+        engine keeps the configured provider, because refusing to plan is worse than planning with a
+        stated mismatch. Cheap and side-effect free (settings only, no network).
+        """
+        out: list[dict[str, str]] = []
+        provider = str(self.get("price.provider", "entity") or "entity").strip()
+        contract = str(self.get("price.contract", "dynamic_hourly") or "dynamic_hourly").strip()
+        dynamic_contracts = ("dynamic_quarter_hourly", "dynamic_hourly")
+        fixed_contracts = ("fixed_single", "fixed_day_night")
+
+        # 1) provider/contract mismatch (SPEC 4.1 table): dynamic providers take a dynamic
+        #    contract, the fixed provider a fixed one; ``entity`` accepts any.
+        if provider in ("zonneplan", "day_ahead") and contract not in dynamic_contracts:
+            out.append(
+                {
+                    "key": "price.contract",
+                    "message": (
+                        f"price.provider {provider!r} supplies dynamic market prices, but "
+                        f"price.contract is {contract!r}; choose dynamic_quarter_hourly or "
+                        "dynamic_hourly"
+                    ),
+                }
+            )
+        elif provider == "fixed" and contract not in fixed_contracts:
+            out.append(
+                {
+                    "key": "price.contract",
+                    "message": (
+                        "price.provider 'fixed' needs a fixed contract, but price.contract is "
+                        f"{contract!r}; choose fixed_single or fixed_day_night"
+                    ),
+                }
+            )
+
+        # 2) fixed-tariff completeness. A value may come from the typed field or, winning when set,
+        #    its entity; an absent one fails loudly at planning time, so warn here first.
+        if contract == "fixed_single":
+            if not self._has_fixed_price(
+                "price.fixed_price_eur_per_kwh", "price.fixed_price_entity"
+            ):
+                out.append(
+                    {
+                        "key": "price.fixed_price_eur_per_kwh",
+                        "message": (
+                            "fixed_single needs a single rate: set price.fixed_price_eur_per_kwh or "
+                            "price.fixed_price_entity"
+                        ),
+                    }
+                )
+        elif contract == "fixed_day_night":
+            for label, price_key, entity_key in (
+                ("day", "price.fixed_day_price_eur_per_kwh", "price.fixed_day_price_entity"),
+                ("night", "price.fixed_night_price_eur_per_kwh", "price.fixed_night_price_entity"),
+            ):
+                if not self._has_fixed_price(price_key, entity_key):
+                    out.append(
+                        {
+                            "key": price_key,
+                            "message": (
+                                f"fixed_day_night needs a {label} rate: set {price_key} or {entity_key}"
+                            ),
+                        }
+                    )
+            if self._fixed_day_equals_night_start():
+                out.append(
+                    {
+                        "key": "price.fixed_day_start_hour",
+                        "message": (
+                            "price.fixed_day_start_hour equals price.fixed_night_start_hour; the "
+                            "day and night windows would be empty"
+                        ),
+                    }
+                )
+
+        # 3) wholesale day-ahead with no adders configured is not a consumer price (SPEC 4.1): the
+        #    forecast stays ex-VAT/ex-tax unless VAT, energy tax or a fee is set.
+        if provider == "day_ahead" and self._adders_are_zero():
+            out.append(
+                {
+                    "key": "price.vat_pct",
+                    "message": (
+                        "wholesale prices with no adders: this is not a consumer price; set "
+                        "price.vat_pct, price.energy_tax_eur_per_kwh and/or the import/export fees"
+                    ),
+                }
+            )
+        return out
+
+    def _has_fixed_price(self, typed_key: str, entity_key: str) -> bool:
+        if self.get(typed_key) is not None:
+            return True
+        return bool(str(self.get(entity_key, "") or "").strip())
+
+    def _fixed_day_equals_night_start(self) -> bool:
+        try:
+            return int(self.get("price.fixed_day_start_hour")) == int(
+                self.get("price.fixed_night_start_hour")
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _adders_are_zero(self) -> bool:
+        def is_zero(key: str) -> bool:
+            try:
+                return float(self.get(key, 0.0) or 0.0) == 0.0
+            except (TypeError, ValueError):
+                return True
+
+        return (
+            is_zero("price.vat_pct")
+            and is_zero("price.energy_tax_eur_per_kwh")
+            and is_zero("price.import_fee_eur_per_kwh")
+            and is_zero("price.export_fee_eur_per_kwh")
+        )
 
     # -- reads ----------------------------------------------------------------
     def get(self, key: str, default: Any = None) -> Any:

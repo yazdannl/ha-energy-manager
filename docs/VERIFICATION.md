@@ -1,7 +1,7 @@
 # Verification record — Smart Energy Manager add-on
 
 Authoritative verification record for the tree published from this repository. Every number below
-was produced by a gate named in §8 on the frozen tree; nothing here is a projection. This record
+was produced by a gate named in §9 on the frozen tree; nothing here is a projection. This record
 supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figures in previous
 revisions described pre-audit trees and are obsolete.
 
@@ -15,15 +15,15 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **519 passed** (two consecutive runs) |
+| Test suite | `python3 -m pytest tests -q` | **562 passed** (two consecutive runs) |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 85 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
 
-Frozen digest of the verified artifact (recipe in §8, normative):
+Frozen digest of the verified artifact (recipe in §9, normative):
 
 * **code + tests (73 files, documentation excluded)**:
-  `beee73a5e6a5cd555458072d693eb09b15fcd42f9e85e1caabd232ddd8c84b2d`
+  `03e63243939b516f313dc77ba169e688fbe1553556189d3614ac0f5c372285f1`
 * **path list of the same 73 files** (detects an added, removed or renamed file):
   `553c23454f8aa5a3efbac4a327d1341f4b4b61211871ab1d28ec8fbdfb2d6216`
 
@@ -208,7 +208,74 @@ capacity `1.92 kWh`, charge `1000 W`, discharge `800 W`.
 
 ---
 
-## 6. R1 scanner (`tools/audit.sh`)
+## 6. The price provider and contract selection (0.3.0)
+
+The forecast view was empty on the live install and could only say "the source failed or the horizon
+is empty". The price panel was empty for one reason: no price source was configured. That was checked
+before anything was built, by feeding the instance's own Zonneplan payloads into the then-shipped
+provider: both tariff sensors parse correctly (the quarter-hourly list and the hourly one; fixed-point
+÷1e7; the scale check passes against the sensor state), so the source path was never broken. What was
+missing was a way to *choose* a source, and an explanation when a panel cannot be filled. Solar was
+empty because no PV planes are configured, and load because nothing was measured yet.
+
+**Every claim below was checked against the instance's own `/api/states` payload** (1337 entities with
+attributes), not a hand-written fixture. Three scripts, none of them part of the repo:
+
+* provider resolution, 28 checks: the contract picks the grid it names (compared by equality against
+  each live sensor parsed directly, because the two grids hold different prices), the other grid is
+  never used when both exist, the **gas trap** is rejected, fixed single and day/night build the right
+  slots on the local clock, a missing or `unknown` fixed price fails loudly, the warning matrix is
+  right, and `explain_forecast` returns frozen slugs with hints that name something fixable.
+* the frozen HTTP contract, 58 checks: `/api/v1/forecast` carries `provider`, `contract`, `notes`,
+  `reason`, `hint` for a live forecast and for a missing one, `provider` is the configured provider
+  while `source` names the concrete producer, a tax-inclusive source is used **verbatim** (the produced
+  slots equal the payload's own `price_tax_included.amount ÷ 1e7`, so no adders are applied on top),
+  and `/api/v1/config` advertises every new key with title-cased groups and `choice` rendered as
+  `str` + `choices` - the exact shape the UI reads.
+* the frontend helpers, under node against the shipped `app.js`: the empty panel prefers the API hint
+  over the generic sentence and keeps the reason slug, and the provider/contract visibility table
+  shows and hides exactly the fields it should (no entity field for `zonneplan`, bidding zone for
+  `day_ahead`, day/night fields plus hours only for `fixed_day_night`), with every always-visible
+  field present in every combination.
+
+**What only real data showed, and what it changed:**
+
+* the instance's **gas** tariff publishes the identical fixed-point shape, and its state agrees with
+  its single 24 h slot, so the scale check does not reject it. Candidate selection therefore requires a
+  kWh unit *and* at least two entries on a regular 15-minute or hourly grid. `ct/kWh` is accepted and
+  converted; a 30-minute grid is not a contract grid and is rejected.
+* **energy-charts publishes no prices for the NL zone.** Verified directly: `bzn=NL` answers HTTP 404
+  "no content available" while `bzn=FR` answers 200 and an invalid code answers 400. So a valid zone
+  can simply have no data; the 404 is turned into a hint naming the zone and pointing at the
+  alternatives instead of a generic failure, and no third-party API was invented to paper over it.
+* the day-window rule had to be defined for a window that crosses midnight (day start after night
+  start) and for DST: the window is evaluated per slot in the configured timezone, not by counting
+  hours.
+
+**Mutation check on the new resolver** (tests run against a throwaway copy, mutation applied, test file
+run, mutation reverted):
+
+| Mutation | Result |
+| --- | --- |
+| `_select_grid` ignores the contract's preferred grid | **caught** (5 tests) |
+| the fixed provider falls back to the market chain | **caught** |
+| the regular-grid requirement removed (single daily slot accepted) | **caught** (after the gap below was closed) |
+| the kWh-unit requirement removed | **not caught - equivalent mutant**, see below |
+
+The two candidate filters turned out to be mutually redundant for the one gas fixture that existed, so
+neither was actually pinned: removing either left the gas test green because the *other* filter still
+rejected that sensor. Two tests were added, one per filter, each with a candidate that only that filter
+can reject (a coherent state on a regular 15-minute grid whose unit is not in the kWh family; and a kWh
+unit with a single 24-hour slot). The grid filter is now pinned. The unit filter remains an equivalent
+mutant for any realistic input, because a non-kWh unit either fails to parse at all (`EUR/m³`) or is
+already rejected by the state/slot scale check; the filter stays as defence in depth and the test
+records the intent rather than pretending to pin an unobservable branch.
+
+The mutation table in §3 is unchanged; the flakiness note there still applies to the whole suite.
+
+---
+
+## 7. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:
 
@@ -231,7 +298,7 @@ value that may be sensitive.
 
 ---
 
-## 7. What is not verified
+## 8. What is not verified
 
 * **No real battery or Zendure hardware.** Driver behaviour is asserted against the documented
   integration semantics and a fake over loopback, not observed on a device.
@@ -252,6 +319,18 @@ value that may be sensitive.
 * **Saving a battery after a *Select*** (`POST /api/v1/batteries`) is covered by the API contract
   tests but has not been exercised against the live instance; nothing was added to the running
   add-on's configuration during this work.
+* **No real energy-charts payload was parsed.** The provider path is covered by tests, and the live
+  endpoint was probed for its status codes (200/400/404), but no successful response body was seen
+  from this environment: the covered zones answered 429 (rate limited) during the probe and the
+  configured zone (NL) answers 404. Its parsing is therefore asserted against the documented shape
+  only.
+* **The fixed tariff's entity path was only exercised with missing values.** The instance's own
+  day/night price sensors report `unknown`, which is exactly the case that must fail loudly and does;
+  a real pair of day/night sensor values was not observed, and neither was a live tariff whose day
+  window crosses midnight.
+* **The provider resolution has not been exercised inside the deployed add-on.** Everything above runs
+  the shipped code against captured live payloads; the running instance's settings were not touched,
+  so which provider it uses is still the owner's choice to make in the UI.
 
 Known behaviour, accepted and deliberate:
 
@@ -262,7 +341,7 @@ Known behaviour, accepted and deliberate:
 
 ---
 
-## 8. How to reproduce
+## 9. How to reproduce
 
 No network access and no hardware are needed for any command below.
 
@@ -270,7 +349,7 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 519 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 562 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 

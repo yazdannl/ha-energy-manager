@@ -306,8 +306,18 @@
     ["latitude_override", "str", null, "Latitude override", "Unset = read from HA.", "general", null],
     ["longitude_override", "str", null, "Longitude override", "Unset = read from HA.", "general", null],
 
-    ["price.source", "str", "zonneplan_entity", "Price source", "Configured source with fallback to energy_charts then static.", "price", ["zonneplan_entity", "energy_charts", "entity_forecast", "static"]],
-    ["price.entity", "str", "", "Price entity", "Runtime-picked HA sensor entity id.", "price", null],
+    ["price.provider", "str", "entity", "Price provider", "Where prices come from. entity = a sensor you pick (advanced); zonneplan = the Zonneplan integration's tariff sensor found in Home Assistant; day_ahead = energy_charts wholesale day-ahead prices for the bidding zone; fixed = a flat or day/night tariff.", "price", ["entity", "zonneplan", "day_ahead", "fixed"]],
+    ["price.contract", "str", "dynamic_hourly", "Contract type", "dynamic_quarter_hourly / dynamic_hourly = market prices per quarter hour or per hour; fixed_single = one rate all day; fixed_day_night = two rates split by the day window below. Wholesale providers need the VAT, energy tax and fee fields to become consumer prices.", "price", ["dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night"]],
+    ["price.source", "str", "zonneplan_entity", "Price source (advanced)", "Only used by the entity provider: configured source with fallback to energy_charts then static.", "price", ["zonneplan_entity", "energy_charts", "entity_forecast", "static"]],
+    ["price.entity", "str", "", "Price entity (advanced)", "Runtime-picked HA sensor entity id.", "price", null],
+    ["price.fixed_price_eur_per_kwh", "float", null, "Fixed rate", "Consumer price incl. VAT and tax, EUR/kWh. Unset = read the entity below.", "price", null],
+    ["price.fixed_day_price_eur_per_kwh", "float", null, "Day rate", "Consumer price incl. VAT and tax for the day window, EUR/kWh.", "price", null],
+    ["price.fixed_night_price_eur_per_kwh", "float", null, "Night rate", "Consumer price incl. VAT and tax outside the day window, EUR/kWh.", "price", null],
+    ["price.fixed_price_entity", "str", "", "Fixed rate entity", "HA sensor holding the consumer price; overrides the typed fixed rate.", "price", null],
+    ["price.fixed_day_price_entity", "str", "", "Day rate entity", "HA sensor holding the day rate; overrides the typed day rate.", "price", null],
+    ["price.fixed_night_price_entity", "str", "", "Night rate entity", "HA sensor holding the night rate; overrides the typed night rate.", "price", null],
+    ["price.fixed_day_start_hour", "int", 7, "Day starts at", "Local hour the day rate starts, 0-23.", "price", null],
+    ["price.fixed_night_start_hour", "int", 23, "Night starts at", "Local hour the night rate starts, 0-23.", "price", null],
     ["price.static_schedule", "json", [], "Static price schedule", "List of {from_hour,to_hour,price_eur_per_kwh,days}.", "price", null],
     ["price.import_fee_eur_per_kwh", "float", 0.0, "Import fee", "Supplier markup on buy, EUR/kWh.", "price", null],
     ["price.export_fee_eur_per_kwh", "float", 0.0, "Export fee", "Deduction on sell, EUR/kWh.", "price", null],
@@ -372,7 +382,15 @@
     dry_run: true,
     override: null,
     batteryEnabled: true,
-    settings: {},
+    settings: {
+      // ?mock=1 demonstrates the 0.3.0 price shape (SPEC §4.1): a day_ahead provider with a
+      // fixed_single contract is a *stated mismatch* — surfaced as price_warnings, never a failure
+      // — and a legacy price.entity is left set but hidden by the provider, so the settings view
+      // also shows the hidden-but-set warning. DEFAULTS still apply to every unset key.
+      "price.provider": "day_ahead",
+      "price.contract": "fixed_single",
+      "price.entity": "sensor.example_legacy_price"
+    },
     batteries: null,
     pendingHolds: [],
     modePersisted: true
@@ -406,6 +424,33 @@
           choices: row[6] || []
         };
       });
+  }
+
+  // The effective value of a setting: an unsaved db override, else the shipped default. Used
+  // by priceWarnings and by the forecast's provider/contract echo.
+  function settingsValue(key) {
+    if (Object.prototype.hasOwnProperty.call(db.settings, key)) return db.settings[key];
+    var row = SETTINGS.filter(function (r) { return r[0] === key; })[0];
+    return row ? row[2] : undefined;
+  }
+  // Mirrors config.py's price_warnings rule (SPEC §4.1): a provider/contract pair outside the
+  // allowed table is a warning, never a failure — the engine keeps the configured provider,
+  // because refusing to plan is worse than planning with a stated mismatch.
+  var _PRICE_PROVIDER_CONTRACTS = {
+    entity: ["dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night"],
+    zonneplan: ["dynamic_quarter_hourly", "dynamic_hourly"],
+    day_ahead: ["dynamic_quarter_hourly", "dynamic_hourly"],
+    fixed: ["fixed_single", "fixed_day_night"]
+  };
+  function priceWarnings() {
+    var provider = settingsValue("price.provider");
+    var contract = settingsValue("price.contract");
+    var allowed = _PRICE_PROVIDER_CONTRACTS[provider] || [];
+    if (allowed.indexOf(contract) >= 0) return [];
+    return [{
+      key: "price.contract",
+      message: "Contract " + contract + " is not one price.provider=" + provider + " uses (" + allowed.join(", ") + "). The engine keeps the configured provider and plans with this mismatch; choose a matching contract or provider."
+    }];
   }
 
   function validateSetting(key, value) {
@@ -616,13 +661,27 @@
     "GET /api/v1/forecast": function (ctx) {
       var kind = ctx.params.kind || "price";
       var hours = ctx.params.hours;
+      if (kind === "price" && ctx.params.empty) {
+        // Empty-panel demo (the frozen 0.3.0 shape): a reason slug + a one-sentence hint. With the
+        // configured day_ahead provider the hint names the configured bidding zone, because
+        // energy-charts publishes no prices for some valid zones (SPEC §4.1). The UI renders it
+        // verbatim, so keep it a complete sentence and do not truncate it.
+        var zone = settingsValue("price.bzn") || "NL";
+        return {
+          kind: "price", generated_at: iso(startMs), source: settingsValue("price.provider"),
+          stale: true, provider: settingsValue("price.provider"), contract: settingsValue("price.contract"),
+          notes: [], reason: "provider_failed",
+          hint: "energy-charts published no day-ahead prices for bidding zone " + zone + "; a valid zone can simply have no data for this window — pick a different zone or a supplier source (zonneplan or a price entity).",
+          slots: []
+        };
+      }
       if (kind === "solar") {
-        return { kind: "solar", generated_at: iso(startMs), source: "forecast_solar", stale: false, planes: [{ kwp: 4.0, tilt_deg: 35, azimuth_deg: 180, damping: 0.0 }], correction_applied: 1.05, notes: [MOCK_NOTE], slots: solarSlots(hours) };
+        return { kind: "solar", generated_at: iso(startMs), source: "forecast_solar", stale: false, provider: "forecast_solar", contract: null, reason: null, hint: null, planes: [{ kwp: 4.0, tilt_deg: 35, azimuth_deg: 180, damping: 0.0 }], correction_applied: 1.05, notes: [MOCK_NOTE], slots: solarSlots(hours) };
       }
       if (kind === "load") {
-        return { kind: "load", generated_at: iso(startMs), source: "statistics", confidence: "medium", stale: false, notes: [MOCK_NOTE], slots: loadSlots(hours) };
+        return { kind: "load", generated_at: iso(startMs), source: "statistics", confidence: "medium", stale: false, provider: "statistics", contract: null, reason: null, hint: null, notes: [MOCK_NOTE], slots: loadSlots(hours) };
       }
-      return { kind: "price", generated_at: iso(startMs), source: "zonneplan_entity", stale: false, notes: [MOCK_NOTE], slots: priceSlots(hours) };
+      return { kind: "price", generated_at: iso(startMs), source: "zonneplan_entity", stale: false, provider: "zonneplan", contract: "dynamic_hourly", reason: null, hint: null, notes: [MOCK_NOTE], slots: priceSlots(hours) };
     },
     "GET /api/v1/batteries": function () { return { batteries: batteryList() }; },
     "POST /api/v1/batteries": function (ctx) {
@@ -696,7 +755,8 @@
           mode: "advisory", dry_run: true, log_level: "info",
           currency: null, timezone: null, latitude_override: null, longitude_override: null
         },
-        settings: settingDescriptors()
+        settings: settingDescriptors(),
+        price_warnings: priceWarnings()
       };
     },
     "PATCH /api/v1/config": function (ctx) {

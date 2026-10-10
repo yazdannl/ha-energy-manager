@@ -384,6 +384,195 @@ class Engine:
             out.setdefault(status.kind, []).append(status)
         return out
 
+    # ------------------------------------------------------------------ forecast explanation
+
+    def price_provider_contract(self) -> dict[str, str]:
+        """Effective price provider + configured contract for the /forecast payload (SPEC 10).
+
+        ``provider`` is the configured ``price.provider`` (or ``unavailable`` when no forecast was
+        produced); ``contract`` is the configured ``price.contract``.
+        """
+        provider = str(self._settings.get("price.provider", "entity") or "entity")
+        contract = str(self._settings.get("price.contract", "dynamic_hourly") or "dynamic_hourly")
+        if self.forecast("price") is None:
+            provider = "unavailable"
+        return {"provider": provider, "contract": contract}
+
+    def explain_forecast(self, kind: str) -> dict[str, Any]:
+        """Why a forecast panel is empty or unavailable (SPEC 10, 0.3.0): ``{"reason", "hint"}``.
+
+        ``reason`` is a frozen slug (``not_configured`` | ``provider_failed`` | ``fixed_price_missing``
+        | ``no_pv_source`` | ``no_history`` | ``empty_horizon`` | ``unknown``), or ``None`` when the
+        panel is healthy. ``hint`` is one sentence naming the setting or condition to fix, so the UI
+        never has to say only "the source failed". Uses settings, the stored provider statuses and
+        (for load) the store's learned profile. Reads current state; no network.
+        """
+        if kind == "price":
+            return self._explain_price()
+        if kind == "solar":
+            return self._explain_solar()
+        if kind == "load":
+            return self._explain_load()
+        return {"reason": "unknown", "hint": f"unknown forecast kind {kind!r}"}
+
+    def _forecast_has_future(self, forecast: Any) -> bool:
+        if forecast is None:
+            return False
+        now = self._clock()
+        return any(
+            getattr(slot, "t", None) is not None and slot.t + timedelta(minutes=15) > now
+            for slot in getattr(forecast, "slots", []) or []
+        )
+
+    def _effective_price_source_name(self) -> str:
+        provider = str(self._settings.get("price.provider", "entity") or "entity")
+        if provider == "zonneplan":
+            return "zonneplan_entity"
+        if provider == "day_ahead":
+            return "energy_charts"
+        if provider == "fixed":
+            return "fixed_tariff"
+        return str(self._settings.get("price.source", "zonneplan_entity") or "zonneplan_entity")
+
+    def _price_statuses(self) -> dict[str, ProviderStatus]:
+        return {
+            status.name: status
+            for (status_kind, _), status in self._provider_status.items()
+            if status_kind == "price"
+        }
+
+    def _missing_fixed_setting(self, contract: str) -> str | None:
+        def absent(typed_key: str, entity_key: str) -> bool:
+            return self._settings.get(typed_key) is None and not str(
+                self._settings.get(entity_key, "") or ""
+            ).strip()
+
+        if contract == "fixed_single":
+            if absent("price.fixed_price_eur_per_kwh", "price.fixed_price_entity"):
+                return "price.fixed_price_eur_per_kwh or price.fixed_price_entity"
+        elif contract == "fixed_day_night":
+            for label, typed_key, entity_key in (
+                ("day", "price.fixed_day_price_eur_per_kwh", "price.fixed_day_price_entity"),
+                ("night", "price.fixed_night_price_eur_per_kwh", "price.fixed_night_price_entity"),
+            ):
+                if absent(typed_key, entity_key):
+                    return f"{typed_key} or {entity_key} ({label} rate)"
+        return None
+
+    def _explain_price(self) -> dict[str, Any]:
+        if self._forecast_has_future(self._price):
+            return {"reason": None, "hint": None}
+        if self._price_source is None:
+            return {"reason": "not_configured", "hint": "price forecasting is disabled on this instance"}
+        provider = str(self._settings.get("price.provider", "entity") or "entity")
+        contract = str(self._settings.get("price.contract", "dynamic_hourly") or "dynamic_hourly")
+        statuses = self._price_statuses()
+        resolved = self._effective_price_source_name()
+
+        if provider == "fixed":
+            missing = self._missing_fixed_setting(contract)
+            if missing:
+                return {
+                    "reason": "fixed_price_missing",
+                    "hint": f"set {missing}; a fixed contract needs a consumer price and never falls back to the market",
+                }
+            return {"reason": "provider_failed", "hint": self._price_failure_hint(statuses, resolved)}
+        if provider == "day_ahead":
+            charts = statuses.get("energy_charts")
+            if charts is not None and (
+                charts.detail.get("http_status") == 404
+                or "publishes no prices" in (charts.last_error or "")
+            ):
+                zone = str(self._settings.get("price.bzn", "NL") or "NL")
+                return {
+                    "reason": "provider_failed",
+                    "hint": (
+                        f"energy_charts returned no day-ahead prices for bidding zone {zone!r} (a valid "
+                        "zone can have none for this window, including tomorrow before the auction); "
+                        "pick a supplier as price.provider (e.g. zonneplan) or set price.entity to your "
+                        "own tariff sensor"
+                    ),
+                }
+        if provider == "zonneplan":
+            zonne = statuses.get("zonneplan_entity")
+            if zonne is not None and "no compatible electricity tariff sensor" in (zonne.last_error or ""):
+                return {
+                    "reason": "provider_failed",
+                    "hint": "enable the Zonneplan integration in Home Assistant, or pick another price provider",
+                }
+        active = statuses.get(resolved)
+        if active is not None and "no future price slots" in (active.last_error or ""):
+            return {"reason": "empty_horizon", "hint": active.last_error or "no future price slots"}
+        return {"reason": "provider_failed", "hint": self._price_failure_hint(statuses, resolved)}
+
+    def _price_failure_hint(self, statuses: dict[str, ProviderStatus], resolved: str) -> str:
+        active = statuses.get(resolved)
+        if active is not None and active.last_error:
+            return active.last_error
+        failing = sorted(name for name, status in statuses.items() if status.last_error)
+        if failing:
+            return "; ".join(f"{name}: {statuses[name].last_error}" for name in failing)
+        return "the price provider chain produced no usable forecast; check the price settings"
+
+    def _explain_solar(self) -> dict[str, Any]:
+        if self._forecast_has_future(self._solar):
+            return {"reason": None, "hint": None}
+        if self._solar_source is None or not bool(self._settings.get("solar.enabled", True)):
+            return {
+                "reason": "not_configured",
+                "hint": "enable solar forecasting (solar.enabled) and add a PV plane (solar.planes)",
+            }
+        if not (self._settings.get("solar.planes") or []):
+            return {"reason": "no_pv_source", "hint": "add a PV plane under solar.planes"}
+        statuses = {
+            status.name: status
+            for (status_kind, _), status in self._provider_status.items()
+            if status_kind == "solar"
+        }
+        failing = sorted(name for name, status in statuses.items() if status.last_error)
+        if failing:
+            return {
+                "reason": "provider_failed",
+                "hint": "; ".join(f"{name}: {statuses[name].last_error}" for name in failing),
+            }
+        return {
+            "reason": "no_pv_source",
+            "hint": "solar is enabled but produced no forecast; check solar.source and the location",
+        }
+
+    def _explain_load(self) -> dict[str, Any]:
+        if self._forecast_has_future(self._load):
+            return {"reason": None, "hint": None}
+        if self._load_source is None:
+            return {"reason": "not_configured", "hint": "load forecasting is disabled on this instance"}
+        entity = str(self._settings.get("load.entity", "") or "")
+        has_profile = False
+        if self._store is not None and callable(getattr(self._store, "profile_get", None)):
+            try:
+                has_profile = self._store.profile_get("load", "profile") is not None
+            except Exception:  # noqa: BLE001 - a store probe failure never breaks the explanation
+                has_profile = False
+        if not entity and not has_profile:
+            return {
+                "reason": "no_history",
+                "hint": "map a load entity (load.entity) or wait for learned load history to accumulate",
+            }
+        statuses = {
+            status.name: status
+            for (status_kind, _), status in self._provider_status.items()
+            if status_kind == "load"
+        }
+        failing = sorted(name for name, status in statuses.items() if status.last_error)
+        if failing:
+            return {
+                "reason": "provider_failed",
+                "hint": "; ".join(f"{name}: {statuses[name].last_error}" for name in failing),
+            }
+        return {
+            "reason": "no_history",
+            "hint": "no load history yet; set load.entity or wait for the profile to be learned",
+        }
+
     # ------------------------------------------------------------------ control
 
     def start(self) -> None:

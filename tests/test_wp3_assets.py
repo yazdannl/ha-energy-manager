@@ -829,3 +829,107 @@ def test_battery_picker_keeps_usable_energy_out_of_the_capacity_role():
     assert data["mapping"]["capacity_entity"] == "sensor.example_e_total_kwh"
     assert data["mapping"]["available_kwh_entity"] == "sensor.example_e_available_kwh"
     assert data["numbers"]["capacity_kwh"] == 1.92
+
+
+# --- forecast empty state + price provider/contract visibility (SPEC §4.1 / §10) -----------------
+
+
+def test_forecast_empty_state_prefers_the_api_hint_verbatim():
+    """An empty panel shows the server `hint` verbatim (never truncated) with the `reason` slug
+    kept beside it, and only falls back to the generic sentence when the server sent no hint."""
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "", hash: "" };
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    // A failed day-ahead lookup names the configured bidding zone in its hint (SPEC §4.1).
+    const zoneHint = A.forecastEmptyState({
+      reason: "provider_failed",
+      hint: "energy-charts published no day-ahead prices for bidding zone NL; pick a different zone or a supplier source."
+    });
+    const noHint = A.forecastEmptyState({ reason: "empty_horizon", hint: null });
+    const noReason = A.forecastEmptyState({ hint: "Set price.provider to a source that has data." });
+    const bare = A.forecastEmptyState({});
+    console.log(JSON.stringify({ zoneHint: zoneHint, noHint: noHint, noReason: noReason, bare: bare }));
+    """
+    data = json.loads(run_node_script(script))
+    # the hint is the prominent message and is passed through verbatim (equal, not truncated)
+    assert data["zoneHint"]["text"] == "energy-charts published no day-ahead prices for bidding zone NL; pick a different zone or a supplier source."
+    assert data["zoneHint"]["hint"] == data["zoneHint"]["text"]
+    assert data["zoneHint"]["reason"] == "provider_failed", "the reason slug is kept for the small badge"
+    # no hint -> the legacy fallback sentence, reason still surfaced
+    assert data["noHint"]["text"] == "No slots returned; the source failed or the horizon is empty."
+    assert data["noHint"]["reason"] == "empty_horizon"
+    # a hint with no reason, and a totally bare payload, still produce safe text
+    assert data["noReason"]["reason"] is None and data["noReason"]["text"].startswith("Set price.provider")
+    assert data["bare"]["reason"] is None and data["bare"]["hint"] is None
+    assert data["bare"]["text"] == "No slots returned; the source failed or the horizon is empty."
+    app = read(WEB / "app.js")
+    assert "forecastEmptyState" in app and "banner banner-warn" in app, "the empty panel renders the hint in a prominent banner"
+
+
+def test_price_field_visibility_per_provider_and_contract():
+    """priceFieldVisibility (SPEC §4.1) reveals the fields that apply to each provider/contract."""
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "", hash: "" };
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    console.log(JSON.stringify({
+      entity: A.priceFieldVisibility("entity", "dynamic_hourly"),
+      zonneplan: A.priceFieldVisibility("zonneplan", "dynamic_quarter_hourly"),
+      dayAhead: A.priceFieldVisibility("day_ahead", "dynamic_hourly"),
+      fixedSingle: A.priceFieldVisibility("fixed", "fixed_single"),
+      fixedDayNight: A.priceFieldVisibility("fixed", "fixed_day_night")
+    }));
+    """
+    data = json.loads(run_node_script(script))
+
+    def keys(name):
+        return set(data[name]["fields"])
+
+    note = {name: data[name]["note"] for name in ("entity", "zonneplan", "dayAhead", "fixedSingle", "fixedDayNight")}
+    always = {
+        "price.vat_pct", "price.energy_tax_eur_per_kwh", "price.import_fee_eur_per_kwh",
+        "price.export_fee_eur_per_kwh", "price.unit", "price.scale_divisor",
+        "price.feed_in_eur_per_kwh", "price.feed_in_entity", "price.feed_in_tax_inclusive",
+        # the selectors themselves must always be shown so the pair can be changed
+        "price.provider", "price.contract",
+    }
+    for name in ("entity", "zonneplan", "dayAhead", "fixedSingle", "fixedDayNight"):
+        assert always <= keys(name), f"{name} dropped an always-visible field: {sorted(always - keys(name))}"
+
+    # entity: the advanced source + entity + static schedule, no bidding zone or fixed rates
+    assert {"price.source", "price.entity", "price.static_schedule"} <= keys("entity")
+    assert "price.bzn" not in keys("entity") and not any(k.startswith("price.fixed_") for k in keys("entity"))
+
+    # zonneplan: NO entity field (the tariff sensor is found automatically); no bzn, no fixed rates
+    assert "price.entity" not in keys("zonneplan") and "price.bzn" not in keys("zonneplan")
+    assert not any(k.startswith("price.fixed_") for k in keys("zonneplan"))
+    assert note["zonneplan"] and "automatically" in note["zonneplan"].lower()
+
+    # day_ahead: the bidding zone, and a note that says wholesale + zone coverage matters (SPEC §4.1
+    # addition): a valid zone may have no prices, so the user knows to pick a supplier instead.
+    assert "price.bzn" in keys("dayAhead") and "price.entity" not in keys("dayAhead")
+    assert not any(k.startswith("price.fixed_") for k in keys("dayAhead"))
+    da = note["dayAhead"].lower()
+    assert "wholesale" in da and "consumer prices" in da
+    assert "zone" in da and "no prices" in da and "supplier" in da
+
+    # fixed + fixed_single: one rate (+ its entity); not the day/night fields
+    assert {"price.fixed_price_eur_per_kwh", "price.fixed_price_entity"} <= keys("fixedSingle")
+    assert "price.fixed_day_price_eur_per_kwh" not in keys("fixedSingle")
+    assert "price.fixed_night_price_eur_per_kwh" not in keys("fixedSingle")
+    assert "price.fixed_day_start_hour" not in keys("fixedSingle")
+
+    # fixed + fixed_day_night: day + night rates/entities and the two window hours; not the single rate
+    fixed_dn = {
+        "price.fixed_day_price_eur_per_kwh", "price.fixed_night_price_eur_per_kwh",
+        "price.fixed_day_price_entity", "price.fixed_night_price_entity",
+        "price.fixed_day_start_hour", "price.fixed_night_start_hour",
+    }
+    assert fixed_dn <= keys("fixedDayNight")
+    assert "price.fixed_price_eur_per_kwh" not in keys("fixedDayNight")
+
+    # contract is what switches the fixed fields: the same provider, a different contract
+    assert keys("fixedSingle") != keys("fixedDayNight")

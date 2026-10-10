@@ -449,12 +449,15 @@ def test_discover_candidates_shape_and_cap(wired):
 def test_config_contract_types_choices_and_safety_group(wired):
     status, _headers, body = wired.json("GET", "/api/v1/config")
     assert status == 200
-    assert set(body) == {"options", "settings", "conflicts"}
+    assert set(body) == {"options", "settings", "conflicts", "price_warnings"}
     # SPEC 5/10: additive option-conflict list, empty when no stored setting overrides an option
     assert body["conflicts"] == [] or (
         isinstance(body["conflicts"], list)
         and all({"key", "option", "stored", "message"} <= set(row) for row in body["conflicts"])
     )
+    # SPEC 4.1/10: additive price provider/contract warnings ({key, message} rows)
+    assert isinstance(body["price_warnings"], list)
+    assert all({"key", "message"} <= set(row) for row in body["price_warnings"])
     rows = {row["key"]: row for row in body["settings"]}
     for row in rows.values():
         assert {"key", "value", "type", "default", "label", "help", "group", "choices"} <= set(row)

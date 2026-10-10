@@ -148,6 +148,12 @@ deprecated     false
   (Energy-Charts.info / Fraunhofer ISE and the data source Bundesnetzagentur | SMARD.de). **[V]**
 * Number of days returned: one per request; loop per local day. There is no partial "tomorrow" until
   the auction result is published (early afternoon CET). **[V]** (live 404 + v2 docs)
+* **Observation (2026-10-10, provider work):** with no `start`/`end`, `bzn=NL` returned **404
+  `no content available`** on two probes while `bzn=FR` returned 200 and an invalid code returned 400 -
+  so NL is a valid zone for which this source can have no prices, and the 404 must be read as "no prices
+  for this window" (the same body as the pre-auction case), never as "unknown zone". The provider turns
+  it into a named, actionable failure rather than a silent fallback, and no other API is called for it.
+  **[V]** (live)
 
 ### `GET /v2/price`, `/v2/price_current`, `/v2/price_next_day` (recommended upgrade)
 
@@ -206,6 +212,14 @@ Upstream code proof: `SENSOR_TYPES[ELECTRICITY_PRICES]` sets `value_factor=1e-7`
 are the same API integer.
 
 ### Coverage, past slots, staleness — **[V]**, live
+
+**Look-alike to reject (2026-10-10, live):** the *gas* tariff sensor
+(`zonneplan_current_tariff_gas`) publishes `forecast[].price_tax_included.amount` in the **same
+fixed-point shape**, and its own state agrees with its single 24 h slot, so neither the shape nor the
+state/slot comparison separates it from an electricity tariff. Only two things do: the unit is **€/m³**
+(not in the €/kWh family) and the list has **one entry spanning 24 h** (no 15-minute/hourly grid).
+Locating a tariff sensor therefore requires a kWh unit **and** ≥ 2 entries on a regular 15-minute or
+hourly grid. **[V]** (live)
 
 * 15-min sensor: 220 entries, 15-min cadence, from ≈ −24.6 h to ≈ +30.4 h, 98 entries fully in the
   past. Legacy hourly: 55 entries, 60-min cadence, ≈ −24.6 h .. +29.4 h, 25 in the past.

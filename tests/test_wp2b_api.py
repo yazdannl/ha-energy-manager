@@ -994,3 +994,90 @@ def test_settings_meta_matches_the_frozen_spec_keys():
     assert rows["solar.api_key"]["type"] == "password"
     # the removed keys must never be advertised again
     assert "solar.declination_correction" not in rows
+
+
+# ----------------------------------------------------------------------------------- forecast + config (0.3.0)
+
+
+class WarnSettings(FakeSettings):
+    """FakeSettings that also answers price_warnings(), like the real Settings (SPEC 4.1)."""
+
+    def __init__(self, warnings, **values):
+        super().__init__(**values)
+        self._warnings = warnings
+
+    def price_warnings(self):
+        return self._warnings
+
+
+class ExplainedFakeEngine(FakeEngine):
+    """FakeEngine that also exposes the price provider/contract + forecast explanation accessors."""
+
+    def __init__(self, *, provider_contract=None, explanation=None, price_forecast="default", price_warnings=None):
+        super().__init__()
+        self._provider_contract = provider_contract or {"provider": "fixed", "contract": "fixed_single"}
+        self._explanation = explanation if explanation is not None else {"reason": None, "hint": None}
+        self._price_forecast = price_forecast
+        self.settings = WarnSettings(
+            price_warnings or [],
+            mode=self.settings.get("mode"),
+            dry_run=self.settings.get("dry_run"),
+        )
+
+    def forecast(self, kind):
+        if kind == "price" and self._price_forecast == "none":
+            return None
+        return super().forecast(kind)
+
+    def price_provider_contract(self):
+        return dict(self._provider_contract)
+
+    def explain_forecast(self, kind):
+        return dict(self._explanation)
+
+
+def test_forecast_price_payload_adds_provider_contract_notes_reason_hint():
+    app = server(ExplainedFakeEngine(provider_contract={"provider": "fixed", "contract": "fixed_single"}))
+    status, _headers, _content, body = call(app, "GET", "/api/v1/forecast?kind=price&hours=36")
+    assert status == 200
+    # additive: every pre-existing key is still there
+    assert {"kind", "generated_at", "source", "stale", "slots"} <= set(body)
+    # the 0.3.0 additions
+    assert body["provider"] == "fixed"
+    assert body["contract"] == "fixed_single"
+    assert isinstance(body["notes"], list)
+    assert body["reason"] is None and body["hint"] is None
+
+
+def test_forecast_empty_price_panel_still_carries_the_new_fields_with_a_reason():
+    engine = ExplainedFakeEngine(
+        price_forecast="none",
+        provider_contract={"provider": "unavailable", "contract": "fixed_single"},
+        explanation={"reason": "fixed_price_missing", "hint": "set price.fixed_price_eur_per_kwh or price.fixed_price_entity"},
+    )
+    app = server(engine)
+    status, _headers, _content, body = call(app, "GET", "/api/v1/forecast?kind=price")
+    assert status == 200
+    assert {"kind", "generated_at", "source", "stale", "slots"} <= set(body)
+    assert body["slots"] == [] and body["source"] == "unavailable"
+    assert body["provider"] == "unavailable" and body["contract"] == "fixed_single"
+    assert body["notes"] == []
+    assert body["reason"] == "fixed_price_missing"
+    assert "price.fixed_price_eur_per_kwh" in body["hint"]
+
+
+def test_forecast_solar_payload_adds_provider_and_notes():
+    app = server(ExplainedFakeEngine())
+    status, _headers, _content, body = call(app, "GET", "/api/v1/forecast?kind=solar")
+    assert status == 200
+    assert body["provider"] == "example_solar" and body["contract"] is None
+    assert isinstance(body["notes"], list)
+
+
+def test_config_payload_carries_price_warnings():
+    engine = ExplainedFakeEngine(price_warnings=[{"key": "price.contract", "message": "provider/contract mismatch example"}])
+    app = server(engine)
+    status, _headers, _content, body = call(app, "GET", "/api/v1/config")
+    assert status == 200
+    assert {"options", "settings", "conflicts", "price_warnings"} <= set(body)
+    assert body["price_warnings"] == [{"key": "price.contract", "message": "provider/contract mismatch example"}]

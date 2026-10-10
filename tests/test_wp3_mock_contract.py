@@ -22,8 +22,12 @@ NODE = shutil.which("node")
 FROZEN_SETTING_KEYS = [
     # general / add-on options
     "mode", "dry_run", "log_level", "currency", "timezone", "latitude_override", "longitude_override",
-    # price (incl. the feed-in tariff path)
-    "price.source", "price.entity", "price.static_schedule", "price.import_fee_eur_per_kwh",
+    # price (incl. the provider/contract selection and the fixed-tariff path)
+    "price.provider", "price.contract", "price.source", "price.entity", "price.static_schedule",
+    "price.fixed_price_eur_per_kwh", "price.fixed_day_price_eur_per_kwh", "price.fixed_night_price_eur_per_kwh",
+    "price.fixed_price_entity", "price.fixed_day_price_entity", "price.fixed_night_price_entity",
+    "price.fixed_day_start_hour", "price.fixed_night_start_hour",
+    "price.import_fee_eur_per_kwh",
     "price.export_fee_eur_per_kwh", "price.vat_pct", "price.energy_tax_eur_per_kwh", "price.unit",
     "price.scale_divisor", "price.bzn", "price.feed_in_eur_per_kwh", "price.feed_in_entity",
     "price.feed_in_tax_inclusive",
@@ -296,23 +300,61 @@ def test_plan_summary_matches_the_api_serializer(fixtures):
 
 def test_forecast_payloads(fixtures):
     price = fixtures["fixtures"]["price"]
-    assert_fields(price, ["kind", "generated_at", "source", "stale", "slots"], "GET /forecast?kind=price")
+    assert_fields(price, ["kind", "generated_at", "source", "stale", "slots", "provider", "contract", "notes", "reason", "hint"], "GET /forecast?kind=price")
     assert price["kind"] == "price"
+    # provider/contract are 0.3.0 additions; a populated panel carries no reason/hint (additive)
+    assert price["provider"] and isinstance(price["provider"], str)
+    assert price["contract"] and isinstance(price["contract"], str)
+    assert isinstance(price["notes"], list) and price["notes"], "the populated price forecast carries notes"
+    assert price["reason"] is None and price["hint"] is None
     for slot in price["slots"]:
         assert_fields(slot, ["t", "buy", "sell", "source", "is_actual", "stale"], "PriceSlot")
 
     solar = fixtures["fixtures"]["solar"]
-    assert_fields(solar, ["kind", "generated_at", "source", "stale", "slots", "planes", "correction_applied", "notes"], "GET /forecast?kind=solar")
+    assert_fields(solar, ["kind", "generated_at", "source", "stale", "slots", "provider", "contract", "planes", "correction_applied", "notes"], "GET /forecast?kind=solar")
     for slot in solar["slots"]:
         assert_fields(slot, ["t", "pv_kw", "uncertainty_pct"], "SolarSlot")
     for plane in solar["planes"]:
         assert_fields(plane, ["kwp", "tilt_deg", "azimuth_deg", "damping"], "SolarForecast.planes")
 
     load = fixtures["fixtures"]["load"]
-    assert_fields(load, ["kind", "generated_at", "source", "stale", "slots", "confidence", "notes"], "GET /forecast?kind=load")
+    assert_fields(load, ["kind", "generated_at", "source", "stale", "slots", "confidence", "provider", "contract", "notes"], "GET /forecast?kind=load")
     assert load["confidence"] in {"low", "medium", "high"}
     for slot in load["slots"]:
         assert_fields(slot, ["t", "load_kw", "p10_kw", "p90_kw"], "LoadSlot")
+
+
+def test_forecast_empty_panel_carries_reason_and_zone_hint(fixtures):
+    """The empty-panel shape: a `reason` slug and a one-sentence `hint`. For a failed day-ahead
+    lookup the hint names the configured bidding zone (SPEC §4.1), rendered verbatim by the UI."""
+    if NODE is None:
+        pytest.skip("node is not installed")
+    script = """
+    const fs = require("fs");
+    (0, eval)(fs.readFileSync("mock.js", "utf8"));
+    (async function () {
+      const empty = await SEM_MOCK.handle("GET", "/api/v1/forecast?kind=price&empty=1", {});
+      const bzn = SEM_MOCK.fixtures().config.settings.filter(function (s) { return s.key === "price.bzn"; })[0].value;
+      console.log(JSON.stringify({ empty: empty, bzn: bzn }));
+    })().catch(function (err) { console.error(err && err.message ? err.message : err); process.exit(1); });
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+        handle.write(script)
+        script_path = handle.name
+    try:
+        proc = subprocess.run([NODE, script_path], capture_output=True, text=True, cwd=str(WEB))
+    finally:
+        Path(script_path).unlink(missing_ok=True)
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    empty = data["empty"]
+    assert empty["slots"] == [], "the demo panel is empty"
+    assert_fields(empty, ["kind", "generated_at", "source", "provider", "contract", "notes", "reason", "hint"], "empty price forecast")
+    assert empty["reason"] == "provider_failed"
+    # the config provider is day_ahead, so the hint names the configured bidding zone verbatim
+    assert empty["provider"] == "day_ahead"
+    assert data["bzn"] in empty["hint"], "the hint names the configured bidding zone"
+    assert "no day-ahead prices" in empty["hint"].lower()
 
 
 def test_batteries_and_discovery_payloads(fixtures):
@@ -335,7 +377,7 @@ def test_batteries_and_discovery_payloads(fixtures):
 
 def test_config_payload_exposes_every_frozen_setting(fixtures):
     config = fixtures["fixtures"]["config"]
-    assert_fields(config, ["options", "settings"], "GET /config")
+    assert_fields(config, ["options", "settings", "price_warnings"], "GET /config")
     assert_fields(config["options"], ["mode", "dry_run", "log_level", "currency", "timezone", "latitude_override", "longitude_override"], "config.options")
     keys = [setting["key"] for setting in config["settings"]]
     missing = [key for key in FROZEN_SETTING_KEYS if key not in keys]
@@ -355,9 +397,26 @@ def test_config_payload_exposes_every_frozen_setting(fixtures):
         ("price.feed_in_entity", "str", ""),
         ("price.feed_in_tax_inclusive", "bool", True),
         ("control.grid_follow_max_w", "float", 0),
+        # provider/contract selection + the fixed-tariff path (config.DEFAULTS)
+        ("price.provider", "str", "entity"),
+        ("price.contract", "str", "dynamic_hourly"),
+        ("price.fixed_price_eur_per_kwh", "float", None),
+        ("price.fixed_price_entity", "str", ""),
+        ("price.fixed_day_start_hour", "int", 7),
+        ("price.fixed_night_start_hour", "int", 23),
     ]:
         assert by_key[key]["type"] == kind, key
         assert by_key[key]["default"] == default, key
+    assert by_key["price.provider"]["choices"] == ["entity", "zonneplan", "day_ahead", "fixed"]
+    assert by_key["price.contract"]["choices"] == ["dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night"]
+    # price_warnings (SPEC §4.1): [{key, message}]; the mock ships a stated mismatch so the UI path
+    # is exercised (day_ahead provider + fixed_single contract keeps the provider, it is a warning).
+    warnings = config["price_warnings"]
+    assert isinstance(warnings, list) and warnings, "the mock must demonstrate a price_warning"
+    for warning in warnings:
+        assert_fields(warning, ["key", "message"], "price_warnings[]")
+        assert isinstance(warning["key"], str) and isinstance(warning["message"], str)
+    assert warnings[0]["key"] == "price.contract"
     # all control.* keys are flagged as Safety by the backend rule
     assert all(s["group"] in {"Safety", "General"} for s in config["settings"] if s["key"].startswith("control."))
     assert by_key["price.feed_in_eur_per_kwh"]["help"], "empty feed-in path needs explanatory help"

@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from app import engine as engine_module  # noqa: E402
 from app.engine import Engine  # noqa: E402
 from app.main import _FakeHA, _FakeStore, _selfcheck_settings, _selfcheck_sources  # noqa: E402
-from app.models import BatteryConfig, Mode, Reason, from_iso  # noqa: E402
+from app.models import BatteryConfig, Mode, ProviderStatus, Reason, from_iso  # noqa: E402
 
 PUBLISHED_ENTITIES = {
     "sensor.sem_autopilot_state",
@@ -1423,3 +1423,110 @@ def test_discover_grid_rows_point_at_the_settings_key():
     battery_rows = engine.discover("battery")
     assert battery_rows and "mapping_key" in battery_rows[0]
     assert "setting_key" not in battery_rows[0]
+
+
+# ----------------------------------------------------------------------------------- forecast explanation
+
+
+def test_explain_forecast_is_silent_for_a_healthy_panel():
+    engine, _store, _ha, clock, _settings = build_engine()
+    engine._refresh_forecasts(clock.now)
+    for kind in ("price", "solar", "load"):
+        assert engine.explain_forecast(kind) == {"reason": None, "hint": None}
+
+
+def test_price_provider_contract_reflects_settings_and_availability():
+    engine, _store, _ha, clock, settings = build_engine()
+    engine._refresh_forecasts(clock.now)
+    settings["price.provider"] = "zonneplan"
+    settings["price.contract"] = "dynamic_quarter_hourly"
+    assert engine.price_provider_contract() == {"provider": "zonneplan", "contract": "dynamic_quarter_hourly"}
+    engine._price = None  # no forecast -> the provider reports unavailable, the contract is still configured
+    assert engine.price_provider_contract() == {"provider": "unavailable", "contract": "dynamic_quarter_hourly"}
+
+
+def test_explain_price_fixed_missing_names_the_setting():
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings["price.provider"] = "fixed"
+    settings["price.contract"] = "fixed_single"
+    engine._price = None
+    explanation = engine.explain_forecast("price")
+    assert explanation["reason"] == "fixed_price_missing"
+    assert "price.fixed_price_eur_per_kwh" in explanation["hint"] and "price.fixed_price_entity" in explanation["hint"]
+
+
+def test_explain_price_fixed_day_night_missing_names_the_rate():
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings["price.provider"] = "fixed"
+    settings["price.contract"] = "fixed_day_night"
+    engine._price = None
+    explanation = engine.explain_forecast("price")
+    assert explanation["reason"] == "fixed_price_missing"
+    assert "price.fixed_day_price_eur_per_kwh" in explanation["hint"] or "price.fixed_night_price_eur_per_kwh" in explanation["hint"]
+
+
+def test_explain_price_day_ahead_404_names_the_zone_and_alternatives():
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings["price.provider"] = "day_ahead"
+    settings["price.bzn"] = "NL"
+    engine._price = None
+    engine._provider_status[("price", "energy_charts")] = ProviderStatus(
+        kind="price",
+        name="energy_charts",
+        active=True,
+        ok=False,
+        last_error="energy_charts: bidding zone 'NL' is valid, but this source publishes no day-ahead prices for it (no content available)",
+        detail={"http_status": 404},
+    )
+    explanation = engine.explain_forecast("price")
+    assert explanation["reason"] == "provider_failed"
+    assert "NL" in explanation["hint"] and "zone" in explanation["hint"].lower()
+    assert "zonneplan" in explanation["hint"].lower() and "price.entity" in explanation["hint"]
+
+
+def test_explain_price_empty_horizon_on_a_parsed_but_futureless_payload():
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings["price.provider"] = "zonneplan"
+    engine._price = None
+    engine._provider_status[("price", "zonneplan_entity")] = ProviderStatus(
+        kind="price", name="zonneplan_entity", active=True, ok=False,
+        last_error="zonneplan_entity: no future price slots in the requested horizon",
+    )
+    assert engine.explain_forecast("price")["reason"] == "empty_horizon"
+
+
+def test_explain_price_zonneplan_no_sensor_found():
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings["price.provider"] = "zonneplan"
+    engine._price = None
+    engine._provider_status[("price", "zonneplan_entity")] = ProviderStatus(
+        kind="price", name="zonneplan_entity", active=True, ok=False,
+        last_error="zonneplan: no compatible electricity tariff sensor found (need a EUR/kWh sensor with a 2+ entry list)",
+    )
+    explanation = engine.explain_forecast("price")
+    assert explanation["reason"] == "provider_failed"
+    assert "Zonneplan integration" in explanation["hint"]
+
+
+def test_explain_solar_no_pv_source():
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings["solar.enabled"] = True
+    settings["solar.planes"] = []
+    engine._solar = None
+    explanation = engine.explain_forecast("solar")
+    assert explanation["reason"] == "no_pv_source"
+    assert "solar.planes" in explanation["hint"]
+
+
+def test_explain_load_no_history():
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings["load.entity"] = ""
+    engine._load = None
+    explanation = engine.explain_forecast("load")
+    assert explanation["reason"] == "no_history"
+    assert "load.entity" in explanation["hint"]
+
+
+def test_explain_unknown_kind():
+    engine, _store, _ha, _clock, _settings = build_engine()
+    assert engine.explain_forecast("nope")["reason"] == "unknown"

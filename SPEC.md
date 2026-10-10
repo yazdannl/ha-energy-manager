@@ -287,6 +287,41 @@ forecast. On failure, fall back in order `configured → energy_charts → stati
 without flagging `stale=True`; when every future slot is stale the optimizer must treat the price
 as flat (equal prices) rather than guessing.
 
+### 4.1 Provider and contract selection (0.3.0)
+
+Choosing a source used to mean knowing which HA sensor to paste. The user now states **where** prices
+come from (`price.provider`) and **what shape their contract has** (`price.contract`); the add-on
+resolves the concrete source, and reports what it resolved to.
+
+| `price.provider` | resolves to | allowed contracts |
+| --- | --- | --- |
+| `entity` (default) | the pre-0.3.0 explicit path: `price.source` + `price.entity`, chain `configured → energy_charts → static` | any |
+| `zonneplan` | a Zonneplan tariff sensor **found in Home Assistant**: an entity whose attribute holds a fixed-point price list (`price_tax_included`/`price_tax_excluded` dicts, `value_factor 1e-7`) and whose own state agrees with its current slot (the existing scale check). The grid is detected structurally, from the slot spacing, never from the entity name: `dynamic_quarter_hourly` prefers the 15-minute grid, `dynamic_hourly` the hourly one, and falling back to the other grid is recorded as a note, never silent | `dynamic_*` |
+| `day_ahead` | `energy_charts` for `price.bzn` (keyless wholesale day-ahead) | `dynamic_*` |
+| `fixed` | the configured flat or day-night tariff (`fixed_tariff` source) on local-time windows. **No market fallback**: a fixed contract whose price is missing fails loudly instead of silently planning against market prices | `fixed_*` |
+
+`price.contract` fixes the expected slot granularity (`dynamic_quarter_hourly` 15-minute,
+`dynamic_hourly` hourly upsampled onto the 15-minute grid) and selects the day/night windows for
+`fixed_day_night`: day = `price.fixed_day_start_hour` until `price.fixed_night_start_hour`, night =
+the rest, evaluated per slot in the configured timezone so DST is handled by the window, not by an
+hour count.
+
+Fixed prices are **consumer prices incl. VAT and tax** (`price.fixed_price_eur_per_kwh`,
+`price.fixed_day_price_eur_per_kwh`, `price.fixed_night_price_eur_per_kwh`); a value may instead be
+read from an HA sensor (`price.fixed_price_entity`, `price.fixed_day_price_entity`,
+`price.fixed_night_price_entity`), which wins when set. No adders are applied to either, because
+they are already consumer prices. No price is ever inferred from an entity's *name*: a missing fixed
+price is a `forecast_unavailable` failure carrying a hint that names the field to fill.
+
+`price.vat_pct` / `price.energy_tax_eur_per_kwh` / fees keep their meaning: adders applied only to
+sources that declare themselves ex-tax. `day_ahead` is one, so its forecast carries a note naming the
+adders actually applied — a wholesale price with no adders configured is not a consumer price, and
+the UI must be able to say so.
+
+A provider/contract combination outside the table above is a **warning, not a failure**: it is
+reported as `price_warnings` in `/api/v1/config` and the engine keeps the configured provider, because
+refusing to plan is worse than planning with a stated mismatch.
+
 ---
 
 ## 5. Batteries (pluggable, N of them)
@@ -590,7 +625,16 @@ GET  /api/v1/plan?hours=36     -> {generated_at, horizon_start, horizon_end, fea
                                (`spread_below_threshold`). The efficiency keys are additive.
 POST /api/v1/plan/recompute    -> {queued: true}       (async; poll status)
 GET  /api/v1/forecast?kind=price|solar|load&hours=36
-                               -> {kind, generated_at, source, stale, slots:[...]}
+                               -> {kind, generated_at, source, stale, slots:[...],
+                                   provider, contract, notes:[...], reason, hint}
+                                   `provider` is the effective provider (or `unavailable`), `contract`
+                                   the configured contract type, `notes` the source's own caveats (e.g.
+                                   the adders applied to a wholesale price). `reason`/`hint` are
+                                   additive (0.3.0): when a panel has no slots `reason` is a stable
+                                   slug (`not_configured`, `provider_failed`, `fixed_price_missing`,
+                                   `no_pv_source`, `no_history`, `empty_horizon`, `unknown`) and
+                                   `hint` one sentence naming the setting or condition to fix, so the
+                                   UI never has to say only "the source failed".
 GET  /api/v1/batteries         -> {batteries:[{config, state, capabilities, mapping_resolved,
                                                discovery:[...]}]}
 POST /api/v1/batteries         -> create  {config}
@@ -602,7 +646,8 @@ GET  /api/v1/discover?kind=battery|price|solar|load|grid
                                -> {candidates:[{entity_id, name, unit, device_class, state,
                                                 platform, suggested_role, confidence}]}
 GET  /api/v1/config            -> {options:{...}, settings:[{key, value, type, default,
-                                                          label, help, group, choices}]}
+                                                          label, help, group, choices}],
+                                   price_warnings:[{key, message}]}
 PATCH /api/v1/config           -> {settings:{key:value}}  -> 200 {applied:[...], errors:[...]}
                                    Unknown or invalid keys are reported per key in errors (never as a whole
                                    request failure), because the settings form renders them field by field.
@@ -927,6 +972,17 @@ round, with the reason:
   together with one state role — because discovery legitimately returns lone `soc`, `connection` or
   `manual_mode` matches for thermostats, bridges, printers and add-ons; it ranks control-ready groups
   first, labels what is missing, and still allows a slug to be typed for anything discovery cannot see.
+
+- **§4.1 (price provider and contract selection; requested after the live install, "the forecast
+  section is empty")** — the price panel was empty because no source was configured, and the UI could
+  only say "the source failed or the horizon is empty". Checked against the live instance before
+  building: the existing Zonneplan provider parses both of its tariff sensors correctly (quarter-hourly
+  144 entries, hourly 36, fixed-point ÷1e7, and its scale check passes against the sensor state), so the
+  source path was never broken. The request was to let the user select a **provider** and a **contract
+  type** and have the add-on fetch the prices from somewhere, so provider resolution (zonneplan lookups
+  in HA, day-ahead via energy_charts, fixed tariffs, and the untouched explicit entity path),
+  `price_warnings`, and the forecast `reason`/`hint`/`notes`/`provider`/`contract` fields were added.
+  A fixed tariff deliberately has **no** market fallback, and no price is inferred from an entity name.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

@@ -698,9 +698,9 @@ class ApiServer:
             if kind not in ("price", "solar", "load"):
                 raise ApiError(400, "invalid_kind", "kind must be price, solar or load")
             forecast = engine.forecast(kind)
-            return self._json(
-                forecast_dict(kind, forecast, now, hours=_hours(query.get("hours"), self._default_hours()))
-            )
+            payload = forecast_dict(kind, forecast, now, hours=_hours(query.get("hours"), self._default_hours()))
+            self._augment_forecast_payload(payload, kind, forecast)
+            return self._json(payload)
 
         if route == "batteries" and method == "GET":
             return self._json({"batteries": engine.batteries_view()})
@@ -913,7 +913,52 @@ class ApiServer:
             # Additive: add-on options the stored settings override (mode/dry_run), so the UI can
             # warn that editing the option has no effect (WP2A ``Settings.option_conflicts``).
             "conflicts": self._option_conflicts(settings),
+            # SPEC 4.1 (0.3.0): price provider/contract problems, reported but never fatal.
+            "price_warnings": self._price_warnings(settings),
         }
+
+    @staticmethod
+    def _price_warnings(settings: Any) -> list[dict[str, Any]]:
+        """``Settings.price_warnings()`` when present, else an empty list (SPEC 4.1)."""
+        probe = getattr(settings, "price_warnings", None)
+        if not callable(probe):
+            return []
+        try:
+            warnings = probe()
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("settings.price_warnings() failed: %s", exc)
+            return []
+        return [dict(warning) for warning in warnings or [] if isinstance(warning, Mapping)]
+
+    def _augment_forecast_payload(self, payload: dict[str, Any], kind: str, forecast: Any) -> dict[str, Any]:
+        """Add the SPEC 10 (0.3.0) forecast fields: provider, contract, notes, reason, hint.
+
+        These are additive and present for every kind; ``provider``/``contract`` carry the effective
+        price provider + contract for the price panel (the ``source`` key still names the concrete
+        source), and ``reason``/``hint`` explain an empty or failed panel so the UI never has to say
+        only "the source failed". Robust to an engine that predates these accessors.
+        """
+        engine = self.engine
+        notes = list(getattr(forecast, "notes", []) or []) if forecast is not None else []
+        provider: Any = None
+        contract: Any = None
+        provider_contract = getattr(engine, "price_provider_contract", None)
+        if kind == "price" and callable(provider_contract):
+            value = provider_contract() or {}
+            provider = value.get("provider")
+            contract = value.get("contract")
+        else:
+            provider = getattr(forecast, "source", None) if forecast is not None else "unavailable"
+        explanation: dict[str, Any] = {}
+        explain = getattr(engine, "explain_forecast", None)
+        if callable(explain):
+            explanation = explain(kind) or {}
+        payload["provider"] = provider
+        payload["contract"] = contract
+        payload["notes"] = notes
+        payload["reason"] = explanation.get("reason")
+        payload["hint"] = explanation.get("hint")
+        return payload
 
     @staticmethod
     def _option_conflicts(settings: Any) -> list[dict[str, Any]]:

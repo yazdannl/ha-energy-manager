@@ -405,3 +405,70 @@ def test_battery_helpers_without_store_keep_memory_only():
     settings.update_battery("battery_1", {"max_discharge_w": 400.0})
     assert settings.battery("battery_1").max_discharge_w == 400.0
     assert settings.get("batteries")[0]["max_discharge_w"] == 400.0
+
+
+# ----------------------------------------------------------------------------------------------
+# SPEC 4.1: price provider/contract warnings (GET /api/v1/config price_warnings).
+# ----------------------------------------------------------------------------------------------
+
+
+def _price_settings(**overrides):
+    return Settings(None, options=overrides)
+
+
+def test_default_price_settings_have_no_warnings():
+    # entity (default) accepts any contract and needs nothing extra.
+    assert _price_settings().price_warnings() == []
+    assert _price_settings(**{"price.provider": "zonneplan", "price.contract": "dynamic_quarter_hourly"}).price_warnings() == []
+
+
+def test_provider_contract_mismatch_is_a_warning_not_a_failure():
+    dynamic_providers = ("zonneplan", "day_ahead")
+    for provider in dynamic_providers:
+        for contract in ("fixed_single", "fixed_day_night"):
+            warnings = {item["key"] for item in _price_settings(**{"price.provider": provider, "price.contract": contract}).price_warnings()}
+            assert "price.contract" in warnings, (provider, contract)
+    # the fixed provider needs a fixed contract
+    for contract in ("dynamic_quarter_hourly", "dynamic_hourly"):
+        warnings = _price_settings(**{"price.provider": "fixed", "price.contract": contract}).price_warnings()
+        assert any(w["key"] == "price.contract" and "fixed" in w["message"] for w in warnings)
+    # entity accepts a fixed contract without a mismatch warning (advanced explicit path)
+    assert all(w["key"] != "price.contract" for w in _price_settings(**{"price.provider": "entity", "price.contract": "fixed_single"}).price_warnings())
+
+
+def test_fixed_single_requires_a_price_or_entity():
+    missing = _price_settings(**{"price.provider": "fixed", "price.contract": "fixed_single"}).price_warnings()
+    assert any(w["key"] == "price.fixed_price_eur_per_kwh" for w in missing)
+    # a typed rate satisfies it
+    assert not any(w["key"] == "price.fixed_price_eur_per_kwh" for w in _price_settings(**{"price.provider": "fixed", "price.contract": "fixed_single", "price.fixed_price_eur_per_kwh": 0.25}).price_warnings())
+    # an entity alone satisfies it too
+    assert not any(w["key"] == "price.fixed_price_eur_per_kwh" for w in _price_settings(**{"price.provider": "fixed", "price.contract": "fixed_single", "price.fixed_price_entity": "sensor.example_tariff"}).price_warnings())
+
+
+def test_fixed_day_night_requires_both_rates_and_distinct_windows():
+    base = {"price.provider": "fixed", "price.contract": "fixed_day_night"}
+    neither = _price_settings(**base).price_warnings()
+    keys = {w["key"] for w in neither}
+    assert "price.fixed_day_price_eur_per_kwh" in keys and "price.fixed_night_price_eur_per_kwh" in keys
+    # only the day rate is set: night still missing
+    only_day = _price_settings(**{**base, "price.fixed_day_price_eur_per_kwh": 0.3}).price_warnings()
+    assert {w["key"] for w in only_day} == {"price.fixed_night_price_eur_per_kwh"}
+    # both rates, but the two start hours collapse the windows
+    collapsed = _price_settings(**{**base, "price.fixed_day_price_eur_per_kwh": 0.3, "price.fixed_night_price_eur_per_kwh": 0.15, "price.fixed_day_start_hour": 7, "price.fixed_night_start_hour": 7}).price_warnings()
+    assert any(w["key"] == "price.fixed_day_start_hour" for w in collapsed)
+    # a valid day/night contract is clean
+    ok = _price_settings(**{**base, "price.fixed_day_price_eur_per_kwh": 0.3, "price.fixed_night_price_eur_per_kwh": 0.15}).price_warnings()
+    assert ok == []
+
+
+def test_day_ahead_wholesale_with_no_adders_warns_it_is_not_a_consumer_price():
+    zero = {"price.provider": "day_ahead", "price.contract": "dynamic_hourly", "price.vat_pct": 0.0, "price.energy_tax_eur_per_kwh": 0.0, "price.import_fee_eur_per_kwh": 0.0, "price.export_fee_eur_per_kwh": 0.0}
+    warnings = _price_settings(**zero).price_warnings()
+    assert any("not a consumer price" in w["message"] for w in warnings)
+    # any single adder configured makes it a consumer price and clears the informational warning
+    for key in ("price.vat_pct", "price.energy_tax_eur_per_kwh", "price.import_fee_eur_per_kwh"):
+        configured = dict(zero)
+        configured[key] = 0.05
+        assert not any("not a consumer price" in w["message"] for w in _price_settings(**configured).price_warnings()), key
+    # not day_ahead: never warned, even with every adder at zero
+    assert not any("not a consumer price" in w["message"] for w in _price_settings(**{**zero, "price.provider": "zonneplan"}).price_warnings())

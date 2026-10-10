@@ -1004,10 +1004,29 @@
     return groups;
   }
 
+  /** Empty-panel copy: the API `hint` (one actionable sentence, e.g. naming the bidding zone
+   *  that has no day-ahead prices) is the prominent message, rendered verbatim, with the `reason`
+   *  slug kept as a small badge beside it. Only when the server sent no hint do we fall back to the
+   *  generic "source failed / empty horizon" sentence, so an explained empty panel is never vague.
+   *  Pure (no DOM) so node tests can assert the preference directly. */
+  function forecastEmptyState(payload) {
+    var reason = payload && payload.reason != null && String(payload.reason) ? String(payload.reason) : null;
+    var hint = payload && payload.hint != null && String(payload.hint) ? String(payload.hint) : null;
+    return {
+      reason: reason,
+      hint: hint,
+      text: hint || "No slots returned; the source failed or the horizon is empty."
+    };
+  }
+
   function renderForecastPanel(body, kind, payload) {
     var slots = Array.isArray(payload.slots) ? payload.slots : [];
     var meta = el("p", { class: "alert-meta" }, [
       badge("source: " + (payload.source || "unknown"), "info"),
+      // Effective provider + configured contract (SPEC §4.1), next to the resolved source so the
+      // empty-state hint below can be read against what was actually configured.
+      payload.provider ? badge("provider: " + payload.provider, "info") : null,
+      payload.contract ? badge("contract: " + payload.contract, "info") : null,
       " generated " + timeAgo(payload.generated_at),
       payload.stale ? badge("stale", "stale") : null,
       kind === "load" && payload.confidence ? " " : null,
@@ -1024,7 +1043,13 @@
     root.SEMCharts.forecast(chart, kind, payload);
 
     if (!slots.length) {
-      body.appendChild(el("p", { class: "muted", text: "No slots returned; the source failed or the horizon is empty." }));
+      // No slots: surface the server's `hint` verbatim and `reason` slug (the backend explains an
+      // empty panel — a failed day-ahead lookup names the bidding zone), not the generic sentence.
+      var empty = forecastEmptyState(payload);
+      body.appendChild(el("div", { class: "banner banner-warn" }, [
+        el("p", { class: "banner-title" }, [empty.text, empty.reason ? " " : null, empty.reason ? badge(empty.reason, "warn") : null]),
+        empty.hint ? null : el("p", { class: "field-help", text: "The server did not explain why this forecast is empty; check the log for the failing source." })
+      ]));
       return;
     }
     var step = slotHours(slots);
@@ -2338,6 +2363,68 @@
     return /safety|limit/i.test(String(descriptor.group || "")) || SAFETY_KEY_RE.test(descriptor.key);
   }
 
+  /* ---- price provider/contract field visibility (SPEC §4.1) --------------------------------
+   * Which price.* fields the settings form reveals depends on price.provider (where prices come
+   * from) and price.contract (their shape): asking for a bidding zone on a fixed tariff, or an
+   * entity on the auto-found Zonneplan sensor, is noise. This declarative table plus its pure
+   * reader decide the visible set. Visibility is a *convenience* only — renderSettings still
+   * surfaces any hidden field that holds a non-default value, so nothing takes effect invisibly. */
+
+  // Meaningful for every provider/contract: the adders/fees that turn a wholesale price into a
+  // consumer price, the declared unit/scale, and the export (feed-in) tariff path.
+  var PRICE_FIELDS_ALWAYS = [
+    "price.vat_pct", "price.energy_tax_eur_per_kwh", "price.import_fee_eur_per_kwh",
+    "price.export_fee_eur_per_kwh", "price.unit", "price.scale_divisor",
+    "price.feed_in_eur_per_kwh", "price.feed_in_entity", "price.feed_in_tax_inclusive"
+  ];
+  // provider=entity (the pre-0.3.0 explicit path): an advanced source + entity, with a static
+  // schedule as the configured->energy_charts->static tail.
+  var PRICE_FIELDS_ENTITY = ["price.source", "price.entity", "price.static_schedule"];
+  // provider=day_ahead: the bidding zone is the only extra field.
+  var PRICE_FIELDS_DAY_AHEAD = ["price.bzn"];
+  // provider=fixed, contract=fixed_single: one consumer rate (typed value, or the entity that wins).
+  var PRICE_FIELDS_FIXED_SINGLE = ["price.fixed_price_eur_per_kwh", "price.fixed_price_entity"];
+  // provider=fixed, contract=fixed_day_night: day + night rates and the two window start hours.
+  var PRICE_FIELDS_FIXED_DAY_NIGHT = [
+    "price.fixed_day_price_eur_per_kwh", "price.fixed_night_price_eur_per_kwh",
+    "price.fixed_day_price_entity", "price.fixed_night_price_entity",
+    "price.fixed_day_start_hour", "price.fixed_night_start_hour"
+  ];
+  // The one-line note under the provider select, explaining the selection so a user who later sees
+  // an explained empty forecast knows where to look. zonneplan is auto-found; day_ahead is wholesale
+  // and its zone coverage can legitimately be empty (hint the forecast then shows).
+  var PRICE_PROVIDER_NOTES = {
+    entity: null,
+    zonneplan: "The Zonneplan tariff sensor is located in Home Assistant automatically (from its price-list attribute and 15-minute/hourly slot spacing) — there is no entity to pick here.",
+    day_ahead: "Wholesale day-ahead prices from energy-charts for the bidding zone below. They are ex-VAT and ex-tax, so the VAT, energy-tax and fee fields turn them into consumer prices. Zone coverage matters: a valid zone may simply publish no prices for this window, and the forecast then shows a hint naming that zone — if so, pick your supplier's own source (zonneplan or a price entity) instead.",
+    fixed: null
+  };
+  var PRICE_FIXED_NOTES = {
+    fixed_single: "One consumer price (incl. VAT and tax) for the whole day. A missing fixed price fails loudly — it is never guessed from the market.",
+    fixed_day_night: "Two consumer prices: the day rate runs from fixed_day_start_hour until fixed_night_start_hour, the night rate for the rest. Evaluated per slot in your timezone, so DST follows the window, not an hour count."
+  };
+
+  /** Visible price.* keys for a provider/contract pair, in render order, plus the note to show.
+   *  Pure (no DOM) so node tests can assert the table. contract only changes the fixed fields. */
+  function priceFieldVisibility(provider, contract) {
+    var p = String(provider || "entity");
+    var c = String(contract || "dynamic_hourly");
+    var keys = ["price.provider", "price.contract"].concat(PRICE_FIELDS_ALWAYS);
+    var note = PRICE_PROVIDER_NOTES[p] != null ? PRICE_PROVIDER_NOTES[p] : null;
+    if (p === "zonneplan") {
+      // No price.entity: the tariff sensor is found structurally, never by entity id.
+    } else if (p === "day_ahead") {
+      keys = keys.concat(PRICE_FIELDS_DAY_AHEAD);
+    } else if (p === "fixed") {
+      keys = keys.concat(c === "fixed_day_night" ? PRICE_FIELDS_FIXED_DAY_NIGHT : PRICE_FIELDS_FIXED_SINGLE);
+      if (PRICE_FIXED_NOTES[c] != null) note = PRICE_FIXED_NOTES[c];
+    } else {
+      // entity (default), and the fallback for any unknown provider, so fields never vanish.
+      keys = keys.concat(PRICE_FIELDS_ENTITY);
+    }
+    return { fields: keys, note: note || null };
+  }
+
   function settingsField(descriptor, dirty) {
     var key = descriptor.key;
     var type = descriptor.type || "str";
@@ -2436,6 +2523,84 @@
       wrap.classList.add("field-dirty");
       dirtyCount = Object.keys(dirtyValues).length;
       saveButtons.forEach(function (b) { b.textContent = "Save changes (" + dirtyCount + ")"; b.disabled = dirtyCount === 0; });
+      // Changing the price provider or contract changes which price fields make sense, so re-render
+      // the group now (the new value is already in dirtyValues, so the preview updates immediately).
+      if (key === "price.provider" || key === "price.contract") draw();
+    }
+
+    function descriptorByKey(key) {
+      return descriptors.filter(function (d) { return d.key === key; })[0] || null;
+    }
+    // The field's current value: an unsaved edit wins over the server value, the server value over
+    // its default. Used for the visibility preview and the hidden-but-set warning.
+    function effectiveValue(descriptor) {
+      if (Object.prototype.hasOwnProperty.call(dirtyValues, descriptor.key)) return dirtyValues[descriptor.key].value;
+      return descriptor.value === undefined ? descriptor.default : descriptor.value;
+    }
+    // The provider/contract values that drive visibility; read off the full descriptor list (not the
+    // search-filtered group), so the preview reacts even when the selectors themselves are filtered.
+    function priceSettingValue(key) {
+      if (Object.prototype.hasOwnProperty.call(dirtyValues, key)) return dirtyValues[key].value;
+      var d = descriptorByKey(key);
+      return d ? (d.value === undefined ? d.default : d.value) : undefined;
+    }
+    function renderField(d) {
+      var merged = Object.prototype.hasOwnProperty.call(dirtyValues, d.key)
+        ? Object.assign({}, d, { value: dirtyValues[d.key].value })
+        : d;
+      var field = settingsField(merged, dirty);
+      if (Object.prototype.hasOwnProperty.call(dirtyValues, d.key)) field.classList.add("field-dirty");
+      if (isSafetySetting(merged)) {
+        field.classList.add("field-safety");
+        field.appendChild(badge("money/safety", "warn"));
+      }
+      return field;
+    }
+    function settingValueEqual(a, b) {
+      if (a === b) return true;
+      if (a && b && typeof a === "object" && typeof b === "object") return JSON.stringify(a) === JSON.stringify(b);
+      return false;
+    }
+    function settingValueText(value) {
+      if (value === null || value === undefined) return "unset";
+      if (typeof value === "object") return JSON.stringify(value);
+      return String(value);
+    }
+    // The Price group renders from GET /api/v1/config metadata: price_warnings at the top, then the
+    // provider select + the fields that apply to the chosen provider/contract, then a muted line
+    // for every hidden field that still holds a non-default value (visibility is a convenience, not
+    // a way to let a value take effect invisibly).
+    function renderPriceGroup(items) {
+      var section = el("section", { class: "group" }, [el("h3", { text: "Price" })]);
+      var warnings = Array.isArray(config.price_warnings) ? config.price_warnings : [];
+      warnings.forEach(function (w) {
+        if (!w) return;
+        section.appendChild(el("div", { class: "banner banner-warn" }, [
+          badge("provider/contract", "warn"),
+          " ",
+          el("strong", { text: String(w.key || "") }),
+          " — " + String(w.message || "")
+        ]));
+      });
+      var vis = priceFieldVisibility(priceSettingValue("price.provider"), priceSettingValue("price.contract"));
+      var visible = {};
+      vis.fields.forEach(function (k) { visible[k] = true; });
+      if (vis.note) section.appendChild(el("p", { class: "field-help", text: vis.note }));
+      var fields = el("div", { class: "fields" });
+      items.forEach(function (d) {
+        if (!Object.prototype.hasOwnProperty.call(visible, d.key)) return; // hidden by this provider/contract
+        fields.appendChild(renderField(d));
+      });
+      section.appendChild(fields);
+      // Hidden-but-set: computed over every price descriptor (never the search-filtered subset), so
+      // a value the current provider/contract ignores can never take effect invisibly.
+      descriptors.forEach(function (d) {
+        if (d.group !== "Price") return;
+        if (Object.prototype.hasOwnProperty.call(visible, d.key)) return;
+        if (settingValueEqual(effectiveValue(d), d.default)) return;
+        section.appendChild(el("p", { class: "muted", text: "Hidden " + d.key + " = " + settingValueText(effectiveValue(d)) + " — not used by the current provider/contract above, but still set." }));
+      });
+      return section;
     }
 
     var search = el("input", { type: "search", id: "settings-search", placeholder: "filter settings by key, label or help", "aria-label": "Filter settings" });
@@ -2473,24 +2638,18 @@
       });
       groups.forEach(function (group) {
         group.items.sort(function (a, b) { return a.key < b.key ? -1 : a.key > b.key ? 1 : 0; });
-        var section = el("section", { class: "group" + (groups.length && /safety|limit/i.test(group.name) ? " group-safety" : "") }, [
-          el("h3", { text: group.name })
-        ]);
-        if (/safety|limit/i.test(group.name)) section.appendChild(el("p", { class: "field-help", text: "These settings can move hardware or change safety limits. Changes ask for confirmation." }));
-        var fields = el("div", { class: "fields" });
-        group.items.forEach(function (d) {
-          var shown = Object.prototype.hasOwnProperty.call(dirtyValues, d.key)
-            ? Object.assign({}, d, { value: dirtyValues[d.key].value })
-            : d;
-          var field = settingsField(shown, dirty);
-          if (Object.prototype.hasOwnProperty.call(dirtyValues, d.key)) field.classList.add("field-dirty");
-          if (isSafetySetting(shown)) {
-            field.classList.add("field-safety");
-            field.appendChild(badge("money/safety", "warn"));
-          }
-          fields.appendChild(field);
-        });
-        section.appendChild(fields);
+        var section;
+        if (group.name === "Price") {
+          section = renderPriceGroup(group.items);
+        } else {
+          section = el("section", { class: "group" + (groups.length && /safety|limit/i.test(group.name) ? " group-safety" : "") }, [
+            el("h3", { text: group.name })
+          ]);
+          if (/safety|limit/i.test(group.name)) section.appendChild(el("p", { class: "field-help", text: "These settings can move hardware or change safety limits. Changes ask for confirmation." }));
+          var fields = el("div", { class: "fields" });
+          group.items.forEach(function (d) { fields.appendChild(renderField(d)); });
+          section.appendChild(fields);
+        }
         listHost.appendChild(section);
       });
       listHost.appendChild(feedInNote(shown));
@@ -2665,6 +2824,8 @@
     normalizeRoute: normalizeRoute,
     reasonText: reasonText,
     actionText: actionText,
+    forecastEmptyState: forecastEmptyState,
+    priceFieldVisibility: priceFieldVisibility,
     fmtPower: fmtPower,
     fmtKwh: fmtKwh,
     fmtPrice: fmtPrice,

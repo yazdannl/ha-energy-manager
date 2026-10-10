@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.3.0
+
+- **You choose where prices come from, and what your contract looks like.** Two settings replace the
+  need to know which sensor to paste: `price.provider` (Zonneplan / day-ahead market / fixed tariff /
+  your own entity) and `price.contract` (dynamic per quarter hour, dynamic hourly, one fixed rate, or a
+  day/night split). The add-on resolves the concrete source, says which one it used, and fetches from
+  there.
+- **Zonneplan is found in Home Assistant, structurally.** The tariff sensor is located by its payload
+  (a kWh unit, at least two entries on a regular 15-minute or hourly grid, and its own state agreeing
+  with the slot it is in) and never by its name. That matters: the gas tariff has the *same*
+  fixed-point shape and its state agrees with its own single slot, so only the unit and the grid
+  separate them. A quarter-hourly contract prefers the 15-minute sensor, an hourly contract the hourly
+  one, and having to use the other grid is reported as a note rather than passing silently.
+- **Day-ahead prices** come from energy-charts, keyless, for the configured bidding zone. They are
+  wholesale: the forecast carries a note naming the VAT, energy tax and fees actually applied, because
+  a wholesale price with no adders is not a consumer price. Zone coverage is real - a valid zone can
+  simply publish nothing for the window, and the hint then names that zone and points at the
+  alternatives instead of claiming a generic failure.
+- **A fixed tariff** is built from one or two consumer prices (typed, or read from a sensor you point
+  at) and, for the day/night split, the two window start hours. Windows are evaluated per slot in your
+  timezone, so a window that crosses midnight and DST both work. A fixed contract has **no market
+  fallback**: a missing price fails loudly with a hint naming the field, because silently planning a
+  flat tariff against market prices would be worse than not planning.
+- **An empty forecast panel now explains itself.** `GET /api/v1/forecast` carries `provider`,
+  `contract`, `notes`, `reason` (a stable slug such as `provider_failed`, `fixed_price_missing`,
+  `no_pv_source`, `no_history`) and `hint` - one sentence naming the setting or condition to fix. The
+  forecast view shows the hint verbatim with the reason beside it, plus the source, provider and
+  contract, instead of the old "the source failed or the horizon is empty".
+- `GET /api/v1/config` carries `price_warnings`: provider/contract mismatches, a missing fixed price, a
+  collapsed day/night window, and wholesale prices with no adders configured. Warnings are reported,
+  never fatal - refusing to plan would be worse than planning with a stated mismatch. The settings
+  form shows only the price fields the chosen provider and contract use, and names any hidden field
+  that still holds a value, so nothing takes effect invisibly.
+- The advanced `entity` provider keeps its old behaviour and remains the default, so an existing
+  configuration is unaffected. `ct/kWh` sensors are now scaled correctly on the state comparison.
+
 ## 0.2.0
 
 - **Batteries are selected, not typed.** The add-battery dialog lists the batteries discovery can see
