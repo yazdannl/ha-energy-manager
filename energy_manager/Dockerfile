@@ -26,4 +26,9 @@ HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
 # Runs as root, as Home Assistant add-ons expect. The entrypoint is run.sh so a container without a
 # Supervisor token fails fast (SPEC.md section 15) instead of running blind; the wrapper execs
 # `python3 -m app.main`, which is also the documented way to run outside Home Assistant.
-CMD ["/bin/sh", "/run.sh"]
+#
+# with-contenv is required: the base image's s6-overlay entrypoint runs this command as a service,
+# and s6 services do not inherit the container environment, so SUPERVISOR_TOKEN would never reach
+# run.sh — the wrapper would then refuse to start the add-on. with-contenv imports the environment
+# the Supervisor passes to the container.
+CMD ["/command/with-contenv", "/bin/sh", "/run.sh"]

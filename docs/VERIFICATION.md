@@ -23,7 +23,7 @@ loopback addresses and placeholder coordinates.
 Frozen digest of the verified artifact (recipe in §7, normative):
 
 * **code + tests (73 files, documentation excluded)**:
-  `850f8d2d805613d2faac10683afcf5316c66da9c5a94dcc58f48fb706db3fba7`
+  `094ed3017783113a357a2a2782b117925dd611b26decd427fbcdf9124cad13b8`
 * **path list of the same 73 files** (detects an added, removed or renamed file):
   `553c23454f8aa5a3efbac4a327d1341f4b4b61211871ab1d28ec8fbdfb2d6216`
 
@@ -93,10 +93,33 @@ Fixed in **0.1.1**: the keys are absent from `options:` (which is what optional 
 now a subset test plus a no-null rule, and `tests/test_wp4_manifests.py` enforces the same rules in
 the suite itself rather than only in CI. The guard was proved failing-first — with the nulls
 reintroduced on a copy, `test_no_option_carries_a_null_value` and
-`test_options_that_come_from_home_assistant_stay_optional` fail — and the fix was then confirmed by
-starting the add-on on the live instance, which is the gate that found the problem in the first
-place. This is the reason the packaging tests now run locally: every other gate in this record was
-green while the add-on could not start.
+`test_options_that_come_from_home_assistant_stay_optional` fail — and the manifest was then
+confirmed by running the built image locally with a Supervisor-style `/data`, where the add-on got
+past option validation and failed for a second, unrelated reason (below). The 0.1.1 commit message
+claimed the fix had been confirmed on the live instance; it was written before that was true, and
+this record corrects it.
+
+This is why the packaging tests now run locally: every other gate in this record was green while the
+add-on could not start at all.
+
+### The second defect the install found: the token never reached the entrypoint
+
+Same class, one layer down. After the manifest fix the add-on still went to `error` within seconds —
+no `sensor.sem_*` entity published, no notification, no plan: it died before doing anything
+observable. Running the built image locally with `-e SUPERVISOR_TOKEN=...` reproduced it in one line:
+
+```
+energy_manager: neither SUPERVISOR_TOKEN nor HASSIO_TOKEN is set.
+```
+
+The base image's s6-overlay entrypoint runs the container command as a *service*, and s6 services do
+not inherit the container environment (that is what `with-contenv` exists for). The token was
+never visible to `run.sh`, which by design refuses to run blind, so the container exited 1 on every
+start. `CMD` now goes through `/command/with-contenv`, and the fail-fast check still fires when no
+token is set. Verified in the real image both ways — token present: starts, serves, logs its banner;
+token absent: exits 1 with the same message — and the CI image job now runs the built image with a
+Supervisor-style environment, so a build-only check can no longer pass while the entrypoint is
+broken.
 
 ---
 

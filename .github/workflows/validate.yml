@@ -77,3 +77,25 @@ jobs:
       - uses: actions/checkout@v4
       - name: docker build
         run: docker build -t sem-test --build-arg BUILD_ARCH=amd64 energy_manager/
+
+      # The two defects that actually reached a live install were both invisible to a build-only
+      # check: Supervisor refused the null options, and s6 dropped the container environment so the
+      # token never reached the entrypoint. Run the image the way the Supervisor does.
+      - name: Run the image with a Supervisor-style environment
+        run: |
+          mkdir -p /tmp/sem-data
+          echo '{"mode":"advisory","dry_run":true,"log_level":"info"}' > /tmp/sem-data/options.json
+          set +e
+          output=$(timeout 30 docker run --rm -e SUPERVISOR_TOKEN=not-a-real-token \
+                     -v /tmp/sem-data:/data sem-test 2>&1)
+          set -e
+          echo "$output"
+          if echo "$output" | grep -q "neither SUPERVISOR_TOKEN"; then
+            echo "::error::the token did not reach the entrypoint (s6 does not pass the container environment)"
+            exit 1
+          fi
+          echo "$output" | grep -q "Smart Energy Manager" || {
+            echo "::error::the add-on never reached its start banner"
+            exit 1
+          }
+          echo "image starts, token reaches the entrypoint"

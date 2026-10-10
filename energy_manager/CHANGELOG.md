@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.2
+
+- **Fixed: the add-on still could not start — the Supervisor token never reached the entrypoint.**
+  0.1.1 got past the option validation and then exited immediately: the base image's s6-overlay
+  entrypoint runs the container command as a service, and s6 services do not inherit the container
+  environment, so `run.sh` saw neither `SUPERVISOR_TOKEN` nor `HASSIO_TOKEN` and refused to start.
+  The command now goes through `/command/with-contenv`, which imports the environment the Supervisor
+  passes to the container. The fail-fast check is unchanged and still fires when no token is set.
+- The CI image job now runs the built image with a Supervisor-style environment and fails if the
+  token does not reach the entrypoint or the app never reaches its start banner — the two defects
+  that reached a live install were both invisible to a build-only check.
+
 ## 0.1.1
 
 - **Fixed: the add-on could not start on a fresh install.** `options:` carried explicit `null`
