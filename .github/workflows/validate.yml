@@ -44,7 +44,10 @@ jobs:
               yaml.safe_load(pathlib.Path(path).read_text())
           cfg = yaml.safe_load(pathlib.Path("energy_manager/config.yaml").read_text())
           assert len(cfg["description"]) <= 200, "description must fit the add-on store"
-          assert set(cfg["options"]) == set(cfg["schema"]), "every option needs a schema entry"
+          assert set(cfg["options"]) <= set(cfg["schema"]), "every option needs a schema entry"
+          assert all(v is not None for v in cfg["options"].values()), (
+              "Supervisor rejects a null option value and then refuses to start the add-on"
+          )
           assert cfg["options"]["mode"] == "advisory", "shipped default must not write"
           assert cfg["options"]["dry_run"] is True, "shipped default must not write"
           assert cfg["ingress"] is True and cfg["ingress_port"] == 8099

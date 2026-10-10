@@ -6,6 +6,12 @@
 ARG BUILD_ARCH=amd64
 FROM ghcr.io/home-assistant/${BUILD_ARCH}-base-python:3.13-alpine3.21
 
+# Supervisor passes the manifest version into the build. Exposing it here means the API, the log
+# banner and the add-on store report one number instead of drifting apart (app/main.py prefers
+# this over its own fallback, which is only used when the add-on runs outside Home Assistant).
+ARG BUILD_VERSION=""
+ENV BUILD_VERSION=${BUILD_VERSION}
+
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 

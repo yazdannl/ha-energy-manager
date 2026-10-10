@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.1
+
+- **Fixed: the add-on could not start on a fresh install.** `options:` carried explicit `null`
+  values for the four keys that are read from Home Assistant at runtime (`currency`, `timezone`,
+  `latitude_override`, `longitude_override`) while the schema declared them optional. Supervisor
+  rejects a null option value and refused the start with `Missing required option 'currency'`.
+  Those keys are now absent from `options:` (which is what "optional" means), and
+  `tests/test_wp4_manifests.py` fails the suite if a null or a stray schema key returns — the
+  previous check required `options` and `schema` to hold identical key sets, which is what forced
+  the nulls in.
+- The image now takes the manifest version from the Supervisor build (`ARG BUILD_VERSION`) instead
+  of relying on a hardcoded string, so the store, the log banner and the API report one number.
+
 ## 0.1.0
 
 First release.

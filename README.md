@@ -319,14 +319,16 @@ addresses.
 
 ```sh
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests   # syntax check
-python3 -m pytest tests -q                                             # test suite (pytest only)
+python3 -m pytest tests -q                                             # test suite (pytest + PyYAML)
 sh tools/audit.sh                                                      # PII / secret tripwire
 python3 tools/make_icons.py                                            # regenerate icon and logo
 docker build -t sem-test --build-arg BUILD_ARCH=amd64 energy_manager/  # build the add-on image
 ```
 
-The Python code targets the standard library only, so `requirements.txt` is empty and no virtual
-environment is required to run the tests other than `pytest` itself.
+The Python code targets the standard library only, so `requirements.txt` is empty and the add-on
+image installs nothing. Running the tests additionally needs `pytest` and `PyYAML` (used by
+`tests/test_wp4_manifests.py`, which checks the add-on manifests against the rules Supervisor
+applies when it starts an add-on).
 
 ## Licence
 

@@ -15,17 +15,17 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **493 passed** (two consecutive runs) |
-| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 84 files scanned`, exit 0 |
+| Test suite | `python3 -m pytest tests -q` | **501 passed** (two consecutive runs) |
+| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 85 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
 
 Frozen digest of the verified artifact (recipe in §7, normative):
 
-* **code + tests (72 files, documentation excluded)**:
-  `b095c5a57616865a4d5bbd4fbf22c95684f0aa28197dae557ec407cbe1e3347f`
-* **path list of the same 72 files** (detects an added, removed or renamed file):
-  `dfb3b4a9b4f6537d5929c22d6ca824fddd44d7c6b8e11894b9e35cb1ce15af63`
+* **code + tests (73 files, documentation excluded)**:
+  `850f8d2d805613d2faac10683afcf5316c66da9c5a94dcc58f48fb706db3fba7`
+* **path list of the same 73 files** (detects an added, removed or renamed file):
+  `553c23454f8aa5a3efbac4a327d1341f4b4b61211871ab1d28ec8fbdfb2d6216`
 
 The recipe sorts the file list **and** the per-file manifest under `LC_ALL=C`, so the digest is
 independent of `find` order and of the locale; a single `sort` is not enough. An earlier revision of
@@ -34,9 +34,9 @@ defect in the record, not in the tree: the file lists were verified byte-identic
 so no source file had changed. Those values (`8f83a0a6…` all files, `c58e912c…` code + tests) are
 superseded by the digest above.
 
-The all-files digest (84 files) is deliberately **not** recorded here: this document is one of the 84,
+The all-files digest (85 files) is deliberately **not** recorded here: this document is one of the 85,
 so every documentation edit would change it while the verified code stayed identical. Compute it with
-the same recipe over the full file list if you want it; the file count printed by the pipeline (84) is
+the same recipe over the full file list if you want it; the file count printed by the pipeline (85) is
 the quick cross-check.
 
 ---
@@ -72,6 +72,31 @@ The defects that mattered, all reproduced by the auditors:
 The pre-audit suite was green at **398 tests** while all of those existed. A green suite was not
 evidence that the safety, packaging or pricing story was sound, which is why independent audits were
 run instead of trusting it.
+
+### The defect the real install found
+
+The three audits, both fix waves and the 493-test suite all missed something that the first real
+install hit within a minute of pressing start:
+
+```
+App f20c2e09_energy_manager has invalid options: Missing required option 'currency'
+```
+
+`config.yaml` listed the four options that are read from Home Assistant at runtime (`currency`,
+`timezone`, `latitude_override`, `longitude_override`) in `options:` with explicit `null` values,
+while the schema declared them optional. Supervisor rejects an explicit null, so the add-on built,
+installed, appeared in the store — and then refused to start. The root cause was the packaging check
+itself: it asserted `set(options) == set(schema)`, which *forced* those keys into `options:`, so the
+only way to satisfy it was to invent values for keys whose entire purpose is to stay unset.
+
+Fixed in **0.1.1**: the keys are absent from `options:` (which is what optional means), the check is
+now a subset test plus a no-null rule, and `tests/test_wp4_manifests.py` enforces the same rules in
+the suite itself rather than only in CI. The guard was proved failing-first — with the nulls
+reintroduced on a copy, `test_no_option_carries_a_null_value` and
+`test_options_that_come_from_home_assistant_stay_optional` fail — and the fix was then confirmed by
+starting the add-on on the live instance, which is the gate that found the problem in the first
+place. This is the reason the packaging tests now run locally: every other gate in this record was
+green while the add-on could not start.
 
 ---
 
@@ -174,10 +199,11 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 493 passed)
+# 2. Full test suite (expect: 501 passed; needs pytest and PyYAML, which only the manifest test
+#    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 
-# 3. R1 tripwire (expect: "audit: clean — 84 files scanned", exit 0)
+# 3. R1 tripwire (expect: "audit: clean — 85 files scanned", exit 0)
 sh tools/audit.sh
 
 # 4. End-to-end selfcheck (expect: 31/31 checks passed, exit 0)
@@ -186,15 +212,15 @@ PYTHONPATH=energy_manager python3 -m app.main --selfcheck
 
 Frozen digests — manifest digests over the file sets the two recipes select. Both stages are sorted
 under `LC_ALL=C`, which makes the value independent of `find` order and of the locale (a single `sort`
-produces a different value). The `wc -l` count is the cross-check (84 and 72).
+produces a different value). The `wc -l` count is the cross-check (85 and 73).
 
 ```sh
-# all files (84)
+# all files (85)
 find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache \
         -o -name node_modules -o -name .mypy_cache \) -prune -o -type f -print \
   | LC_ALL=C sort | xargs sha256sum | LC_ALL=C sort | sha256sum
 
-# code + tests only (72), documentation excluded
+# code + tests only (73), documentation excluded
 find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache \
         -o -name node_modules -o -name .mypy_cache -o -name '*.md' -o -name 'LICENSE*' \) -prune \
      -o -type f -print \

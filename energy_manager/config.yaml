@@ -1,5 +1,5 @@
 name: Smart Energy Manager
-version: 0.1.0
+version: 0.1.1
 slug: energy_manager
 description: Plans and optionally executes battery dispatch to cut electricity cost from dynamic prices, solar forecasts and a learned load profile.
 url: https://github.com/yazdannl/ha-energy-manager
@@ -19,14 +19,13 @@ panel_title: Energy
 homeassistant_api: true
 hassio_api: false
 # image: ghcr.io/yazdannl/energy-manager-{arch}   # optional: uncomment to pull a prebuilt image
+# Every value here must be non-null: Supervisor rejects an explicit null ("Missing required
+# option") and refuses to start the add-on. Optional keys belong in `schema:` alone, where absent
+# means "read it from Home Assistant"; both rules are enforced by tests/test_wp4_manifests.py.
 options:
   mode: advisory
   dry_run: true
   log_level: info
-  currency: null
-  timezone: null
-  latitude_override: null
-  longitude_override: null
 schema:
   mode: list(off|advisory|auto)
   dry_run: bool
