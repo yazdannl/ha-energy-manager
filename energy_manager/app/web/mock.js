@@ -331,8 +331,8 @@
 
     ["price.provider", "str", "entity", "Price provider", "Where prices come from. entity = a sensor you pick (advanced); zonneplan = the Zonneplan integration's tariff sensor found in Home Assistant; day_ahead = energy_charts wholesale day-ahead prices for the bidding zone; fixed = a flat or day/night tariff.", "price", ["entity", "zonneplan", "day_ahead", "fixed"]],
     ["price.contract", "str", "dynamic_hourly", "Contract type", "dynamic_quarter_hourly / dynamic_hourly = market prices per quarter hour or per hour; fixed_single = one rate all day; fixed_day_night = two rates split by the day window below. Wholesale providers need the VAT, energy tax and fee fields to become consumer prices.", "price", ["dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night"]],
-    ["price.source", "str", "zonneplan_entity", "Price source (advanced)", "Only used by the entity provider: configured source with fallback to energy_charts then static.", "price", ["zonneplan_entity", "energy_charts", "entity_forecast", "static"]],
-    ["price.entity", "str", "", "Price entity (advanced)", "Runtime-picked HA sensor entity id.", "price", null],
+    ["price.source", "str", "zonneplan_entity", "Price source", "Only used by the entity provider: configured source with fallback to energy_charts then static.", "price", ["zonneplan_entity", "energy_charts", "entity_forecast", "static"]],
+    ["price.entity", "str", "", "Price entity", "Runtime-picked HA sensor entity id.", "price", null],
     ["price.fixed_price_eur_per_kwh", "float", null, "Fixed rate", "Consumer price incl. VAT and tax, EUR/kWh. Unset = read the entity below.", "price", null],
     ["price.fixed_day_price_eur_per_kwh", "float", null, "Day rate", "Consumer price incl. VAT and tax for the day window, EUR/kWh.", "price", null],
     ["price.fixed_night_price_eur_per_kwh", "float", null, "Night rate", "Consumer price incl. VAT and tax outside the day window, EUR/kWh.", "price", null],
@@ -397,6 +397,7 @@
     ["control.grid_follow_max_ratio", "float", 0.5, "Grid follow max ratio", "", "control", null],
     ["control.grid_follow_max_w", "float", 0, "Grid follow max W", "Power budget for grid-follow corrections; 0 = a share of the batteries' capability.", "control", null],
     ["control.stale_state_seconds", "int", 180, "Stale state seconds", "Older measurement means hold power.", "control", null],
+    ["control.stale_plan_seconds", "int", 1800, "Stale plan seconds", "Refuse to dispatch an active plan older than this.", "control", null],
     ["control.failsafe_on_error", "bool", true, "Fail safe on error", "Write 0 W on unrecoverable error.", "control", null],
 
     ["notify.enabled", "bool", true, "Notifications", "", "notify", null],
@@ -446,6 +447,22 @@
     return group.charAt(0).toUpperCase() + group.slice(1);
   }
 
+  // Mirrors config.py SETTINGS_META `advanced=True` (SPEC §13.3): the frozen advanced
+  // classification, which the UI folds behind each group's "Advanced (n)" disclosure. The Safety
+  // group is visible regardless of the flag, and a label never carries a manual "(advanced)"
+  // suffix — folding is the only signal.
+  var ADVANCED_KEYS = [
+    "currency", "timezone", "latitude_override", "longitude_override", "batteries",
+    "price.source", "price.entity", "price.unit", "price.scale_divisor", "price.vat_pct",
+    "price.energy_tax_eur_per_kwh", "price.import_fee_eur_per_kwh", "price.export_fee_eur_per_kwh",
+    "price.fixed_price_entity", "price.fixed_day_price_entity", "price.fixed_night_price_entity",
+    "price.fixed_day_start_hour", "price.fixed_night_start_hour", "price.static_schedule",
+    "price.feed_in_entity", "solar.performance_ratio", "solar.weather_entity", "solar.planes",
+    "solar.api_key", "load.temperature_entity", "grid.import_entity", "grid.export_entity",
+    "notify.events", "notify.persistent", "optimizer.slot_minutes", "optimizer.power_steps",
+    "optimizer.soc_step_kwh", "optimizer.salvage_multiplier"
+  ];
+
   function settingDescriptors() {
     return SETTINGS.slice()
       .sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; })
@@ -459,7 +476,8 @@
           label: row[3],
           help: row[4],
           group: descriptorGroup(key, row[5]),
-          choices: row[6] || []
+          choices: row[6] || [],
+          advanced: ADVANCED_KEYS.indexOf(key) >= 0
         };
       });
   }

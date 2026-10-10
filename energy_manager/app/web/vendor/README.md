@@ -36,3 +36,38 @@ sha256sum uPlot.iife.min.js uPlot.min.css   # must match the table above
 
 Then prepend the licence banners and update this table. Do not switch to a CDN URL: the add-on has
 no runtime network access for the UI.
+
+## Bootstrap 5.3.3
+
+| | |
+| --- | --- |
+| Project | Bootstrap — https://github.com/twbs/bootstrap |
+| Version | 5.3.3 (tag `v5.3.3`) |
+| Licence | MIT — see `LICENSE.bootstrap.txt` (copied from the upstream `LICENSE` file at that tag) |
+| Source URL | `https://raw.githubusercontent.com/twbs/bootstrap/v5.3.3/dist/css/bootstrap.min.css` |
+| Local file | `bootstrap.min.css` |
+
+The vendored file is the official `dist/css/bootstrap.min.css` and is byte-identical to the upstream
+release: Bootstrap already ships its own licence banner, so nothing was prepended or edited.
+
+```
+3c8f27e6009ccfd710a905e6dcf12d0ee3c6f2ac7da05b0572d3e0d12e736fc8  bootstrap.min.css
+```
+
+Size: 232803 bytes.
+
+Only the CSS is vendored. Bootstrap's JavaScript is deliberately **not** vendored (SPEC §13.1):
+interactions stay in `app.js`. `style.css` loads after this file and maps Bootstrap's `--bs-*`
+tokens onto the palette, so the result is this product's design, not Bootstrap's default look.
+
+### Refresh procedure
+
+```sh
+cd /tmp
+curl -fsSLO https://raw.githubusercontent.com/twbs/bootstrap/v5.3.3/dist/css/bootstrap.min.css
+sha256sum bootstrap.min.css   # must match the checksum above
+curl -fsSL -o LICENSE.bootstrap.txt https://raw.githubusercontent.com/twbs/bootstrap/v5.3.3/LICENSE
+```
+
+Then copy both files into `vendor/` and update this table. Do not switch to a CDN URL: the add-on
+has no runtime network access for the UI.

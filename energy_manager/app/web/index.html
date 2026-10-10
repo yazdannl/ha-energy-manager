@@ -1,13 +1,14 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-bs-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title>Smart Energy Manager</title>
 <!-- Static SPA. No build step, no runtime CDN: all assets are served from this directory. -->
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="vendor/bootstrap.min.css">
 <link rel="stylesheet" href="vendor/uPlot.min.css">
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
 <a class="skip-link" href="#view">Skip to content</a>
@@ -17,7 +18,13 @@
     <span class="brand-title">Smart Energy Manager</span>
     <span class="brand-sub" id="build-info">&nbsp;</span>
   </p>
-  <p class="conn" id="conn-status" role="status" aria-live="polite">Connecting&hellip;</p>
+  <div class="topbar-actions">
+    <p class="conn" id="conn-status" role="status" aria-live="polite">Connecting&hellip;</p>
+    <!-- ponytail: app.js owns the theme choice; it updates this label and data-bs-theme on <html>. -->
+    <button id="theme-toggle" class="btn btn-ghost" type="button" aria-label="Theme: dark">
+      <span class="theme-state">Theme: dark</span>
+    </button>
+  </div>
 </header>
 
 <nav id="nav" aria-label="Views">

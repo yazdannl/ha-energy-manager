@@ -511,8 +511,66 @@
     });
   }
 
+  /* ------------------------------------------------------------------ theme override */
+
+  // auto -> dark -> light; persisted, and auto removes the attribute so prefers-color-scheme wins.
+  function themeMode() {
+    var mode = readStored("sem.theme", "auto");
+    return mode === "dark" || mode === "light" ? mode : "auto";
+  }
+
+  function applyTheme(mode) {
+    var rootEl = document.documentElement;
+    if (!rootEl) return;
+    if (mode === "auto") delete rootEl.dataset.bsTheme;
+    else rootEl.dataset.bsTheme = mode;
+  }
+
+  function wireThemeToggle() {
+    applyTheme(themeMode());
+    var btn = document.getElementById("theme-toggle");
+    if (!btn) return;
+    var labels = { auto: "Theme: auto", dark: "Theme: dark", light: "Theme: light" };
+    function label() {
+      var text = labels[themeMode()];
+      // ponytail: index.html ships a .theme-state span; update it instead of wiping the button.
+      var span = btn.querySelector ? btn.querySelector(".theme-state") : null;
+      if (span) span.textContent = text;
+      else btn.textContent = text;
+      btn.setAttribute("aria-label", text);
+    }
+    label();
+    btn.addEventListener("click", function () {
+      var mode = themeMode();
+      var next = mode === "auto" ? "dark" : mode === "dark" ? "light" : "auto";
+      writeStored("sem.theme", next);
+      applyTheme(next);
+      label();
+    });
+  }
+
+  // The router asks a view's guard before it re-renders, so a cancelled navigation keeps the
+  // current DOM (and its unsaved edits) instead of rebuilding it from the API.
+  var skipNextHash = false;
+  function onHashChange() {
+    // ponytail: restoring the old hash would re-render settings and lose the edits the user kept.
+    if (skipNextHash) { skipNextHash = false; return; }
+    var guard = state.navGuard;
+    if (guard && guard.dirty && guard.dirty()) {
+      var target = root.location.hash;
+      var body = typeof guard.body === "function" ? guard.body() : guard.body;
+      confirmAction({ title: guard.title, body: body, confirmLabel: guard.confirmLabel }).then(function (ok) {
+        if (ok) { state.navGuard = null; renderRoute(); }
+        else { skipNextHash = true; root.location.hash = guard.hash; }
+      });
+      return;
+    }
+    renderRoute();
+  }
+
   function boot() {
-    root.addEventListener("hashchange", renderRoute);
+    wireThemeToggle();
+    root.addEventListener("hashchange", onHashChange);
     if (!root.location.hash) root.location.hash = VIEW_DEFAULT;
     else renderRoute();
     refreshHeader();
@@ -2363,6 +2421,90 @@
     return /safety|limit/i.test(String(descriptor.group || "")) || SAFETY_KEY_RE.test(descriptor.key);
   }
 
+  // localStorage for the settings IA (active group, disclosure state, "show all advanced") and the
+  // theme override. Guarded because storage can be unavailable (private mode) or absent (node).
+  function readStored(key, fallback) {
+    try {
+      if (typeof localStorage === "undefined") return fallback;
+      var raw = localStorage.getItem(key);
+      return raw === null ? fallback : JSON.parse(raw);
+    } catch (err) { return fallback; }
+  }
+  function writeStored(key, value) {
+    try { if (typeof localStorage !== "undefined") localStorage.setItem(key, JSON.stringify(value)); }
+    catch (err) { /* storage may be unavailable: keep the in-memory state only */ }
+  }
+
+  function settingValueEqual(a, b) {
+    if (a === b) return true;
+    if (a && b && typeof a === "object" && typeof b === "object") return JSON.stringify(a) === JSON.stringify(b);
+    return false;
+  }
+
+  /** A descriptor's effective value: an explicit server/edited value wins over its default. */
+  function settingEffectiveValue(item) {
+    if (!item) return undefined;
+    return item.value === undefined ? item.default : item.value;
+  }
+
+  /** Is this key switched off by the price/solar visibility tables for the current selection?
+   *  Pure, and never true for a Safety row (a safety key is always applicable). */
+  function settingHiddenBySource(item, opts) {
+    if (!item || isSafetySetting(item)) return false;
+    var group = item.group || "Other";
+    if (group === "Price") return priceFieldVisibility(opts.priceProvider, opts.priceContract).fields.indexOf(item.key) < 0;
+    if (group === "Solar") return solarFieldVisibility(opts.solarSource).fields.indexOf(item.key) < 0;
+    return false;
+  }
+
+  /** The old filter surface: key, label, help and group name, case-insensitive. */
+  function settingMatchesQuery(item, query) {
+    var needle = String(query || "").trim().toLowerCase();
+    if (!needle) return true;
+    return (item.key + " " + (item.label || "") + " " + (item.help || "") + " " + (item.group || "")).toLowerCase().indexOf(needle) >= 0;
+  }
+
+  /** Should this settings row be shown at all? Pure (no DOM): the tested surface for the settings
+   *  IA. A query reveals every match (folded and source-hidden alike); otherwise a folded advanced
+   *  row stays behind its group's disclosure, the price/solar tables hide fields that cannot apply
+   *  unless they hold a non-default value, and Safety rows are never folded or source-hidden.
+   *  opts = {showAdvanced, showAll, query, priceProvider, priceContract, solarSource}; showAdvanced
+   *  is this group's disclosure state (a boolean, or a {group: bool} map for convenience). */
+  function settingsVisible(item, opts) {
+    opts = opts || {};
+    // ponytail: a non-empty query reveals every match, folded and source-hidden rows included.
+    if (opts.query) return settingMatchesQuery(item, opts.query);
+    if (isSafetySetting(item)) return true;
+    var open = opts.showAdvanced;
+    // ponytail: an object lets one call decide for a whole rail; a scalar is this row's group.
+    if (open && typeof open === "object") open = !!open[(item && item.group) || "Other"];
+    if (item && item.advanced === true && !open && !opts.showAll) return false;
+    if (settingHiddenBySource(item, opts)) return !settingValueEqual(settingEffectiveValue(item), item.default);
+    return true;
+  }
+
+  /** One entry per server group for the settings rail: its rows, the rows that fold behind the
+   *  group's "Advanced (n)" disclosure, and how many of its keys differ from their defaults.
+   *  Pure (no DOM): the tested surface for the settings IA. Stable order = GROUP_ORDER, then the
+   *  unknown groups alphabetically. */
+  function settingsGroups(items) {
+    var list = Array.isArray(items) ? items : [];
+    var byName = {}, groups = [];
+    list.forEach(function (item) {
+      var name = (item && item.group) || "Other";
+      if (!byName[name]) { byName[name] = { name: name, rows: [], advancedRows: [], changedCount: 0 }; groups.push(byName[name]); }
+      var group = byName[name];
+      group.rows.push(item);
+      if (item.advanced === true) group.advancedRows.push(item);
+      if (!settingValueEqual(settingEffectiveValue(item), item.default)) group.changedCount++;
+    });
+    groups.sort(function (a, b) {
+      var ia = GROUP_ORDER.indexOf(a.name), ib = GROUP_ORDER.indexOf(b.name);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    });
+    return groups;
+  }
+
   /* ---- price provider/contract field visibility (SPEC §4.1) --------------------------------
    * Which price.* fields the settings form reveals depends on price.provider (where prices come
    * from) and price.contract (their shape): asking for a bidding zone on a fixed tariff, or an
@@ -2528,7 +2670,8 @@
       wrap.appendChild(el("label", { for: "set-" + key, text: descriptor.label || key }));
       wrap.appendChild(el("span", { class: "field-key", text: key }));
       wrap.appendChild(input);
-    } else if (Array.isArray(descriptor.choices)) {
+    } else if (Array.isArray(descriptor.choices) && descriptor.choices.length) {
+      // ponytail: the API always sends choices, as [] when there is no enum, so empty means free text.
       input = el("select", { id: "set-" + key });
       descriptor.choices.forEach(function (choice) {
         var option = el("option", { value: choice, text: choice });
@@ -2563,15 +2706,32 @@
     if (!descriptors.length) { body.appendChild(el("p", { class: "muted", text: "The server sent no setting descriptors." })); return; }
     var dirtyValues = {};
     var dirtyCount = 0;
+
+    // Remembered UI state (SPEC 13.2): active rail group, each group's disclosure, "show all
+    // advanced". localStorage is the only store — the server payload is untouched by folding.
+    var STORE_GROUP = "sem.settings.group";
+    var STORE_ADVANCED = "sem.settings.advanced";
+    var STORE_SHOW_ALL = "sem.settings.showAllAdvanced";
+    var advancedOpen = readStored(STORE_ADVANCED, {});
+    if (!advancedOpen || typeof advancedOpen !== "object") advancedOpen = {};
+    var showAllAdvanced = readStored(STORE_SHOW_ALL, false) === true;
+    var activeGroup = readStored(STORE_GROUP, null);
+    var railEntries = {};
+
     function dirty(key, value, wrap, invalid) {
       dirtyValues[key] = { value: value, invalid: !!invalid };
       wrap.classList.add("field-dirty");
+      if (invalid) wrap.setAttribute("data-invalid", "1");
+      else wrap.removeAttribute("data-invalid");
       dirtyCount = Object.keys(dirtyValues).length;
-      saveButtons.forEach(function (b) { b.textContent = "Save changes (" + dirtyCount + ")"; b.disabled = dirtyCount === 0; });
+      updateCounts();
       // Changing the price provider/contract or the solar source changes which fields make sense,
       // so re-render the group now (the new value is already in dirtyValues, so the preview updates
-      // immediately).
-      if (key === "price.provider" || key === "price.contract" || key === "solar.source") draw();
+      // immediately). Editing a source-hidden key can add or drop its muted "hidden but set" line,
+      // so that re-renders too.
+      var descriptor = descriptorByKey(key);
+      if (key === "price.provider" || key === "price.contract" || key === "solar.source" ||
+          (descriptor && settingHiddenBySource(descriptor, currentOpts()))) draw();
     }
 
     function descriptorByKey(key) {
@@ -2579,113 +2739,153 @@
     }
     // The field's current value: an unsaved edit wins over the server value, the server value over
     // its default. Used for the visibility preview and the hidden-but-set warning.
-    function effectiveValue(descriptor) {
-      if (Object.prototype.hasOwnProperty.call(dirtyValues, descriptor.key)) return dirtyValues[descriptor.key].value;
-      return descriptor.value === undefined ? descriptor.default : descriptor.value;
-    }
-    // The visibility-relevant key values (price.provider/contract, solar.source); read off the full
-    // descriptor list (not the search-filtered group), so the preview reacts even when the
-    // selectors themselves are filtered.
     function settingValue(key) {
       if (Object.prototype.hasOwnProperty.call(dirtyValues, key)) return dirtyValues[key].value;
       var d = descriptorByKey(key);
-      return d ? (d.value === undefined ? d.default : d.value) : undefined;
+      return d ? settingEffectiveValue(d) : undefined;
     }
-    function renderField(d) {
-      var merged = Object.prototype.hasOwnProperty.call(dirtyValues, d.key)
-        ? Object.assign({}, d, { value: dirtyValues[d.key].value })
-        : d;
-      var field = settingsField(merged, dirty);
-      if (Object.prototype.hasOwnProperty.call(dirtyValues, d.key)) field.classList.add("field-dirty");
-      if (isSafetySetting(merged)) {
-        field.classList.add("field-safety");
-        field.appendChild(badge("money/safety", "warn"));
-      }
-      return field;
+    // Every visibility decision runs on merged rows, so an edit (or the selector it changes) is
+    // reflected immediately even though the server payload is unchanged.
+    function mergeItem(descriptor) {
+      return Object.prototype.hasOwnProperty.call(dirtyValues, descriptor.key)
+        ? Object.assign({}, descriptor, { value: dirtyValues[descriptor.key].value })
+        : descriptor;
     }
-    function settingValueEqual(a, b) {
-      if (a === b) return true;
-      if (a && b && typeof a === "object" && typeof b === "object") return JSON.stringify(a) === JSON.stringify(b);
-      return false;
+    function mergedItems() { return descriptors.map(mergeItem); }
+    function currentOpts() {
+      return {
+        showAdvanced: advancedOpen,
+        showAll: showAllAdvanced,
+        query: search.value,
+        priceProvider: settingValue("price.provider"),
+        priceContract: settingValue("price.contract"),
+        solarSource: settingValue("solar.source")
+      };
     }
     function settingValueText(value) {
       if (value === null || value === undefined) return "unset";
       if (typeof value === "object") return JSON.stringify(value);
       return String(value);
     }
-    // The Price group renders from GET /api/v1/config metadata: price_warnings at the top, then the
-    // provider select + the fields that apply to the chosen provider/contract, then a muted line
-    // for every hidden field that still holds a non-default value (visibility is a convenience, not
-    // a way to let a value take effect invisibly).
-    function renderPriceGroup(items) {
-      var section = el("section", { class: "group" }, [el("h3", { text: "Price" })]);
-      var warnings = Array.isArray(config.price_warnings) ? config.price_warnings : [];
-      warnings.forEach(function (w) {
-        if (!w) return;
-        section.appendChild(el("div", { class: "banner banner-warn" }, [
-          badge("provider/contract", "warn"),
-          " ",
-          el("strong", { text: String(w.key || "") }),
-          " — " + String(w.message || "")
-        ]));
-      });
-      var vis = priceFieldVisibility(settingValue("price.provider"), settingValue("price.contract"));
-      var visible = {};
-      vis.fields.forEach(function (k) { visible[k] = true; });
-      if (vis.note) section.appendChild(el("p", { class: "field-help", text: vis.note }));
+    // One row, rendered exactly once. A source-hidden row is still listed when it holds a value
+    // (muted, "not used by the current selection"); a search match also labels its group.
+    function renderRow(item, opts, searching) {
+      var row;
+      if (settingHiddenBySource(item, opts)) {
+        row = el("p", { class: "muted", dataset: { key: item.key } }, [
+          "Hidden " + item.key + " = " + settingValueText(settingEffectiveValue(item)) +
+            " — not used by the current " + ((item.group || "") === "Solar" ? "solar source" : "provider/contract") + ", but still set."
+        ]);
+      } else {
+        row = settingsField(item, dirty);
+        if (isSafetySetting(item)) {
+          row.classList.add("field-safety");
+          row.appendChild(badge("money/safety", "warn"));
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(dirtyValues, item.key)) row.classList.add("field-dirty");
+      if (searching) row.appendChild(el("span", { class: "chip", text: item.group || "Other" }));
+      return row;
+    }
+    // Group-level guidance: the Price warnings/provider note and the Solar notes stay with their
+    // fields; the Safety note explains why saving those asks a second time.
+    function groupNotes(section, group, opts) {
+      if (group.name === "Price") {
+        (Array.isArray(config.price_warnings) ? config.price_warnings : []).forEach(function (w) {
+          if (!w) return;
+          section.appendChild(el("div", { class: "banner banner-warn" }, [
+            badge("provider/contract", "warn"), " ",
+            el("strong", { text: String(w.key || "") }),
+            " — " + String(w.message || "")
+          ]));
+        });
+        var priceVis = priceFieldVisibility(opts.priceProvider, opts.priceContract);
+        if (priceVis.note) section.appendChild(el("p", { class: "field-help", text: priceVis.note }));
+      } else if (group.name === "Solar") {
+        var solarVis = solarFieldVisibility(opts.solarSource);
+        if (solarVis.note) section.appendChild(el("p", { class: "field-help", text: solarVis.note }));
+        section.appendChild(el("p", { class: "field-help", text: SOLAR_MEASURED_NOTE }));
+        // Only useful when the source can actually use it: capacity is the one with cloud attenuation.
+        if (solarVis.fields.indexOf("solar.weather_entity") >= 0) {
+          section.appendChild(el("p", { class: "field-help", text: SOLAR_WEATHER_NOTE }));
+        }
+      } else if (/safety|limit/i.test(group.name)) {
+        section.appendChild(el("p", { class: "field-help", text: "These settings can move hardware or change safety limits. Changes ask for confirmation." }));
+      }
+    }
+    // One group: the rows that apply, then the folded advanced rows. Safety rows never fold, so they
+    // are always in the plain set. Searching and "show all advanced" reveal folded rows in place;
+    // otherwise they sit behind a disclosure whose open state is remembered per group.
+    function renderGroup(group, rows, searching) {
+      var opts = currentOpts();
+      var section = el("section", { class: "settings-group", dataset: { group: group.name } });
+      section.appendChild(el("h3", { text: group.name }));
+      var groupBody = el("div", { class: "settings-group-body" });
+      if (!searching) groupNotes(groupBody, group, opts);
+      // Folding follows the *server* group (SPEC 13.2: only Safety never folds). isSafetySetting is
+      // wider than that - it also covers money-moving keys such as price.feed_in_* so they ask for a
+      // confirmation - and those still belong behind the disclosure when the payload marks them advanced.
+      var foldable = rows.filter(function (r) { return r.advanced === true && (r.group || "") !== "Safety"; });
+      var plain = rows.filter(function (r) { return !(r.advanced === true && (r.group || "") !== "Safety"); });
       var fields = el("div", { class: "fields" });
-      items.forEach(function (d) {
-        if (!Object.prototype.hasOwnProperty.call(visible, d.key)) return; // hidden by this provider/contract
-        fields.appendChild(renderField(d));
+      plain.forEach(function (r) { if (settingsVisible(r, opts)) fields.appendChild(renderRow(r, opts, searching)); });
+      var advancedVisible = foldable.filter(function (r) {
+        return settingsVisible(r, Object.assign({}, opts, { showAdvanced: true }));
       });
-      section.appendChild(fields);
-      // Hidden-but-set: computed over every price descriptor (never the search-filtered subset), so
-      // a value the current provider/contract ignores can never take effect invisibly.
-      descriptors.forEach(function (d) {
-        if (d.group !== "Price") return;
-        if (Object.prototype.hasOwnProperty.call(visible, d.key)) return;
-        if (settingValueEqual(effectiveValue(d), d.default)) return;
-        section.appendChild(el("p", { class: "muted", text: "Hidden " + d.key + " = " + settingValueText(effectiveValue(d)) + " — not used by the current provider/contract above, but still set." }));
-      });
+      if (advancedVisible.length && (searching || showAllAdvanced)) {
+        // ponytail: inline, not a forced-open <details>, so the switch cannot fight the stored per-group state.
+        advancedVisible.forEach(function (r) { fields.appendChild(renderRow(r, opts, searching)); });
+      }
+      groupBody.appendChild(fields);
+      if (advancedVisible.length && !searching && !showAllAdvanced) {
+        var details = el("details", { class: "disclosure", open: advancedOpen[group.name] === true });
+        details.appendChild(el("summary", { text: "Advanced (" + advancedVisible.length + ")" }));
+        var advFields = el("div", { class: "disclosure-body" });
+        advancedVisible.forEach(function (r) { advFields.appendChild(renderRow(r, opts, searching)); });
+        details.appendChild(advFields);
+        details.addEventListener("toggle", function () {
+          advancedOpen[group.name] = details.open;
+          writeStored(STORE_ADVANCED, advancedOpen);
+        });
+        groupBody.appendChild(details);
+      }
+      section.appendChild(groupBody);
       return section;
     }
-
-    // The Solar group is the same shape for solar.source: the source note, the fields that apply to
-    // the chosen source, the two guidance lines (measured PV entity, weather entity support), then a
-    // muted line for every hidden field that still holds a non-default value. The forecast view shows
-    // `source` and the source's notes, so this is the half of the story a user reads before saving.
-    function renderSolarGroup(items) {
-      var section = el("section", { class: "group" }, [el("h3", { text: "Solar" })]);
-      var vis = solarFieldVisibility(settingValue("solar.source"));
-      var visible = {};
-      vis.fields.forEach(function (k) { visible[k] = true; });
-      var fields = el("div", { class: "fields" });
-      items.forEach(function (d) {
-        if (!Object.prototype.hasOwnProperty.call(visible, d.key)) return; // hidden by this source
-        fields.appendChild(renderField(d));
+    function renderRail(groups, active) {
+      clear(railHost);
+      railEntries = {};
+      groups.forEach(function (group) {
+        var count = el("span", { class: "badge " + (group.changedCount ? "badge-warn" : "badge-info"), text: String(group.changedCount) });
+        var entry = el("button", { type: "button", class: "chip" }, [group.name, " ", count]);
+        if (group.name === active) entry.setAttribute("aria-current", "true");
+        entry.addEventListener("click", function () {
+          activeGroup = group.name;
+          writeStored(STORE_GROUP, activeGroup);
+          if (search.value) search.value = "";
+          draw();
+        });
+        railEntries[group.name] = { button: entry, count: count };
+        railHost.appendChild(entry);
       });
-      section.appendChild(fields);
-      // Under the selector (and the fields it reveals), not above them: pick a source first, then
-      // read what it means — the note explains the visible set, so it belongs next to it.
-      if (vis.note) section.appendChild(el("p", { class: "field-help", text: vis.note }));
-      section.appendChild(el("p", { class: "field-help", text: SOLAR_MEASURED_NOTE }));
-      // Only useful when the source can actually use it: capacity is the one with cloud attenuation.
-      if (Object.prototype.hasOwnProperty.call(visible, "solar.weather_entity")) {
-        section.appendChild(el("p", { class: "field-help", text: SOLAR_WEATHER_NOTE }));
-      }
-      // Hidden-but-set, computed over every solar descriptor (never the search-filtered subset), so
-      // planes set for forecast_solar while capacity runs (or the other way round) stay visible.
-      descriptors.forEach(function (d) {
-        if (d.group !== "Solar") return;
-        if (Object.prototype.hasOwnProperty.call(visible, d.key)) return;
-        if (settingValueEqual(effectiveValue(d), d.default)) return;
-        section.appendChild(el("p", { class: "muted", text: "Hidden " + d.key + " = " + settingValueText(effectiveValue(d)) + " — not used by the current solar source above, but still set." }));
+    }
+    function updateCounts(groups) {
+      groups = groups || settingsGroups(mergedItems());
+      groups.forEach(function (group) {
+        var entry = railEntries[group.name];
+        if (!entry) return;
+        entry.count.textContent = String(group.changedCount);
+        entry.count.className = "badge " + (group.changedCount ? "badge-warn" : "badge-info");
       });
-      return section;
+      saveNote.textContent = dirtyCount ? dirtyCount + " key" + (dirtyCount === 1 ? "" : "s") + " changed, not saved yet" : "No unsaved changes";
+      saveButtons.forEach(function (b) { b.textContent = "Save changes (" + dirtyCount + ")"; b.disabled = dirtyCount === 0; });
     }
 
     var search = el("input", { type: "search", id: "settings-search", placeholder: "filter settings by key, label or help", "aria-label": "Filter settings" });
+    var showAllBox = el("input", { type: "checkbox", id: "settings-show-advanced", checked: showAllAdvanced });
+    var railHost = el("nav", { class: "settings-rail", "aria-label": "Settings groups" });
     var listHost = el("div");
+    var saveNote = el("span", { class: "muted", text: "No unsaved changes" });
     var saveButtons = [];
     function saveButton() {
       var b = button("Save changes (0)", "btn-primary");
@@ -2695,47 +2895,32 @@
       return b;
     }
 
-    function visible() {
-      var needle = String(search.value || "").trim().toLowerCase();
-      if (!needle) return descriptors;
-      return descriptors.filter(function (d) {
-        return (d.key + " " + (d.label || "") + " " + (d.help || "") + " " + (d.group || "")).toLowerCase().indexOf(needle) >= 0;
-      });
-    }
-
     function draw() {
       clear(listHost);
-      var shown = visible();
-      if (!shown.length) { listHost.appendChild(el("p", { class: "muted", text: "No settings match that filter." })); return; }
-      var groups = [], index = {};
-      shown.forEach(function (d) {
-        var group = d.group || "Other";
-        if (!(group in index)) { index[group] = groups.length; groups.push({ name: group, items: [] }); }
-        groups[index[group]].items.push(d);
-      });
-      groups.sort(function (a, b) {
-        var ia = GROUP_ORDER.indexOf(a.name), ib = GROUP_ORDER.indexOf(b.name);
-        return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-      });
-      groups.forEach(function (group) {
-        group.items.sort(function (a, b) { return a.key < b.key ? -1 : a.key > b.key ? 1 : 0; });
-        var section;
-        if (group.name === "Price") {
-          section = renderPriceGroup(group.items);
-        } else if (group.name === "Solar") {
-          section = renderSolarGroup(group.items);
-        } else {
-          section = el("section", { class: "group" + (groups.length && /safety|limit/i.test(group.name) ? " group-safety" : "") }, [
-            el("h3", { text: group.name })
-          ]);
-          if (/safety|limit/i.test(group.name)) section.appendChild(el("p", { class: "field-help", text: "These settings can move hardware or change safety limits. Changes ask for confirmation." }));
-          var fields = el("div", { class: "fields" });
-          group.items.forEach(function (d) { fields.appendChild(renderField(d)); });
-          section.appendChild(fields);
-        }
-        listHost.appendChild(section);
-      });
-      listHost.appendChild(feedInNote(shown));
+      var opts = currentOpts();
+      var query = String(opts.query || "").trim();
+      var groups = settingsGroups(mergedItems());
+      var active = null;
+      groups.forEach(function (g) { if (g.name === activeGroup) active = g; });
+      if (!active && groups.length) { active = groups[0]; activeGroup = active.name; writeStored(STORE_GROUP, activeGroup); }
+      renderRail(groups, activeGroup);
+      var note = feedInNote(mergedItems());
+      if (note) listHost.appendChild(note);
+      if (query) {
+        // Search reveals matches everywhere: every group, folded and source-hidden rows included,
+        // each match labelled with the group it lives in.
+        var matched = false;
+        groups.forEach(function (group) {
+          var rows = group.rows.filter(function (r) { return settingsVisible(r, opts); });
+          if (!rows.length) return;
+          matched = true;
+          listHost.appendChild(renderGroup(group, rows, true));
+        });
+        if (!matched) listHost.appendChild(el("p", { class: "muted", text: "No settings match that filter." }));
+      } else {
+        listHost.appendChild(renderGroup(active, active.rows, false));
+      }
+      updateCounts(groups);
     }
 
     function feedInNote(shown) {
@@ -2786,6 +2971,7 @@
           renderPatchErrors(listHost, errors);
           return;
         }
+        state.navGuard = null;
         root.setTimeout(function () { renderRoute(); }, 600);
       };
       if (safety.length) {
@@ -2812,9 +2998,38 @@
     }
 
     search.addEventListener("input", draw);
-    body.appendChild(el("div", { class: "toolbar" }, [el("label", { for: "settings-search" }, [el("span", { text: "Search" }), search]), saveButton()]));
+    showAllBox.addEventListener("change", function () {
+      showAllAdvanced = showAllBox.checked;
+      writeStored(STORE_SHOW_ALL, showAllAdvanced);
+      draw();
+    });
+    body.appendChild(el("div", { class: "toolbar" }, [
+      el("label", { for: "settings-search" }, [el("span", { text: "Search" }), search]),
+      el("label", { class: "switch", for: "settings-show-advanced" }, [showAllBox, " Show all advanced"])
+    ]));
+    body.appendChild(railHost);
     body.appendChild(listHost);
-    body.appendChild(el("div", { class: "toolbar" }, [saveButton()]));
+    var saveBar = el("div", { class: "save-bar" }, [
+      saveNote,
+      el("div", { class: "save-bar-actions" }, [
+        button("Revert", "", function () { dirtyValues = {}; dirtyCount = 0; draw(); }),
+        saveButton()
+      ])
+    ]);
+    body.appendChild(saveBar);
+    // Leaving with unsaved edits asks first; the router consults this guard before it re-renders.
+    state.navGuard = {
+      hash: root.location.hash,
+      title: "Discard unsaved settings?",
+      body: function () {
+        return dirtyCount + " setting" + (dirtyCount === 1 ? "" : "s") + " changed here " +
+          (dirtyCount === 1 ? "is" : "are") + " not saved yet. Leave and discard " + (dirtyCount === 1 ? "it" : "them") + "?";
+      },
+      confirmLabel: "Leave without saving",
+      // ponytail: a detached settings DOM is never really dirty, so a stale guard cannot block a route.
+      dirty: function () { return Object.keys(dirtyValues).length > 0 && listHost.isConnected; }
+    };
+    updateCounts();
     draw();
   }
 
@@ -2910,6 +3125,8 @@
     forecastEmptyState: forecastEmptyState,
     priceFieldVisibility: priceFieldVisibility,
     solarFieldVisibility: solarFieldVisibility,
+    settingsGroups: settingsGroups,
+    settingsVisible: settingsVisible,
     fmtPower: fmtPower,
     fmtKwh: fmtKwh,
     fmtPrice: fmtPrice,

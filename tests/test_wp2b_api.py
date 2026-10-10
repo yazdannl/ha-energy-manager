@@ -618,7 +618,17 @@ def test_config_get_masks_secrets_and_publishes_metadata():
         assert expected in keys, expected
     allowed_types = {"bool", "int", "float", "str", "password", "json", "list"}
     for row in body["settings"]:
-        assert set(row) == {"key", "value", "type", "default", "label", "help", "group", "choices"}
+        assert set(row) == {
+            "key",
+            "value",
+            "type",
+            "default",
+            "label",
+            "help",
+            "group",
+            "choices",
+            "advanced",
+        }
         assert row["type"] in allowed_types, row
         assert row["group"]
         if row["type"] == "list" and row["choices"]:
@@ -641,6 +651,23 @@ def test_config_get_masks_secrets_and_publishes_metadata():
         "optimizer.target_soc_pct_end",
     ):
         assert next(r for r in body["settings"] if r["key"] == key)["group"] == "Safety"
+
+
+def test_config_rows_carry_the_advanced_folding_flag():
+    """SPEC 13.2/13.3: advanced rows are folded in the UI, essential ones are not."""
+    app = server()
+    _status, _headers, _content, body = call(app, "GET", "/api/v1/config")
+    rows = {row["key"]: row for row in body["settings"]}
+    assert rows["price.source"]["advanced"] is True
+    assert rows["batteries"]["advanced"] is True
+    assert rows["grid.import_entity"]["advanced"] is True
+    assert rows["mode"]["advanced"] is False
+    assert rows["price.provider"]["advanced"] is False
+    assert rows["grid.power_entity"]["advanced"] is False
+    # every row is classified and the group override is untouched by the flag
+    assert all(isinstance(row["advanced"], bool) for row in rows.values())
+    assert rows["price.source"]["group"] == "Price" and rows["price.source"]["label"] == "Price source"
+    assert all(row["group"] == "Safety" for row in rows.values() if row["key"].startswith("control."))
 
 
 def test_config_catalogue_matches_defaults_exactly():

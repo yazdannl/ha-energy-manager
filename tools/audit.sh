@@ -54,6 +54,13 @@
 #     placeholder such as an integration namespace plus a short lower-case word stays quiet.
 #   * Line-level opt-out: a line containing "audit-allow:" is skipped. Use it only in prose that
 #     must quote a forbidden shape, never to silence real data.
+#   * Vendored third-party assets: app/web/vendor/bootstrap.min.css is skipped from the rules below
+#     while - and only while - its bytes match a sha256 recorded in the vendor README next to it.
+#     The minified stylesheet is full of fractional measurements, which is the shape the coordinate
+#     rule exists to catch. An exclusion list would be a hiding place; a verified exclusion is not:
+#     change one byte and the file is scanned like any other, so the digest cannot cover a payload.
+#     The download URL, the version, the digest and the size are recorded in the same README, and the
+#     scan summary names the file it skipped so a clean audit cannot quietly skip something else.
 
 set -u
 
@@ -62,14 +69,39 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit 2
 cd "$root" || exit 2
 
 files=$(mktemp) || exit 2
+filtered=$(mktemp) || exit 2
 findings=$(mktemp) || exit 2
-trap 'rm -f "$files" "$findings"' EXIT HUP INT TERM
+trap 'rm -f "$files" "$filtered" "$findings"' EXIT HUP INT TERM
 
 # .git and the usual local/uncommitted junk are not scanned. Binary files are skipped by grep -I.
 find . \
     \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache \
        -o -name node_modules -o -name .mypy_cache \) -prune -o \
     -type f -print | LC_ALL=C sort > "$files"
+
+# --- Verified exclusion for vendored third-party code -------------------------------------------
+# One minified third-party stylesheet is excluded from the content rules, and only while its bytes
+# match an identity recorded in the vendor record beside it (see the ceiling note at the top). The
+# exclusion is self-invalidating: modify, truncate or substitute the file and it is scanned normally,
+# which is exactly what the audit test asserts. Without sha256sum nothing is excluded.
+VENDOR_FILE=./energy_manager/app/web/vendor/bootstrap.min.css
+VENDOR_RECORD=energy_manager/app/web/vendor/README.md
+skipped=''
+
+vendor_verified() {
+    command -v sha256sum >/dev/null 2>&1 || return 1
+    [ -f "$VENDOR_FILE" ] || return 1
+    [ -f "$VENDOR_RECORD" ] || return 1
+    actual=$(sha256sum "$VENDOR_FILE" 2>/dev/null | awk '{print $1}')
+    [ -n "$actual" ] || return 1
+    grep -E -o '[0-9a-f]{64}' "$VENDOR_RECORD" | grep -q -x -F -- "$actual"
+}
+
+if vendor_verified; then
+    grep -v -F -x -- "$VENDOR_FILE" "$files" > "$filtered" || true
+    mv "$filtered" "$files"
+    skipped=" (skipped ${VENDOR_FILE#./}: sha256 verified against $VENDOR_RECORD)"
+fi
 
 # Redaction: at most four leading characters of a match, so a scan never re-prints a value that may
 # be sensitive (and never copies one into a log or a prompt).
@@ -288,5 +320,5 @@ if [ "$count" -gt 0 ]; then
     exit 1
 fi
 
-echo "audit: clean — $(wc -l < "$files" | tr -d ' ') files scanned"
+echo "audit: clean — $(wc -l < "$files" | tr -d ' ') files scanned$skipped"
 exit 0

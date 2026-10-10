@@ -141,7 +141,10 @@ def test_real_settings_descriptors_and_patch_through_the_api(wired):
     defaults = build_defaults()
     assert set(rows) == set(defaults)
     for row in rows.values():
-        assert set(row) == {"key", "value", "type", "default", "label", "help", "group", "choices"}
+        # SPEC 10: `advanced` is the additive row field that drives the Settings disclosure (SPEC 13.2).
+        assert set(row) == {"key", "value", "type", "default", "label", "help", "group", "choices", "advanced"}
+        assert isinstance(row["advanced"], bool), row["key"]
+        assert "(advanced)" not in row["label"], "folding is the only signal, not the label text"
     assert rows["mode"]["choices"] == ["off", "advisory", "auto"]
     for key in ("grid.power_entity", "grid.import_entity", "grid.export_entity"):
         assert key in rows

@@ -131,6 +131,8 @@ def _descriptor_row(key: str, descriptor: Mapping[str, Any]) -> dict[str, Any]:
         "help": str(descriptor.get("help") or ""),
         "group": group,
         "choices": list(descriptor.get("choices") or []),
+        # additive (SPEC 13.3): the Settings UI folds advanced rows behind a disclosure
+        "advanced": bool(descriptor.get("advanced", False)),
     }
 
 

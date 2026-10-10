@@ -7,6 +7,7 @@ from SPEC §13 are present in the source. Node-based checks are skipped when nod
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -32,8 +33,10 @@ REQUIRED_FILES = [
     "README.md",
     "vendor/uPlot.min.js",
     "vendor/uPlot.min.css",
+    "vendor/bootstrap.min.css",
     "vendor/README.md",
     "vendor/LICENSE.uPlot.txt",
+    "vendor/LICENSE.bootstrap.txt",
 ]
 
 
@@ -54,6 +57,63 @@ def run_node_script(body: str) -> str:
     proc = subprocess.run([NODE, "-e", body], capture_output=True, text=True, cwd=str(WEB))
     assert proc.returncode == 0, proc.stderr
     return proc.stdout
+
+
+def test_vendored_bootstrap_matches_its_recorded_identity():
+    """The vendored framework must be the official build, pinned by the checksum in vendor/README.md.
+
+    A truncated or hand-edited copy of a 230 KB stylesheet is otherwise invisible until something
+    looks wrong in the browser, so the README is the record of what was vendored and this test keeps
+    the file and the record in step. Refreshing the file means updating the README (and nothing else).
+    """
+    css = read(VENDOR / "bootstrap.min.css")
+    assert len(css) > 100_000, f"bootstrap.min.css looks truncated: {len(css)} bytes"
+    assert "Bootstrap  v5.3.3" in css, "not the expected Bootstrap build"
+    assert "Licensed under MIT" in css
+
+    record = read(VENDOR / "README.md")
+    digest = hashlib.sha256(css.encode("utf-8")).hexdigest()
+    assert digest in record, f"vendor/README.md does not record the file's sha256 ({digest})"
+    assert str(len(css.encode("utf-8"))) in record, "vendor/README.md does not record the byte size"
+    assert "5.3.3" in record and "bootstrap" in record.lower()
+    assert "://" in record  # the source URL must be recorded for a refresh
+
+    license_text = read(VENDOR / "LICENSE.bootstrap.txt")
+    assert "MIT License" in license_text and "Bootstrap Authors" in license_text
+
+
+def test_index_loads_bootstrap_before_the_design_layer():
+    """Bootstrap first, then the design layer that overrides its tokens (SPEC 13.1)."""
+    html = read(WEB / "index.html")
+    refs = re.findall(r'(?:href|src)="([^"]+)"', html)
+    assert "vendor/bootstrap.min.css" in refs, "the vendored framework is not loaded"
+    assert refs.index("vendor/bootstrap.min.css") < refs.index("style.css"), (
+        "style.css must come after bootstrap.min.css or its overrides lose"
+    )
+    assert 'data-bs-theme' in html, "the theme attribute must be declared on <html>"
+
+
+def test_design_layer_keeps_the_chart_token_interface():
+    """charts.js reads the chart colours through getComputedStyle, so the names are a frozen interface."""
+    css = read(WEB / "style.css")
+    for token in (
+        "--chart-price", "--chart-sell", "--chart-pv", "--chart-load", "--chart-soc",
+        "--chart-battery-charge", "--chart-battery-discharge", "--chart-stale",
+        "--chart-break-even", "--chart-grid", "--chart-axis", "--chart-baseline",
+        "--chart-cost", "--chart-savings", "--chart-pv-accuracy", "--chart-load-accuracy",
+        "--chart-price-accuracy",
+    ):
+        assert token in css, f"the design layer dropped {token}, which charts.js reads"
+    charts = read(WEB / "charts.js")
+    assert "getComputedStyle" in charts and "--chart-" in charts
+
+
+def test_no_style_or_script_fetches_anything_at_runtime():
+    """No CDN, no webfont, no remote image: the add-on is served from a LAN and may be offline."""
+    for name in ("index.html", "style.css", "app.js", "charts.js", "mock.js"):
+        text = read(WEB / name)
+        assert "@import" not in text, f"{name} uses @import"
+        assert "url(http" not in text and "url(//" not in text, f"{name} loads a remote asset"
 
 
 def test_all_required_assets_exist():
@@ -971,3 +1031,65 @@ def test_solar_field_visibility_per_source():
 
     # an empty/unknown source must not make fields vanish: fall back to the API source's set
     assert keys("unknown") == keys("api")
+
+
+def test_settings_groups_and_visibility_helpers():
+    """The settings IA is tested through two pure helpers (SPEC 13.4), so node needs no DOM.
+
+    Every key must land in exactly one group, the foldable set must be the advanced rows outside the
+    Safety group, a source-inapplicable field may hide only while it holds its default, and a search
+    match must win over both rules - that is what keeps "nothing is invisible" true.
+    """
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "?mock=1", hash: "#/settings" };
+    (0, eval)(fs.readFileSync("mock.js", "utf8"));
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    (async () => {
+      const cfg = await globalThis.SEM_MOCK.handle("GET", "/api/v1/config");
+      const rows = cfg.settings;
+      const value = (key) => (rows.find((r) => r.key === key) || {}).value;
+      const selection = {
+        priceProvider: value("price.provider"),
+        priceContract: value("price.contract"),
+        solarSource: value("solar.source")
+      };
+      const groups = A.settingsGroups(rows);
+      const seen = groups.flatMap((g) => g.rows.map((r) => r.key));
+      const pick = (key) => rows.find((r) => r.key === key);
+      const asDefault = (key) => Object.assign({}, pick(key), { value: pick(key).default });
+      console.log(JSON.stringify({
+        groupNames: groups.map((g) => g.name),
+        seen: seen.length,
+        unique: new Set(seen).size,
+        total: rows.length,
+        advancedInGroups: groups.flatMap((g) => g.advancedRows.map((r) => r.key)).length,
+        expectedAdvanced: rows.filter((r) => r.advanced && r.group !== "Safety").length,
+        safetyFolded: groups.filter((g) => g.name === "Safety").flatMap((g) => g.advancedRows).length,
+        hiddenWhenDefault: A.settingsVisible(asDefault("solar.planes"), Object.assign({}, selection)),
+        shownWhenSet: A.settingsVisible(pick("solar.planes"), Object.assign({}, selection)),
+        queryWins: A.settingsVisible(asDefault("solar.planes"), Object.assign({ query: "solar.planes" }, selection)),
+        safetyAlwaysVisible: A.settingsVisible(pick("control.tick_seconds"), Object.assign({}, selection)),
+        unknownGroupStable: groups.length > 0 && groups.every((g) => typeof g.changedCount === "number")
+      }));
+    })();
+    """
+    data = json.loads(run_node_script(script))
+
+    assert data["seen"] == data["total"], "every setting must appear in exactly one group"
+    assert data["unique"] == data["total"], "a setting must not appear in two groups"
+    assert len(data["groupNames"]) == len(set(data["groupNames"])), data["groupNames"]
+    assert data["advancedInGroups"] == data["expectedAdvanced"], (
+        "the foldable set must be the advanced rows outside Safety: "
+        f"{data['advancedInGroups']} != {data['expectedAdvanced']}"
+    )
+    assert data["safetyFolded"] == 0, "Safety rows must never be folded"
+    assert data["hiddenWhenDefault"] is False, "a source-inapplicable field may hide while at its default"
+    # settingsVisible is the visibility table, not the "hidden but set" rule: a source-inapplicable
+    # field stays hidden here (the renderer lists it separately, as a muted line, and
+    # tools/ui_render_check.js asserts that every such key is still reachable).
+    assert data["shownWhenSet"] is False, "the visibility table itself must stay independent of the value"
+    assert data["queryWins"] is True, "a search match must reveal a hidden field"
+    assert data["safetyAlwaysVisible"] is True, "safety settings are never hidden by a source table"
+    assert data["unknownGroupStable"] is True

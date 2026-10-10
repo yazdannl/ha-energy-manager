@@ -1,7 +1,7 @@
 # Verification record — Smart Energy Manager add-on
 
 Authoritative verification record for the tree published from this repository. Every number below
-was produced by a gate named in §10 on the frozen tree; nothing here is a projection. This record
+was produced by a gate named in §11 on the frozen tree; nothing here is a projection. This record
 supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figures in previous
 revisions described pre-audit trees and are obsolete.
 
@@ -15,17 +15,17 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **581 passed** (two consecutive runs) |
-| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 85 files scanned`, exit 0 |
+| Test suite | `python3 -m pytest tests -q` | **595 passed** (two consecutive runs) |
+| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 89 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
 
-Frozen digest of the verified artifact (recipe in §10, normative):
+Frozen digest of the verified artifact (recipe in §11, normative):
 
-* **code + tests (73 files, documentation excluded)**:
-  `f37e1ee052c52975322cd925616afa8e958f4a4ba07340cf7b27a9911c497748`
-* **path list of the same 73 files** (detects an added, removed or renamed file):
-  `553c23454f8aa5a3efbac4a327d1341f4b4b61211871ab1d28ec8fbdfb2d6216`
+* **code + tests (77 files, documentation excluded)**:
+  `d92974e5c47f530883b394ea85bf5e7ae6e2bbceddfa31c65c94f1987e5088f6`
+* **path list of the same 77 files** (detects an added, removed or renamed file):
+  `63e3910878cca4ec6ac8802e98b49448c7d6655eab98076ddfcf1d0140adf88b`
 
 The recipe sorts the file list **and** the per-file manifest under `LC_ALL=C`, so the digest is
 independent of `find` order and of the locale; a single `sort` is not enough. An earlier revision of
@@ -34,9 +34,9 @@ defect in the record, not in the tree: the file lists were verified byte-identic
 so no source file had changed. Those values (`8f83a0a6…` all files, `c58e912c…` code + tests) are
 superseded by the digest above.
 
-The all-files digest (85 files) is deliberately **not** recorded here: this document is one of the 85,
+The all-files digest (90 files) is deliberately **not** recorded here: this document is one of the 90,
 so every documentation edit would change it while the verified code stayed identical. Compute it with
-the same recipe over the full file list if you want it; the file count printed by the pipeline (85) is
+the same recipe over the full file list if you want it; the file count printed by the pipeline (90) is
 the quick cross-check.
 
 ---
@@ -339,7 +339,75 @@ kind that hides behind a green suite:
 
 ---
 
-## 8. R1 scanner (`tools/audit.sh`)
+## 8. The interface rebuild (0.5.0), checked by rendering it headless
+
+The request was blunt - the UI was "cluttered and not modern at all" - and it asked for a modern
+minimalist look with *more* options available to whoever wants them. That second half was the real
+defect: the settings form dropped any field that did not apply to the selected source **and** still
+held its default value, so plenty of options simply did not exist on screen, at any point, for anyone.
+
+**Framework.** Bootstrap 5.3.3, vendored as one CSS file and restyled through its own `--bs-*` tokens
+by `style.css`. Tailwind was the alternative and was not chosen because it needs a build step, which
+§13 forbids and which the add-on's offline, no-CDN, no-Node-at-runtime constraints have no room for.
+The vendored file is byte-identical to the official dist (sha256 `3c8f27e6…736fc8`, 232803 bytes,
+independently re-downloaded and compared, not just recorded).
+
+**What the redesign guarantees, and the gate that holds it.** `tools/ui_render_check.js` (run by
+`tests/test_wp3_ui_render.py`, skipped when node is absent) renders the real `app.js` and `mock.js`
+through a dependency-free DOM shim (`tools/ui_dom_shim.js`, ~300 lines: elements, attributes,
+`classList`, `dataset`, `isConnected`, closed-`<details>` semantics) and asserts **36** properties of
+the result. The load-bearing ones:
+
+* all seven views render from mock data with no `undefined` or `NaN` in the output;
+* every setting the API sends is reachable: selecting each group through the rail and scanning the
+  rendered rows finds all **75** keys (the **65** that apply to the current price/solar selection, plus
+  the ten that are hidden-but-set and therefore still listed, muted, as "not used by the current
+  selection");
+* advanced rows are **not** shown by default, opening the disclosure shows them, and `Show all
+  advanced` shows every applicable advanced key (**33** exist, **23** apply to the mock's selection);
+* the 16 Safety rows are visible **without** unfolding anything;
+* the rail lists exactly the server's nine groups, the save bar exists, every class the front-end
+  emits has a CSS rule, the `--chart-*` interface survived, no inline `style=` is emitted, no asset is
+  external, Bootstrap loads before the design layer and the theme control pins and persists an
+  explicit theme.
+
+**The other gates this wave added**, each of which caught something real:
+
+| Gate | What it catches | Found |
+| --- | --- | --- |
+| `test_mock_settings_cover_every_backend_setting` | mock/backend settings drift (the mock is the offline surface) | `control.stale_plan_seconds` was missing from the mock entirely - the exact "silently dropped option" this wave exists to stop |
+| `test_mock_advanced_flags_match_the_frozen_classification` | the mock's fold flags drifting from `config.SETTINGS_META` | nothing after the fix; it pins the frozen §13.3 list in both directions |
+| `test_vendored_bootstrap_matches_its_recorded_identity` | a truncated or hand-edited vendored stylesheet | nothing to fix; the file is pinned by the sha256 recorded in `vendor/README.md` |
+| `test_index_loads_bootstrap_before_the_design_layer` | an override layer loaded before the framework it overrides | nothing to fix |
+| `test_no_style_or_script_fetches_anything_at_runtime` | a CDN, webfont or remote image sneaking into a LAN-served UI | nothing to fix |
+| `test_settings_groups_and_visibility_helpers` | the fold/visibility rules regressing (one group per key, Safety never folded, a search match always wins, a value keeps an inapplicable field listed) | nothing after the fix |
+| the headless render check | a fold rule that exempts a key the payload marks advanced | `price.feed_in_entity` was rendered inline: a front-end safety regex (which exists to make money-moving keys ask for confirmation) was doing double duty as the fold rule, so a Price-group advanced key escaped the disclosure. Folding now follows the server group, as SPEC 13.2 says |
+| the same check's class-coverage assertion | an emitted class with no CSS behind it | `.theme-state` had none (added) |
+
+**One defect was found by the worker implementing it**, not by a test: `settingsField` treated the
+API's `choices: []` as "this is a select", so every free-text setting rendered as an empty dropdown -
+the form was unusable until that became `choices.length > 0`. It is worth recording that the new
+render gate would **not** have caught it (an empty `<select>` is structurally valid); it was caught by
+reading the diff against the data, which is why the diff review stays part of the process.
+
+**The audit gate had to grow, carefully.** The vendored stylesheet is full of fractional measurements,
+which is exactly the shape the R1 coordinate rule exists to catch, so the scanner reported 110
+findings on it. Filtering by path would have created a hiding place; instead `tools/audit.sh` skips
+the file *only while its bytes match a digest recorded in the vendor README*, names what it skipped in
+its summary, and scans it normally the moment a byte changes. Both directions are tested (a verified
+file is skipped; an edited file and a mismatched digest are scanned) along with the recorded digest
+itself, so the exclusion cannot cover a payload.
+
+**What this does not prove.** There is no browser on this machine. The render check is structural: it
+proves the DOM the front-end builds, not the pixels a person sees. Contrast was computed by the CSS
+worker while writing the palette (>= 4.5:1 body text, >= 3:1 large text and UI), the tokens and the
+accessibility rules are intact in source and asserted, and the layout is responsive by construction -
+but spacing, the light palette in practice and the breakpoints have not been eyeballed here. The
+click-through is the owner's, and it is the honest last step of this wave.
+
+---
+
+## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:
 
@@ -354,6 +422,12 @@ It is a **tripwire, not a proof**. The committed tree is clean under it, and it 
 * bearer / JWT credential shapes;
 * email addresses.
 
+One file is skipped, and only conditionally: the vendored Bootstrap stylesheet, whose minified body
+is full of fractional measurements and therefore trips the coordinate rule 110 times. It is skipped
+*only while its bytes match a sha256 recorded in `vendor/README.md`*, the scan summary names what it
+skipped, and the file is scanned like any other the moment a byte changes (both directions are
+tested). A path-based exclusion would have been a hiding place; this one cannot hide a payload.
+
 Documented ceilings, from the script header: MAC addresses written with hyphens, dots or no
 separator; IPv6 literals; public dynamic-DNS hostnames; 3-decimal coordinate pairs; and
 negative-only mixed-length pairs are **not** caught. The header also names the accepted false
@@ -362,7 +436,7 @@ value that may be sensitive.
 
 ---
 
-## 9. What is not verified
+## 10. What is not verified
 
 * **No real battery or Zendure hardware.** Driver behaviour is asserted against the documented
   integration semantics and a fake over loopback, not observed on a device.
@@ -383,6 +457,8 @@ value that may be sensitive.
 * **Saving a battery after a *Select*** (`POST /api/v1/batteries`) is covered by the API contract
   tests but has not been exercised against the live instance; nothing was added to the running
   add-on's configuration during this work.
+* **The redesigned interface has been checked structurally, not visually** (see §8): no screenshot,
+  no contrast measurement on rendered pixels, no real device at 360 px.
 * **No clear-day validation of the capacity model.** Its clear-sky peak was checked against an almanac
   (sunrise/sunset and peak heights are physical) and against a *partly cloudy* measured day, where it
   correctly sits above the measurement; no measured clear day was available in the three days of
@@ -410,7 +486,7 @@ Known behaviour, accepted and deliberate:
 
 ---
 
-## 10. How to reproduce
+## 11. How to reproduce
 
 No network access and no hardware are needed for any command below.
 
@@ -418,23 +494,27 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 581 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 595 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 
-# 3. R1 tripwire (expect: "audit: clean — 85 files scanned", exit 0)
+# 3. R1 tripwire (expect: "audit: clean — 89 files scanned", exit 0)
 sh tools/audit.sh
 
 # 4. End-to-end selfcheck (expect: 31/31 checks passed, exit 0)
 PYTHONPATH=energy_manager python3 -m app.main --selfcheck
+
+# 5. Render the front-end headless and check its structure (expect: "0 failed", exit 0; also run by
+#    tests/test_wp3_ui_render.py, which skips when node is absent)
+node tools/ui_render_check.js
 ```
 
 Frozen digests — manifest digests over the file sets the two recipes select. Both stages are sorted
 under `LC_ALL=C`, which makes the value independent of `find` order and of the locale (a single `sort`
-produces a different value). The `wc -l` count is the cross-check (85 and 73).
+produces a different value). The `wc -l` count is the cross-check (90 and 77).
 
 ```sh
-# all files (85)
+# all files (90)
 find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache \
         -o -name node_modules -o -name .mypy_cache \) -prune -o -type f -print \
   | LC_ALL=C sort | xargs sha256sum | LC_ALL=C sort | sha256sum

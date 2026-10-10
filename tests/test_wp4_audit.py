@@ -12,6 +12,7 @@ planted in any committed file is meant to turn this test red.
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
 import tempfile
@@ -157,3 +158,58 @@ def test_scanner_ignores_runtime_and_binary_paths():
 def test_repository_tree_is_clean():
     result = _run_scanner(ROOT)
     assert result.returncode == 0, f"the committed tree has findings:\n{result.stdout}"
+
+def test_vendored_asset_is_skipped_only_while_its_digest_is_recorded():
+    """A vendored third-party file is skipped from the content rules, but never unconditionally.
+
+    The exclusion exists because a minified stylesheet is full of fractional measurements, and the
+    coordinate rule is meant to catch fractions. It stops applying the moment the bytes change, so it
+    cannot become a place to hide a coordinate: the same tree that scans clean is scanned *and*
+    flagged one byte later. A missing sha256sum also means no exclusion.
+    """
+    shape = "{width:33." + "33333333px}\n"  # exactly what the coordinate rule flags
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _copy_scanner(root)
+        vendor = root / "energy_manager" / "app" / "web" / "vendor"
+        vendor.mkdir(parents=True)
+        css = vendor / "bootstrap.min.css"
+        css.write_text(shape)
+        digest = hashlib.sha256(css.read_bytes()).hexdigest()
+        (vendor / "README.md").write_text(
+            "# Vendored browser assets\n\n## Bootstrap 5.3.3\n\n"
+            f"source https://example.invalid/bootstrap.min.css\nsha256 {digest}\n"
+        )
+
+        verified = _run_scanner(root)
+        assert verified.returncode == 0, f"a verified vendored asset must be skipped:\n{verified.stdout}"
+        assert "skipped" in verified.stdout and "bootstrap.min.css" in verified.stdout, (
+            "the scan summary must name the file it skipped:\n" + verified.stdout
+        )
+
+        # The recorded digest no longer matches: the file is scanned again and the shape is reported.
+        css.write_text(shape.rstrip("\n") + "/* edited */\n")
+        modified = _run_scanner(root)
+        assert modified.returncode == 1, (
+            "a modified vendored file must be scanned like any other:\n" + modified.stdout
+        )
+        assert "bootstrap.min.css" in modified.stdout and "[coordinate]" in modified.stdout, modified.stdout
+
+        # A substitution with an unrecorded digest is a finding for the same reason.
+        css.write_text(shape)
+        (vendor / "README.md").write_text(
+            "# Vendored browser assets\n\n## Bootstrap 5.3.3\n\n"
+            f"source https://example.invalid/bootstrap.min.css\nsha256 {'0' * 64}\n"
+        )
+        mismatched = _run_scanner(root)
+        assert mismatched.returncode == 1, (
+            "a digest that does not match the file must not buy an exclusion:\n" + mismatched.stdout
+        )
+
+
+def test_vendored_asset_exclusion_is_visible_in_the_real_tree():
+    """The committed tree must be clean *and* the summary must say what was skipped."""
+    result = _run_scanner(ROOT)
+    assert result.returncode == 0, result.stdout
+    assert "vendor/bootstrap.min.css" in result.stdout, result.stdout
+    assert "sha256 verified" in result.stdout, result.stdout

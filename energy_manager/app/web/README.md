@@ -8,11 +8,12 @@ with `<script defer>` in `index.html`.
 
 | File | Role |
 | --- | --- |
-| `index.html` | Shell: header, nav, `<main id="view">`, live region, confirm `<dialog>`, script tags |
-| `style.css` | Dark-first design tokens, responsive layout, colour-blind-safe palette, motion/focus rules |
+| `index.html` | Shell: topbar (with the theme control), nav, `<main id="view">`, live region, confirm `<dialog>`, script tags |
+| `style.css` | Design layer over Bootstrap's `--bs-*` tokens: palette, spacing/radius scales, every component, motion/focus rules |
 | `app.js` | State, hash router, API client, all seven views, confirm + pending/confirmed write handling |
 | `charts.js` | uPlot wrappers (`SEMCharts.plan/mini/forecast/savings/accuracy`) with graceful fallbacks |
 | `mock.js` | Synthetic fixtures for `?mock=1`; also loadable in Node for the static test suite |
+| `vendor/bootstrap.min.css` | Vendored Bootstrap 5.3.3 CSS (MIT) - the reset, grid, utilities, form controls and design tokens. Its JavaScript is **not** vendored; interactions live in `app.js` |
 | `vendor/uPlot.min.js`, `vendor/uPlot.min.css` | Vendored uPlot 1.6.32 (MIT). See `vendor/README.md` for version, source URL, checksums and refresh steps |
 
 ## Running it
@@ -36,6 +37,31 @@ The add-on is served below a tokenised path, so the app must never request `/api
 derives the base from `location.pathname` (`basePath()`) and builds
 `<base>api/v1/<endpoint>`. All static asset URLs in `index.html` are relative. This is enforced by
 `tests/test_wp3_assets.py`.
+
+## Design system (SPEC 13.1)
+
+Bootstrap supplies the primitives, `style.css` supplies the design: it maps Bootstrap's `--bs-*`
+variables onto this project's palette for both `data-bs-theme="dark"` and `"light"`, and (when the
+attribute is absent) for `prefers-color-scheme`. The result is this product's look, not Bootstrap's.
+The `--chart-*` custom properties are a frozen interface - `charts.js` reads them through
+`getComputedStyle` - so keep the names. Class vocabulary is fixed: the existing names (`panel`,
+`now-card`, `chip`, `badge`, `field`, `grid`, `row`, `muted`, `stale`, `btn`, `dialog`) plus
+`settings-rail`, `settings-group`, `settings-group-body`, `disclosure`, `disclosure-body`, `save-bar`,
+`save-bar-actions`, `segmented`, `switch`, `unit-input`, `theme-state`. The theme control cycles
+auto -> dark -> light and persists the choice in `localStorage`.
+
+## Settings information architecture (SPEC 13.2)
+
+`renderSettings` renders **every** setting the API sends, exactly once, inside its server group. A
+row whose payload says `advanced: true` sits behind that group's `Advanced (n)` disclosure (state
+remembered per group; `Show all advanced` opens them all). Rows in the `Safety` group never fold,
+even though the wider `isSafetySetting()` (which also drives the confirmation step for money-moving
+keys) would otherwise exempt them - folding follows the *server* group. A field that cannot apply to
+the selected price/solar source is hidden only while it still equals its default; once it holds a
+value it stays listed as a muted "not used by the current selection" line, and a search match always
+wins over both rules. Two pure helpers carry this logic and are tested without a browser:
+`SEM_APP.settingsGroups(items)` and `SEM_APP.settingsVisible(item, {showAdvanced, showAll, query,
+priceProvider, priceContract, solarSource})`.
 
 ## Conventions
 
@@ -75,3 +101,9 @@ derives the base from `location.pathname` (`basePath()`) and builds
   test them without a DOM.
 - `node --check` must stay clean; the pytest suite in `tests/test_wp3_*.py` covers assets, routes
   and mock payload fields but does not need a browser.
+- `node tools/ui_render_check.js` (run by `tests/test_wp3_ui_render.py`) renders the real `app.js`
+  and `mock.js` through `tools/ui_dom_shim.js` and asserts the structure: every view renders from
+  mock data, every applicable setting is reachable through its group, advanced rows fold and unfold,
+  the safety group never folds, no rendered text says `undefined`, every emitted class exists in CSS,
+  no asset is remote and `<html>` can carry an explicit theme. It exits non-zero on the first broken
+  expectation, so run it after any change to the render functions.

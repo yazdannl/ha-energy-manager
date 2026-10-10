@@ -15,6 +15,7 @@ if str(ROOT / "energy_manager") not in sys.path:
 
 from app.config import (  # noqa: E402
     DEFAULTS,
+    SETTINGS_META,
     Settings,
     battery_payload,
     coerce_setting,
@@ -472,3 +473,81 @@ def test_day_ahead_wholesale_with_no_adders_warns_it_is_not_a_consumer_price():
         assert not any("not a consumer price" in w["message"] for w in _price_settings(**configured).price_warnings()), key
     # not day_ahead: never warned, even with every adder at zero
     assert not any("not a consumer price" in w["message"] for w in _price_settings(**{**zero, "price.provider": "zonneplan"}).price_warnings())
+
+
+# ----------------------------------------------------------------------------------------------
+# SPEC 13.3: the frozen `advanced` classification travels from _Meta to the UI (folded, not hidden).
+# ----------------------------------------------------------------------------------------------
+
+#: Exactly the keys SPEC 13.3 freezes as advanced. Everything else is essential.
+ADVANCED_KEYS = {
+    "currency",
+    "timezone",
+    "latitude_override",
+    "longitude_override",
+    "batteries",
+    "price.source",
+    "price.entity",
+    "price.unit",
+    "price.scale_divisor",
+    "price.vat_pct",
+    "price.energy_tax_eur_per_kwh",
+    "price.import_fee_eur_per_kwh",
+    "price.export_fee_eur_per_kwh",
+    "price.fixed_price_entity",
+    "price.fixed_day_price_entity",
+    "price.fixed_night_price_entity",
+    "price.fixed_day_start_hour",
+    "price.fixed_night_start_hour",
+    "price.static_schedule",
+    "price.feed_in_entity",
+    "solar.performance_ratio",
+    "solar.weather_entity",
+    "solar.planes",
+    "solar.api_key",
+    "load.temperature_entity",
+    "grid.import_entity",
+    "grid.export_entity",
+    "notify.events",
+    "notify.persistent",
+    "optimizer.slot_minutes",
+    "optimizer.power_steps",
+    "optimizer.soc_step_kwh",
+    "optimizer.salvage_multiplier",
+}
+
+
+def test_every_meta_payload_carries_a_boolean_advanced():
+    """No key may be left unclassified: the Settings form folds on this flag alone (SPEC 13.2)."""
+    for key, meta in SETTINGS_META.items():
+        payload = meta.as_payload()
+        assert isinstance(payload.get("advanced"), bool), key
+    descriptors = setting_descriptors()
+    keys = {row["key"] for row in descriptors}
+    assert keys >= set(SETTINGS_META) == set(DEFAULTS)
+    for row in descriptors:
+        assert isinstance(row["advanced"], bool), row["key"]
+
+
+def test_advanced_classification_is_exactly_the_frozen_list():
+    """Both directions: a new key must be classified deliberately, and nothing new may be advanced."""
+    from_meta = {key for key, meta in SETTINGS_META.items() if meta.as_payload()["advanced"]}
+    from_payload = {row["key"] for row in setting_descriptors() if row["advanced"]}
+    assert from_meta == ADVANCED_KEYS
+    assert from_payload == ADVANCED_KEYS
+    # a handful of keys that must stay essential, on both sides of the folding line
+    for essential in ("mode", "dry_run", "price.provider", "price.contract", "load.entity"):
+        assert essential not in ADVANCED_KEYS, essential
+        assert next(row for row in setting_descriptors() if row["key"] == essential)["advanced"] is False
+    for advanced in ("price.source", "batteries", "optimizer.salvage_multiplier"):
+        assert next(row for row in setting_descriptors() if row["key"] == advanced)["advanced"] is True
+
+
+def test_no_label_carries_a_manual_advanced_suffix():
+    """Folding is the only signal, and labels are user-facing text (SPEC 13.2/13.3)."""
+    for row in setting_descriptors():
+        assert "(advanced)" not in row["label"], row["key"]
+    assert {row["label"] for row in setting_descriptors() if row["key"] in ("price.source", "price.entity")} == {
+        "Price source",
+        "Price entity",
+    }

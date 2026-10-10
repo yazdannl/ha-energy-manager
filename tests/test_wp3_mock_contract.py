@@ -10,6 +10,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -17,6 +18,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / "energy_manager" / "app" / "web"
+if str(ROOT / "energy_manager") not in sys.path:
+    sys.path.insert(0, str(ROOT / "energy_manager"))
 NODE = shutil.which("node")
 
 FROZEN_SETTING_KEYS = [
@@ -644,3 +647,43 @@ def test_mock_battery_discovery_carries_the_picker_fields(fixtures):
     }
     assert data["searchByModel"] == ["Example Sensor Bank"], "search reaches the model, not just entity text"
     assert data["searchMiss"] is True, "a local miss falls back to the server-side search"
+
+
+def test_mock_settings_cover_every_backend_setting(fixtures):
+    """The mock is the UI's offline surface, so it must expose exactly the real settings.
+
+    A key missing here stays invisible until someone develops against `?mock=1` and never sees the
+    field at all - which is how `control.stale_plan_seconds` went missing while the old form silently
+    dropped keys. The frozen-key list above is a floor, not a parity check: this is the parity check.
+    """
+    import sys
+
+    from app.config import SETTINGS_META
+
+    config = fixtures["fixtures"]["config"]
+    mock_keys = [row["key"] for row in config["settings"]]
+    assert len(mock_keys) == len(set(mock_keys)), "duplicate key in the mock settings fixture"
+    real = set(SETTINGS_META)
+    assert set(mock_keys) == real, (
+        f"mock/backend settings drift -- missing from the mock: {sorted(real - set(mock_keys))}, "
+        f"unknown to the backend: {sorted(set(mock_keys) - real)}"
+    )
+    for row in config["settings"]:
+        assert isinstance(row.get("advanced"), bool), f"{row['key']} has no boolean advanced flag"
+        assert "(advanced)" not in row["label"], f"{row['key']} still marks advanced in its label"
+
+
+def test_mock_advanced_flags_match_the_frozen_classification(fixtures):
+    """SPEC 13.3 freezes which keys the UI folds; the mock must agree with the backend exactly."""
+    import sys
+
+    from app.config import SETTINGS_META
+
+    config = fixtures["fixtures"]["config"]
+    mock_advanced = {row["key"] for row in config["settings"] if row["advanced"]}
+    real_advanced = {key for key, meta in SETTINGS_META.items() if meta.advanced}
+    assert real_advanced, "the backend marks nothing advanced - the disclosure would be empty"
+    assert mock_advanced == real_advanced, (
+        f"mock/backend advanced drift -- only in the mock: {sorted(mock_advanced - real_advanced)}, "
+        f"only in the backend: {sorted(real_advanced - mock_advanced)}"
+    )

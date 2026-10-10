@@ -684,7 +684,8 @@ GET  /api/v1/discover?kind=battery|price|solar|load|grid
                                -> {candidates:[{entity_id, name, unit, device_class, state,
                                                 platform, suggested_role, confidence}]}
 GET  /api/v1/config            -> {options:{...}, settings:[{key, value, type, default,
-                                                          label, help, group, choices}],
+                                                          label, help, group, choices,
+                                                          advanced}],
                                    price_warnings:[{key, message}]}
 PATCH /api/v1/config           -> {settings:{key:value}}  -> 200 {applied:[...], errors:[...]}
                                    Unknown or invalid keys are reported per key in errors (never as a whole
@@ -842,6 +843,68 @@ writes (show pending → confirmed using the server response); the whole UI must
 via `?mock=1` so it can be developed and tested without the backend (mock payloads live in
 `app/web/mock.js`, obviously synthetic).
 
+### 13.1 Design system (frozen)
+
+The look is Bootstrap 5.3.3, vendored as one minified CSS file (`vendor/bootstrap.min.css`, MIT,
+checksum recorded in `vendor/README.md`) and loaded before `style.css`. Reasons this is vendored CSS
+and not a Tailwind build: §13 forbids a build step, the add-on must not fetch anything at runtime,
+and the vendoring + checksum + refresh-step convention already exists for uPlot. Bootstrap supplies
+the reset, grid, utilities, form controls and `--bs-*` tokens; `style.css` is the design layer and
+maps those tokens onto the palette below, so the result is this product's design, not Bootstrap's
+default look. Bootstrap's JavaScript is **not** vendored: interactions stay in `app.js`.
+
+- Component vocabulary is fixed: existing names (`panel`, `now-card`, `chip`, `badge`, `field`,
+  `grid`, `row`, `muted`, `stale`, `btn`, `dialog`) stay in use and are restyled, plus new
+  `settings-rail`, `settings-group`, `disclosure`, `save-bar`, `segmented`, `switch`, `unit-input`.
+- Tokens: the colour-blind-safe palette stays; the `--chart-*` custom properties are a frozen
+  interface (`charts.js` reads them through `getComputedStyle`). Dark and light are both first class
+  via `data-bs-theme` plus `prefers-color-scheme`, with an explicit user override that persists.
+- Minimalist rules: one accent colour, 1px borders instead of shadows, one radius scale, an 8 px
+  spacing scale, tabular figures for numbers, no gradients, no external fonts, no images.
+- Accessibility is unchanged and normative: keyboard reachable, visible `:focus-visible` ring,
+  `prefers-reduced-motion` honoured, contrast >= 4.5:1, never colour-only, skip link kept.
+
+### 13.2 Progressive disclosure in Settings (frozen)
+
+The settings form was a single wall of ~75 fields, and fields that did not apply to the chosen
+source were not rendered at all. It is now grouped and folded instead of truncated:
+
+- **Every** key of `GET /api/v1/config` is rendered exactly once, inside its server-provided group;
+  nothing is dropped because it has its default value.
+- Groups are chosen from a `settings-rail` (one group visible at a time; a horizontal chip strip on
+  narrow screens), with the change count per group so folded edits stay visible.
+- A row whose payload has `advanced: true` sits behind its group's `Advanced (n)` disclosure, which
+  is collapsed by default, remembers its state per group, and can be revealed for every group at once
+  with the `Show all advanced` switch (also remembered). Rows in the `Safety` group are never folded.
+- The price/solar visibility tables (source-dependent relevance) still hide fields that cannot apply
+  to the current selection, but a hidden field holding a non-default value is still listed, muted, as
+  "not used by the current selection".
+- Search matches all keys, including folded and hidden ones, and shows the group each match is in.
+- A `save-bar` (sticky) shows how many keys are changed with Save and Revert; navigating away with
+  unsaved changes asks first.
+
+### 13.3 `advanced` classification (frozen)
+
+`_Meta.advanced` (default `False`) travels to the UI as the `advanced` row field. Frozen as advanced:
+`currency`, `timezone`, `latitude_override`, `longitude_override`, `batteries`,
+`price.source`, `price.entity`, `price.unit`, `price.scale_divisor`, `price.vat_pct`,
+`price.energy_tax_eur_per_kwh`, `price.import_fee_eur_per_kwh`, `price.export_fee_eur_per_kwh`,
+`price.fixed_price_entity`, `price.fixed_day_price_entity`, `price.fixed_night_price_entity`,
+`price.fixed_day_start_hour`, `price.fixed_night_start_hour`, `price.static_schedule`,
+`price.feed_in_entity`, `solar.performance_ratio`, `solar.weather_entity`, `solar.planes`,
+`solar.api_key`, `load.temperature_entity`, `grid.import_entity`, `grid.export_entity`,
+`notify.events`, `notify.persistent`, `optimizer.slot_minutes`, `optimizer.power_steps`,
+`optimizer.soc_step_kwh`, `optimizer.salvage_multiplier`. Everything else is essential; the
+`Safety` group is always visible regardless of the flag, and a label never carries a manual
+"(advanced)" suffix - folding is the only signal.
+
+### 13.4 UI tests
+
+Beyond the existing asset checks: the settings IA is tested through pure helpers exported on
+`SEM_APP` (`settingsGroups`, `settingsVisible`) so node can exercise them without a DOM, the frozen
+classification is asserted against the server payload, and the mock payload in `mock.js` mirrors the
+new row field.
+
 ---
 
 ## 14. Tests and acceptance (WP5)
@@ -969,6 +1032,13 @@ than by weakening `tools/audit.sh`.
 ---
 
 ## 16. Amendment log (why the spec changed)
+
+**0.5.0 UI redesign (user request: "cluttered and not modern at all", "modern minimalist ui with more
+options available if the user wants to change them", "use either bootstrap or tailwindcss").** §13.1
+fixes the design system (vendored Bootstrap 5.3.3 CSS, restyled through `--bs-*` token mapping) and
+§13.2 replaces the truncated settings wall with grouped, folded disclosure: every key renders, the
+server decides what is `advanced` (§13.3), and nothing is invisible just because it holds its default.
+§10 gains the additive `advanced` row field.
 
 Three independent adversarial audits (gpt-6-luna, deepseek-v4.1, step-5-preview) reviewed the built
 tree. The fixes they triggered changed shipped details, so the frozen contract is amended here, in one

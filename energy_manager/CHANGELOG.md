@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.0
+
+- **The interface was rebuilt: same features, far less wall-of-fields.** The settings form is now a
+  group rail - General, Price, Solar, Load, Grid, Optimizer, Safety, Notify, Batteries - showing one
+  group at a time, with a sticky save bar that counts your unsaved edits and asks before you navigate
+  away from them.
+- **Every setting is reachable now.** The old form silently dropped any field that did not apply to
+  the selected source *and* still held its default value, so options simply did not exist as far as
+  the UI was concerned. Nothing is dropped because of its value any more: fields that do not apply to
+  the current price/solar source stay listed (muted, "not used by the current selection") when they
+  hold something, and everything else is behind a per-group `Advanced (n)` disclosure that remembers
+  whether you opened it. `Show all advanced` opens every group at once. Safety settings are never
+  folded.
+- **The server decides what is advanced.** A new additive `advanced` row field carries that
+  classification from the configuration metadata (SPEC 13.3), so the UI cannot drift from the backend
+  and no label has to say "(advanced)" any more.
+- **Bootstrap 5.3.3, vendored as CSS.** The look is a design layer over Bootstrap's tokens rather than
+  a pile of bespoke rules: one accent colour, 1px borders, an 8px spacing scale, tabular figures, no
+  gradients or webfonts, light *and* dark palettes, and a three-state theme control (auto / dark /
+  light) that follows your operating system by default. Still no build step and still no CDN: the
+  stylesheet is a pinned file in `vendor/` (checksum and refresh steps recorded) and the audit gate
+  skips it only while its bytes match that record.
+- Fixes found while building it: every free-text setting rendered as an empty dropdown (the API sends
+  `choices: []`, which the form mistook for a select); `control.stale_plan_seconds` was missing from
+  the offline mock entirely; and `price.feed_in_entity` escaped folding because a front-end safety
+  regex was doing double duty as the fold rule.
+- New gates: `tools/ui_render_check.js` renders the real front-end headless through a small DOM shim
+  and asserts that every view renders, every applicable setting is reachable, folding and unfolding
+  work, no number prints as `undefined`, every emitted class exists in CSS and no asset is remote.
+
 ## 0.4.0
 
 - **AC-coupled solar, estimated from the array's watt peak.** `solar.source` now has two modes:
