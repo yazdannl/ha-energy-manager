@@ -23,7 +23,7 @@ loopback addresses and placeholder coordinates.
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (77 files, documentation excluded)**:
-  `d92974e5c47f530883b394ea85bf5e7ae6e2bbceddfa31c65c94f1987e5088f6`
+  `2209d590a2f4047bf48cf8c3f6953b5d6aa2ec69b7d1dc65fd9ca217a90af133`
 * **path list of the same 77 files** (detects an added, removed or renamed file):
   `63e3910878cca4ec6ac8802e98b49448c7d6655eab98076ddfcf1d0140adf88b`
 
@@ -397,6 +397,15 @@ the file *only while its bytes match a digest recorded in the vendor README*, na
 its summary, and scans it normally the moment a byte changes. Both directions are tested (a verified
 file is skipped; an edited file and a mismatched digest are scanned) along with the recorded digest
 itself, so the exclusion cannot cover a payload.
+
+**A stale-UI hazard found while deploying it.** The add-on served its own assets with
+`Cache-Control: public, max-age=3600` and its asset URLs are unversioned, so after an in-place
+Supervisor update a browser could keep rendering the previous release for up to an hour with nothing
+indicating staleness - the exact "did my update apply?" trap, and one that no test in this repository
+would have caught, because caching only exists between a browser and this server. Every asset now
+revalidates (`no-cache`); the two static-serving tests assert it per asset rather than only for
+`index.html`, which is where the old exception lived. The bug was found by reading the response
+headers while checking the live deployment, not by the suite.
 
 **What this does not prove.** There is no browser on this machine. The render check is structural: it
 proves the DOM the front-end builds, not the pixels a person sees. Contrast was computed by the CSS

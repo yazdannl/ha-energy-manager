@@ -938,9 +938,13 @@ def test_static_serving_and_traversal_rejection(tmp_path):
 
     status, headers, _content, _body = call(app, "GET", "/app.js")
     assert status == 200 and headers["Content-Type"].startswith("text/javascript")
+    # Every asset revalidates, not just the shell: an add-on is updated in place and its asset URLs
+    # are unversioned, so a cached stylesheet would keep showing the previous release's UI.
+    assert headers["Cache-Control"] == "no-cache", "a cached asset would hide an update"
 
     status, headers, _content, _body = call(app, "GET", "/sub/style.css")
     assert status == 200 and headers["Content-Type"].startswith("text/css")
+    assert headers["Cache-Control"] == "no-cache"
 
     for attack in (
         "/../secret.txt",

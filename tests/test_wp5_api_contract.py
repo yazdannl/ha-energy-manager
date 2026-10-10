@@ -642,6 +642,7 @@ def test_static_serving_and_traversal(wired):
         status, headers, body = wired.request("GET", asset)
         assert status == 200, asset
         assert body, asset
+        assert headers.get("Cache-Control") == "no-cache", f"{asset} would be cached and hide an update"
     # traversal attempts must 404
     for path in (
         "/../energy_manager/app/config.py",

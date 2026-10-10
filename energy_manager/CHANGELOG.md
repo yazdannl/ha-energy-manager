@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1
+
+- **Fixed: an update could take an hour to appear.** The add-on served its own assets - `style.css`,
+  `app.js`, `charts.js`, `mock.js`, the vendored framework - with `Cache-Control: public,
+  max-age=3600`, and the asset URLs carry no version, so a browser could keep rendering the previous
+  release's interface for up to an hour after an update, with nothing on screen to say so. Every asset
+  now revalidates on every load. The top bar shows the running version, so the panel itself tells you
+  which release you are looking at.
+
 ## 0.5.0
 
 - **The interface was rebuilt: same features, far less wall-of-fields.** The settings form is now a

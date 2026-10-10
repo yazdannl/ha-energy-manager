@@ -1011,7 +1011,11 @@ class ApiServer:
         extension = os.path.splitext(full)[1].lower()
         headers = {
             "Content-Type": CONTENT_TYPES.get(extension, "application/octet-stream"),
-            "Cache-Control": "no-cache" if relative == "index.html" else "public, max-age=3600",
+            # Revalidate every asset on every load: the Supervisor updates an add-on in place and the
+            # asset URLs carry no version, so a long max-age leaves a browser showing the previous
+            # release's UI for up to an hour after an update - a stale interface with no way to tell.
+            # The files are local and small, so freshness is worth more than the saved bytes.
+            "Cache-Control": "no-cache",
         }
         try:
             with open(full, "rb") as handle:
