@@ -1,0 +1,37 @@
+name: Smart Energy Manager
+version: 0.1.0
+slug: energy_manager
+description: Plans and optionally executes battery dispatch to cut electricity cost from dynamic prices, solar forecasts and a learned load profile.
+url: https://github.com/yazdannl/ha-energy-manager
+arch:
+  - aarch64
+  - amd64
+  - armv7
+  - armhf
+  - i386
+startup: application
+boot: auto
+init: false
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:home-battery
+panel_title: Energy
+homeassistant_api: true
+hassio_api: false
+# image: ghcr.io/yazdannl/energy-manager-{arch}   # optional: uncomment to pull a prebuilt image
+options:
+  mode: advisory
+  dry_run: true
+  log_level: info
+  currency: null
+  timezone: null
+  latitude_override: null
+  longitude_override: null
+schema:
+  mode: list(off|advisory|auto)
+  dry_run: bool
+  log_level: list(debug|info|warning|error)
+  currency: str?
+  timezone: str?
+  latitude_override: float?
+  longitude_override: float?

@@ -1,0 +1,31 @@
+# Runtime data — never commit (SPEC.md R1)
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.sqlite
+options.json
+captures/
+local/
+
+# Runtime JSON artefacts — never commit (SPEC.md R1).
+# Test fixtures are the one exception; put them under tests/.
+*.json
+!tests/*.json
+!tests/**/*.json
+
+# Local environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+node_modules/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,833 @@
+/* mock.js — synthetic fixtures for ?mock=1.
+ *
+ * Everything here is obviously fake: reserved-namespace entity ids (`*.example_*`), round numbers,
+ * and a fixed baseline ("Example Street 1", 12.0 kWh battery). No network access, ever.
+ *
+ * Loadable in Node (no DOM at load time) so the static test suite can assert that every payload
+ * carries the SPEC §10 fields. `SEM_MOCK.fixtures()` returns one plain object with all GET payloads.
+ */
+(function (root) {
+  "use strict";
+
+  var SLOT_MS = 15 * 60000;
+  var CAP_KWH = 12.0;
+  var MIN_KWH = 4.0;
+  var MAX_KWH = 10.4;
+  var MOCK_ROUND_TRIP_PCT = 90.0;
+  var MOCK_ETA = Math.sqrt(MOCK_ROUND_TRIP_PCT / 100);
+
+  /** Mirrors config.py: keep a derived round_trip_efficiency_pct on every read-back config. */
+  function withDerivedEfficiency(config) {
+    if (config && typeof config.round_trip_efficiency_pct !== "number") {
+      var etaCharge = typeof config.eta_charge === "number" ? config.eta_charge : null;
+      var etaDischarge = typeof config.eta_discharge === "number" ? config.eta_discharge : null;
+      if (etaCharge && etaDischarge) config.round_trip_efficiency_pct = round(etaCharge * etaDischarge * 100, 6);
+    }
+    return config;
+  }
+
+  /** Mirrors config.py: a pct-only payload is split evenly; explicit etas win. */
+  function applyEfficiencyInput(config) {
+    if (config && typeof config.round_trip_efficiency_pct === "number") {
+      var explicit = typeof config.eta_charge === "number" || typeof config.eta_discharge === "number";
+      if (!explicit) {
+        var eta = Math.sqrt(config.round_trip_efficiency_pct / 100);
+        config.eta_charge = eta;
+        config.eta_discharge = eta;
+      }
+    }
+    return withDerivedEfficiency(config);
+  }
+
+  var startMs = Math.floor(Date.now() / SLOT_MS) * SLOT_MS;
+
+  function iso(ms) { return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z"); }
+  function round(value, digits) {
+    var f = Math.pow(10, digits);
+    return Math.round(value * f) / f;
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+  // Deterministic pseudo noise (no Math.random, so runs are reproducible).
+  function wobble(i) { return Math.sin(i * 12.9898) * 0.5 + Math.sin(i * 4.1414) * 0.5; }
+
+  var _slots = null;
+  function planSlots() {
+    if (_slots) return _slots;
+    var out = [];
+    var soc = 6.0;
+    var lastBuy = 0.21;
+    var count = 4 * 48; // 48 h; views request a window and slice it
+    for (var i = 0; i < count; i++) {
+      var t = startMs + i * SLOT_MS;
+      var d = new Date(t);
+      var hour = d.getHours() + d.getMinutes() / 60;
+      var daylight = Math.max(0, Math.sin(Math.PI * (hour - 6) / 12));
+      var pv = round(3.2 * Math.pow(daylight, 1.4), 2);
+      var load = round(clamp(0.55 + 0.25 * Math.sin((hour / 24) * 2 * Math.PI) + (hour > 17 && hour < 21 ? 0.35 : 0) + 0.05 * wobble(i), 0.1, 2.5), 2);
+      var stale = i > count * 0.8;
+      var buy = stale ? lastBuy : round(clamp(0.14 + 0.16 * (1 - daylight) * (0.6 + 0.4 * Math.abs(wobble(i))) + (hour >= 18 && hour < 21 ? 0.06 : 0), 0.05, 0.6), 4);
+      lastBuy = buy;
+      var sell = round(Math.max(0.04, buy * 0.35), 4);
+      // Mock: a few evening slots see a profitable peak feed-in so both the discharge and the
+      // efficiency_loss branches appear in the demo plan.
+      if (hour >= 18 && hour < 21 && i % 3 === 0) sell = round(buy * 1.3, 4);
+
+      var power = 0, action = "hold", reason = "reserve_hold";
+      if (pv * 1000 > load * 1000 + 300 && soc < MAX_KWH - 0.2) {
+        power = Math.min(800, Math.round((pv - load) * 1000 / 50) * 50);
+        action = "pv_charge"; reason = "pv_surplus_charge";
+      } else if (buy < 0.17 && soc < MAX_KWH - 0.2) {
+        power = 600; action = "charge"; reason = "arbitrage_charge";
+      } else if (hour >= 18 && hour < 21 && soc > MIN_KWH + 0.4) {
+        var breakEven = buy / (MOCK_ETA * MOCK_ETA);
+        if (sell >= breakEven) {
+          power = -700; action = "discharge"; reason = "peak_discharge";
+        } else {
+          action = "hold"; reason = "efficiency_loss";
+        }
+      } else if (soc >= MAX_KWH - 0.2) {
+        action = "reserve"; reason = "battery_full";
+      } else if (soc <= MIN_KWH + 0.2) {
+        action = "reserve"; reason = "battery_empty";
+      }
+      if (power > 0) soc = Math.min(MAX_KWH, soc + (power / 1000) * 0.25 * 0.95);
+      else if (power < 0) soc = Math.max(MIN_KWH, soc + (power / 1000) * 0.25 / 0.95);
+      soc = round(soc, 2);
+
+      out.push({
+        t: iso(t),
+        buy: buy,
+        sell: sell,
+        pv_kw: pv,
+        load_kw: load,
+        load_p10: round(load * 0.7, 2),
+        load_p90: round(load * 1.35, 2),
+        soc_kwh: soc,
+        soc_pct: round((soc / CAP_KWH) * 100, 1),
+        power_w: power,
+        action: action,
+        reason: reason,
+        price_stale: stale,
+        pv_source: "forecast_solar",
+        price_source: "zonneplan_entity"
+      });
+    }
+    _slots = out;
+    return out;
+  }
+
+  function windowSlots(hours) {
+    var n = clamp(parseInt(hours, 10) || 36, 1, 48) * 4;
+    return planSlots().slice(0, n);
+  }
+
+  function planPayload(hours) {
+    var slots = windowSlots(hours);
+    var cost = 0, baseline = 0;
+    slots.forEach(function (s) {
+      var dt = 0.25;
+      var grid = s.load_kw - s.pv_kw - s.power_w / 1000;
+      cost += dt * (grid >= 0 ? s.buy * grid : -s.sell * -grid);
+      var base = s.load_kw - s.pv_kw;
+      baseline += dt * (base >= 0 ? s.buy * base : -s.sell * -base);
+    });
+    // Summary extras mirror the optimiser (SPEC 8.1): the terminal salvage is
+    // salvage_multiplier x median(buy) x eta_discharge per stored kWh, so the exact objective is
+    // grid cost + cycle cost - salvage, and the break-even sale price is taken at the same median
+    // buy. Both are computed from the rounded grid cost the summary reports so the three numbers
+    // stay consistent. The real serializer emits break-even unrounded; so does this mock.
+    var cycleCost = 0.0;
+    var costs = round(cost, 2);
+    var buys = slots.map(function (s) { return s.buy; }).sort(function (a, b) { return a - b; });
+    var medianBuy = 0;
+    if (buys.length) {
+      var mid = Math.floor(buys.length / 2);
+      medianBuy = buys.length % 2 ? buys[mid] : (buys[mid - 1] + buys[mid]) / 2;
+    }
+    var roundTrip = round(MOCK_ETA * MOCK_ETA, 6);
+    var terminalKwh = slots.length ? slots[slots.length - 1].soc_kwh : 0;
+    return {
+      generated_at: iso(startMs),
+      horizon_start: slots.length ? slots[0].t : iso(startMs),
+      horizon_end: slots.length ? iso(startMs + slots.length * SLOT_MS) : iso(startMs),
+      slot_minutes: 15,
+      feasible: true,
+      infeasible_reason: null,
+      mode: db.mode,
+      dry_run: db.dry_run,
+      sources: { price: "zonneplan_entity", solar: "forecast_solar", load: "statistics" },
+      summary: {
+        cost_estimate_eur: costs,
+        baseline_cost_eur: round(baseline, 2),
+        saved_eur: round(baseline - cost, 2),
+        charged_kwh: 6.4,
+        discharged_kwh: 5.9,
+        grid_charge_kwh: 2.1,
+        pv_charge_kwh: 4.3,
+        cycles: 0.52,
+        arbitrage_kwh: 2.1,
+        effective_step_kwh: 0.02,
+        solver_iterations: 346752,
+        cycle_cost_eur: cycleCost,
+        objective_eur: round(costs + cycleCost - medianBuy * MOCK_ETA * terminalKwh, 2),
+        eta_charge: MOCK_ETA,
+        eta_discharge: MOCK_ETA,
+        round_trip_efficiency: roundTrip,
+        break_even_sell_eur_per_kwh: medianBuy / roundTrip + cycleCost / MOCK_ETA
+      },
+      slots: slots,
+      batteries: [{ id: "battery_1", name: "Example Battery 1", share_w: slots.length ? slots[0].power_w : 0 }]
+    };
+  }
+
+  function priceSlots(hours) {
+    return windowSlots(hours).map(function (s) {
+      return { t: s.t, buy: s.buy, sell: s.sell, source: "zonneplan_entity", is_actual: false, stale: s.price_stale };
+    });
+  }
+
+  function solarSlots(hours) {
+    return windowSlots(hours).map(function (s) {
+      return { t: s.t, pv_kw: s.pv_kw, uncertainty_pct: 25.0 };
+    });
+  }
+
+  function loadSlots(hours) {
+    return windowSlots(hours).map(function (s) {
+      return { t: s.t, load_kw: s.load_kw, p10_kw: s.load_p10, p90_kw: s.load_p90 };
+    });
+  }
+
+  var MOCK_NOTE = "Synthetic mock data (?mock=1): not a real installation.";
+
+  function statePayload(batteryId) {
+    return {
+      id: batteryId || "battery_1",
+      available: true,
+      soc_pct: 62.5,
+      power_w: -240,
+      capacity_kwh: CAP_KWH,
+      energy_kwh: 7.5,
+      pv_power_w: 0,
+      temperature_c: 21.5,
+      read_at: iso(Date.now() - 20000),
+      last_error: null,
+      stale: false,
+      extra: { cycles: 128.5, name: "Example Battery 1" }
+    };
+  }
+
+  function batteryRecord() {
+    return {
+      config: {
+        id: "battery_1",
+        name: "Example Battery 1",
+        driver: "generic",
+        capacity_kwh: CAP_KWH,
+        min_soc_pct: 10.0,
+        max_soc_pct: 90.0,
+        max_charge_w: 800.0,
+        max_discharge_w: 800.0,
+        eta_charge: MOCK_ETA,
+        eta_discharge: MOCK_ETA,
+        round_trip_efficiency_pct: MOCK_ROUND_TRIP_PCT,
+        mapping: {
+          power_setpoint_entity: "number.example_battery_input_limit",
+          mode_select_entity: "select.example_battery_mode",
+          mode_manual_value: "manual",
+          soc_entity: "sensor.example_battery_soc_1",
+          capacity_entity: "sensor.example_battery_capacity"
+        },
+        enabled: db.batteryEnabled
+      },
+      state: statePayload(),
+      capabilities: {
+        max_charge_w: 800.0,
+        max_discharge_w: 800.0,
+        min_soc_pct: 10.0,
+        max_soc_pct: 90.0,
+        signed_setpoint: true,
+        manual_mode_required: true,
+        writes: ["power_setpoint_entity", "mode_select_entity"]
+      },
+      mapping_resolved: true,
+      discovery: discoveryCandidates("battery")
+    };
+  }
+
+  function discoveryCandidates(kind) {
+    var all = {
+      battery: [
+        { entity_id: "number.example_battery_input_limit", name: "Example battery input limit", unit: "W", device_class: "power", state: "-240", platform: "zendure_ha", suggested_role: "power_setpoint_entity", confidence: 0.86 },
+        { entity_id: "sensor.example_battery_soc_1", name: "Example battery state of charge", unit: "%", device_class: "battery", state: "62.5", platform: "zendure_ha", suggested_role: "soc_entity", confidence: 0.92 },
+        { entity_id: "sensor.example_battery_capacity", name: "Example battery capacity", unit: "kWh", device_class: "energy_storage", state: "12.0", platform: "zendure_ha", suggested_role: "capacity_entity", confidence: 0.74 },
+        { entity_id: "select.example_battery_mode", name: "Example battery mode", unit: null, device_class: null, state: "manual", platform: "zendure_ha", suggested_role: "mode_select_entity", confidence: 0.68 },
+        { entity_id: "sensor.example_battery_output_home_power", name: "Example battery output power", unit: "W", device_class: "power", state: "240", platform: "zendure_ha", suggested_role: "discharge_power_entity", confidence: 0.55 }
+      ],
+      price: [
+        { entity_id: "sensor.example_price_now", name: "Example dynamic price forecast", unit: "EUR/kWh", device_class: "monetary", state: "0.2140", platform: "example_integration", suggested_role: "price.entity", confidence: 0.81 }
+      ],
+      solar: [
+        { entity_id: "sensor.example_pv_power", name: "Example PV power", unit: "W", device_class: "power", state: "2450", platform: "example_integration", suggested_role: "solar.measured_entity", confidence: 0.88 }
+      ],
+      load: [
+        { entity_id: "sensor.example_load_power", name: "Example household load power", unit: "W", device_class: "power", state: "810", platform: "example_integration", suggested_role: "load.entity", confidence: 0.9 },
+        { entity_id: "sensor.example_outdoor_temperature", name: "Example outdoor temperature", unit: "°C", device_class: "temperature", state: "11.5", platform: "example_integration", suggested_role: "load.temperature_entity", confidence: 0.62 }
+      ],
+      grid: [
+        { entity_id: "sensor.example_grid_power", name: "Example grid power", unit: "W", device_class: "power", state: "-1640", platform: "example_integration", suggested_role: "grid.entity", confidence: 0.85 }
+      ]
+    };
+    return all[kind] || [];
+  }
+
+  // -----------------------------------------------------------------------------------
+  // Settings descriptors (SPEC §3 frozen keys). Types drive the generated form.
+  // -----------------------------------------------------------------------------------
+
+  // Mirrors config.DEFAULTS / SETTINGS_META: ui type, default, label, help, lowercase group.
+  // The "Safety" group is derived exactly like the backend does (descriptorGroup below).
+  var SETTINGS = [
+    ["mode", "str", "advisory", "Mode", "off, advisory or auto; advisory never writes.", "general", ["off", "advisory", "auto"]],
+    ["dry_run", "bool", true, "Dry run", "Log the writes that would happen without doing them.", "general", null],
+    ["log_level", "str", "info", "Log level", "", "general", ["debug", "info", "warning", "error"]],
+    ["currency", "str", null, "Currency", "Unset = read from HA.", "general", null],
+    ["timezone", "str", null, "Timezone", "Unset = read from HA.", "general", null],
+    ["latitude_override", "str", null, "Latitude override", "Unset = read from HA.", "general", null],
+    ["longitude_override", "str", null, "Longitude override", "Unset = read from HA.", "general", null],
+
+    ["price.source", "str", "zonneplan_entity", "Price source", "Configured source with fallback to energy_charts then static.", "price", ["zonneplan_entity", "energy_charts", "entity_forecast", "static"]],
+    ["price.entity", "str", "", "Price entity", "Runtime-picked HA sensor entity id.", "price", null],
+    ["price.static_schedule", "json", [], "Static price schedule", "List of {from_hour,to_hour,price_eur_per_kwh,days}.", "price", null],
+    ["price.import_fee_eur_per_kwh", "float", 0.0, "Import fee", "Supplier markup on buy, EUR/kWh.", "price", null],
+    ["price.export_fee_eur_per_kwh", "float", 0.0, "Export fee", "Deduction on sell, EUR/kWh.", "price", null],
+    ["price.vat_pct", "float", 21.0, "VAT %", "Applied when a source publishes ex-VAT prices.", "price", null],
+    ["price.energy_tax_eur_per_kwh", "float", 0.0, "Energy tax", "Applied when a source publishes ex-tax prices.", "price", null],
+    ["price.unit", "str", "auto", "Declared unit", "auto = use the provider's declared unit.", "price", ["auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh"]],
+    ["price.scale_divisor", "float", 1.0, "Scale divisor", "For providers publishing fixed-point integers.", "price", null],
+    ["price.bzn", "str", "NL", "Bidding zone", "energy_charts zone, e.g. NL, DE-LU.", "price", null],
+    ["price.feed_in_eur_per_kwh", "float", null, "Feed-in tariff", "EUR/kWh received for export, net of the export fee. Unset = sell price unknown.", "price", null],
+    ["price.feed_in_entity", "str", "", "Feed-in price entity", "HA sensor with the current feed-in price; overrides the flat tariff.", "price", null],
+    ["price.feed_in_tax_inclusive", "bool", true, "Feed-in incl. VAT", "Off = add price.vat_pct to the feed-in price.", "price", null],
+
+    ["solar.enabled", "bool", true, "Solar forecast", "Enable the PV forecast.", "solar", null],
+    ["solar.source", "str", "forecast_solar", "Solar source", "", "solar", ["forecast_solar"]],
+    ["solar.planes", "json", [], "PV planes", "List of {kwp, tilt_deg, azimuth_deg (compass: 0=north), damping}.", "solar", null],
+    ["solar.api_key", "password", "", "Forecast.Solar key", "Optional personal key; keyless is single-plane hourly.", "solar", null],
+    ["solar.bias_correction", "bool", true, "Bias correction", "Learn a multiplicative correction from measured PV.", "solar", null],
+    ["solar.measured_entity", "str", "", "Measured PV entity", "Runtime-picked PV power sensor.", "solar", null],
+
+    ["load.mode", "str", "auto", "Load source", "auto uses the load entity if mapped, else derived.", "load", ["auto", "entity", "derived"]],
+    ["load.entity", "str", "", "Load entity", "Runtime-picked load power sensor.", "load", null],
+    ["load.temperature_entity", "str", "", "Outdoor temperature entity", "Optional regression term.", "load", null],
+    ["load.base_kwh_per_day", "float", 0.0, "Fallback daily energy", "Flat profile until something is learned.", "load", null],
+
+    ["grid.power_entity", "str", "", "Grid power entity", "Signed grid power sensor, positive = import; enables the derived load tier.", "grid", null],
+    ["grid.import_entity", "str", "", "Grid import entity", "Separate import power sensor (optional).", "grid", null],
+    ["grid.export_entity", "str", "", "Grid export entity", "Separate export power sensor (optional).", "grid", null],
+
+    ["optimizer.slot_minutes", "int", 15, "Slot minutes", "", "optimizer", null],
+    ["optimizer.horizon_hours", "int", 30, "Horizon hours", "Clamped to 12..48 by the optimizer. Default 30 h matches the ~+30 h Zonneplan feed.", "optimizer", null],
+    ["optimizer.soc_step_kwh", "float", 0.02, "SoC step", "kWh per DP state.", "optimizer", null],
+    ["optimizer.power_steps", "int", 24, "Power steps", "Discrete actions per state.", "optimizer", null],
+    ["optimizer.salvage_multiplier", "float", 1.0, "Salvage multiplier", "Terminal SoC valued at multiplier x median buy price.", "optimizer", null],
+    ["optimizer.cycle_cost_eur_per_kwh", "float", 0.0, "Cycle cost", "EUR per kWh cycled.", "optimizer", null],
+    ["optimizer.allow_grid_charge", "bool", true, "Allow grid charging", "", "optimizer", null],
+    ["optimizer.allow_export", "bool", false, "Allow export", "Off until a feed-in tariff is configured; sell is then 0.00.", "optimizer", null],
+    ["optimizer.reserve_soc_pct", "float", 0.0, "Reserve SoC", "Extra floor above battery min_soc.", "optimizer", null],
+    ["optimizer.max_grid_import_w", "float", 0, "Max grid import W", "0 = unlimited.", "optimizer", null],
+    ["optimizer.max_grid_export_w", "float", 0, "Max grid export W", "0 = unlimited.", "optimizer", null],
+    ["optimizer.min_spread_eur_per_kwh", "float", 0.0, "Min spread", "Ignore arbitrage thinner than this.", "optimizer", null],
+    ["optimizer.target_soc_pct_end", "float", null, "End SoC target %", "Unset = no hard terminal target.", "optimizer", null],
+
+    ["control.tick_seconds", "int", 30, "Tick seconds", "", "control", null],
+    ["control.replan_minutes", "int", 15, "Replan minutes", "", "control", null],
+    ["control.grid_follow", "bool", true, "Grid follow", "Correct small grid deviations.", "control", null],
+    ["control.grid_follow_deadband_w", "float", 30, "Grid deadband W", "", "control", null],
+    ["control.grid_follow_max_ratio", "float", 0.5, "Grid follow max ratio", "", "control", null],
+    ["control.grid_follow_max_w", "float", 0, "Grid follow max W", "Power budget for grid-follow corrections; 0 = a share of the batteries' capability.", "control", null],
+    ["control.stale_state_seconds", "int", 180, "Stale state seconds", "Older measurement means hold power.", "control", null],
+    ["control.failsafe_on_error", "bool", true, "Fail safe on error", "Write 0 W on unrecoverable error.", "control", null],
+
+    ["notify.enabled", "bool", true, "Notifications", "", "notify", null],
+    ["notify.persistent", "bool", true, "Persistent notification", "Also create an HA persistent notification.", "notify", null],
+    ["notify.mobile_service", "str", "", "Mobile service", "e.g. notify.example_mobile_app; empty = off.", "notify", null],
+    ["notify.events", "list", ["plan_changed", "plan_applied", "battery_floor_reached", "negative_price", "forecast_unavailable", "driver_error"], "Notify on events", "", "notify", ["plan_changed", "plan_applied", "battery_floor_reached", "negative_price", "forecast_unavailable", "driver_error"]],
+
+    ["batteries", "json", [], "Batteries", "Managed by the battery wizard, not the settings form.", "batteries", null]
+  ];
+
+  var db = {
+    mode: "advisory",
+    dry_run: true,
+    override: null,
+    batteryEnabled: true,
+    settings: {},
+    batteries: null,
+    pendingHolds: [],
+    modePersisted: true
+  };
+  function batteryList() {
+    if (!db.batteries) db.batteries = [batteryRecord()];
+    return db.batteries;
+  }
+
+  // Mirrors api.py `_descriptor_row`: keys flagged by the backend's own safety regex land in a
+  // dedicated "Safety" group; the rest are Title-cased topic names.
+  var MOCK_BACKEND_SAFETY_RE = /(reserve_soc_pct|max_grid_import_w|max_grid_export_w|target_soc_pct_end|allow_grid_charge|allow_export|min_spread_eur_per_kwh|^control\.)/;
+  function descriptorGroup(key, group) {
+    if (MOCK_BACKEND_SAFETY_RE.test(key)) return "Safety";
+    return group.charAt(0).toUpperCase() + group.slice(1);
+  }
+
+  function settingDescriptors() {
+    return SETTINGS.slice()
+      .sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; })
+      .map(function (row) {
+        var key = row[0];
+        return {
+          key: key,
+          value: Object.prototype.hasOwnProperty.call(db.settings, key) ? db.settings[key] : row[2],
+          type: row[1],
+          default: row[2],
+          label: row[3],
+          help: row[4],
+          group: descriptorGroup(key, row[5]),
+          choices: row[6] || []
+        };
+      });
+  }
+
+  function validateSetting(key, value) {
+    var row = SETTINGS.filter(function (r) { return r[0] === key; })[0];
+    if (!row) return "unknown setting key";
+    var type = row[1];
+    if (type === "bool" && typeof value !== "boolean") return "expected true or false";
+    if ((type === "int" || type === "float") && (typeof value !== "number" || !isFinite(value))) return "expected a number";
+    if (type === "int" && typeof value === "number" && value !== Math.round(value)) return "expected a whole number";
+    if (Array.isArray(row[6]) && type !== "list" && row[6].indexOf(value) === -1) return "choose one of " + row[6].join(", ");
+    if (/max_grid_(import|export)_w$/.test(key) && typeof value === "number" && value < 0) return "must be 0 (unlimited) or positive";
+    if (/pct$/.test(key) && typeof value === "number" && (value < 0 || value > 100)) return "must be between 0 and 100";
+    return null;
+  }
+
+  // -----------------------------------------------------------------------------------
+  // Savings
+  // -----------------------------------------------------------------------------------
+
+  // Source of truth: analytics.py BASELINE_NOTE, returned verbatim as `baseline_note`.
+  var BASELINE_NOTE = "Baseline: the same measured consumption at the same prices with the battery doing nothing. Savings = baseline cost - actual cost.";
+
+  // Buckets stay `null` where the backend has no load forecast to re-price against (unknown is
+  // never a fabricated 0). The oldest bucket of every range and the whole `all` range demo that.
+  function baselineKnown(range, i, n) {
+    return range !== "all" && i < n - 1;
+  }
+
+  function savingsBuckets(range) {
+    var out = [];
+    var sizes = { day: 3600000, week: 86400000, month: 3 * 86400000, year: 30 * 86400000, all: 365 * 86400000 };
+    var counts = { day: 24, week: 7, month: 10, year: 12, all: 3 };
+    var step = sizes[range] || sizes.month;
+    var n = counts[range] || counts.month;
+    for (var i = n - 1; i >= 0; i--) {
+      var end = startMs - i * step;
+      var begin = end - step;
+      var base = round(1.2 + 0.4 * Math.abs(wobble(i + n)), 2);
+      var cost = round(base * 0.82, 2);
+      var revenue = round(0.18 + 0.05 * Math.abs(wobble(i + 7)), 2);
+      var known = baselineKnown(range, i, n);
+      out.push({
+        key: labelFor(range, begin, i),
+        start: iso(begin),
+        end: iso(end),
+        import_kwh: round(1.6 + 0.3 * Math.abs(wobble(i)), 2),
+        export_kwh: round(0.7 + 0.2 * Math.abs(wobble(i + 3)), 2),
+        pv_kwh: round(4.4 + 0.6 * Math.abs(wobble(i + 5)), 2),
+        cost_eur: cost,
+        revenue_eur: revenue,
+        baseline_cost_eur: known ? base : null,
+        savings_eur: known ? round(base - (cost - revenue), 2) : null,
+        cycles: round(0.4 + 0.05 * Math.abs(wobble(i + 9)), 2)
+      });
+    }
+    return out;
+  }
+
+  function labelFor(range, beginMs, i) {
+    var d = new Date(beginMs);
+    if (range === "day") return String(d.getHours()).padStart(2, "0") + ":00";
+    if (range === "year") return String(d.getFullYear()) + "-" + String(d.getMonth() + 1).padStart(2, "0");
+    if (range === "all") return String(d.getFullYear());
+    if (range === "week") return String(d.getFullYear()) + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+    return "Period " + (i + 1);
+  }
+
+  function savingsPayload(range) {
+    var buckets = savingsBuckets(range || "month");
+    var totals = {
+      import_kwh: 0, export_kwh: 0, pv_kwh: 0, cost_eur: 0, revenue_eur: 0, cycles: 0,
+      baseline_cost_eur: null, savings_eur: null,
+      arbitrage_kwh: 2.1 * buckets.length, self_consumption_kwh: 3.8 * buckets.length,
+      battery_throughput_kwh: 5.9 * buckets.length, buckets: buckets.length
+    };
+    var knownBaseline = false;
+    buckets.forEach(function (b) {
+      totals.import_kwh += b.import_kwh;
+      totals.export_kwh += b.export_kwh;
+      totals.pv_kwh += b.pv_kwh;
+      totals.cost_eur += b.cost_eur;
+      totals.revenue_eur += b.revenue_eur;
+      totals.cycles += b.cycles;
+      if (b.baseline_cost_eur !== null) {
+        knownBaseline = true;
+        totals.baseline_cost_eur += b.baseline_cost_eur;
+        totals.savings_eur += b.savings_eur || 0;
+      }
+    });
+    if (!knownBaseline) {
+      totals.baseline_cost_eur = null;
+      totals.savings_eur = null;
+    }
+    Object.keys(totals).forEach(function (k) { if (typeof totals[k] === "number") totals[k] = round(totals[k], 2); });
+    return { range: range || "month", buckets: buckets, totals: totals, baseline_note: BASELINE_NOTE };
+  }
+
+  // -----------------------------------------------------------------------------------
+  // Accuracy, log, providers
+  // -----------------------------------------------------------------------------------
+
+  function accuracyReport(kind, base, spread) {
+    var series = [];
+    for (var i = 13; i >= 0; i--) {
+      var day = new Date(Date.now() - i * 86400000);
+      series.push({
+        day: day.toISOString().slice(0, 10),
+        mape_pct: round(base + spread * wobble(i + kind.length), 1),
+        bias_pct: round(spread * 0.4 * wobble(i + 2), 1)
+      });
+    }
+    return { kind: kind, days: 14, mape_pct: round(base + 1.0, 1), bias_pct: round(spread * 0.2, 1), mae: round(base / 8, 3), samples: 1344, series: series };
+  }
+
+  function accuracyPayload(days) {
+    return {
+      days: parseInt(days, 10) || 14,
+      pv: accuracyReport("pv", 12.5, 3.0),
+      load: accuracyReport("load", 9.0, 2.0),
+      price: accuracyReport("price", 4.5, 1.0)
+    };
+  }
+
+  function logEntries(limit) {
+    var n = clamp(parseInt(limit, 10) || 100, 1, 500);
+    var rows = [];
+    var kinds = [
+      { kind: "dispatch", level: "info", code: "ok", message: "Setpoint applied (synthetic)." },
+      { kind: "dispatch", level: "warning", code: "soc_floor", message: "Discharge blocked by the SoC floor." },
+      { kind: "dispatch", level: "warning", code: "mode_not_auto", message: "Write skipped: mode is advisory." },
+      { kind: "dispatch", level: "error", code: "driver_error", message: "Read-back mismatch after write." },
+      { kind: "event", level: "info", code: "plan_changed", message: "A new plan was published." },
+      { kind: "event", level: "warning", code: "forecast_unavailable", message: "Solar forecast provider returned no slots." },
+      { kind: "alert", level: "warning", code: "grid_import_limit", message: "Requested power would exceed the grid import limit." }
+    ];
+    for (var i = 0; i < Math.min(n, 14); i++) {
+      var row = kinds[i % kinds.length];
+      rows.push({
+        ts: iso(Date.now() - i * 7 * 60000),
+        kind: row.kind,
+        level: row.level,
+        code: row.code,
+        message: row.message,
+        detail: row.kind === "dispatch"
+          ? { battery_id: "battery_1", requested_w: 700, applied_w: row.level === "info" ? 700 : 0, dry_run: db.dry_run, mode: db.mode }
+          : { note: "synthetic mock row" }
+      });
+    }
+    return { entries: rows };
+  }
+
+  function providersPayload() {
+    return {
+      solar: [{ kind: "solar", name: "forecast_solar", active: true, ok: true, last_success: iso(Date.now() - 600000), last_error: null, stale: false, detail: { planes: 1, refresh_minutes: 30 } },
+              { kind: "solar", name: "cache", active: false, ok: true, last_success: iso(Date.now() - 600000), last_error: null, stale: false, detail: {} }],
+      price: [{ kind: "price", name: "zonneplan_entity", active: true, ok: true, last_success: iso(Date.now() - 300000), last_error: null, stale: false, detail: { raw_unit: "eur_per_kwh" } },
+              { kind: "price", name: "static", active: false, ok: true, last_success: null, last_error: null, stale: false, detail: {} }],
+      load: [{ kind: "load", name: "statistics", active: true, ok: true, last_success: iso(Date.now() - 900000), last_error: null, stale: false, detail: { confidence: "medium" } }]
+    };
+  }
+
+  // -----------------------------------------------------------------------------------
+  // Routes
+  // -----------------------------------------------------------------------------------
+
+  function statusPayload() {
+    var providers = providersPayload();
+    return {
+      version: "0.1.0",
+      commit: "example00",
+      uptime_s: 8412.0,
+      mode: db.mode,
+      dry_run: db.dry_run,
+      ha_connected: true,
+      ha_last_error: null,
+      location: "Example Street 1",
+      now: iso(Date.now()),
+      price_now: 0.214,
+      price_rank_pct: 33.0,
+      pv_now_w: 2450.0,
+      load_now_w: 810.0,
+      grid_now_w: -1640.0,
+      batteries: [statePayload()],
+      active_plan: planPayload(36),
+      last_plan_at: iso(Date.now() - 120000),
+      last_tick_at: iso(Date.now() - 20000),
+      next_cheap_window: [iso(Date.now() + 3 * 3600000), iso(Date.now() + 4 * 3600000)],
+      next_expensive_window: [iso(Date.now() + 6 * 3600000), iso(Date.now() + 7 * 3600000)],
+      override: db.override,
+      pending_holds: db.pendingHolds.slice(),
+      mode_persisted: db.modePersisted,
+      alerts: [
+        { ts: iso(Date.now() - 600000), level: "warning", code: "forecast_unavailable", message: "Example alert: solar forecast provider returned no slots; using cache.", detail: { source: "forecast_solar" }, acknowledged: false },
+        { ts: iso(Date.now() - 3600000), level: "info", code: "plan_changed", message: "Example alert: a new plan was published.", detail: {}, acknowledged: false }
+      ],
+      provider_status: providers.solar.concat(providers.price, providers.load),
+      scheduler_healthy: true
+    };
+  }
+
+  var routes = {
+    "GET /api/v1/health": function () {
+      return { status: "ok", version: "0.1.0", uptime_s: 8412.0, commit: "example00" };
+    },
+    "GET /api/v1/status": function () { return statusPayload(); },
+    "GET /api/v1/plan": function (ctx) { return planPayload(ctx.params.hours); },
+    "POST /api/v1/plan/recompute": function () { return { queued: true }; },
+    "GET /api/v1/forecast": function (ctx) {
+      var kind = ctx.params.kind || "price";
+      var hours = ctx.params.hours;
+      if (kind === "solar") {
+        return { kind: "solar", generated_at: iso(startMs), source: "forecast_solar", stale: false, planes: [{ kwp: 4.0, tilt_deg: 35, azimuth_deg: 180, damping: 0.0 }], correction_applied: 1.05, notes: [MOCK_NOTE], slots: solarSlots(hours) };
+      }
+      if (kind === "load") {
+        return { kind: "load", generated_at: iso(startMs), source: "statistics", confidence: "medium", stale: false, notes: [MOCK_NOTE], slots: loadSlots(hours) };
+      }
+      return { kind: "price", generated_at: iso(startMs), source: "zonneplan_entity", stale: false, notes: [MOCK_NOTE], slots: priceSlots(hours) };
+    },
+    "GET /api/v1/batteries": function () { return { batteries: batteryList() }; },
+    "POST /api/v1/batteries": function (ctx) {
+      var config = (ctx.body && ctx.body.config) || null;
+      if (!config || !config.id) return { error: { code: "invalid_config", message: "config.id is required" } };
+      var record = {
+        config: applyEfficiencyInput(config),
+        state: statePayload(config.id),
+        capabilities: { max_charge_w: config.max_charge_w || 0, max_discharge_w: config.max_discharge_w || 0, signed_setpoint: true },
+        mapping_resolved: true,
+        discovery: discoveryCandidates("battery")
+      };
+      batteryList().push(record);
+      return record;
+    },
+    "PATCH /api/v1/batteries/:id": function (ctx) {
+      var found = batteryList().filter(function (b) { return b.config.id === ctx.id; })[0];
+      if (!found) return { error: { code: "not_found", message: "unknown battery " + ctx.id } };
+      var patch = (ctx.body && ctx.body.patch) || {};
+      var pctOnly = typeof patch.round_trip_efficiency_pct === "number" &&
+        typeof patch.eta_charge !== "number" && typeof patch.eta_discharge !== "number";
+      Object.keys(patch).forEach(function (k) { found.config[k] = patch[k]; });
+      if (pctOnly) {
+        // A pct-only patch replaces inherited per-direction values with the even split.
+        delete found.config.eta_charge;
+        delete found.config.eta_discharge;
+      }
+      applyEfficiencyInput(found.config);
+      if (typeof patch.enabled === "boolean") db.batteryEnabled = patch.enabled;
+      return found;
+    },
+    "DELETE /api/v1/batteries/:id": function (ctx) {
+      db.batteries = batteryList().filter(function (b) { return b.config.id !== ctx.id; });
+      return {};
+    },
+    "POST /api/v1/batteries/:id/test": function (ctx) {
+      var body = ctx.body || {};
+      var intent = String(body.intent || "discharge").toLowerCase() === "charge" ? "charge" : "discharge";
+      var magnitude = Math.abs(typeof body.power_w === "number" ? body.power_w : 0);
+      var seconds = typeof body.seconds === "number" ? body.seconds : 0;
+      if (db.mode !== "auto" || db.dry_run) {
+        return { error: { code: "conflict", message: "Test discharge requires mode auto with dry run off (409)." } };
+      }
+      var record = batteryList().filter(function (b) { return b.config.id === ctx.id; })[0];
+      if (!record) return { error: { code: "not_found", message: "unknown battery " + ctx.id } };
+      var maxDischarge = typeof record.config.max_discharge_w === "number" ? record.config.max_discharge_w : 800;
+      var maxCharge = typeof record.config.max_charge_w === "number" ? record.config.max_charge_w : 800;
+      // Mirrors engine.test_discharge: exact seconds clamped to 1..60, explicit signed intent.
+      var boundedSeconds = clamp(seconds || 5.0, 1.0, 60.0);
+      var signed = clamp(intent === "charge" ? magnitude : -magnitude, -maxDischarge, maxCharge);
+      return {
+        started: true,
+        battery_id: ctx.id,
+        power_w: round(signed, 1),
+        intent: intent,
+        seconds: boundedSeconds,
+        until: iso(Date.now() + boundedSeconds * 1000),
+        applied_w: round(signed, 1),
+        ok: true,
+        code: "ok",
+        message: "Bounded test applied (synthetic mock).",
+        dry_run: false
+      };
+    },
+    "GET /api/v1/discover": function (ctx) {
+      return { candidates: discoveryCandidates(ctx.params.kind || "battery").slice(0, 50) };
+    },
+    "GET /api/v1/config": function () {
+      return {
+        options: {
+          mode: "advisory", dry_run: true, log_level: "info",
+          currency: null, timezone: null, latitude_override: null, longitude_override: null
+        },
+        settings: settingDescriptors()
+      };
+    },
+    "PATCH /api/v1/config": function (ctx) {
+      var incoming = (ctx.body && ctx.body.settings) || {};
+      var applied = [], errors = [];
+      Object.keys(incoming).forEach(function (key) {
+        var problem = validateSetting(key, incoming[key]);
+        if (problem) errors.push({ key: key, message: problem });
+        else { db.settings[key] = incoming[key]; applied.push(key); }
+      });
+      return { applied: applied, errors: errors };
+    },
+    "POST /api/v1/mode": function (ctx) {
+      var body = ctx.body || {};
+      if (body.mode === "off" || body.mode === "advisory" || body.mode === "auto") db.mode = body.mode;
+      if (typeof body.dry_run === "boolean") db.dry_run = body.dry_run;
+      return { mode: db.mode, dry_run: db.dry_run };
+    },
+    "POST /api/v1/stop": function () {
+      // Atomic stop: a real 0 W hold to every battery, even when dry_run is on, then advisory mode.
+      var dry = db.dry_run;
+      var cleared = !!db.override;
+      db.mode = "advisory";
+      db.override = null;
+      var stopped = batteryList().map(function (record) {
+        var enabled = record.config.enabled !== false;
+        return {
+          battery_id: record.config.id,
+          ok: enabled,
+          applied_w: 0,
+          code: enabled ? "ok" : "battery_unavailable",
+          message: enabled ? "Hold at 0 W written to the hardware." : "Battery is disabled; it was not stopped.",
+          dry_run: dry
+        };
+      });
+      // A battery that failed to stop keeps its last real setpoint live: report it via /status.
+      db.pendingHolds = stopped.filter(function (row) { return !row.ok; }).map(function (row) { return row.battery_id; });
+      db.modePersisted = true;
+      return { mode: db.mode, override_cleared: cleared, stopped: stopped };
+    },
+    "POST /api/v1/override": function (ctx) {
+      var body = ctx.body || {};
+      var minutes = clamp(parseInt(body.minutes, 10) || 1, 1, 240);
+      db.override = {
+        power_w: typeof body.power_w === "number" ? body.power_w : 0,
+        minutes: minutes,
+        battery_id: body.battery_id || null,
+        expires_at: iso(Date.now() + minutes * 60000)
+      };
+      return db.override;
+    },
+    "DELETE /api/v1/override": function () { db.override = null; return {}; },
+    "GET /api/v1/savings": function (ctx) { return savingsPayload(ctx.params.range); },
+    "GET /api/v1/accuracy": function (ctx) { return accuracyPayload(ctx.params.days); },
+    "GET /api/v1/log": function (ctx) { return logEntries(ctx.params.limit); },
+    "GET /api/v1/providers": function () { return providersPayload(); },
+    "POST /api/v1/notify/test": function () { return {}; }
+  };
+
+  function splitPath(path) {
+    var q = String(path || "").indexOf("?");
+    var query = {};
+    if (q >= 0) {
+      String(path).slice(q + 1).split("&").forEach(function (pair) {
+        if (!pair) return;
+        var bits = pair.split("=");
+        query[decodeURIComponent(bits[0])] = decodeURIComponent(bits.slice(1).join("=") || "");
+      });
+      path = String(path).slice(0, q);
+    }
+    return { path: path, query: query };
+  }
+
+  function match(method, rawPath) {
+    var parts = splitPath(rawPath);
+    // The SPA may be served under an ingress sub-path; strip everything before /api/v1.
+    var path = parts.path;
+    var marker = path.lastIndexOf("/api/v1/");
+    if (marker >= 0) path = path.slice(marker);
+    var direct = routes[method + " " + path];
+    if (direct) return { handler: direct, id: null, params: parts.query };
+    var m = /^\/api\/v1\/batteries\/([^/]+)(\/test)?$/.exec(path);
+    if (m) {
+      var key = method + " /api/v1/batteries/:id" + (m[2] ? "/test" : "");
+      if (routes[key]) return { handler: routes[key], id: decodeURIComponent(m[1]), params: parts.query };
+    }
+    return null;
+  }
+
+  function handle(method, rawPath, body) {
+    return new Promise(function (resolve, reject) {
+      var found = match(method, rawPath);
+      if (!found) {
+        reject({ code: "not_found", message: "Mock has no route for " + method + " " + rawPath });
+        return;
+      }
+      setTimeout(function () {
+        var payload;
+        try {
+          payload = found.handler({ body: body || null, params: found.params || {}, id: found.id });
+        } catch (err) {
+          reject({ code: "mock_error", message: err.message });
+          return;
+        }
+        if (payload && payload.error) {
+          reject({ code: payload.error.code, message: payload.error.message });
+        } else {
+          resolve(payload);
+        }
+      }, 150);
+    });
+  }
+
+  function fixtures() {
+    var out = { health: routes["GET /api/v1/health"]({ params: {} }) };
+    out.status = routes["GET /api/v1/status"]({ params: {} });
+    out.plan = routes["GET /api/v1/plan"]({ params: { hours: "36" } });
+    out.price = routes["GET /api/v1/forecast"]({ params: { kind: "price", hours: "36" } });
+    out.solar = routes["GET /api/v1/forecast"]({ params: { kind: "solar", hours: "36" } });
+    out.load = routes["GET /api/v1/forecast"]({ params: { kind: "load", hours: "36" } });
+    out.batteries = routes["GET /api/v1/batteries"]({ params: {} });
+    out.discover = {};
+    ["battery", "price", "solar", "load", "grid"].forEach(function (kind) {
+      out.discover[kind] = routes["GET /api/v1/discover"]({ params: { kind: kind } });
+    });
+    out.config = routes["GET /api/v1/config"]({ params: {} });
+    out.savings = {};
+    ["day", "week", "month", "year", "all"].forEach(function (range) {
+      out.savings[range] = routes["GET /api/v1/savings"]({ params: { range: range } });
+    });
+    out.accuracy = routes["GET /api/v1/accuracy"]({ params: { days: "14" } });
+    out.log = routes["GET /api/v1/log"]({ params: { limit: "50" } });
+    out.providers = routes["GET /api/v1/providers"]({ params: {} });
+    return out;
+  }
+
+  root.SEM_MOCK = {
+    routes: routes,
+    handle: handle,
+    fixtures: fixtures,
+    note: MOCK_NOTE
+  };
+})(typeof globalThis !== "undefined" ? globalThis : this);

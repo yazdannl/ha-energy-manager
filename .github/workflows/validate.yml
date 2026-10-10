@@ -1,0 +1,76 @@
+# Repository validation (SPEC.md sections 14 and 15).
+#
+# No secrets, no deployment and no third-party action beyond the official checkout/setup-python
+# actions. The PII tripwire (tools/audit.sh) runs on every push, because the same gate has to pass
+# locally before the orchestrator pushes.
+
+name: validate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Audit, manifest, lint, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Compile all Python sources
+        run: python -m compileall -q energy_manager/app tools/make_icons.py tests
+
+      - name: Install test dependencies (CI only; the add-on itself has none)
+        run: python -m pip install --disable-pip-version-check --quiet pytest pyyaml
+
+      - name: PII and secret audit (SPEC.md R1)
+        run: sh tools/audit.sh
+
+      - name: Add-on manifests
+        run: |
+          python - <<'PY'
+          import pathlib
+          import yaml
+
+          for path in ("repository.yaml", "energy_manager/config.yaml", "energy_manager/build.yaml"):
+              yaml.safe_load(pathlib.Path(path).read_text())
+          cfg = yaml.safe_load(pathlib.Path("energy_manager/config.yaml").read_text())
+          assert len(cfg["description"]) <= 200, "description must fit the add-on store"
+          assert set(cfg["options"]) == set(cfg["schema"]), "every option needs a schema entry"
+          assert cfg["options"]["mode"] == "advisory", "shipped default must not write"
+          assert cfg["options"]["dry_run"] is True, "shipped default must not write"
+          assert cfg["ingress"] is True and cfg["ingress_port"] == 8099
+          print("manifests ok")
+          PY
+
+      - name: POSIX shell syntax
+        run: |
+          sh -n tools/audit.sh
+          sh -n energy_manager/run.sh
+
+      - name: ShellCheck (sh), if available
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -s sh tools/audit.sh energy_manager/run.sh
+          else
+            echo "shellcheck not installed on this runner; skipped"
+          fi
+
+      - name: Tests
+        run: python -m pytest tests -q
+
+  image:
+    name: Build add-on image (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build
+        run: docker build -t sem-test --build-arg BUILD_ARCH=amd64 energy_manager/

@@ -1,0 +1,4 @@
+# Home Assistant add-on repository descriptor (SPEC.md section 15).
+name: Smart Energy Manager add-ons
+url: https://github.com/yazdannl/ha-energy-manager
+maintainer: yazdannl

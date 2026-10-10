@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Smart Energy Manager</title>
+<!-- Static SPA. No build step, no runtime CDN: all assets are served from this directory. -->
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="vendor/uPlot.min.css">
+</head>
+<body>
+<a class="skip-link" href="#view">Skip to content</a>
+
+<header class="topbar">
+  <p class="brand">
+    <span class="brand-title">Smart Energy Manager</span>
+    <span class="brand-sub" id="build-info">&nbsp;</span>
+  </p>
+  <p class="conn" id="conn-status" role="status" aria-live="polite">Connecting&hellip;</p>
+</header>
+
+<nav id="nav" aria-label="Views">
+  <ul>
+    <li><a href="#/dashboard">Dashboard</a></li>
+    <li><a href="#/plan">Plan</a></li>
+    <li><a href="#/forecasts">Forecasts</a></li>
+    <li><a href="#/batteries">Batteries</a></li>
+    <li><a href="#/savings">Savings</a></li>
+    <li><a href="#/settings">Settings</a></li>
+    <li><a href="#/log">Log</a></li>
+  </ul>
+</nav>
+
+<main id="view" tabindex="-1">
+  <p class="muted">Loading&hellip;</p>
+</main>
+
+<footer class="footer">
+  <p>
+    Prices, energies and powers are shown with explicit units. Times are rendered in this
+    browser&rsquo;s local timezone; the server sends ISO-8601 timestamps with offset.
+  </p>
+</footer>
+
+<p id="live" class="sr-live" role="status" aria-live="polite"></p>
+
+<dialog id="confirm-dialog" class="dialog" aria-labelledby="confirm-title">
+  <form method="dialog" id="confirm-form">
+    <h2 id="confirm-title">Confirm</h2>
+    <p id="confirm-body">Are you sure?</p>
+    <p class="confirm-check" id="confirm-check-wrap" hidden>
+      <label>
+        <input type="checkbox" id="confirm-check">
+        <span id="confirm-check-label">I understand</span>
+      </label>
+    </p>
+    <p class="confirm-hint" id="confirm-hint" hidden>Please tick the box to continue.</p>
+    <p class="dialog-actions">
+      <button type="submit" value="cancel" class="btn" id="confirm-cancel">Cancel</button>
+      <button type="submit" value="ok" class="btn btn-danger" id="confirm-ok">Confirm</button>
+    </p>
+  </form>
+</dialog>
+
+<script src="vendor/uPlot.min.js" defer></script>
+<script src="mock.js" defer></script>
+<script src="charts.js" defer></script>
+<script src="app.js" defer></script>
+</body>
+</html>

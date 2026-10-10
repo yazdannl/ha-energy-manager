@@ -1,0 +1,914 @@
+# Smart Energy Manager — frozen build spec
+
+Authoritative contract for all build workers. If code and this spec disagree, the spec wins or the
+spec is amended in a PR that says why. Read `models.py` next to this file: those dataclasses are the
+shared vocabulary and are not redefined here.
+
+---
+
+## 0. Hard rules (violating these fails the build)
+
+**R1 — No personal, instance or account data in the repository. Ever.**
+The repo is public. Nothing that identifies the user, their house, their hardware or their account
+may be committed:
+
+- no latitude/longitude/elevation/address/postcode values,
+- no real Home Assistant entity IDs, unique IDs, device IDs or device serial numbers,
+- no tokens, API keys, passwords, webhook IDs, `auth.json` content,
+- no real energy/price figures, tariffs, meter numbers or supplier account data,
+- no hostnames, internal IPs, domains or URLs belonging to the user's setup,
+- no captured API payloads or logs from the live instance (screenshots included).
+
+Allowed in committed files: integration-level generic identifiers that are identical on every
+install (e.g. the HA domain `zendure_ha`, entity translation keys such as `input_limit`), public
+API endpoints, and obviously fake examples. Fake examples must be recognisably fake and use a
+reserved namespace:
+
+```
+sensor.example_pv_power        sensor.example_battery_soc_1
+sensor.example_price_now       sensor.example_load_power
+latitude: 0.0 default only as "unset" placeholder — never a plausible real value
+docs/README examples use "Example Street 1", 52.0 / 5.0 style round numbers
+```
+
+Everything instance-specific is **resolved at runtime** and kept out of git:
+
+| Kind | Where it lives at runtime |
+| --- | --- |
+| Location, timezone, currency | read from HA `GET /api/config` |
+| Entity/device mapping | entity picker in the UI, confirmed by the user |
+| API keys, tariff params, limits | add-on options or UI settings |
+| Learned profiles, plans, actuals | SQLite in the add-on `/data` volume |
+
+`.gitignore` must exclude `*.db`, `data/`, `*.log`, `*.json` runtime artefacts, `.venv/`,
+`__pycache__/`, and any local `.env`.
+
+**R2 — Audit gate: no `git push`, no remote deploy, no add-on-store registration** until the user
+explicitly approves after auditing. Workers commit locally only. Do not add a remote. Do not run
+`gh`, `git push`, `supervisor` write calls, or anything that publishes. Push is a separate,
+user-approved step performed by the orchestrator.
+
+**R3 — Zero third-party runtime dependencies.** The add-on runs on the HA base Python image with
+the standard library only: `http.server`, `urllib.request`, `sqlite3`, `json`, `threading`,
+`zoneinfo`, `dataclasses`, `statistics`, `socket`, `hashlib`, `base64`, `ssl`, `zlib`. No pip
+installs, no frameworks, no numpy/pandas/pulp. `requirements.txt` stays empty (it exists only to
+document that fact). Vendored browser assets under `app/web/vendor/` are the only third-party
+files and they must carry their upstream licence header.
+
+**R4 — Safety over cleverness.** Battery control code must fail safe (hold/zero power), never
+exceed configured SoC or power limits, and must be testable without hardware.
+
+**R5 — Ponytail.** Smallest correct solution; no speculative abstraction, no config option that
+nothing reads, no dependency we can avoid. Mark deliberate simplifications in code with a
+`ponytail:` comment naming the ceiling and the upgrade path. Every non-trivial algorithm gets one
+small runnable check.
+
+---
+
+## 1. What the product is
+
+A Home Assistant add-on that plans and (optionally) executes battery dispatch to minimise
+electricity cost, using four inputs: solar production forecast, dynamic price forecast, learned
+household load profile, and live battery/grid measurements.
+
+Modes (`mode`):
+
+| Mode | Behaviour |
+| --- | --- |
+| `off` | No planning, no writes. Data collection, alerts and the UI/API keep working, and a plan computed before the switch is dropped so the UI never shows a stale plan as current. An explicit user-triggered recompute is still served as a preview (it is a read-only what-if), but no scheduled planning happens and nothing is written. |
+| `advisory` | **(default)** Plan is computed, published and shown. **Never writes to the battery**, with the single exception in §9.4: a battery whose last non-zero setpoint is still live is neutralised on Stop, on a mode/`dry_run` change, on exit and on boot. |
+| `auto` | Plan is executed through the configured battery drivers. |
+
+`dry_run` (bool, default `true`): in `auto`, compute and log the exact writes that *would* happen
+without performing them. A fresh install therefore cannot move hardware even if someone switches to
+`auto` and forgets `dry_run`.
+
+Shipping defaults must be safe on a factory-fresh HA: `mode: advisory`, `dry_run: true`.
+
+---
+
+## 2. Repository layout and ownership
+
+```
+repository.yaml                     WP4   add-on repository descriptor
+README.md                           WP4   user-facing overview, install, screenshots-in-words
+LICENSE                             WP4   MIT
+.gitignore                          WP4   see R1
+.github/workflows/validate.yml      WP4   HA add-on lint + pytest + shellcheck-lite
+docs/EXTERNAL_APIS.md               WP1   verified external contracts
+docs/ARCHITECTURE.md                WP4   how it fits together (short)
+docs/UI.md                          WP3   UI map, screenshots-free walkthrough
+tools/audit.sh                      WP4   PII/secret scanner (see §14)
+SPEC.md                             orch  this file
+energy_manager/
+  app/                              (python package, imported as `app`)
+    __init__.py                     WP2A
+    models.py                       orch  FROZEN dataclasses
+    config.py                       WP2A defaults + option parsing + settings merge
+    harest.py                       WP2A HA REST client
+    haws.py                         WP2A HA WebSocket client (minimal, stdlib)
+    store.py                        WP2A SQLite store
+    sources/__init__.py             WP2A
+    sources/price.py                WP2A price forecast providers
+    sources/solar.py                WP2A PV forecast providers
+    sources/load.py                 WP2A load forecast + learning
+    sources/measure.py              WP2A measurement sampling
+    optimize/__init__.py            WP2B
+    optimize/dp.py                  WP2B SoC dynamic program
+    optimize/allocate.py            WP2B per-battery allocation
+    control/__init__.py             WP2B
+    control/safety.py               WP2B guard rails (pure functions)
+    control/dispatcher.py           WP2B tick loop -> driver writes
+    control/drivers/__init__.py     WP2B driver registry
+    control/drivers/base.py         WP2B BatteryDriver protocol
+    control/drivers/zendure.py      WP2B Zendure driver
+    control/drivers/generic.py      WP2B entity-mapping driver
+    engine.py                       WP2B application core, owns threads and shared state
+    api.py                          WP2B HTTP JSON API (frozen contract §10)
+    notify.py                       WP2B HA notifications + persistent notices
+    analytics.py                    WP2B savings + accuracy accounting
+    main.py                         WP2B entrypoint: bootstrap, serve
+    web/index.html                  WP3
+    web/app.js                      WP3
+    web/style.css                   WP3
+    web/charts.js                   WP3
+    web/vendor/uPlot.min.js         WP3 vendored, licence header preserved
+    web/vendor/uPlot.min.css        WP3 vendored
+  config.yaml                       WP4 add-on manifest
+  Dockerfile                        WP4
+  build.yaml                        WP4
+  run.sh                            WP4
+  requirements.txt                  WP4 empty by design (R3)
+  CHANGELOG.md                      WP4
+  DOCS.md                           WP4 add-on store documentation tab
+  icon.png  logo.png                WP4 generated, no deps
+tests/                              WP5 pytest suite (stdlib + pytest only)
+```
+
+**File ownership is exclusive.** Never create or edit a file owned by another worker; if a change
+is needed there, report it to the orchestrator instead. Shared fixtures go in `tests/` (WP5) or the
+area you own.
+
+---
+
+## 3. Runtime configuration
+
+Two layers, merged with UI settings winning over add-on options:
+
+1. **Add-on options** (`config.yaml`) — the small set an install needs at first boot.
+2. **UI settings** — everything else, persisted in SQLite `settings`, editable without a restart.
+
+Frozen option schema (`energy_manager/config.yaml`):
+
+```yaml
+options:
+  mode: advisory
+  dry_run: true
+  log_level: info
+  currency: null          # null = read from HA
+  timezone: null          # null = read from HA
+  latitude_override: null # null = read from HA /api/config
+  longitude_override: null
+schema:
+  mode: list(off|advisory|auto)
+  dry_run: bool
+  log_level: list(debug|info|warning|error)
+  currency: str?
+  timezone: str?
+  latitude_override: float?
+  longitude_override: float?
+```
+
+Frozen settings keys (SQLite `settings`, all optional, each with a default in `config.py`; the
+defaults below are the shipped values):
+
+```
+price.source              zonneplan_entity | energy_charts | entity_forecast | static
+price.entity              entity id of the price sensor (runtime-picked, stored in DB only)
+price.static_schedule     list of {from_hour, to_hour, price_eur_per_kwh, days}
+price.import_fee_eur_per_kwh   0.0   # supplier markup added on buy
+price.export_fee_eur_per_kwh   0.0   # deduction applied on sell
+price.vat_pct             21.0       # applied when a source yields ex-VAT prices
+price.energy_tax_eur_per_kwh   0.0   # applied when a source yields ex-tax prices
+price.feed_in_eur_per_kwh  null  # flat feed-in tariff received, net of the export fee; null = sell unknown
+price.feed_in_entity       ""    # optional HA sensor with the live feed-in price (overrides the flat tariff)
+price.feed_in_tax_inclusive true  # false = add price.vat_pct to the feed-in price
+price.unit               auto|eur_per_kwh|eur_per_mwh|micro_eur_per_kwh
+price.scale_divisor      1.0   # fixed-point divisor for providers publishing integers (per source)
+price.bzn                NL    # bidding zone for the energy_charts day-ahead source
+solar.enabled            true
+solar.source             forecast_solar
+solar.planes             []   # [{kwp, tilt_deg, azimuth_deg, damping}]
+solar.api_key            ""   # optional forecast.solar personal key (raises rate limits, enables multi-plane)
+solar.bias_correction    true # learn multiplicative correction from measured PV
+solar.measured_entity    ""   # runtime-picked PV power sensor for bias learning
+load.mode                auto|entity|derived   # auto uses load entity if mapped else derived
+load.entity              ""   # runtime-picked load power sensor
+load.temperature_entity  ""   # optional outdoor temperature for the regression term
+load.base_kwh_per_day    0.0  # fallback flat profile when nothing is learned yet
+grid.power_entity        ""   # signed grid power sensor, positive = import (enables the derived load tier)
+grid.import_entity       ""   # separate import power sensor, optional
+grid.export_entity       ""   # separate export power sensor, optional
+optimizer.slot_minutes   15
+optimizer.horizon_hours  30   # matches the ~+30 h price feed
+optimizer.soc_step_kwh   0.02
+optimizer.power_steps    24
+optimizer.salvage_multiplier 1.0   # terminal SoC valued at multiplier x median buy price
+optimizer.cycle_cost_eur_per_kwh 0.0
+optimizer.allow_grid_charge  true
+optimizer.allow_export       false  # off until a feed-in tariff is configured; sell is 0.00
+optimizer.reserve_soc_pct    0.0   # extra floor above battery min_soc
+optimizer.max_grid_import_w  0     # 0 = unlimited
+optimizer.max_grid_export_w  0     # 0 = unlimited
+optimizer.min_spread_eur_per_kwh 0.0  # ignore arbitrage thinner than this
+optimizer.target_soc_pct_end  null   # hard end-of-horizon SoC target if set
+control.tick_seconds     30
+control.replan_minutes   15
+control.grid_follow      true
+control.grid_follow_deadband_w 30
+control.grid_follow_max_ratio  0.5
+control.grid_follow_max_w      0     # 0 = derive the absolute grid-follow budget from capability x ratio (min 500 W)
+control.stale_state_seconds    180   # older measurement => hold power
+control.failsafe_on_error       true # write 0 W on unrecoverable error
+notify.enabled           true
+notify.persistent        true        # HA persistent notification
+notify.mobile_service    ""          # e.g. notify.example_mobile_app, empty = off
+notify.events            [plan_changed, plan_applied, battery_floor_reached,
+                          negative_price, forecast_unavailable, driver_error]
+batteries                []          # see §5, list of battery config objects
+```
+
+`config.py` exposes exactly:
+
+```python
+DEFAULTS: dict[str, object]
+class Settings:                      # read-only view over DEFAULTS + options + DB overrides
+    def get(self, key: str, default=None): ...
+    def set(self, key: str, value) -> None: ...        # persists to store
+    def all(self) -> dict[str, object]: ...
+    def battery_list(self) -> list[BatteryConfig]: ...
+    def update_battery(self, battery_id: str, patch: dict) -> BatteryConfig: ...
+def load_options(path: str = "/data/options.json") -> dict: ...   # {} when missing
+def resolve_location(ha_config: dict, options: dict) -> tuple[float, float, str]: ...
+```
+
+Location resolution order: option override → HA `/api/config` → raise `ConfigError`. A missing
+location disables solar forecasting with a visible warning; it never invents coordinates.
+
+---
+
+## 4. Pricing semantics
+
+All internal prices are **EUR/kWh, tax included, buy side**; sell prices are **EUR/kWh received**
+(feed-in compensation net of fees). Providers normalise into that shape and record `raw_unit` plus
+the normalisation applied in the plan payload so the UI can explain a number.
+
+`PriceForecast` = ordered list of `PriceSlot(t, buy, sell, source, is_actual)`, 15-minute resolution,
+covering at least `now` → `now + horizon_hours`; slots are gap-free and future-filled by the last
+known value with `is_actual=False` and a `stale` flag so the UI can grey it out.
+
+Unit handling: providers declare their own unit and, when they publish fixed-point integers, their
+`scale_divisor`; `models.eur_per_kwh_from_raw` does the conversion. Magnitude-based guessing is
+forbidden — a wrong guess here silently corrupts every cost number. `price.unit: auto` means "use the
+provider's declared unit".
+
+Sources (each a small pure function `fetch(...) -> PriceForecast` behind one registry):
+
+| key | how | notes |
+| --- | --- | --- |
+| `zonneplan_entity` | read one HA price sensor's `forecast` attribute | default; unit auto-detected (§5 of docs/EXTERNAL_APIS.md); stale attribute detection is mandatory |
+| `energy_charts` | `https://api.energy-charts.info/price?bzn=<zone>` keyless | day-ahead, `EUR/MWh`, zone from settings (`price.bzn`, default `NL`) |
+| `entity_forecast` | any HA sensor whose attribute is a list of `{start/datetime, price}` | covers Nordpool/Tibber/ENTSO-E integrations generically |
+| `static` | configured schedule | always available, used as last-resort fallback |
+
+Mandatory behaviour: **a price source that yields no future slots is a failure**, not an empty
+forecast. On failure, fall back in order `configured → energy_charts → static`, and raise a
+`forecast_unavailable` event naming the source that failed. Never plan against a stale price list
+without flagging `stale=True`; when every future slot is stale the optimizer must treat the price
+as flat (equal prices) rather than guessing.
+
+---
+
+## 5. Batteries (pluggable, N of them)
+
+```python
+@dataclass(frozen=True)
+class BatteryConfig:
+    id: str                 # stable slug chosen at runtime, e.g. "battery_1"
+    name: str
+    driver: str             # "zendure" | "generic"
+    capacity_kwh: float     # usable AC-side capacity
+    min_soc_pct: float
+    max_soc_pct: float
+    max_charge_w: float
+    max_discharge_w: float
+    eta_charge: float       # 0<eta<=1, AC->cell
+    eta_discharge: float    # 0<eta<=1, cell->AC
+    mapping: dict[str, str] # driver-specific entity mapping, resolved at runtime
+    enabled: bool = True
+```
+
+Efficiency is entered per battery as a **round trip**: the UI/API field `round_trip_efficiency_pct` is
+split evenly into `eta_charge = eta_discharge = sqrt(pct/100)`, and explicit per-direction values (when
+given) override the split, after which the round trip is their product. The cost model uses
+`round_trip = eta_charge * eta_discharge`, so the break-even sale price for energy bought at `buy`
+EUR/kWh is `buy / round_trip` plus the wear per delivered kWh (`cycle_cost / eta_discharge`): buying at
+20 ct with a 75 % round trip breaks even at **26.7 ct**, not 25 ct.
+
+Runtime discovery is mandatory for `driver: zendure`: find candidate entities by asking HA for the
+entity registry entries whose `platform` is `zendure_ha` (or `unique_id` prefix `zendure_ha.`) and
+matching **translation keys** (`input_limit`, `output_limit`, `electric_level`,
+`solar_input_power`, `output_home_power`, `available_kwh`, `total_kwh`, `soc_set`, `min_soc`,
+`ac_mode`, `connection`). Never hardcode a device-derived entity id. The wizard shows the resolved
+mapping and requires explicit user confirmation before the mapping is stored.
+
+`driver: generic` takes an explicit mapping: `power_setpoint_entity` (signed W, + charge /
+− discharge), or the pair `charge_power_entity` + `discharge_power_entity`, plus optional
+`mode_select_entity`/`mode_manual_value`, `soc_entity`, `capacity_entity`. A generic battery with no
+usable setpoint entity must be rejected at save time with a clear message, not at dispatch time.
+
+Aggregation for optimisation uses `capacity_kwh`, summed power limits and capacity-weighted
+efficiencies; per-battery allocation then honours each battery's own limits (§8.3) and spends the
+best-efficiency battery first. The weighted mean is an approximation when batteries differ
+materially, so the plan reports the aggregate `eta_charge`/`eta_discharge`/round trip it assumed, and
+every per-battery break-even is computed from that battery's own values.
+
+---
+
+## 6. `models.py` (frozen)
+
+Exact contents live in `energy_manager/app/models.py`; the orchestrator owns that file. Summary of
+the public surface every worker may rely on:
+
+```
+Enums:      Mode(off|advisory|auto), Action(hold|charge|discharge|pv_charge|export|
+            self_consumption|reserve), Reason(str, human readable, stable slugs)
+Dataclasses: BatteryConfig, BatteryState, SystemState, PriceSlot, PriceForecast, SolarSlot,
+            SolarForecast, LoadSlot, LoadForecast, PlanSlot, PlanSummary, Plan, Measurement,
+            AlertRecord, DispatchResult, SavingsBucket, AccuracyReport, ProviderStatus
+Helpers:     to_iso(dt) / from_iso(s), quarter_floor(dt), slot_range(start, end, minutes),
+             eur_per_kwh_from_raw(value, unit)  (documented, unit-tested conversions)
+Constants:   PRICE_UNITS = {"auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh"}
+Helpers:     BatteryConfig.round_trip_efficiency, BatteryConfig.break_even_sell_eur_per_kwh(buy, cycle_cost);
+             Reason.EFFICIENCY_LOSS (a slot is idle because the spread does not cover the round-trip loss)
+```
+
+`SystemState` is the single source of truth the API reads: `mode, dry_run, ha_connected, location,
+now, price_now, price_rank_pct, pv_now_w, load_now_w, grid_now_w, batteries[list[BatteryState]],
+active_plan: Plan|None, last_plan_at, last_tick_at, alerts[list[AlertRecord]], provider_status,
+version, uptime_s`. The API `/status` payload additionally reports `pending_holds[list[str]]` (batteries whose
+last real setpoint is still live) and `mode_persisted: bool`; the engine owns those two values and they are
+not `SystemState` fields.
+
+---
+
+## 7. Forecasts
+
+### 7.1 Solar (`sources/solar.py`)
+`ForecastSolarProvider` calls the keyless v1 estimate endpoint for each configured plane, sums the
+planes on a common 15-minute grid, and caches the raw response in SQLite (`forecast_cache`) with a
+refresh policy of 30 minutes (keyless rate limits permitting; on HTTP 429 back off exponentially and
+serve cache). Providers return `SolarForecast` with per-slot `pv_kw` plus `uncertainty_pct`
+(default 25% until learned, then from measured error).
+
+**Keyless resolution is hourly, not 15-minute** (verified, see appendix A): request with `?time=utc`, then
+interpolate the hourly curve onto the 15-minute slot grid (linear between hourly samples, and keep the
+first partial sample anchored at its own timestamp). Keyless also means **single plane** and a ~2-day
+horizon; a personal key in the URL path enables multiple planes. Never log the response `message.info`
+field: it echoes the requested coordinates back.
+
+Measured bias learning: when `solar.bias_correction` and a measured PV entity are configured,
+`analytics` compares realised PV against the forecast for the same slot and maintains a per
+"slot-of-day bucket" (24 hourly buckets) multiplicative factor as an EWMA with `alpha=0.2`, clamped
+to `[0.3, 1.8]`, stored in `learning_profiles`. Factors older than 14 days decay toward 1.0.
+
+### 7.2 Load (`sources/load.py`)
+Sources in priority order, all producing 15-minute `LoadForecast` slots with `p10/p50/p90`:
+
+1. **Long-term statistics** via `haws.statistics_during_period` for the mapped load entity (60 days,
+   `hour` period) — preferred, survives recorder purging.
+2. **Recorder history** (`GET /api/history/period`) if statistics are unavailable.
+3. **Derived** when no load entity is mapped: `load = grid_import − grid_export + pv + discharge −
+   charge`, assembled from mapped power sensors.
+4. **Fallback** flat profile from `load.base_kwh_per_day` spread by a default residential shape.
+
+Model: median per (weekend|weekday, hour) profile over the last 8 weeks, scaled by
+`recent_7d_mean / profile_mean` (clamped `[0.5, 2.0]`), then an EWMA bias correction per hour bucket
+over the last 7 days, then an optional least-squares temperature term
+(`load = a + b*T_forecast`, applied only when the regression explains ≥ 5% of variance).
+Hourly values are linearly interpolated to 15-minute slots. Cold-start (no history) uses the
+fallback profile and reports `confidence: low`.
+
+### 7.3 Measurement sampling (`sources/measure.py`)
+Every `control.tick_seconds`, sample grid power, PV power, load power, per-battery power and SoC into
+`actuals` (5-minute resolution, upsert, targeted per-entity reads only). These rows are the ground truth for savings and accuracy
+accounting, so sampling must never be skipped because a write failed.
+
+---
+
+## 8. Optimizer
+
+### 8.1 Model
+Discrete time slots of `optimizer.slot_minutes` (default 15) over `optimizer.horizon_hours`
+(default 30, clamped to `[12, 48]`). For slot `i`: `pv_i` (kW), `load_i` (kW), `buy_i` (EUR/kWh),
+`sell_i` (EUR/kWh), `dt` = hours.
+
+Aggregated battery: usable energy `E_cap = Σ capacity_kwh * (max_soc−min_soc)/100` (kWh),
+AC-side charge limit `P_chg = Σ max_charge_w/1000`, discharge limit `P_dis = Σ max_discharge_w/1000`,
+`eta_chg`/`eta_dis` = capacity-weighted means, floor `E_min` and ceiling `E_max` in kWh derived from
+the strictest min/max SoC across enabled batteries.
+
+Sign convention: AC-side battery power `p_i` in kW, **positive = charging, negative = discharging**.
+
+```
+grid_i = load_i − pv_i + p_i        (positive p_i charges, which *raises* grid import)
+cost_i = dt * ( buy_i * max(grid_i, 0) − sell_i * max(−grid_i, 0) )
+```
+
+Subject to
+`grid_i ≤ max_grid_import_w/1000`, `−grid_i ≤ max_grid_export_w/1000` (when set),
+`−P_dis ≤ p_i ≤ P_chg` (0 if `allow_grid_charge` is false and the slot has no PV surplus),
+`E_min ≤ e_i ≤ E_max`, energy transition
+`e_{i+1} = e_i + dt*(p_i*eta_chg)` for `p_i ≥ 0`, `e_i + dt*(p_i/eta_dis)` for `p_i < 0`
+(single-expression form allowed but must be exact at `p=0`).
+
+Objective: minimise `Σ cost_i + cycle_cost*|Δe_i| − salvage * e_N`, where
+`salvage = optimizer.salvage_multiplier * median(buy over horizon) * eta_dis` — stored energy delivers
+only `eta_dis` AC per stored kWh, so valuing it at the full buy price would over-charge the pack —
+exists so the schedule does not dump the pack for a trivial gain.
+
+Arbitrage is only planned when the sale price clears the round-trip break-even
+(`sell_j > buy_i / round_trip + cycle_cost / eta_dis`, with `buy_i` the charge slot's price); a slot
+left idle for that reason reports `Reason.EFFICIENCY_LOSS`, which is distinct from the user's own
+`optimizer.min_spread_eur_per_kwh` floor (`Reason.SPREAD_BELOW_THRESHOLD`). `optimizer.target_soc_pct_end` adds a hard terminal constraint when set
+(infeasible target ⇒ drop to a soft penalty and raise an alert, never crash).
+
+### 8.2 Algorithm (`optimize/dp.py`)
+Dynamic programming over discretised energy:
+
+- state grid: `E_min → E_max` step `optimizer.soc_step_kwh`, at most **400** states (coarsen the step
+  if the pack is large; log the effective step).
+- action set per state: `optimizer.power_steps` evenly spaced values in `[p_lo, p_hi]` where `p_lo/p_hi`
+  are the feasible bounds after clipping by grid limits and SoC reachability; always include `0`.
+- transition cost uses the interpolated value of the next slot's value function at the exact
+  reachable energy, so quantisation does not bias the decision; reconstruct the optimal path by
+  storing the argmin per (slot, state).
+- complexity target: `slots * states * actions ≤ 2_000_000` iterations; if exceeded, widen the step
+  and log a `debug` line.
+
+Return `Plan` with `slots`, `summary` (`cost_estimate_eur`, `baseline_cost_eur` = do-nothing
+schedule cost over the same horizon, `saved_eur`, `charged_kwh`, `discharged_kwh`, `cycles`,
+`arbitrage_kwh`), and `feasible: bool` + `infeasible_reason`. **Determinism is required**: identical
+inputs produce byte-identical plans (no dict/set iteration order leaking into results).
+
+Each `PlanSlot` also carries a human-stable `reason` slug: `arbitrage_charge`, `pv_surplus_charge`,
+`peak_discharge`, `self_consumption`, `reserve_hold`, `grid_limit_hold`, `spread_below_threshold`,
+`terminal_target`.
+
+### 8.3 Allocation (`optimize/allocate.py`)
+Greedy, deterministic: distribute the slot's total charge demand across enabled batteries
+proportionally to remaining headroom (`max_charge_w`, and SoC room), and discharge demand
+proportionally to available energy above floor; clamp per battery, redistribute the shortfall once
+(no unbounded loops), and return `list[tuple[BatteryConfig, float]]` summing to the requested total
+minus any physically impossible remainder. Efficiency differences must be respected: prefer the
+battery with the better efficiency when only part of the demand fits.
+
+The discharge floor is **per battery**, `max(min_soc_pct, reserve_soc_pct)` of *that* battery's own
+capacity — never an aggregate-only constraint, or a nearly empty pack gets drained past its floor while
+a fuller one is untouched. `reserve_soc_pct` is a parameter of the allocation helpers and every caller
+(dispatcher, engine) must pass it; the end-to-end path is covered by a test, not just the helper.
+
+---
+
+## 9. Control loop, drivers, safety
+
+### 9.1 Loop (`control/dispatcher.py`)
+Runs on its own thread (`control.tick_seconds`, default 30 s):
+
+1. Sample measurements (§7.3).
+2. Replan if: no plan, plan older than `control.replan_minutes`, price/PV/load inputs changed
+   materially (price vector changed in any future slot, PV changed >10%, SoC out of plan tolerance
+   >3%), or a forced replan was requested through the API.
+3. Compute the current slot's target power from the plan, interpolating the slot boundary change.
+4. Optional grid-follow correction: `Δp = −(grid_measured − grid_planned)`, applied when
+   `|Δp| > deadband` and `|Δp|` is inside an absolute watt budget — `control.grid_follow_max_w`
+   when non-zero, else `max(500 W, battery capability * control.grid_follow_max_ratio)` — keeping the
+   result inside every limit. The budget is independent of the planned power, so a zero planned
+   power can still be corrected.
+5. `control.safety.check(...)` returns an adjusted, allowed power plus reasons.
+6. In `auto` and not `dry_run`: write through the drivers; otherwise log the would-be write as a
+   `dry_run` dispatch entry (visible in the UI log).
+
+Every step is recorded in `dispatch_log`, including rejections with their reason — the UI's answer to
+"why didn't it charge?" must always exist.
+
+### 9.2 Drivers (`control/drivers/`)
+```python
+class BatteryDriver(Protocol):
+    def id(self) -> str: ...
+    def read_state(self) -> BatteryState: ...
+    def apply(self, power_w: float, *, dry_run: bool) -> DispatchResult: ...
+    def hold(self, *, dry_run: bool) -> DispatchResult: ...   # safe zero/neutral
+    def capabilities(self) -> dict: ...                        # limits, what it can express
+```
+Writes go through the HA service API (`POST /api/services/...`) or state-setting only where a
+service does not exist. Each `apply` is idempotent within a slot: skip the write when the device
+already reports the target within tolerance (avoid hammering the device — the SolarFlow is a BLE/cloud
+device with finite write budget).
+
+`zendure.py` must: put the Zendure manager into manual dispatch before controlling power, express
+charge vs discharge with the driver's own entity semantics (verified in `docs/EXTERNAL_APIS.md`),
+respect device limits when writing, verify read-back after each write inside tolerance, and treat a
+mismatch as a driver error (not a silent success). It must never write to `soc_set`/`min_soc` on
+every tick — SoC floors are expressed as optimized power, with the device SoC limits configured
+separately and rarely.
+
+### 9.3 Safety (`control/safety.py`, pure functions, unit-tested)
+`check(requested_w, plan_slot, batteries, state, settings, now) -> SafetyDecision(allowed_w,
+clamped: bool, reasons: list[str], block: bool)` enforcing, in order:
+
+1. `mode != auto` → block (`advisory`/`off` write nothing). The one exception is the neutralising
+   hold in §9.4, which runs for a battery whose last non-zero setpoint is still live (mode change,
+   `dry_run` change, Stop, exit, boot). A `dry_run` tick never writes.
+2. Kill switch / override active → block or return the override power.
+3. State older than `control.stale_state_seconds` → block (hold).
+4. HA disconnected or battery unavailable → block for that battery.
+5. SoC clamp: no charge above `E_max`, no discharge below `E_min + reserve`.
+6. Power clamp per battery limits (after allocation) and aggregated limits.
+7. Grid limits: predicted import/export with the requested power must stay inside
+   `max_grid_import_w`/`max_grid_export_w`; clamp, and block if the resulting power would still
+   violate them.
+8. Ramp limit: never change a battery's AC power by more than 1000 W per tick.
+
+Blocked actions must be visible: alert + `dispatch_log` row + UI banner. Thresholds are configurable,
+and the function must be pure (no I/O) so tests can cover it exhaustively.
+
+### 9.4 Override and kill switch
+`POST /api/v1/override {power_w, minutes}` pins a battery (or all) to a fixed power for a bounded
+time (max 240 min, auto-expires, visible countdown). `mode: off` is the global kill switch.
+
+**"Stop now" must actually stop the hardware.** Switching to `advisory` only stops *this add-on* from
+writing; the Zendure integration has no watchdog, so the device keeps its last setpoint and the battery
+would carry on charging or discharging (see appendix A). Therefore `POST /api/v1/stop` is a dedicated,
+atomic safety action that:
+
+1. clears any active override,
+2. writes `hold()` (0 W / neutral) **for real** to every battery whose last non-zero setpoint is
+   still live (a persisted per-battery live-write latch), deliberately bypassing the `mode != auto`
+   and `dry_run` blocks — de-escalating to zero power is the safe direction, and a stop button that
+   silently does nothing under `dry_run` would be worse than useless. A battery the add-on has never
+   commanded is not touched, so an advisory install cannot switch the user's own battery mode,
+3. sets `mode: advisory` so no further plan writes happen,
+4. records an `event` plus one `dispatch_log` row per battery, and returns per-battery results.
+
+It is the only write path allowed to run outside `auto`, and it must never raise: a failing battery is
+reported in the response, not thrown. `control.safety` stays pure and is not involved in this path.
+
+---
+
+## 10. HTTP API (frozen contract — UI codes against this)
+
+Plain JSON over the add-on ingress port, no auth (ingress supplies it), `Content-Type:
+application/json`, all timestamps ISO-8601 with offset. Errors: `{"error": {"code": "...", "message":
+"..."}}` with 4xx/5xx. All GETs must work in `mode: off` and with no batteries configured —
+degraded but not broken.
+
+```
+GET  /api/v1/health            -> {status:"ok", version, uptime_s, commit}
+GET  /api/v1/status            -> SystemState (§6) serialised
+GET  /api/v1/plan?hours=36     -> {generated_at, horizon_start, horizon_end, feasible,
+                                   summary:{…, eta_charge, eta_discharge, round_trip_efficiency,
+                                            break_even_sell_eur_per_kwh},
+                                   slots:[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90,
+                                           soc_kwh, soc_pct, power_w, action, reason,
+                                           price_stale, pv_source, price_source}],
+                                   batteries:[{id, name, share_w, round_trip_efficiency,
+                                               break_even_sell_eur_per_kwh}]}
+                               `reason` is a stable `Reason` slug; a slot that stays idle because the
+                               sale price does not cover the round-trip loss reports `efficiency_loss`,
+                               which is distinct from the user's own spread floor
+                               (`spread_below_threshold`). The efficiency keys are additive.
+POST /api/v1/plan/recompute    -> {queued: true}       (async; poll status)
+GET  /api/v1/forecast?kind=price|solar|load&hours=36
+                               -> {kind, generated_at, source, stale, slots:[...]}
+GET  /api/v1/batteries         -> {batteries:[{config, state, capabilities, mapping_resolved,
+                                               discovery:[...]}]}
+POST /api/v1/batteries         -> create  {config}
+PATCH /api/v1/batteries/{id}   -> update  {patch}
+DELETE /api/v1/batteries/{id}  -> delete
+POST /api/v1/batteries/{id}/test -> {power_w, seconds}  (bounded, requires mode:auto + !dry_run,
+                                   refuses otherwise with 409 and an explanatory message)
+GET  /api/v1/discover?kind=battery|price|solar|load|grid
+                               -> {candidates:[{entity_id, name, unit, device_class, state,
+                                                platform, suggested_role, confidence}]}
+GET  /api/v1/config            -> {options:{...}, settings:[{key, value, type, default,
+                                                          label, help, group, choices}]}
+PATCH /api/v1/config           -> {settings:{key:value}}  -> 200 {applied:[...], errors:[...]}
+                                   Unknown or invalid keys are reported per key in errors (never as a whole
+                                   request failure), because the settings form renders them field by field.
+                                   Only a malformed body (not an object / empty) is a 400.
+POST /api/v1/mode              -> {mode?, dry_run?}   (partial update; omitted field is unchanged)
+POST /api/v1/stop              -> {mode, override_cleared, stopped:[{battery_id, ok, applied_w, code,
+                                   message, dry_run}]}   (atomic safety stop, see §9.4)
+POST /api/v1/override          -> {power_w, minutes, battery_id?}
+DELETE /api/v1/override        -> {}
+GET  /api/v1/savings?range=day|week|month|year|all
+                               -> {range, buckets:[SavingsBucket], totals:{...}, baseline_note}
+GET  /api/v1/accuracy?days=14  -> {pv:AccuracyReport, load:AccuracyReport, price:AccuracyReport}
+GET  /api/v1/log?limit=100&level=&kind=  -> {entries:[{ts, kind, level, code, message, detail}]}
+GET  /api/v1/providers         -> {solar:[ProviderStatus], price:[ProviderStatus], load:[...]}
+GET  /api/v1/export?what=plan|actuals|savings&format=json|csv   -> file download
+POST /api/v1/notify/test       -> {}  (sends a test notification if enabled)
+GET  /                         -> SPA index.html (+ /app.js, /style.css, /charts.js, /vendor/*)
+```
+
+`GET /api/v1/discover` is what makes the mapping wizard possible: it lists candidate entities with a
+`suggested_role` and a `confidence` in `[0,1]`, derived from the entity registry (platform,
+translation key) plus state attributes. It must never leak the whole entity list by default — cap at
+50 rows per request with a `search` filter, and mark instance-specific values as runtime-only.
+
+Details the UI needs, so they are contract and not implementation detail:
+
+* `/plan` slots carry `soc_pct` (capacity-weighted mean SoC), `pv_source` and `price_source` alongside the
+  fields in `models.PlanSlot`.
+* `/config` settings entries use `type` ∈ `bool|int|float|str|password|json|list`, include `choices` for
+  enumerations and multi-selects, and group hardware-moving keys under the group name `Safety` so the UI
+  can gate them behind a confirmation step.
+* `/savings` totals include `arbitrage_kwh` and `self_consumption_kwh` so the UI can split realised value
+  between price arbitrage and avoided self-consumption.
+* `/batteries` returns a flat `capabilities` object and a cycle count.
+* `/log` entries have `kind` ∈ `dispatch|event|alert`; dispatch entries carry
+  `detail.{requested_w, applied_w, battery_id, mode, dry_run}`.
+* `/export` must work as a plain browser download link (correct `Content-Disposition`).
+
+Static asset serving must be safe: normalise paths, reject anything escaping `web/`, and serve with
+correct `Content-Type` + `Cache-Control: no-cache` for the SPA entry.
+
+---
+
+## 11. Persistence (SQLite, `store.py`)
+
+Opened with `PRAGMA journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, and a schema
+version table with an explicit forward-only migration list. Thread-safe via one connection per thread
+(`threading.local`) or a lock — declare which and keep it consistent.
+
+```
+plans(id INTEGER PK, created_at TEXT, horizon_start TEXT, horizon_end TEXT, mode TEXT,
+      dry_run INTEGER, feasible INTEGER, summary_json TEXT, batteries_json TEXT)
+plan_slots(plan_id INTEGER, t TEXT, buy REAL, sell REAL, pv_kw REAL, load_kw REAL,
+           soc_kwh REAL, power_w REAL, action TEXT, reason TEXT,
+           PRIMARY KEY(plan_id, t)) WITHOUT ROWID
+dispatch_log(id PK, ts TEXT, battery_id TEXT, requested_w REAL, applied_w REAL, soc_pct REAL,
+             mode TEXT, dry_run INTEGER, result TEXT, code TEXT, message TEXT)
+measurements(ts TEXT, entity_role TEXT, value REAL, unit TEXT, PRIMARY KEY(ts, entity_role))
+actuals(ts TEXT PK, pv_kw REAL, load_kw REAL, grid_kw REAL, battery_kw REAL, soc_kwh REAL,
+        price_buy REAL, plan_power_w REAL, dispatch_power_w REAL)
+forecast_cache(kind TEXT, key TEXT, fetched_at TEXT, payload_json TEXT, PRIMARY KEY(kind,key))
+learning_profiles(kind TEXT, key TEXT, updated_at TEXT, payload_json TEXT, PRIMARY KEY(kind,key))
+savings_daily(day TEXT PK, import_kwh REAL, export_kwh REAL, cost_eur REAL, revenue_eur REAL,
+              baseline_cost_eur REAL, savings_eur REAL, pv_kwh REAL, battery_cycles REAL)
+events(id PK, ts TEXT, level TEXT, code TEXT, message TEXT, payload_json TEXT)
+settings(key TEXT PK, value_json TEXT, updated_at TEXT)
+meta(key TEXT PK, value TEXT)
+```
+
+Retention: `measurements`/`actuals` raw rows trimmed to 400 days on a daily maintenance run,
+`dispatch_log` to 20 000 rows, `events` to 5 000, and plans to the `plans_rows` (default 200) most
+recent, whose `plan_slots` rows go with them. Measurements are upserted into 5-minute buckets, and
+only mapped entities are read (targeted `GET /api/states/<entity>`, never the full state snapshot). Savings baselines are computed **before** trimming
+and stored in `savings_daily`.
+
+Savings accounting: `baseline_cost_eur` = the do-nothing **net** cost under the same realised load, PV
+and tariff — import cost minus export revenue, with no battery flows — so `savings = baseline −
+actual` (net). When the load is not knowable (no load forecast or measurement), baseline and savings
+are `null`/unknown, never a fabricated zero. This definition must appear in the UI and in `docs/ARCHITECTURE.md`,
+because it is the number the user will judge the add-on by.
+
+---
+
+## 12. Published HA entities
+
+The add-on mirrors its state into HA so users can chart/automate without our UI. Implemented with
+`POST /api/states/<entity_id>` (no MQTT dependency, no YAML to install), entity ids in the reserved
+namespace documented in the README:
+
+```
+sensor.sem_autopilot_state      off|advisory|auto|dry_run
+sensor.sem_plan_action          action slug, with attributes: reason, target_power_w, soc_target_pct
+sensor.sem_price_now            EUR/kWh, attributes: rank_pct, cheap_window_start, expensive_hour_start
+sensor.sem_pv_forecast_today    kWh, attributes: tomorrow_kwh, peak_w, peak_at
+sensor.sem_load_forecast_now    kW, attributes: today_kwh, confidence
+sensor.sem_savings_today        EUR, attributes: month_eur, year_eur, baseline_kwh
+sensor.sem_battery_soc_avg      %
+sensor.sem_forecast_accuracy    %, attributes: pv_mape, load_mape, price_mae
+binary_sensor.sem_autopilot_active
+binary_sensor.sem_battery_at_floor
+```
+
+Publishing is idempotent, throttled (min 20 s between writes per entity), and skipped entirely when
+HA is unreachable — never block the control loop on a state publish. `sensor.sem_*` is the documented
+contract; README lists the table.
+
+---
+
+## 13. UI (`app/web/`, WP3)
+
+Single page app, no build step, no runtime CDN (assets vendored). Layers: `index.html`, `style.css`,
+`app.js` (state, routing, fetch, render), `charts.js` (uPlot wrappers). Dark-first design, respects
+`prefers-color-scheme`, keyboard navigable, colour-blind-safe palette (blue/green/orange, no
+red/green price encoding without a shape cue too), works from 360 px wide up to desktop, honours
+`prefers-reduced-motion`.
+
+Views (hash routing `#/dashboard`, `#/plan`, `#/forecasts`, `#/batteries`, `#/savings`, `#/settings`,
+`#/log`):
+
+1. **Dashboard** — now-cards (SoC, PV, load, grid, price + rank, current action + reason,
+   autopilot state, next cheap and next expensive window), 24 h SoC/price mini-chart, alert strip,
+   "Stop now" and mode switches with a confirmation step for `auto`.
+2. **Plan** — main timeline: price bars + PV/load areas + SoC line + charge/discharge bars in one
+   aligned chart, per-slot table with reason, plan summary (cost, baseline, saving, cycles), horizon
+   selector (12/24/36/48 h), "Recompute" button, feasibility warnings.
+3. **Forecasts** — three panels (price, solar, load) with source, freshness badge, `stale` greying,
+   P10/P90 band for load, per-day totals, plus accuracy summary (MAPE/bias) with a 14-day trend.
+4. **Batteries** — card per battery: live power/SoC/limits/efficiency, mapping state
+   (resolved vs needs confirmation), add/edit wizard using `/api/v1/discover` with role assignment
+   and a confirm step, per-battery enable toggle, bounded test discharge (disabled unless `auto` and
+   not `dry_run`), computed round-trip efficiency and cycle count.
+5. **Savings** — today/week/month/year/all, savings chart vs baseline, import/export kWh, realised
+   arbitrage vs self-consumption split, plain-language explanation of the baseline definition.
+6. **Settings** — grouped, searchable form generated from `GET /api/v1/config` (no hand-written
+   field list per key), immediate validation errors from the PATCH response, safety group visually
+   separated with an "are you sure" step for limits that can move hardware.
+7. **Log** — filterable decision log: every dispatch attempt with requested vs applied power and the
+   blocking reason, plus events/alerts. This is the debugging surface; it must never be empty when
+   something surprising happened.
+
+Cross-cutting UI rules: no colour-only meaning; every number shows its unit; stale data is visibly
+stale (badge + desaturated); loading and error states for every panel; optimistic UI is forbidden for
+writes (show pending → confirmed using the server response); the whole UI must render with fake data
+via `?mock=1` so it can be developed and tested without the backend (mock payloads live in
+`app/web/mock.js`, obviously synthetic).
+
+---
+
+## 14. Tests and acceptance (WP5)
+
+`python3 -m pytest tests/ -q` must pass with no network access and no HA instance. Required coverage:
+
+- **Optimizer vs brute force**: on random small instances (4–8 slots, coarse SoC grid), DP optimum
+  equals exhaustive-search optimum within 1e-6; DP is deterministic across 3 runs.
+- **Optimizer sanity**: with a high PV window the plan charges then discharges instead of cycling at
+  a loss; with flat prices the plan does not arbitrage below `min_spread_eur_per_kwh`; with a hard
+  terminal target the plan reaches it; infeasible terminal target yields `feasible: false` and a
+  reason, not an exception.
+- **Safety**: exhaustive table over (mode, dry_run, staleness, SoC at floor/ceiling, grid limit,
+  ramp limit, override active) asserting the exact clamp/block outcome, including that `advisory`
+  never produces a non-blocked decision and `auto + dry_run` never performs I/O.
+- **Price normalisation**: `eur_per_mwh`, `micro_eur_per_kwh`, VAT/tax adders, `auto` detection, plus
+  stale-forecast handling and the fallback chain (configured → energy_charts → static), all with
+  synthetic fixtures; no fixture may contain a real instance value.
+- **Load forecast**: profile learning from synthetic history, weekday/weekend separation, level
+  scaling, EWMA correction, cold start.
+- **WS client** (`haws.py`): frame codec unit tests (masking, 126/127-length, ping/pong, close,
+  fragmented text frames) plus an integration test against a local mini WS echo server built from the
+  same socket helpers.
+- **API contract**: every route from §10 answers with the documented shape against a fake engine,
+  including error paths (404 unknown battery, 409 test-discharge while advisory, 400 invalid config
+  key), and static file traversal attempts return 404.
+- **End-to-end**: a `tests/fake_ha.py` HTTP server emulating `/api/config`, `/api/states`,
+  `/api/services/*`, history and the WS handshake; the app boots against it in `advisory`, produces a
+  plan, publishes states, and never issues a service call (assert on the fake server's request log).
+  Then in `auto` + `dry_run` it still issues no service call; in `auto` (dry_run off) it issues exactly
+  the expected setpoint writes to the mapped entities.
+- **Audit** (`tools/audit.sh`) returns non-zero if any committed file contains a plausibly real
+  coordinate, private IP, complete private dotted quad (`192.168.*.*`/`10.*.*.*`/`172.16-31.*.*`;
+  bare prefixes in prose do not match), `sensor.<realm-identifying>`
+  instance id, bearer/JWT-looking string, or an email address. It must pass on the final tree.
+
+Acceptance for the whole build: fresh checkout → `pytest -q` green, `tools/audit.sh` green,
+`docker build` of `energy_manager/` succeeds (or, if Docker is unavailable in the build environment,
+`python3 -m compileall` + a documented dry-run boot with `HA_URL` pointing at `tests/fake_ha.py`),
+and the SPA renders all seven views against `?mock=1` with `node --check` clean JS.
+
+---
+
+## A. Verified external facts that constrain the code
+
+Full detail, sources and confidence tags live in `docs/EXTERNAL_APIS.md` (WP1). These are the ones that
+change what the code must do, and they override any assumption elsewhere in this spec:
+
+**Forecast.Solar** — keyless responses are **hourly, single-plane, ~2 days**, so the provider must
+interpolate to the 15-minute grid and a keyless multi-plane config must degrade to the first plane with a
+warning. Response keys are `result.watts`, `result.watt_hours_period`, `result.watt_hours_day` (there is no
+`result.watthours.*`). `?time=utc` is mandatory (default timestamps carry no offset). Keyless limit is
+12 requests/hour/IP. Azimuth is compass−180 (0 = south), declination 0–90 (90 = vertical). Never log
+`message.info`, it contains the coordinates.
+
+**Energy-Charts price** — returns **today only** (96 × 15-min slots, `unit: "EUR / MWh"`); tomorrow's data
+404s until early afternoon CET. Prices are ex-tax wholesale, so apply the configured VAT and energy tax
+adders, do not add them twice for `zonneplan_entity`. Attribution is required in the README/DOCS
+(CC BY 4.0, Bundesnetzagentur | SMARD.de).
+
+**Zonneplan** — both `electricity_price` and `price_tax_included.amount` are fixed-point with a scale of
+**1e-7 (divide by 10^7)**. `price_tax_included` is already the consumer price incl. VAT and energy tax:
+apply no further adders. The list **contains past slots** (~a day back) and reaches ~+30 h, so providers
+must drop past slots and judge staleness by **coverage of the requested horizon**, not by entity
+availability — a failed refresh keeps old data and still looks available.
+
+**Home Assistant REST** — service calls take a **flat body** (top-level `entity_id`/data keys); a nested
+`target` object is rejected with 400. `POST /api/states/<id>` is admin-only, creates no `unique_id` and
+disappears on restart (fine for our mirror sensors, documented in the README). `/api/states` is ~855 KB for
+1 322 entities: never fetch it unfiltered on a schedule; use the entity registry plus targeted reads.
+History needs `filter_entity_id` and only covers `purge_keep_days`; long-term statistics are never purged,
+which is why §7.2 prefers them. Error codes are 400/401/404/405/500 — there is no 422 and no documented
+rate limit.
+
+**Home Assistant WebSocket** — `auth_required → auth → auth_ok`; the server PINGs every ~55 s and the
+client **must PONG** or the connection is dropped. Zendure entity-registry `unique_id`s are **not**
+prefixed with the integration domain, so discovery must key on `platform` + `translation_key`, never on a
+`unique_id` prefix (this is what §5 requires). `statistics_during_period` rows carry ms-epoch `start/end`
+plus only the requested statistic types, and need no admin rights.
+
+**Zendure driver (highest-risk item in the build)** — `manual_power` uses the **opposite sign convention to
+this application's `models.py`: negative = charge, positive = discharge**, so the driver must negate when
+writing and when reading back. It is system-wide, not per device. Writes only take effect when the
+integration processes the next P1 event, so read-back verification must tolerate a short delay and retry
+rather than declaring failure immediately. The integration's own smart modes overwrite external writes, so
+`operation` must be `manual` before and re-asserted during control. `electric_level` is the authoritative
+SoC (`soc_status` is calibration bookkeeping). `available_kwh` is usable energy above `min_soc`;
+`total_kwh` is installed capacity. DC PV charging happens regardless of the AC setpoint. There is **no
+device watchdog**: the last setpoint persists if the controller disappears, which is why the engine must
+write `hold()` on shutdown and on fatal error, and why the README must tell users to set the manager back
+to a safe mode if they uninstall the add-on.
+
+**Also required**: `tests/test_wp2a_haws.py` currently contains literal `unique_id=` strings that the PII
+scanner flags; fix by using the allowlisted example namespace or an explicit `audit-allow:` marker rather
+than by weakening `tools/audit.sh`.
+
+---
+
+## 15. Packaging (WP4)
+
+- `config.yaml`: `name: Smart Energy Manager`, `version: 0.1.0`, `slug: energy_manager`, `arch:
+  [aarch64, amd64, armv7, armhf, i386]`, `startup: application`, `boot: auto`, `init: false`,
+  `ingress: true`, `ingress_port: 8099`, `panel_icon: mdi:home-battery`, `panel_title: Energy`,
+  `homeassistant_api: true`, `hassio_api: false`, `options:`/`schema:` exactly as §3 (all
+  instance-specific values `null`/empty), `description` ≤ 200 chars, `url` the repo URL,
+  `image: {ghcr.io/yazdannl/energy-manager-{arch}}` optional and commented for local builds.
+- `Dockerfile`: `FROM ghcr.io/home-assistant/{arch}-base-python:3.13-alpine3.21` (build-arg `BUILD_ARCH`),
+  copy `app/` to `/app`, `WORKDIR /app`, `ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1`,
+  `CMD ["/bin/sh", "/run.sh"]` so the fail-fast wrapper is the real entrypoint, no pip layer (R3),
+  runs as root as HA add-ons expect,
+  healthcheck hitting `/api/v1/health`.
+- `run.sh`: fail fast with a clear message when neither `SUPERVISOR_TOKEN` nor the legacy
+  `HASSIO_TOKEN` is set, then `exec python3 -m app.main`, keeping the shell wrapper POSIX `sh`.
+- `README.md`: what it does, requirements (HAOS/Supervised, a dynamic-price source, a battery),
+  install steps, the `sensor.sem_*` table, safety model and default-safety explanation, a
+  "privacy: what leaves your system" section (Forecast.Solar and the day-ahead price provider; none
+  of your data is sent anywhere else), troubleshooting, and the savings-baseline definition.
+- `DOCS.md`: add-on store tab, short, points at README.
+- `icon.png` (128×128) and `logo.png` (250×100): generated by a small committed script
+  `tools/make_icons.py` using only `zlib`/`struct`; no binaries with unclear provenance.
+- `.github/workflows/validate.yml`: `python -m compileall`, `pytest -q`, `tools/audit.sh`, and the
+  official `hassio-addons/workflow-general`/`builder` lint if it can be pinned safely (skip if it
+  requires secrets).
+
+---
+
+## 16. Amendment log (why the spec changed)
+
+Three independent adversarial audits (gpt-6-luna, deepseek-v4.1, step-5-preview) reviewed the built
+tree. The fixes they triggered changed shipped details, so the frozen contract is amended here, in one
+round, with the reason:
+
+- **§1/§9.3/§9.4** — `advisory`/`off` never write, except the neutralising hold for a setpoint the
+  add-on itself left live (persisted per-battery latch). Audits 1 and 2 independently reproduced the
+  old `hold()` silently skipping on lazy measured power, and advisory exits writing to hardware.
+- **§3/§8.1** — `optimizer.horizon_hours` default 36 → 30 (matches the ~+30 h feed);
+  `optimizer.allow_export` default true → false, plus `price.feed_in_*`. Both auditors found the sell
+  price was silently the consumer price plus VAT, which over-exports at fictional revenue.
+- **§3/§9.1** — `control.grid_follow_max_w` added, and the grid-follow budget is absolute rather than
+  a fraction of the current target, because a zero target could never be corrected.
+- **§7.3/§11** — targeted entity reads, 5-minute measurement buckets and plan retention
+  (`plans_rows`): the audit measured ~2.4 GB/day of JSON and unbounded plan growth.
+- **§11** — the baseline is net cost and may be unknown; the old wording omitted export revenue and
+  reported a missing load reading as a negative saving.
+- **§6/§10** — the API `/status` reports `pending_holds` and `mode_persisted` (the engine owns those values;
+  they are not `SystemState` fields — see the later §6/§7.2 entry). The `/stop` body is unchanged
+  (`{mode, override_cleared, stopped[]}`).
+- **§15** — the image entrypoint is `/bin/sh /run.sh` and the wrapper accepts the legacy
+  `HASSIO_TOKEN`, so the fail-fast actually runs.
+- **§5/§6/§8.1** — per-battery round-trip efficiency is an input (`round_trip_efficiency_pct`), the
+  break-even sale price is defined as `buy / round_trip` plus wear per delivered kWh, terminal stored
+  energy is valued at `eta_dis` rather than face value, and an idle-but-unprofitable slot says
+  `efficiency_loss`. Requested after the audit round: the schedules must price the conversion loss
+  instead of showing a paper profit on a cycle that loses energy.
+- **§6/§7.2 (polish round after the final verification)** — `load.temperature_entity` is wired into the
+  history collection so the documented regression term is no longer a silent no-op; §6's status wording now
+  says the API reports `pending_holds`/`mode_persisted` instead of claiming they are `SystemState` fields;
+  and the R1 scanner gained rules for 4-decimal unlabelled coordinate pairs, private hostnames, MACs and
+  bare 32-hex ids, all of which the final verifier demonstrated it previously missed.
+
+The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
+were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded
+in `docs/VERIFICATION.md`.

@@ -1,0 +1,1035 @@
+"""HTTP JSON API (SPEC section 10, frozen contract) and static SPA serving.
+
+Standard library only: ``http.server.ThreadingHTTPServer``.  No auth -- the add-on is reached
+through Home Assistant ingress, which supplies it.  All GETs work with no batteries configured and
+in ``mode: off``; responses never contain tokens, and instance entity ids only appear where the UI
+needs them (the battery mapping).
+
+Ponytail: one request handler with an explicit route table instead of a router framework; static
+files are served from ``app/web`` with a normalised, traversal-rejecting join.
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+import logging
+import os
+import posixpath
+import re
+import threading
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Mapping
+from urllib.parse import parse_qs, unquote, urlsplit
+
+from .models import (
+    AccuracyReport,
+    Plan,
+    PlanSummary,
+    ProviderStatus,
+    SavingsBucket,
+    SystemState,
+    from_iso,
+    to_iso,
+)
+
+log = logging.getLogger(__name__)
+
+MAX_BODY_BYTES = 1_000_000
+API_PREFIX = "/api/v1"
+SECRET_KEY_HINTS = ("key", "token", "secret", "password", "passwd")
+
+CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".map": "application/json; charset=utf-8",
+    ".webmanifest": "application/manifest+json",
+}
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+# ---------------------------------------------------------------------------------------------
+# Settings catalogue.  ``config.DEFAULTS``/``setting_descriptors`` is the source of truth for the
+# keys, values and validation; this layer only maps the descriptor type onto the UI types of SPEC 10
+# (bool|int|float|str|password|json|list), adds the enumerated choices and marks the keys that can
+# move hardware as group ``Safety``.  A key that exists in DEFAULTS is always advertised, and no key
+# outside DEFAULTS ever is (a regression test pins both directions, the UI form depends on it).
+# ---------------------------------------------------------------------------------------------
+
+SAFETY_KEY_RE = re.compile(
+    r"(reserve_soc_pct|max_grid_import_w|max_grid_export_w|target_soc_pct_end|allow_grid_charge"
+    r"|allow_export|min_spread_eur_per_kwh|^control\.)"
+)
+UI_TYPES = {
+    "choice": "str",
+    "multi_choice": "list",
+    "select": "str",
+    "entity": "str",
+    "float?": "float",
+}
+#: Keys that come from the add-on options (config.yaml) rather than the settings form.
+ADDON_OPTION_KEYS = (
+    "mode",
+    "dry_run",
+    "log_level",
+    "currency",
+    "timezone",
+    "latitude_override",
+    "longitude_override",
+)
+
+
+def _ui_type(key: str, raw: Any) -> str:
+    """Descriptor type -> the UI type contract of SPEC 10."""
+    if any(hint in key.lower() for hint in SECRET_KEY_HINTS):
+        return "password"
+    kind = str(raw or "str")
+    if kind in ("bool", "int", "float", "json", "list"):
+        return kind
+    if kind == "str":
+        return "str"
+    return UI_TYPES.get(kind, "str")
+
+
+def _infer_ui_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, dict):
+        return "json"
+    return "str"
+
+
+def _descriptor_row(key: str, descriptor: Mapping[str, Any]) -> dict[str, Any]:
+    group = "Safety" if SAFETY_KEY_RE.search(key) else str(descriptor.get("group") or "general").title()
+    return {
+        "key": key,
+        "value": descriptor.get("value", descriptor.get("default")),
+        "type": _ui_type(key, descriptor.get("type")),
+        "default": descriptor.get("default"),
+        "label": str(descriptor.get("label") or key),
+        "help": str(descriptor.get("help") or ""),
+        "group": group,
+        "choices": list(descriptor.get("choices") or []),
+    }
+
+
+def default_settings() -> dict[str, Any]:
+    """``config.DEFAULTS`` when WP2A is importable, else ``{}`` (standalone api.py)."""
+    try:
+        from .config import DEFAULTS
+    except ImportError:  # pragma: no cover - standalone api tests
+        return {}
+    return dict(DEFAULTS)
+
+
+def _mask(key: str, value: Any) -> Any:
+    if any(hint in key.lower() for hint in SECRET_KEY_HINTS):
+        return "" if not value else "***"
+    return value
+
+
+def _coerce(meta: Mapping[str, Any], value: Any) -> Any:
+    """Normalise one setting value; raises ``ApiError(400)``.  ``config`` validates for real."""
+    kind = str(meta["type"])
+    key = str(meta["key"])
+    choices = [str(choice) for choice in meta.get("choices") or []]
+    if kind == "bool":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and int(value) in (0, 1):
+            return bool(int(value))
+        if isinstance(value, str) and value.strip().lower() in ("true", "false", "on", "off", "yes", "no"):
+            return value.strip().lower() in ("true", "on", "yes")
+        raise ApiError(400, "invalid_value", f"{key} expects a boolean")
+    if kind in ("int", "float"):
+        if isinstance(value, bool) or value is None or value == "":
+            raise ApiError(400, "invalid_value", f"{key} expects a number")
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_value", f"{key} expects a number") from None
+        return int(number) if kind == "int" else number
+    if kind == "list":
+        if isinstance(value, list):
+            items = value
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                items = []
+            else:
+                try:
+                    parsed = json.loads(text)
+                except ValueError:
+                    items = [part.strip() for part in text.split(",") if part.strip()]
+                else:
+                    items = parsed if isinstance(parsed, list) else [parsed]
+        else:
+            raise ApiError(400, "invalid_value", f"{key} expects a list")
+        if choices:
+            for item in items:
+                if str(item) not in choices:
+                    raise ApiError(
+                        400, "invalid_value", f"{key} may only contain: {', '.join(choices)}"
+                    )
+        return items
+    if kind == "json":
+        if isinstance(value, (dict, list)):
+            return value
+        if value is None or value == "":
+            return {}
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except ValueError:
+                raise ApiError(400, "invalid_value", f"{key} expects JSON") from None
+        raise ApiError(400, "invalid_value", f"{key} expects JSON")
+    if value is None:
+        return "" if kind != "json" else {}
+    text = str(value)
+    if choices and text not in choices:
+        raise ApiError(400, "invalid_value", f"{key} must be one of {', '.join(choices)}")
+    return text
+
+
+def _external_descriptors(settings: Any) -> list[Mapping[str, Any]]:
+    """WP2A's ``config.setting_descriptors`` when the module is present, else nothing."""
+    try:
+        from .config import setting_descriptors
+    except ImportError:  # standalone api.py without WP2A's config module
+        return []
+    try:
+        return list(setting_descriptors(settings))
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("setting_descriptors failed: %s", exc)
+        return []
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return to_iso(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
+    if hasattr(value, "value"):  # Enum
+        return value.value
+    raise TypeError(f"cannot serialise {type(value).__name__}")
+
+
+def _json_dump(payload: Any) -> bytes:
+    return json.dumps(payload, default=_json_default, allow_nan=False, separators=(",", ":")).encode("utf-8")
+
+
+# ---------------------------------------------------------------------------------------------
+# Serialisers
+# ---------------------------------------------------------------------------------------------
+
+
+def plan_summary_dict(summary: PlanSummary) -> dict[str, Any]:
+    payload = {
+        "cost_estimate_eur": summary.cost_estimate_eur,
+        "baseline_cost_eur": summary.baseline_cost_eur,
+        "saved_eur": summary.saved_eur,
+        "charged_kwh": summary.charged_kwh,
+        "discharged_kwh": summary.discharged_kwh,
+        "grid_charge_kwh": summary.grid_charge_kwh,
+        "pv_charge_kwh": summary.pv_charge_kwh,
+        "cycles": summary.cycles,
+        "arbitrage_kwh": summary.arbitrage_kwh,
+        "effective_step_kwh": summary.effective_step_kwh,
+        "solver_iterations": summary.solver_iterations,
+        "cycle_cost_eur": summary.cycle_cost_eur,
+        "objective_eur": summary.objective_eur,
+    }
+    # The efficiency the plan assumed (SPEC 5/8.1): the aggregate etas and the break-even sale price
+    # at the plan's median buy.  Additive keys, read with ``getattr`` so a summary restored from
+    # the store (which only keeps the declared fields) yields null instead of failing.
+    payload["eta_charge"] = getattr(summary, "eta_charge", None)
+    payload["eta_discharge"] = getattr(summary, "eta_discharge", None)
+    payload["round_trip_efficiency"] = getattr(summary, "round_trip_efficiency", None)
+    payload["break_even_sell_eur_per_kwh"] = getattr(summary, "break_even_sell_eur_per_kwh", None)
+    return payload
+
+
+def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dict[str, Any]:
+    if plan is None:
+        return {
+            "generated_at": None,
+            "horizon_start": None,
+            "horizon_end": None,
+            "feasible": False,
+            "infeasible_reason": "no_plan",
+            "summary": plan_summary_dict(PlanSummary()),
+            "slots": [],
+            "batteries": [],
+        }
+    limit = now + timedelta(hours=hours) if hours else None
+    slots = [slot for slot in plan.slots if limit is None or slot.t < limit]
+    return {
+        "generated_at": to_iso(plan.generated_at),
+        "horizon_start": to_iso(plan.horizon_start),
+        "horizon_end": to_iso(plan.horizon_end),
+        "feasible": plan.feasible,
+        "infeasible_reason": plan.infeasible_reason,
+        "mode": plan.mode,
+        "dry_run": plan.dry_run,
+        "sources": dict(plan.sources),
+        "summary": plan_summary_dict(plan.summary),
+        "slots": [
+            {
+                "t": to_iso(slot.t),
+                "buy": slot.buy,
+                "sell": slot.sell,
+                "pv_kw": slot.pv_kw,
+                "load_kw": slot.load_kw,
+                "load_p10": slot.load_p10_kw,
+                "load_p90": slot.load_p90_kw,
+                "soc_kwh": slot.soc_kwh,
+                "soc_pct": slot.soc_pct if slot.soc_pct is not None else _plan_soc_pct(plan, slot.soc_kwh),
+                "power_w": slot.power_w,
+                "action": slot.action.value,
+                "reason": slot.reason,
+                "price_stale": slot.price_stale,
+                "pv_source": slot.pv_source or plan.sources.get("solar", "unknown"),
+                "price_source": slot.price_source or plan.sources.get("price", "unknown"),
+            }
+            for slot in slots
+        ],
+        "batteries": [
+            {
+                "id": entry.get("id"),
+                "name": entry.get("name"),
+                "share_w": entry.get("share_w"),
+                # SPEC 5: this battery's own round trip and break-even (its own etas, the plan's
+                # reference price).  Additive; the UI computes the rest itself.
+                "round_trip_efficiency": entry.get("round_trip_efficiency"),
+                "break_even_sell_eur_per_kwh": entry.get("break_even_sell_eur_per_kwh"),
+            }
+            for entry in plan.batteries
+        ],
+    }
+
+
+def _plan_soc_pct(plan: Plan, soc_kwh: float) -> float | None:
+    capacity = 0.0
+    for entry in plan.batteries:
+        try:
+            capacity += float(entry.get("capacity_kwh") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    if capacity <= 0:
+        return None
+    return round(max(0.0, min(100.0, soc_kwh / capacity * 100.0)), 2)
+
+
+def forecast_dict(kind: str, forecast: Any, now: datetime, hours: int | None = None) -> dict[str, Any]:
+    limit = now + timedelta(hours=hours) if hours else None
+    if forecast is None:
+        return {
+            "kind": kind,
+            "generated_at": None,
+            "source": "unavailable",
+            "stale": True,
+            "slots": [],
+        }
+    slots = [
+        slot for slot in forecast.slots if limit is None or slot.t < limit
+    ]
+    if kind == "price":
+        payload = [
+            {"t": to_iso(slot.t), "buy": slot.buy, "sell": slot.sell, "is_actual": slot.is_actual, "stale": slot.stale}
+            for slot in slots
+        ]
+    elif kind == "solar":
+        payload = [
+            {"t": to_iso(slot.t), "pv_kw": slot.pv_kw, "uncertainty_pct": slot.uncertainty_pct}
+            for slot in slots
+        ]
+    else:
+        payload = [
+            {"t": to_iso(slot.t), "load_kw": slot.load_kw, "p10_kw": slot.p10_kw, "p90_kw": slot.p90_kw}
+            for slot in slots
+        ]
+    out = {
+        "kind": kind,
+        "generated_at": to_iso(getattr(forecast, "generated_at", None)),
+        "source": getattr(forecast, "source", "unknown"),
+        "stale": bool(getattr(forecast, "stale", False)),
+        "slots": payload,
+    }
+    if kind == "load":
+        out["confidence"] = getattr(forecast, "confidence", "low")
+    if kind == "solar":
+        out["correction_applied"] = getattr(forecast, "correction_applied", 1.0)
+        out["total_kwh"] = getattr(forecast, "total_kwh", lambda: 0.0)()
+    return out
+
+
+def provider_dict(status: ProviderStatus) -> dict[str, Any]:
+    return {
+        "kind": status.kind,
+        "name": status.name,
+        "active": status.active,
+        "ok": status.ok,
+        "last_success": to_iso(status.last_success),
+        "last_error": status.last_error,
+        "stale": status.stale,
+        "detail": dict(status.detail),
+    }
+
+
+def savings_bucket_dict(bucket: SavingsBucket) -> dict[str, Any]:
+    return {
+        "key": bucket.key,
+        "start": to_iso(bucket.start),
+        "end": to_iso(bucket.end),
+        "import_kwh": bucket.import_kwh,
+        "export_kwh": bucket.export_kwh,
+        "pv_kwh": bucket.pv_kwh,
+        "cost_eur": bucket.cost_eur,
+        "revenue_eur": bucket.revenue_eur,
+        "baseline_cost_eur": bucket.baseline_cost_eur,
+        "savings_eur": bucket.savings_eur,
+        "cycles": bucket.cycles,
+    }
+
+
+def accuracy_dict(report: AccuracyReport) -> dict[str, Any]:
+    return {
+        "kind": report.kind,
+        "days": report.days,
+        "mape_pct": report.mape_pct,
+        "bias_pct": report.bias_pct,
+        "mae": report.mae,
+        "samples": report.samples,
+        "series": list(report.series),
+    }
+
+
+def status_dict(
+    state: SystemState,
+    plan: Plan | None,
+    pending_holds: Sequence[str] = (),
+    mode_persisted: bool = True,
+) -> dict[str, Any]:
+    now = state.now or datetime.now(timezone.utc)
+    override = None
+    if state.override:
+        override = dict(state.override)
+        expires = state.override.get("expires_at")
+        if isinstance(expires, str):
+            try:
+                moment = from_iso(expires)
+                override["seconds_left"] = max(0.0, (moment - now).total_seconds()) if moment else None
+            except ValueError:
+                override["seconds_left"] = None
+    current = plan.slot_at(now) if plan is not None else None
+    return {
+        "version": state.version,
+        "commit": state.commit,
+        "uptime_s": round(state.uptime_s, 1),
+        "mode": state.mode,
+        "dry_run": state.dry_run,
+        # Batteries whose last real setpoint is still live (SPEC 10): the UI can show that a
+        # neutralising hold is outstanding.
+        "pending_holds": list(pending_holds),
+        # False when a mode change (e.g. Stop now) could not be written to the settings file: the
+        # running process is already in the new mode, but a restart would come up in the old one
+        # (audit finding 4).
+        "mode_persisted": bool(mode_persisted),
+        "ha_connected": state.ha_connected,
+        "ha_last_error": state.ha_last_error,
+        "location": state.location,
+        "now": to_iso(now),
+        "price_now": state.price_now,
+        "price_rank_pct": state.price_rank_pct,
+        "pv_now_w": state.pv_now_w,
+        "load_now_w": state.load_now_w,
+        "grid_now_w": state.grid_now_w,
+        "batteries": [
+            {
+                "id": battery.id,
+                "available": battery.available,
+                "soc_pct": battery.soc_pct,
+                "power_w": battery.power_w,
+                "capacity_kwh": battery.capacity_kwh,
+                "energy_kwh": battery.energy_kwh,
+                "pv_power_w": battery.pv_power_w,
+                "temperature_c": battery.temperature_c,
+                "read_at": to_iso(battery.read_at),
+                "age_s": battery.age_seconds(now),
+                "stale": battery.stale,
+                # Non-blocking diagnostics: a frozen integration whose timestamps stopped
+                # advancing is visible here (and in the warning log) without blocking control
+                # (audit finding 1).
+                "timestamps_seen": bool((battery.extra or {}).get("timestamps_seen")),
+                "stalled_polls": int((battery.extra or {}).get("stalled_polls") or 0),
+                "frozen": bool((battery.extra or {}).get("frozen")),
+                "last_error": battery.last_error,
+            }
+            for battery in state.batteries
+        ],
+        # The full slot timeline is GET /api/v1/plan; /status carries the summary so the dashboard
+        # can poll cheaply.
+        "active_plan": None
+        if plan is None
+        else {
+            "generated_at": to_iso(plan.generated_at),
+            "horizon_start": to_iso(plan.horizon_start),
+            "horizon_end": to_iso(plan.horizon_end),
+            "feasible": plan.feasible,
+            "infeasible_reason": plan.infeasible_reason,
+            "summary": plan_summary_dict(plan.summary),
+            "slot_count": len(plan.slots),
+            "current": None
+            if current is None
+            else {
+                "t": to_iso(current.t),
+                "power_w": current.power_w,
+                "action": current.action.value,
+                "reason": current.reason,
+                "soc_kwh": current.soc_kwh,
+            },
+        },
+        "last_plan_at": to_iso(state.last_plan_at),
+        "last_tick_at": to_iso(state.last_tick_at),
+        "next_cheap_window": [to_iso(state.next_cheap_window[0]), to_iso(state.next_cheap_window[1])]
+        if state.next_cheap_window
+        else None,
+        "next_expensive_window": [
+            to_iso(state.next_expensive_window[0]),
+            to_iso(state.next_expensive_window[1]),
+        ]
+        if state.next_expensive_window
+        else None,
+        "override": override,
+        "alerts": [
+            {
+                "ts": to_iso(alert.ts),
+                "level": alert.level,
+                "code": alert.code,
+                "message": alert.message,
+                "detail": dict(alert.detail),
+                "acknowledged": alert.acknowledged,
+            }
+            for alert in state.alerts
+        ],
+        "provider_status": [provider_dict(status) for status in state.provider_status],
+        "scheduler_healthy": state.scheduler_healthy,
+    }
+
+
+# ---------------------------------------------------------------------------------------------
+# The server
+# ---------------------------------------------------------------------------------------------
+
+
+class ApiServer:
+    """Route table from SPEC 10 plus safe static serving from ``app/web``."""
+
+    def __init__(
+        self,
+        engine: Any,
+        *,
+        web_root: str | None = None,
+        host: str = "0.0.0.0",
+        port: int = 8099,
+        version: str = "0.1.0",
+    ) -> None:
+        self.engine = engine
+        self.web_root = os.path.normpath(web_root or os.path.join(os.path.dirname(__file__), "web"))
+        self.host = host
+        self.port = int(port)
+        self.version = version
+        self._httpd: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    # -- lifecycle --------------------------------------------------------------------
+
+    def start(self) -> "ApiServer":
+        handler = _make_handler(self)
+        self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
+        self._httpd.daemon_threads = True
+        self.port = self._httpd.server_address[1]
+        self._thread = threading.Thread(target=self._httpd.serve_forever, name="sem-api", daemon=True)
+        self._thread.start()
+        log.info("API listening on %s:%s", self.host, self.port)
+        return self
+
+    @property
+    def address(self) -> tuple[str, int]:
+        if self._httpd is not None:
+            return self._httpd.server_address[0], self._httpd.server_address[1]
+        return self.host, self.port
+
+    def serve_forever(self) -> None:
+        self.start()
+        assert self._httpd is not None
+        try:
+            self._httpd.serve_forever()
+        except KeyboardInterrupt:  # pragma: no cover - interactive
+            pass
+
+    def stop(self) -> None:
+        if self._httpd is not None:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+            self._httpd = None
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    # -- request handling -------------------------------------------------------------
+
+    def dispatch(self, method: str, target: str, body: bytes = b"") -> tuple[int, dict[str, str], bytes]:
+        """Return ``(status, headers, body)``; never raises for a client mistake."""
+        method = method.upper()
+        split = urlsplit(target)
+        path = unquote(split.path or "/")
+        query = {key: values[-1] for key, values in parse_qs(split.query, keep_blank_values=True).items()}
+        payload: Any = None
+        if body:
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return self._error(400, "invalid_json", "request body must be valid JSON")
+        try:
+            status, headers, content = self._route(method, path, query, payload)
+        except ApiError as exc:
+            return self._error(exc.status, exc.code, exc.message)
+        except KeyError as exc:
+            return self._error(404, "not_found", f"unknown item: {exc}")
+        except PermissionError as exc:
+            return self._error(409, "conflict", str(exc))
+        except ValueError as exc:
+            return self._error(400, "invalid_request", str(exc))
+        except Exception as exc:  # pragma: no cover - unexpected: log, do not leak internals
+            log.exception("unhandled API error")
+            return self._error(
+                500, "internal_error", f"internal error ({type(exc).__name__}); see the add-on log"
+            )
+        return status, headers, content
+
+    def _error(self, status: int, code: str, message: str) -> tuple[int, dict[str, str], bytes]:
+        return (
+            status,
+            {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"},
+            _json_dump({"error": {"code": code, "message": message}}),
+        )
+
+    def _json(self, payload: Any, status: int = 200) -> tuple[int, dict[str, str], bytes]:
+        return (
+            status,
+            {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"},
+            _json_dump(payload),
+        )
+
+    # -- routes -----------------------------------------------------------------------
+
+    def _route(
+        self, method: str, path: str, query: Mapping[str, str], payload: Any
+    ) -> tuple[int, dict[str, str], bytes]:
+        if path.startswith(API_PREFIX):
+            return self._api(method, path[len(API_PREFIX):].strip("/"), query, payload)
+        if method != "GET":
+            raise ApiError(405, "method_not_allowed", f"{method} is not allowed on {path}")
+        return self._static(path)
+
+    def _api(
+        self, method: str, route: str, query: Mapping[str, str], payload: Any
+    ) -> tuple[int, dict[str, str], bytes]:
+        engine = self.engine
+        segments = [segment for segment in route.split("/") if segment]
+        now = self._now()
+
+        if route == "health" and method == "GET":
+            state = engine.snapshot()
+            return self._json(
+                {
+                    "status": "ok",
+                    "version": state.version or self.version,
+                    "uptime_s": round(state.uptime_s, 1),
+                    "commit": state.commit,
+                }
+            )
+
+        if route == "status" and method == "GET":
+            state = engine.snapshot()
+            pending = getattr(engine, "pending_holds", None)
+            persisted = getattr(engine, "mode_persisted", None)
+            return self._json(
+                status_dict(
+                    state,
+                    engine.active_plan(),
+                    pending() if callable(pending) else (),
+                    persisted() if callable(persisted) else True,
+                )
+            )
+
+        if route == "plan" and method == "GET":
+            return self._json(
+                plan_dict(engine.active_plan(), now, hours=_hours(query.get("hours"), self._default_hours()))
+            )
+
+        if route == "plan/recompute" and method == "POST":
+            return self._json(engine.request_replan("api"))
+
+        if route == "forecast" and method == "GET":
+            kind = str(query.get("kind") or "price")
+            if kind not in ("price", "solar", "load"):
+                raise ApiError(400, "invalid_kind", "kind must be price, solar or load")
+            forecast = engine.forecast(kind)
+            return self._json(
+                forecast_dict(kind, forecast, now, hours=_hours(query.get("hours"), self._default_hours()))
+            )
+
+        if route == "batteries" and method == "GET":
+            return self._json({"batteries": engine.batteries_view()})
+
+        if route == "batteries" and method == "POST":
+            config = self._body(payload).get("config")
+            if not isinstance(config, Mapping):
+                raise ApiError(400, "invalid_body", "body must be {config: {...}}")
+            return self._json({"config": engine.create_battery(config)}, status=201)
+
+        if len(segments) >= 2 and segments[0] == "batteries":
+            battery_id = segments[1]
+            if len(segments) == 2 and method == "PATCH":
+                patch = self._body(payload).get("patch")
+                if not isinstance(patch, Mapping):
+                    raise ApiError(400, "invalid_body", "body must be {patch: {...}}")
+                return self._json({"config": engine.update_battery(battery_id, patch)})
+            if len(segments) == 2 and method == "DELETE":
+                return self._json(engine.delete_battery(battery_id))
+            if len(segments) == 3 and segments[2] == "test" and method == "POST":
+                body = self._body(payload)
+                return self._json(
+                    engine.test_discharge(
+                        battery_id,
+                        float(body.get("power_w") or 0.0),
+                        float(body.get("seconds") or 5.0),
+                        str(body.get("intent") or "discharge"),
+                    )
+                )
+            raise ApiError(404, "not_found", f"no route for {method} /{route}")
+
+        if route == "discover" and method == "GET":
+            kind = str(query.get("kind") or "battery")
+            if kind not in ("battery", "price", "solar", "load", "grid"):
+                raise ApiError(400, "invalid_kind", "kind must be battery, price, solar, load or grid")
+            return self._json(
+                {
+                    "candidates": engine.discover(
+                        kind, search=query.get("search"), limit=_limit(query.get("limit"), 50)
+                    )
+                }
+            )
+
+        if route == "config" and method == "GET":
+            return self._json(self._config_payload())
+
+        if route == "config" and method == "PATCH":
+            body = self._body(payload)
+            patch = body.get("settings")
+            if not isinstance(patch, Mapping) or not patch:
+                raise ApiError(400, "invalid_body", "body must be {settings: {...}} with at least one key")
+            catalogue = self._setting_catalogue()
+            coerced: dict[str, Any] = {}
+            errors: list[dict[str, str]] = []
+            for key in sorted(patch):
+                meta = catalogue.get(str(key))
+                if meta is None:
+                    errors.append({"key": str(key), "message": "unknown setting"})
+                    continue
+                try:
+                    coerced[str(key)] = _coerce(meta, patch[key])
+                except ApiError as exc:
+                    errors.append({"key": str(key), "message": exc.message})
+            result = engine.apply_settings(coerced) if coerced else {"applied": [], "errors": []}
+            errors.extend(result["errors"])
+            # Per-key failures are data, not a request failure: the form renders them field by field.
+            return self._json({"applied": result["applied"], "errors": errors})
+
+        if route == "mode" and method == "POST":
+            body = self._body(payload)
+            mode = body.get("mode")
+            dry_run = body.get("dry_run")
+            if mode is None and dry_run is None:
+                raise ApiError(400, "invalid_body", "mode and/or dry_run is required")
+            if mode is not None and str(mode) not in ("off", "advisory", "auto"):
+                raise ApiError(400, "invalid_mode", "mode must be off, advisory or auto")
+            if dry_run is not None and not isinstance(dry_run, bool):
+                raise ApiError(400, "invalid_body", "dry_run must be a boolean")
+            # Partial update: an omitted field keeps its current value (SPEC 10).
+            return self._json(engine.set_mode(None if mode is None else str(mode), dry_run))
+
+        if route == "override" and method == "POST":
+            body = self._body(payload)
+            if body.get("power_w") is None:
+                raise ApiError(400, "invalid_body", "power_w is required")
+            return self._json(
+                {
+                    "override": engine.set_override(
+                        float(body["power_w"]),
+                        float(body.get("minutes") or 30),
+                        body.get("battery_id"),
+                    )
+                }
+            )
+
+        if route == "override" and method == "DELETE":
+            return self._json(engine.clear_override())
+
+        if route == "stop" and method == "POST":
+            return self._json(engine.stop_now())
+
+        if route == "savings" and method == "GET":
+            range_key = str(query.get("range") or "day")
+            buckets, totals = engine.savings(range_key)
+            from .analytics import BASELINE_NOTE
+
+            return self._json(
+                {
+                    "range": range_key,
+                    "buckets": [savings_bucket_dict(bucket) for bucket in buckets],
+                    "totals": totals,
+                    "baseline_note": BASELINE_NOTE,
+                }
+            )
+
+        if route == "accuracy" and method == "GET":
+            days = _limit(query.get("days"), 14)
+            reports = engine.accuracy(days)
+            return self._json({kind: accuracy_dict(report) for kind, report in reports.items()})
+
+        if route == "log" and method == "GET":
+            level = query.get("level") or None
+            kind = query.get("kind") or None
+            if level not in (None, "info", "warning", "error"):
+                raise ApiError(400, "invalid_level", "level must be info, warning or error")
+            if kind not in (None, "dispatch", "event", "alert"):
+                raise ApiError(400, "invalid_kind", "kind must be dispatch, event or alert")
+            return self._json(
+                {"entries": engine.log(_limit(query.get("limit"), 100), level=level, kind=kind)}
+            )
+
+        if route == "providers" and method == "GET":
+            providers = engine.providers()
+            return self._json(
+                {kind: [provider_dict(status) for status in providers.get(kind, [])] for kind in ("solar", "price", "load")}
+            )
+
+        if route == "export" and method == "GET":
+            what = str(query.get("what") or "plan")
+            fmt = str(query.get("format") or "json")
+            export = engine.export(what, fmt)
+            headers = {
+                "Content-Type": export["content_type"],
+                "Cache-Control": "no-store",
+                "Content-Disposition": f'attachment; filename="{export["filename"]}"',
+            }
+            if fmt == "csv":
+                buffer = io.StringIO()
+                rows = export["rows"]
+                if rows:
+                    writer = csv.DictWriter(buffer, fieldnames=list(rows[0].keys()))
+                    writer.writeheader()
+                    for row in rows:
+                        writer.writerow({key: _csv_cell(value) for key, value in row.items()})
+                content = buffer.getvalue().encode("utf-8")
+            else:
+                content = _json_dump({"what": export["what"], "rows": export["rows"]})
+            return 200, headers, content
+
+        if route == "notify/test" and method == "POST":
+            return self._json({"sent": bool(engine.notify_test())})
+
+        raise ApiError(404, "not_found", f"no route for {method} {API_PREFIX}/{route}")
+
+    # -- helpers ----------------------------------------------------------------------
+
+    def _now(self) -> datetime:
+        """The engine's clock when it has one, so hour filters align with the plan horizon."""
+        try:
+            moment = self.engine.snapshot().now
+        except Exception:  # pragma: no cover - defensive
+            moment = None
+        return moment or datetime.now(timezone.utc)
+
+    def _default_hours(self) -> int:
+        """Default forecast/plan window: the configured horizon (SPEC 3 ``optimizer.horizon_hours``)."""
+        try:
+            return int(self.engine.settings.get("optimizer.horizon_hours", 30) or 30)
+        except Exception:  # pragma: no cover - defensive
+            return 30
+
+    @staticmethod
+    def _body(payload: Any) -> Mapping[str, Any]:
+        if payload is None:
+            return {}
+        if not isinstance(payload, Mapping):
+            raise ApiError(400, "invalid_body", "body must be a JSON object")
+        return payload
+
+    def _config_payload(self) -> dict[str, Any]:
+        settings = self.engine.settings
+        options: dict[str, Any] = {}
+        raw_options = getattr(settings, "options", None)
+        if callable(raw_options):
+            try:
+                raw_options = raw_options()
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug("settings.options() failed: %s", exc)
+                raw_options = None
+        if isinstance(raw_options, Mapping):
+            for key, value in raw_options.items():
+                if key in ADDON_OPTION_KEYS:
+                    options[str(key)] = _mask(str(key), value)
+        rows = self._setting_catalogue()
+        for key, row in rows.items():
+            row["value"] = _mask(key, row["value"])
+        return {
+            "options": options,
+            "settings": [rows[key] for key in sorted(rows)],
+            # Additive: add-on options the stored settings override (mode/dry_run), so the UI can
+            # warn that editing the option has no effect (WP2A ``Settings.option_conflicts``).
+            "conflicts": self._option_conflicts(settings),
+        }
+
+    @staticmethod
+    def _option_conflicts(settings: Any) -> list[dict[str, Any]]:
+        """``Settings.option_conflicts()`` when present, else an empty list (SPEC 10)."""
+        probe = getattr(settings, "option_conflicts", None)
+        if not callable(probe):
+            return []
+        try:
+            conflicts = probe()
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("settings.option_conflicts() failed: %s", exc)
+            return []
+        return [dict(conflict) for conflict in conflicts or [] if isinstance(conflict, Mapping)]
+
+    def _setting_catalogue(self) -> dict[str, dict[str, Any]]:
+        """Every settings key of ``config.DEFAULTS``, ready for the generated UI form (SPEC 10)."""
+        settings = self.engine.settings
+        rows: dict[str, dict[str, Any]] = {}
+        for descriptor in _external_descriptors(settings):
+            key = str(descriptor.get("key") or "")
+            if key:
+                rows[key] = _descriptor_row(key, descriptor)
+        for key, default in default_settings().items():
+            if key in rows:
+                continue
+            try:
+                value = settings.get(key, default)
+            except Exception:  # pragma: no cover - defensive
+                value = default
+            rows[key] = _descriptor_row(key, {"default": default, "value": value, "type": _infer_ui_type(default)})
+        return rows
+
+    def _static(self, path: str) -> tuple[int, dict[str, str], bytes]:
+        if "\x00" in path or "\\" in path:
+            return self._error(404, "not_found", "unknown path")
+        relative = posixpath.normpath(path.lstrip("/"))
+        if relative in (".", ""):
+            relative = "index.html"
+        if relative.startswith("..") or posixpath.isabs(relative):
+            return self._error(404, "not_found", "unknown path")
+        full = os.path.normpath(os.path.join(self.web_root, relative))
+        if full != self.web_root and not full.startswith(self.web_root + os.sep):
+            return self._error(404, "not_found", "unknown path")
+        if os.path.isdir(full):
+            full = os.path.join(full, "index.html")
+        if not os.path.isfile(full):
+            return self._error(404, "not_found", f"no such asset: {relative}")
+        extension = os.path.splitext(full)[1].lower()
+        headers = {
+            "Content-Type": CONTENT_TYPES.get(extension, "application/octet-stream"),
+            "Cache-Control": "no-cache" if relative == "index.html" else "public, max-age=3600",
+        }
+        try:
+            with open(full, "rb") as handle:
+                return 200, headers, handle.read()
+        except OSError as exc:  # pragma: no cover - defensive
+            return self._error(500, "read_failed", str(exc))
+
+
+def _hours(raw: Any, default: int) -> int:
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(48, value))
+
+
+def _limit(raw: Any, default: int) -> int:
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(1000, value))
+
+
+def _csv_cell(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, default=_json_default)
+    return value
+
+
+def _make_handler(app: ApiServer) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "SmartEnergyManager"
+        protocol_version = "HTTP/1.1"
+        app_server = app
+
+        def _respond(self, method: str) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length < 0 or length > MAX_BODY_BYTES:
+                status, headers, body = app._error(413, "too_large", "request body too large")
+            else:
+                body_in = self.rfile.read(length) if length else b""
+                status, headers, body = app.dispatch(method, self.path, body_in)
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            if method != "HEAD":
+                self.wfile.write(body)
+
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+            self._respond("GET")
+
+        def do_POST(self) -> None:  # noqa: N802
+            self._respond("POST")
+
+        def do_PATCH(self) -> None:  # noqa: N802
+            self._respond("PATCH")
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._respond("DELETE")
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            log.debug("http %s", fmt % args)
+
+    return Handler
