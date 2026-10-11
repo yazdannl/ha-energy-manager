@@ -40,7 +40,8 @@ configured batteries.
 - **`dry_run`** (default `true`) suppresses the plan dispatcher's writes even in `auto`.
 - **The only write paths** are the mapped battery setpoint entities and the `sensor.sem_*` state
   contract. `POST /api/v1/stop` is the one deliberate exception that writes while not in `auto`.
-- **Horizon** default 30 h of 15-minute slots. Prices, PV and load are all resampled onto that grid.
+- **Horizon** default 30 h of `optimizer.slot_minutes` slots (60 min by default, so 30 slots).
+  Prices, PV and load are all resampled onto that grid.
 
 ---
 
@@ -532,7 +533,7 @@ is the authority for the `advanced` classification (the test suite asserts the e
 
 | Key | Type | Default | Bounds | Label — help |
 | --- | --- | --- | --- | --- |
-| `optimizer.slot_minutes` | int | `15` | 5…60 | **Slot minutes** *(advanced)* |
+| `optimizer.slot_minutes` | int | `60` | 5…60 | **Slot minutes** *(advanced)* |
 | `optimizer.horizon_hours` | int | `30` | 1…72 (clamped 12…48 by the optimizer) | **Horizon hours** |
 | `optimizer.soc_step_kwh` | float | `0.02` | 0.001…5 | **SoC step** *(advanced)* — kWh per DP state |
 | `optimizer.power_steps` | int | `24` | 3…200 | **Power steps** *(advanced)* — discrete actions per state |
@@ -687,8 +688,8 @@ Rows are capped at **50** per request with an optional `search` filter; results 
   positive = import.
 - **Prices** are EUR/kWh, tax included, at the meter; `sell` is EUR/kWh **received**.
 - **Energy** is kWh AC-side unless stated; power W everywhere in the API/UI, kW in the optimizer.
-- **Time**: 15-minute slots (`optimizer.slot_minutes`), quarter-floored; all timestamps ISO-8601
-  with offset.
+- **Time**: `optimizer.slot_minutes` slots (60 min by default), floored to that step; all
+  timestamps ISO-8601 with offset.
 - **Determinism**: identical inputs must produce byte-identical plans — no dict/set iteration order
   may leak into results.
 
@@ -728,18 +729,25 @@ slot.energy_tax = per-slot tax component when the provider publishes a tax-exclu
 Per-slot tax component (`_entry_tax_component`) =
 `max(0, price_incl_tax − price_excl_tax)` in EUR/kWh (Zonneplan publishes both sides).
 
-**Resampling** (`_build_forecast`): provider entries are quarter-floored; entries before the current
-quarter are dropped; the 15-minute grid `[start, start + horizon_hours)` is filled by exact match,
-else the last known earlier value marked `stale=True`. A source that yields **no future slots is a
+**Resampling** (`_build_forecast`): provider entries are floored to the plan grid step
+(`_grid_start`, i.e. `quarter_floor(now, optimizer.slot_minutes)` - the plan's own first slot, so the
+dispatcher never sees a filled *current* slot); entries before that start are dropped; the 15-minute
+grid `[start, start + horizon_hours)` is filled by exact match, else the last known earlier value
+marked `stale=True`. A source that yields **no future slots is a
 failure**, not an empty forecast (`ProviderError`). An empty entry list where every entry is in the
 past is reported as `no future price slots`.
+
+The fallback chain's acceptance window is the *current quarter* onwards (`load_price_forecast`): a
+provider must still have something in the future, whatever the plan grid's step is.
 
 **Fallback chain** (`_chain(configured)`): `configured → energy_charts → static`; a failure raises a
 `forecast_unavailable` event naming the source. When every future slot is stale, the optimizer treats
 the price as flat (equal prices) rather than guessing.
 
 **Coverage** (`_apply_coverage`): the uncovered tail is marked stale and the forecast `degraded`,
-with a note naming the coverage end; a gap is *not* a provider failure. For HA consumer sensors
+with a note naming the coverage end; a gap is *not* a provider failure. Coverage is measured with the
+*fresh* slots' own cadence (60 min for an hourly feed), so a forecast that reaches the horizon is not
+reported as a short tail. For HA consumer sensors
 (`zonneplan`, `entity_forecast`), less than one hour of fresh coverage marks the whole list stale.
 
 **Provider → source resolution** (`_resolve_source`, `_locate_zonneplan_entity`,
@@ -1405,7 +1413,7 @@ into the caller. Messages contain generic text plus numbers — never entity ids
 
 | Constant | Value | Where |
 | --- | --- | --- |
-| Slot length | 15 min (`optimizer.slot_minutes`) | price/solar/load/optimizer |
+| Slot length | 60 min (`optimizer.slot_minutes`; providers still feed a 15 min grid) | price/solar/load/optimizer |
 | Measurement bucket | 5 min | `sources/measure.py` |
 | Actuals bucket | 5 min | `engine.py` (`ACTUALS_MINUTES`) |
 | DP states / iterations | 400 / 2 000 000 | `optimize/dp.py` |

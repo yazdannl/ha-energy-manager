@@ -211,7 +211,7 @@ load.base_kwh_per_day    0.0  # fallback flat profile when nothing is learned ye
 grid.power_entity        ""   # signed grid power sensor, positive = import (enables the derived load tier)
 grid.import_entity       ""   # separate import power sensor, optional
 grid.export_entity       ""   # separate export power sensor, optional
-optimizer.slot_minutes   15
+optimizer.slot_minutes   60
 optimizer.horizon_hours  30   # matches the ~+30 h price feed
 optimizer.soc_step_kwh   0.02
 optimizer.power_steps    24
@@ -267,7 +267,10 @@ the normalisation applied in the plan payload so the UI can explain a number.
 
 `PriceForecast` = ordered list of `PriceSlot(t, buy, sell, source, is_actual, energy_tax)`, 15-minute
 resolution, covering at least `now` → `now + horizon_hours`; slots are gap-free and future-filled by
-the last known value with `is_actual=False` and a `stale` flag so the UI can grey it out.
+the last known value with `is_actual=False` and a `stale` flag so the UI can grey it out. The grid
+starts at the start of the plan slot containing `now` (`optimizer.slot_minutes`): the plan grid is
+floored to that step, so any later start would leave the plan's first slot - the slot the dispatcher
+acts on - filled and stale, and a stale current slot is never executed (SPEC 9.1).
 
 Unit handling: providers declare their own unit and, when they publish fixed-point integers, their
 `scale_divisor`; `models.eur_per_kwh_from_raw` does the conversion. Magnitude-based guessing is
@@ -566,8 +569,8 @@ accounting, so sampling must never be skipped because a write failed.
 ## 8. Optimizer
 
 ### 8.1 Model
-Discrete time slots of `optimizer.slot_minutes` (default 15) over `optimizer.horizon_hours`
-(default 30, clamped to `[12, 48]`). For slot `i`: `pv_i` (kW), `load_i` (kW), `buy_i` (EUR/kWh),
+Discrete time slots of `optimizer.slot_minutes` (default 60, matching the common hourly dynamic
+tariff) over `optimizer.horizon_hours` (default 30, clamped to `[12, 48]`). For slot `i`: `pv_i` (kW), `load_i` (kW), `buy_i` (EUR/kWh),
 `sell_i` (EUR/kWh), `dt` = hours.
 
 Aggregated battery: usable energy `E_cap = Σ capacity_kwh * (max_soc−min_soc)/100` (kWh),

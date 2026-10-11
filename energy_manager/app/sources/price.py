@@ -156,6 +156,26 @@ def _horizon_hours(settings: Any) -> int:
     return horizon_hours(settings)
 
 
+def plan_slot_minutes(settings: Any) -> int:
+    """The plan/dispatch grid the optimiser will use (``optimizer.slot_minutes``, SPEC 3).
+
+    Providers need this because the price grid has to cover every plan slot: the plan grid is
+    floored to this step, so a price grid that started later (at the current quarter, say) would
+    leave the plan's first slot forward/backward-filled and *stale*, and the dispatcher refuses to
+    execute a stale current slot (SPEC 9.1, audit finding 2).
+    """
+    try:
+        minutes = int(settings.get("optimizer.slot_minutes", 60) or 60)
+    except (TypeError, ValueError):
+        return 60
+    return minutes if minutes > 0 else 60
+
+
+def _grid_start(now: datetime, settings: Any) -> datetime:
+    """Start of the plan slot containing ``now``: where the price grid must begin."""
+    return quarter_floor(now, plan_slot_minutes(settings))
+
+
 def _fees(settings: Any) -> tuple[float, float]:
     def number(key: str) -> float:
         try:
@@ -238,12 +258,13 @@ def _build_forecast(
     """Resample normalised buy prices onto the 15-minute grid with forward/backward fill.
 
     Pairs are ``(t, buy)`` or ``(t, buy, energy_tax)``; slots start with ``sell = 0.0`` (received
-    nothing) and :func:`_apply_feed_in` fills the feed-in price on the load path. Provider lists
-    contain past slots (docs/EXTERNAL_APIS.md section 3); everything before the current quarter is
-    dropped.
+    nothing) and :func:`_apply_feed_in` fills the feed-in price on the load path. The grid starts at
+    the plan slot containing ``now`` (:func:`_grid_start`), so every plan slot - including the one
+    the dispatcher acts on right now - has an exact price when the provider publishes the cadence
+    the plan uses; provider entries older than that slot are dropped (docs/EXTERNAL_APIS.md 3).
     """
     horizon = _horizon_hours(settings)
-    start = quarter_floor(now, SLOT_MINUTES)
+    start = _grid_start(now, settings)
     end = start + timedelta(hours=horizon)
     grid = slot_range(start, end, SLOT_MINUTES)
 
@@ -312,7 +333,7 @@ def _apply_coverage(
     payload with almost no forward coverage means the refresh failed even though the entity still
     looks available (docs/EXTERNAL_APIS.md section 7, items 3 and 12).
     """
-    start = quarter_floor(now, SLOT_MINUTES)
+    start = _grid_start(now, settings)
     horizon_end = start + timedelta(hours=_horizon_hours(settings))
     future = [slot for slot in forecast.slots if slot.t >= start]
     fresh = [slot for slot in future if not slot.stale]
@@ -324,10 +345,17 @@ def _apply_coverage(
     for slot in future:
         if slot.t > coverage_end:
             slot.stale = True
-    if coverage_end < horizon_end:
+    # ``slot_range`` excludes its end, so the grid's last slot always starts one step before
+    # ``horizon_end``: coverage reaches the horizon when the *fresh* slots' own cadence carries the
+    # last one up to it. Measure with that cadence (60 min for an hourly feed, 15 for a
+    # quarter-hourly one), or a fully covered forecast would report a phantom uncovered tail and a
+    # note claiming stale slots that are fresh.
+    step = _grid_minutes([slot.t for slot in fresh]) or SLOT_MINUTES
+    covered_until = coverage_end + timedelta(minutes=step)
+    if covered_until < horizon_end:
         forecast.degraded = True
         forecast.notes.append(
-            f"coverage ends {to_iso(coverage_end)} before the requested horizon "
+            f"coverage ends {to_iso(covered_until)} before the requested horizon "
             f"{to_iso(horizon_end)}; uncovered slots are stale"
         )
     if mark_overall_stale and coverage_end < start + timedelta(hours=MIN_FRESH_COVERAGE_HOURS):
@@ -982,7 +1010,7 @@ def fetch_static(
         raise ProviderError("static: price.static_schedule is empty")
     zone = _zone(tz or settings.get("timezone"))
     horizon = _horizon_hours(settings)
-    start = quarter_floor(moment, SLOT_MINUTES)
+    start = _grid_start(moment, settings)
     grid = slot_range(start, start + timedelta(hours=horizon), SLOT_MINUTES)
     pairs: list[tuple[datetime, Any]] = []
     for slot_time in grid:
@@ -1091,7 +1119,7 @@ def fetch_fixed_tariff(
     zone = _zone(tz or settings.get("timezone"))
     contract = str(settings.get("price.contract", "fixed_single") or "fixed_single")
     horizon = _horizon_hours(settings)
-    start = quarter_floor(moment, SLOT_MINUTES)
+    start = _grid_start(moment, settings)
     grid = slot_range(start, start + timedelta(hours=horizon), SLOT_MINUTES)
     if contract == "fixed_day_night":
         day_price = _fixed_rate(
@@ -1185,6 +1213,8 @@ def load_price_forecast(
         raise ConfigError(f"unknown price source: {configured}")
     # ``fixed`` must never fall back to the market (SPEC 4.1): a single-element chain.
     chain = [configured] if no_fallback else _chain(configured)
+    # The acceptance window is about *future* coverage, so it starts at the current quarter - not at
+    # the (coarser) plan slot start the providers themselves fill from.
     start = quarter_floor(moment, SLOT_MINUTES)
     end = start + timedelta(hours=horizon_hours(settings))
     statuses: dict[str, ProviderStatus] = {}

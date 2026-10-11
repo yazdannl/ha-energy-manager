@@ -15,7 +15,7 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **631 passed** (two consecutive runs) |
+| Test suite | `python3 -m pytest tests -q` | **634 passed** (two consecutive runs) |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 91 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
@@ -24,7 +24,7 @@ loopback addresses and placeholder coordinates.
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (77 files, documentation excluded)**:
-  `fac4311fd139c5b182e09d492118f56ecda6cbdd1d513c59320e8fde2d65315c`
+  `0c8eea4500fac38c881f148462de38a4aeb1dc306d9f639607f620619d67b978`
 * **path list of the same 77 files** (detects an added, removed or renamed file):
   `63e3910878cca4ec6ac8802e98b49448c7d6655eab98076ddfcf1d0140adf88b`
 
@@ -359,8 +359,9 @@ independently re-downloaded and compared, not just recorded).
 **What the redesign guarantees, and the gate that holds it.** `tools/ui_render_check.js` (run by
 `tests/test_wp3_ui_render.py`, skipped when node is absent) renders the real `app.js` and `mock.js`
 through a dependency-free DOM shim (`tools/ui_dom_shim.js`, ~300 lines: elements, attributes,
-`classList`, `dataset`, `isConnected`, closed-`<details>` semantics) and asserts **44** properties of
-the result (42 at 0.7.0; §8.3 added the quiet-refresh pair and §8.4 the chart-layout five). The
+`classList`, `dataset`, `isConnected`, closed-`<details>` semantics) and asserts **49** properties of
+the result (42 at 0.7.0; §8.3 added the quiet-refresh pair, §8.4 the chart-layout five and §8.5 the
+plan-grid pair). The
 load-bearing ones:
 
 * all seven views render from mock data with no `undefined` or `NaN` in the output;
@@ -563,9 +564,9 @@ answers it. The load-bearing changes:
   legend, narrower axis gutters below ~480 px that keep their units, and `SEMCharts.refresh()` on an
   explicit theme change (previously only `prefers-color-scheme` changes refreshed a mounted chart).
 
-What the gates prove: `node tools/ui_render_check.js` asserts 44 properties, including that the
+What the gates prove: `node tools/ui_render_check.js` asserts 49 properties, including that the
 dashboard answer renders exactly once and survives a visibility-triggered quiet refresh; the pytest
-suite (631) holds the frozen contracts, the settings-IA pure tables and the copy rules.
+suite (634) holds the frozen contracts, the settings-IA pure tables and the copy rules.
 `docs/UI.md` and `docs/REFERENCE.md` §2 were updated in the same change, and
 `energy_manager/CHANGELOG.md` carries the user-facing entry.
 
@@ -616,6 +617,48 @@ legend/cursor behaviour, screen-reader announcements) remain the not-verified li
 The shim itself gained `element.style` as a real CSS declaration (property writes land in the
 serialized style attribute), `contains()`, and `previousElementSibling`/`nextElementSibling`, so the
 stub can exercise code paths the browser runs.
+
+---
+
+### 8.5 The plan grid defaults to the tariff's own slot length (0.8.2)
+
+`optimizer.slot_minutes` shipped as 15 minutes while the price feeds a household actually gets are
+hourly (the Zonneplan sensor's own list is hourly; `dynamic_hourly`). The optimiser is fed by
+`align_slots` onto the plan grid, so on a 15-minute grid each hour had one slot filled from a real
+entry and three forward-filled and flagged `stale` — and a stale slot is treated as a flat price
+(SPEC 4). The default is now **60 minutes**: 30 fresh slots over the 30 h horizon with an hourly feed.
+
+That change alone was not enough, and the shipped tests said so. Two gates failed
+(`test_a_plan_computed_without_a_live_soc_is_withheld_until_the_first_read`, `test_every_mode_boots_
+serves_and_writes_only_when_live[auto-False-True]`): the plan grid is floored to its own step, so at
+16:50 the plan starts at 16:00 while the price grid started at the current quarter (16:45). The
+plan's first slot — the one the dispatcher acts on — was therefore *backward-filled* and stale, and
+`dispatcher._stale_input_reason` refuses to execute a stale current slot (audit finding 2). With an
+hourly tariff on a 15-minute plan grid that blocked the battery for three quarters of every hour; it
+is a blocked *dispatch*, not merely a weaker plan. So:
+
+1. `sources/price.py::_grid_start` starts every provider's price grid at the plan slot containing
+   `now` (`quarter_floor(now, optimizer.slot_minutes)`); the current plan slot always matches a real
+   provider entry, and a quarter-hourly feed is unchanged (its floor is still the current quarter).
+   This also fixes `sensor.sem_price_now` reporting the *next* hour's price during the last quarter
+   of the hour, and the `load_price_forecast` acceptance window deliberately stays on the current
+   quarter so a provider must still have *future* coverage.
+2. `_apply_coverage` measures coverage with the **fresh** slots' own cadence. It previously compared
+   the last fresh slot's *start* with `horizon_end`, and `slot_range` excludes its end, so every
+   fully covered forecast was `degraded` with a note claiming stale slots that were fresh.
+
+New gates (both in `tests/test_wp2a_price.py`):
+`test_the_price_grid_starts_at_the_plan_slot_so_the_current_slot_is_never_stale` (hourly feed at
+16:50: the grid starts at 16:00, that slot is fresh, the 60-minute plan's current slot is fresh, no
+plan slot is stale, and a 15-minute plan grid still starts at 16:45) and
+`test_a_fully_covered_forecast_is_not_reported_as_a_short_tail` (covered → `degraded is False`, no
+"coverage ends" note; 12 h of coverage → still stale/degraded).
+`tests/test_wp2b_optimizer.py::test_the_plan_grid_defaults_to_the_price_resolution` pins the three
+copies of the default (dataclass, `from_settings` fallback, `config.DEFAULTS`) and the 5…60 bounds.
+
+Not verified here: the live instance's plan payload after the change (the add-on is ingress-only, so
+only the owner's browser sees it; `sensor.sem_*` does not publish slot counts). The engine's slot
+lifecycle, the dispatcher's per-slot refusal and the provider resampling are covered by the suite.
 
 ---
 
@@ -706,11 +749,11 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 631 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 634 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 
-# 3. R1 tripwire (expect: "audit: clean — 90 files scanned", exit 0)
+# 3. R1 tripwire (expect: "audit: clean — 91 files scanned", exit 0)
 sh tools/audit.sh
 
 # 4. End-to-end selfcheck (expect: 31/31 checks passed, exit 0)

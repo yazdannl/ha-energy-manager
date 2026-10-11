@@ -253,6 +253,77 @@ def test_zonneplan_entity_divides_by_1e7_drops_past_and_forward_fills():
     assert forecast.slots[-1].buy == pytest.approx(last_amount / 1e7 + 0.01)
 
 
+def test_the_price_grid_starts_at_the_plan_slot_so_the_current_slot_is_never_stale():
+    """SPEC 4 + 9.1: the price grid must cover the plan slot the dispatcher is acting on.
+
+    An hourly feed on a 60-minute plan grid is the shipped default. If the grid started at the
+    current quarter instead (16:45 for 16:50), the plan's first slot (16:00) would be filled from a
+    later slot and flagged stale - and the dispatcher refuses to execute a stale current slot, so
+    the battery would sit idle for most of every hour. The grid therefore starts where the plan
+    grid starts, and the current slot matches a real provider entry.
+    """
+    now = NOW + timedelta(minutes=50)  # not on a slot boundary
+    start = now.replace(minute=0, second=0, microsecond=0)
+    entries = [
+        {"datetime": (start + timedelta(hours=index)).isoformat(), "price": 0.20 + 0.01 * index}
+        for index in range(48)
+    ]
+    hourly = settings(**{"price.entity": "sensor.example_price_now", "optimizer.slot_minutes": 60})
+    forecast = fetch_entity_forecast(FakeClient(sensor_state(entries)), hourly, now=now)
+    assert forecast.slots[0].t == start, "the price grid must start at the current plan slot"
+    assert forecast.slots[0].stale is False
+    assert forecast.slots[0].buy == pytest.approx(0.20)
+
+    from app.models import LoadForecast, LoadSlot, SolarForecast, SolarSlot
+    from app.optimize.dp import align_slots
+
+    solar = SolarForecast(
+        source="capacity",
+        generated_at=now,
+        slots=[SolarSlot(t=start + timedelta(hours=i), pv_kw=1.0) for i in range(31)],
+    )
+    load = LoadForecast(
+        source="statistics",
+        generated_at=now,
+        slots=[LoadSlot(t=start + timedelta(hours=i), load_kw=0.5) for i in range(31)],
+    )
+    slots = align_slots(forecast, solar, load, start, start + timedelta(hours=30), 60)
+    current = next(slot for slot in slots if slot.t <= now < slot.t + timedelta(hours=1))
+    assert current.t == start
+    assert current.price_stale is False, "the dispatcher refuses a stale current slot"
+    assert not any(slot.price_stale for slot in slots)
+
+    # A quarter-hourly plan grid still starts at the current quarter: unchanged 15-minute behaviour.
+    quarter = settings(**{"price.entity": "sensor.example_price_now", "optimizer.slot_minutes": 15})
+    fifteen = fetch_entity_forecast(FakeClient(sensor_state(entries)), quarter, now=now)
+    assert fifteen.slots[0].t == now.replace(minute=45, second=0, microsecond=0)
+
+
+def test_a_fully_covered_forecast_is_not_reported_as_a_short_tail():
+    """SPEC 4: the grid ends one step before the horizon, which is not an uncovered tail.
+
+    ``slot_range`` excludes its end, so the last slot of a fully covered forecast always *starts*
+    before ``horizon_end``. Comparing that start with the horizon would report a phantom uncovered
+    tail - and a note claiming stale slots that are fresh - on every complete forecast.
+    """
+    hours = DEFAULTS["optimizer.horizon_hours"]
+    start = NOW.replace(minute=0, second=0, microsecond=0)
+    entries = [
+        {"datetime": (start + timedelta(minutes=15 * index)).isoformat(), "price": 0.20}
+        for index in range(hours * 4 + 4)
+    ]
+    configured = settings(**{"price.entity": "sensor.example_price_now", "optimizer.slot_minutes": 60})
+    forecast = fetch_entity_forecast(FakeClient(sensor_state(entries)), configured, now=NOW)
+    assert forecast.slots[-1].stale is False, "the horizon is covered to the end"
+    assert forecast.degraded is False
+    assert not any("coverage ends" in note for note in forecast.notes)
+
+    short = fetch_entity_forecast(FakeClient(sensor_state(entries[: 12 * 4])), configured, now=NOW)
+    assert short.slots[-1].stale is True
+    assert short.degraded is True
+    assert any("coverage ends" in note for note in short.notes)
+
+
 def test_zonneplan_scale_mismatch_disables_the_provider():
     entries = zonneplan_entries(NOW - timedelta(minutes=15), 8)
     bad_state = sensor_state(entries, state="0.55")  # stale payload or changed scale

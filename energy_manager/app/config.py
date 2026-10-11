@@ -109,7 +109,11 @@ DEFAULTS: dict[str, Any] = {
     "grid.import_entity": "",  # separate import power sensor, optional
     "grid.export_entity": "",  # separate export power sensor, optional
     # -- optimizer ----------------------------------------------------------------------
-    "optimizer.slot_minutes": 15,
+    # 60 min by default: most dynamic tariffs (and the Zonneplan sensor's own hourly list) are
+    # hourly, and a plan grid finer than the price resolution only produces forward-filled slots
+    # the optimiser must treat as flat (SPEC section 4). Set 5-60 to trade resolution for
+    # fidelity; providers are always resampled onto this grid.
+    "optimizer.slot_minutes": 60,
     # 30 h: the default Zonneplan feed reaches only ~+30 h, so a longer horizon always renders a
     # degraded (grey) tail; still covers the rest of today plus most of tomorrow.
     "optimizer.horizon_hours": 30,
@@ -252,7 +256,17 @@ SETTINGS_META: dict[str, _Meta] = {
     "grid.power_entity": _Meta("str", "grid", "Grid power entity", "Signed grid power sensor, positive = import; enables the derived load tier."),
     "grid.import_entity": _Meta("str", "grid", "Grid import entity", "Separate import power sensor (optional).", advanced=True),
     "grid.export_entity": _Meta("str", "grid", "Grid export entity", "Separate export power sensor (optional).", advanced=True),
-    "optimizer.slot_minutes": _Meta("int", "optimizer", "Slot minutes", "", minimum=5, maximum=60, advanced=True),
+    "optimizer.slot_minutes": _Meta(
+        "int",
+        "optimizer",
+        "Slot minutes",
+        "Plan and dispatch resolution. Set it to the tariff's own slot length (60 for hourly "
+        "prices): a finer grid than the price feed only adds forward-filled slots the optimiser "
+        "treats as flat.",
+        minimum=5,
+        maximum=60,
+        advanced=True,
+    ),
     "optimizer.horizon_hours": _Meta("int", "optimizer", "Horizon hours", "Clamped to 12..48 by the optimizer. Default 30 h matches the ~+30 h Zonneplan feed.", minimum=1, maximum=72),
     "optimizer.soc_step_kwh": _Meta("float", "optimizer", "SoC step", "kWh per DP state.", minimum=0.001, maximum=5.0, advanced=True),
     "optimizer.power_steps": _Meta("int", "optimizer", "Power steps", "Discrete actions per state.", minimum=3, maximum=200, advanced=True),

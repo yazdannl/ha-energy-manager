@@ -102,7 +102,9 @@ def aggregate_break_even_sell_eur_per_kwh(
 class OptimizerOptions:
     """Tunables read from ``optimizer.*`` settings (SPEC section 3)."""
 
-    slot_minutes: int = 15
+    #: Plan and dispatch resolution. The shipped default matches the common hourly dynamic
+    #: tariff; ``config.DEFAULTS`` must agree (a regression test pins the two together).
+    slot_minutes: int = 60
     horizon_hours: int = 30
     soc_step_kwh: float = 0.02
     power_steps: int = 24
@@ -121,7 +123,7 @@ class OptimizerOptions:
     def from_settings(cls, settings: Any) -> "OptimizerOptions":
         get = settings.get
         return cls(
-            slot_minutes=int(get("optimizer.slot_minutes", 15) or 15),
+            slot_minutes=int(get("optimizer.slot_minutes", 60) or 60),
             horizon_hours=int(get("optimizer.horizon_hours", 30) or 30),
             soc_step_kwh=float(get("optimizer.soc_step_kwh", 0.02) or 0.02),
             power_steps=int(get("optimizer.power_steps", 24) or 24),

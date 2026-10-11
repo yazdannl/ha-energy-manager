@@ -805,3 +805,30 @@ def test_optimizer_options_default_the_horizon_to_the_shipped_setting():
     from app.config import DEFAULTS
 
     assert DEFAULTS["optimizer.horizon_hours"] == dp.OptimizerOptions().horizon_hours
+
+
+def test_the_plan_grid_defaults_to_the_price_resolution():
+    """SPEC 3/4: the plan grid defaults to 60 min, and every copy of that default agrees.
+
+    An hourly tariff on a 15-minute plan grid leaves three of every four slots forward-filled and
+    flagged stale, and the optimiser treats a stale price as flat (SPEC 4), so the shipped default
+    must match the tariff granularity a household actually has. The dataclass default, the
+    ``from_settings`` fallback and ``config.DEFAULTS`` are the three places that could drift.
+    """
+    from app.config import DEFAULTS
+
+    assert dp.OptimizerOptions().slot_minutes == 60
+    assert dp.OptimizerOptions.from_settings({}).slot_minutes == 60
+    assert DEFAULTS["optimizer.slot_minutes"] == dp.OptimizerOptions().slot_minutes
+    # the setting still wins when present, and the documented bounds still hold
+    assert dp.OptimizerOptions.from_settings({"optimizer.slot_minutes": 15}).slot_minutes == 15
+    assert dp.OptimizerOptions.from_settings({"optimizer.slot_minutes": 5}).slot_minutes == 5
+    metadata = _setting_metadata("optimizer.slot_minutes")
+    assert (metadata.minimum, metadata.maximum) == (5, 60)
+    assert metadata.advanced is True
+
+
+def _setting_metadata(key: str):
+    from app.config import SETTINGS_META
+
+    return SETTINGS_META[key]

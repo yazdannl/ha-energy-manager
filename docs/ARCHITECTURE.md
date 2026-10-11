@@ -21,7 +21,7 @@ next to it.
 | `app/sources/solar.py` | PV forecast provider (Forecast.Solar, keyless or with a personal key; capacity/derived model with NASA POWER observed clearness), plane summation, cache and bias correction. |
 | `app/sources/load.py` | Load forecast: long-term statistics profile, level scaling, EWMA bias, optional temperature regression, flat fallback. |
 | `app/sources/measure.py` | Sampling of grid/PV/load/battery measurements into 5-minute `actuals` rows. |
-| `app/optimize/dp.py` | SoC dynamic program over 15-minute slots; deterministic, with a bounded state/action grid. |
+| `app/optimize/dp.py` | SoC dynamic program over `optimizer.slot_minutes` slots (60 by default); deterministic, with a bounded state/action grid. |
 | `app/optimize/allocate.py` | Split of the aggregate slot power across batteries, respecting per-battery limits and efficiency. |
 | `app/control/safety.py` | Pure guard-rail functions: the ordered clamp/block decision for a requested power. |
 | `app/control/dispatcher.py` | Tick loop: sample, replan when needed, grid-follow correction, safety, driver writes, dispatch log. |
@@ -248,8 +248,10 @@ These are conscious trade-offs, not accidents. Each has an upgrade path.
   frame codec itself and the API uses the standard HTTP server behind ingress. No auth is built on
   top: ingress supplies it. Upgrade path: a real ASGI server would be a new dependency for no
   user-visible gain at this scale.
-- **Time resolution is 15 minutes.** Prices are published in quarter-hour slots; PV and load are
-  resampled onto the same grid by interpolation or hourly scaling. Anything finer is smoothed away.
+- **Time resolution is a setting.** Price, PV and load providers all publish a 15-minute grid; the
+  plan and dispatch grid is `optimizer.slot_minutes` (60 by default, matching the hourly dynamic
+  tariffs most suppliers publish). A plan grid finer than the price feed only adds forward-filled
+  slots the optimiser treats as flat, so the default matches the tariff's own slot length.
 - **One process, one household.** No multi-site or multi-user support, no remote API, no MQTT.
 
 ## What it deliberately does not do

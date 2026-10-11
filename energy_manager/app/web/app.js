@@ -813,7 +813,7 @@
     if (!plan || !Array.isArray(plan.slots)) return null;
     var now = parseDate(when || new Date());
     if (!now) return null;
-    var step = (plan.slot_minutes || 15) * 60000;
+    var step = (plan.slot_minutes || 60) * 60000;
     for (var i = 0; i < plan.slots.length; i++) {
       var t = parseDate(plan.slots[i].t);
       if (t && t.getTime() <= now.getTime() && now.getTime() < t.getTime() + step) return plan.slots[i];
@@ -1310,7 +1310,9 @@
       flags.push({
         level: "warn",
         title: "Stale prices",
-        text: stale + " of " + slots.length + " price slots are stale (grey in the timeline). The optimiser treats a stale price as flat, so those slots cannot argue for or against a charge — this plan leans on the " + fresh + " slot" + (fresh === 1 ? "" : "s") + " with a fresh price."
+        text: stale + " of " + slots.length + " slots carry no fresh price (grey in the timeline). " +
+          "The optimiser treats a stale price as flat, so those slots cannot argue for or against a " +
+          "charge; this plan leans on the " + fresh + " slot" + (fresh === 1 ? "" : "s") + " with a fresh price."
       });
     }
     var sources = [];
@@ -1386,7 +1388,7 @@
   // Slot length comes from the payload, never assumed: a 5-minute plan must not be captioned as
   // 15-minute resolution (UI_REVIEW §3.5/§3.6).
   function planSlotMinutes(plan) {
-    var minutes = plan && isNum(plan.slot_minutes) && plan.slot_minutes > 0 ? plan.slot_minutes : 15;
+    var minutes = plan && isNum(plan.slot_minutes) && plan.slot_minutes > 0 ? plan.slot_minutes : 60;
     return Math.round(minutes);
   }
 

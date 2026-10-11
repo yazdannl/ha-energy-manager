@@ -47,7 +47,7 @@ accessibility list, and the open questions follow.
 Every actionable finding below has been implemented in the web assets (`app.js`, `charts.js`,
 `index.html`, `style.css`, `mock.js`); the review text itself is unchanged, so §3.x still reads as
 the original critique. Verification at this revision: `node tools/ui_render_check.js` (49/49) and the
-full pytest suite (631 passing, including `test_wp3_ui_render.py`, `test_wp3_assets.py` and
+full pytest suite (634 passing, including `test_wp3_ui_render.py`, `test_wp3_assets.py` and
 `test_wp3_mock_contract.py`).
 
 | # | Status | Where the fix lives |

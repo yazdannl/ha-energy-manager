@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.8.2
+
+- **The plan grid now defaults to 60 minutes**, matching the hourly dynamic tariffs most suppliers
+  publish (`optimizer.slot_minutes` = 60; was 15).
+- **The price grid now starts where the plan grid starts.** This is the fix that makes the 60-minute
+  default safe: the plan grid is floored to its own step, so a price forecast starting at the
+  *current quarter* (16:45 at 16:50) left the plan's first slot - the one the dispatcher acts on -
+  filled from a later slot and flagged stale, and the dispatcher never executes a stale current
+  slot. With an hourly tariff on a 15-minute plan grid that meant the battery was blocked for three
+  quarters of every hour, and the optimiser discarded 90 of 120 slots as flat. Now the current plan
+  slot always matches a real provider entry: an hourly feed plans 30 fresh slots with no gaps, and a
+  quarter-hourly feed is unchanged (its grid still starts at the current quarter). It also stops
+  `sensor.sem_price_now` reporting the *next* hour's price during the last quarter of the hour.
+- **A fully covered forecast is no longer reported as a short tail.** The grid ends one step before
+  the horizon (`slot_range` excludes its end), and comparing that slot's *start* with the horizon
+  marked every complete forecast `degraded` and added a "coverage ends …; uncovered slots are stale"
+  note that was simply false. Coverage is now measured with the fresh slots' own cadence.
+- Dispatch resolution follows the same setting: setpoints change once per slot, and the action
+  windows, captions and slot table all report the plan's own resolution (it is never assumed to be
+  15 minutes). Setting it in the add-on's Settings page overrides the new default.
+- The offline demo fixtures (`?mock=1`) use the same 60-minute plan grid, so the demo's captions and
+  slot table show what a default installation shows.
+- Stale-price warning reworded to name plan slots rather than "price slots".
+
 ## 0.8.1
 
 - **The chart legend no longer lands on top of the text under it.** On a phone the legend was drawn

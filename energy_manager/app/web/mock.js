@@ -9,7 +9,9 @@
 (function (root) {
   "use strict";
 
-  var SLOT_MS = 15 * 60000;
+  // The demo plan uses the shipped plan resolution (config.DEFAULTS optimizer.slot_minutes = 60),
+  // so the mock's own captions, slot table and windows match a default installation.
+  var SLOT_MS = 60 * 60000;
   var CAP_KWH = 12.0;
   var MIN_KWH = 4.0;
   var MAX_KWH = 10.4;
@@ -79,7 +81,7 @@
     var out = [];
     var soc = 6.0;
     var lastBuy = 0.21;
-    var count = 4 * 48; // 48 h; views request a window and slice it
+    var count = 48; // 48 h; views request a window and slice it
     for (var i = 0; i < count; i++) {
       var t = startMs + i * SLOT_MS;
       var d = new Date(t);
@@ -93,7 +95,7 @@
       var sell = round(Math.max(0.04, buy * 0.35), 4);
       // Mock: a few evening slots see a profitable peak feed-in so both the discharge and the
       // efficiency_loss branches appear in the demo plan.
-      if (hour >= 18 && hour < 21 && i % 3 === 0) sell = round(buy * 1.3, 4);
+      if (hour >= 18 && hour < 21 && i % 2 === 0) sell = round(buy * 1.3, 4);
 
       var power = 0, action = "hold", reason = "reserve_hold";
       if (pv * 1000 > load * 1000 + 300 && soc < MAX_KWH - 0.2) {
@@ -113,8 +115,8 @@
       } else if (soc <= MIN_KWH + 0.2) {
         action = "reserve"; reason = "battery_empty";
       }
-      if (power > 0) soc = Math.min(MAX_KWH, soc + (power / 1000) * 0.25 * 0.95);
-      else if (power < 0) soc = Math.max(MIN_KWH, soc + (power / 1000) * 0.25 / 0.95);
+      if (power > 0) soc = Math.min(MAX_KWH, soc + (power / 1000) * 1.0 * 0.95);
+      else if (power < 0) soc = Math.max(MIN_KWH, soc + (power / 1000) * 1.0 / 0.95);
       soc = round(soc, 2);
 
       out.push({
@@ -140,7 +142,7 @@
   }
 
   function windowSlots(hours) {
-    var n = clamp(parseInt(hours, 10) || 36, 1, 48) * 4;
+    var n = clamp(parseInt(hours, 10) || 36, 1, 48);
     return planSlots().slice(0, n);
   }
 
@@ -148,7 +150,7 @@
     var slots = windowSlots(hours);
     var cost = 0, baseline = 0;
     slots.forEach(function (s) {
-      var dt = 0.25;
+      var dt = 1.0;
       var grid = s.load_kw - s.pv_kw - s.power_w / 1000;
       cost += dt * (grid >= 0 ? s.buy * grid : -s.sell * -grid);
       var base = s.load_kw - s.pv_kw;
@@ -164,7 +166,7 @@
     var dischargedKwh = 0.0;
     slots.forEach(function (s) {
       var power = Number(s.power_w);
-      if (isFinite(power) && power < 0) dischargedKwh += -power / 1000.0 * 0.25;
+      if (isFinite(power) && power < 0) dischargedKwh += -power / 1000.0 * 1.0;
     });
     var cycleCost = round(MOCK_WEAR * dischargedKwh, 6);
     var costs = round(cost, 2);
@@ -180,7 +182,7 @@
       generated_at: iso(startMs),
       horizon_start: slots.length ? slots[0].t : iso(startMs),
       horizon_end: slots.length ? iso(startMs + slots.length * SLOT_MS) : iso(startMs),
-      slot_minutes: 15,
+      slot_minutes: 60,
       feasible: true,
       infeasible_reason: null,
       mode: db.mode,
@@ -412,7 +414,7 @@
     ["grid.import_entity", "str", "", "Grid import entity", "Separate import power sensor (optional).", "grid", null],
     ["grid.export_entity", "str", "", "Grid export entity", "Separate export power sensor (optional).", "grid", null],
 
-    ["optimizer.slot_minutes", "int", 15, "Slot minutes", "", "optimizer", null],
+    ["optimizer.slot_minutes", "int", 60, "Slot minutes", "Plan and dispatch resolution; match it to the tariff's slot length.", "optimizer", null],
     ["optimizer.horizon_hours", "int", 30, "Horizon hours", "Clamped to 12..48 by the optimizer. Default 30 h matches the ~+30 h Zonneplan feed.", "optimizer", null],
     ["optimizer.soc_step_kwh", "float", 0.02, "SoC step", "kWh per DP state.", "optimizer", null],
     ["optimizer.power_steps", "int", 24, "Power steps", "Discrete actions per state.", "optimizer", null],
