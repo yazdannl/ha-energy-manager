@@ -128,14 +128,15 @@ Wear comes from the pack's own economics, not a number you have to look up: ente
 price** and the **cycle life** on the battery card and the add-on derives
 
 ```
-wear = price / (cycle_life × usable kWh)      # EUR per kWh delivered
+wear = price / (cycle_life × usable kWh × η_dis)   # EUR per kWh delivered
 ```
 
-For example 3000 EUR over 6000 cycles on 9.6 kWh usable is about 5.2 ct per delivered kWh. A full
-cycle costs `price / cycle_life`; charging alone costs no wear, because wear is charged per kWh
-actually delivered to the house. Leave the fields empty and the battery plans as wear-free. The
-advanced `optimizer.cycle_cost_eur_per_kwh` setting overrides the derived value when you want to
-model something the price/life pair cannot express.
+Dividing by the AC energy a full discharge delivers (`usable kWh × η_dis`) is what makes a full
+cycle cost exactly `price / cycle_life`. For example 3000 EUR over 6000 cycles on 9.6 kWh usable at
+a 95 % discharge efficiency is about 5.5 ct per delivered kWh. Charging alone costs no wear, because
+wear is charged per kWh actually delivered to the house. Leave the fields empty and the battery
+plans as wear-free. The advanced `optimizer.cycle_cost_eur_per_kwh` setting overrides the derived
+value when you want to model something the price/life pair cannot express.
 
 A cycle loses energy, so the buy price is not the break-even price:
 
@@ -164,9 +165,9 @@ against the sell prices. A slot that stays idle because
 the spread does not cover the loss reports `efficiency_loss` — that is the conversion loss, distinct
 from your own `optimizer.min_spread_eur_per_kwh` floor, which reports `spread_below_threshold`.
 
-With several batteries the plan works on capacity-weighted mean efficiencies and usable-weighted mean
-wear (a documented approximation when packs differ materially), spends the most efficient battery
-first, and reports the aggregate round trip and wear it assumed. Break-even is still computed per
+With several batteries the plan works on capacity-weighted mean efficiencies and delivered-energy-
+weighted mean wear (a documented approximation when packs differ materially), spends the most
+efficient battery first, and reports the aggregate round trip and wear it assumed. Break-even is still computed per
 battery from its own values, so a cheap old pack and an efficient new one are not averaged into one
 misleading number.
 

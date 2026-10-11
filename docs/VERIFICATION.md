@@ -15,7 +15,7 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **625 passed** (two consecutive runs) |
+| Test suite | `python3 -m pytest tests -q` | **631 passed** (two consecutive runs) |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 90 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
@@ -23,7 +23,7 @@ loopback addresses and placeholder coordinates.
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (77 files, documentation excluded)**:
-  `3b23073b3d1288f9efcfe1397b8e88462981dcd06b160a9315dc6054e9bfdbbc`
+  `be90facad864490c51fb83827786e4d37516bbd125a9ce4a2e3f7f5539c2c2f7`
 * **path list of the same 77 files** (detects an added, removed or renamed file):
   `63e3910878cca4ec6ac8802e98b49448c7d6655eab98076ddfcf1d0140adf88b`
 
@@ -160,8 +160,9 @@ regressions; it proves these specific, previously demonstrated defects cannot re
 * `round_trip_efficiency_pct` is the input; the split is exact — `sqrt` with a 1-ULP correction so
   that the product of the two directions is exactly the requested round trip.
 * The break-even sale price is `buy / round_trip + wear`, with wear derived per battery from
-  `price_eur / (cycle_life × usable_kwh)`; 20 ct at a 75 % round trip gives 26.666… ct exactly (not
-  25 ct, which would be the 80 % case).
+  `price_eur / (cycle_life × usable_kwh × eta_discharge)` so that one full cycle costs exactly
+  `price_eur / cycle_life`; 20 ct at a 75 % round trip gives 26.666… ct exactly (not 25 ct, which
+  would be the 80 % case).
 * The planner holds when the sale price is below break-even and cycles above it
   (`test_a_round_trip_loss_labels_the_idle_slot_efficiency_loss` and its counterpart
   `test_the_same_slot_with_a_full_round_trip_is_not_an_efficiency_loss`).
@@ -485,21 +486,39 @@ solar irradiation data … at the specific time". The answers and the changes, i
   watt-peak fit. It is additive: cloud coverage and the measured-PV bias keep priority, and
   `forecast_solar` is untouched.
 * **Wear.** `BatteryConfig` gained `price_eur` and `cycle_life`; `wear_eur_per_kwh =
-  price / (cycle_life × usable_kwh)` per delivered kWh, usable-weighted across the fleet, with
-  `optimizer.cycle_cost_eur_per_kwh` kept as an advanced override (the owner chose those two options
-  explicitly).
+  price / (cycle_life × usable_kwh × eta_discharge)` per delivered kWh (the eta divisor makes one
+  full discharge cost exactly `price / cycle_life`; an independent review caught the missing term),
+  delivered-energy-weighted across the fleet, with `optimizer.cycle_cost_eur_per_kwh` kept as an
+  advanced override (the owner chose those two options explicitly).
 * **Break-even.** `buy / round_trip + wear`, no per-direction term, and the DP charges wear on the
   discharge leg only (`wear × eta_dis × max(0, e_i − e_{i+1})`).
+* **NASA robustness (review follow-up).** A failed fetch is remembered for 3 hours so an unreachable
+  NASA costs one request rather than one per refresh, the local timezone is part of the profile's
+  cache identity (the buckets are local hours), the profile cache rejects a future timestamp, and
+  cache I/O failures are a miss, never a failed forecast. Two review findings are accepted as
+  documented approximations: the DP's single delivered-energy-weighted fleet wear, and the derived
+  fit scaling every historical export sample by the recent 21-day clearness median rather than the
+  weather of its own date. The learned per-hour bias still applies on top of the NASA attenuation;
+  it was fitted against the NASA-free model and self-corrects within days (SPEC §7.1.1a).
 
 What the gates prove: `test_wp2a_solar.py` covers the NASA fetch shape, the fill value, the
-per-hour medians (including the no-evidence default of 1.0), the weather-coverage skip, the failure
-path and the derived fit with and without clearness; `test_wp1_external_contracts.py` pins the UTC
+per-hour medians (including the no-evidence default of 1.0), the weather-coverage skip (also in a
+non-UTC zone), the failure path and backoff, cache keying and cache-I/O tolerance, and the derived
+fit with and without clearness; `test_wp1_external_contracts.py` pins the UTC
 stamp shape and the clearness definition; `test_wp2a_config.py` covers the derivation, the zero-input
-cases and validation; `test_wp2b_efficiency.py` and `test_wp5_optimizer_oracle.py` recompute the
-discharge-only objective independently and assert DP == brute force; `test_wp3_assets.py` and
-`test_wp3_mock_contract.py` pin the UI maths and the mock contract. Two adversarial checks were not
+cases and validation (including NaN/inf); `test_wp2b_efficiency.py` and `test_wp5_optimizer_oracle.py`
+recompute the discharge-only objective independently and assert DP == brute force;
+`test_wp3_assets.py` and `test_wp3_mock_contract.py` pin the UI maths and the mock contract. Two
+adversarial checks were not
 run this wave (no independent audit), and the NASA clearness has not been compared against a
 pyranometer: the synthetic recovery tests and the live probe of the API shape are what exists.
+
+**Review follow-up (2026-10-11).** Before the first deployment an independent review (medium tier,
+separate session) was run on this wave. It found the missing `eta_discharge` in the wear divisor
+(fixed, with a full-cycle test), a coverage computation that asked NASA even when the weather
+forecast covered every hour of a non-UTC horizon (fixed), and NASA cache I/O outside the exception
+handler (fixed). Its remaining findings are either pre-existing or accepted approximations, and are
+listed in the bullet above and SPEC §7.1.1a/§7.1.2 rather than silently dropped.
 
 ---
 
@@ -590,7 +609,7 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 625 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 631 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 

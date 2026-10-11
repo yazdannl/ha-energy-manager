@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -20,9 +21,13 @@ from app.sources.solar import (  # noqa: E402
     BACKOFF_KEY,
     BACKOFF_KIND,
     DERIVED_MIN_SAMPLES,
+    NASA_FAILURE_BACKOFF_HOURS,
+    NASA_KIND,
+    NASA_PROFILE_KEY,
     _capacity_geometry,
     _implied_capacity_wp,
     _interpolate,
+    _nasa_cache,
     _parse_watts,
     _plane_irradiance,
     fetch_nasa_hourly,
@@ -971,6 +976,114 @@ def test_capacity_forecast_does_not_ask_nasa_when_the_weather_entity_covers_the_
     assert status.ok, status.last_error
     assert status.detail["nasa_status"] == "not needed"
     assert nasa.urls == []
+
+
+def test_weather_coverage_in_a_non_utc_zone_also_skips_nasa(store):
+    # The cloud map is keyed by slot and looked up by local hour; the coverage test must count
+    # local hours too, or a non-UTC install would ask NASA for a horizon the weather already covers.
+    weather = WeatherStub(forecast=hourly_forecast([50] * 30))
+    nasa = NasaStub(error=AssertionError("NASA must not be called when cloud data covers every hour"))
+    settings = capacity_settings(
+        store, **{"solar.nasa_irradiance": True, "solar.weather_entity": WEATHER_ENTITY}
+    )
+    forecast, status = load_capacity(
+        settings, store, weather, location=(52, 5, "Europe/Amsterdam"), http=nasa
+    )
+    assert status.ok, status.last_error
+    assert status.detail["nasa_status"] == "not needed"
+    assert nasa.urls == []
+    assert all(slot.uncertainty_pct == 25.0 for slot in forecast.slots)
+
+
+def test_partial_cloud_coverage_in_a_non_utc_zone_keeps_cloud_over_nasa(store):
+    zone = ZoneInfo("Europe/Amsterdam")
+    location = (52, 5, "Europe/Amsterdam")
+    weather = WeatherStub(forecast=hourly_forecast([80] * 6))
+    plain = capacity_settings(store, **{"solar.weather_entity": WEATHER_ENTITY})
+    with_nasa_settings = capacity_settings(
+        store, **{"solar.nasa_irradiance": True, "solar.weather_entity": WEATHER_ENTITY}
+    )
+    nasa = NasaStub(nasa_payload({hour: NASA_RATIO for hour in range(8, 16)}))
+    without, _ = load_capacity(plain, store, weather, location=location)
+    with_nasa, status = load_capacity(with_nasa_settings, store, weather, location=location, http=nasa)
+    assert status.ok, status.last_error
+    assert nasa.urls, "partial coverage must consult NASA"
+    assert status.detail["nasa_status"] == "fresh fit"
+    covered = {(NOW + timedelta(hours=index)).astimezone(zone).hour for index in range(6)}
+    checked = False
+    for slot, base in zip(with_nasa.slots, without.slots):
+        if base.pv_kw <= 0.0:
+            continue
+        hour = slot.t.astimezone(zone).hour
+        expected = 1.0 if hour in covered else (NASA_RATIO if 8 <= hour <= 15 else 1.0)
+        assert slot.pv_kw == pytest.approx(base.pv_kw * expected, rel=1e-9), f"hour {hour}"
+        checked = True
+    assert checked, "the horizon must contain daylight"
+
+
+class NasaCacheErrorStore:
+    """A store whose NASA profile I/O always fails, as a locked database would."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def profile_get(self, kind, key):
+        if kind == NASA_KIND:
+            raise RuntimeError("database is locked")
+        return self.inner.profile_get(kind, key)
+
+    def profile_put(self, kind, key, payload, updated_at=None):
+        if kind == NASA_KIND:
+            raise RuntimeError("database is locked")
+        return self.inner.profile_put(kind, key, payload, updated_at)
+
+
+def test_nasa_cache_io_failure_is_not_a_failed_forecast(store):
+    settings = capacity_settings(store, **{"solar.nasa_irradiance": True})
+    broken = NasaCacheErrorStore(store)
+    forecast, status = load_capacity(settings, broken, http=NasaStub(nasa_payload({12: NASA_RATIO})))
+    assert status.ok, status.last_error
+    assert status.detail["nasa_status"] == "fresh fit", "a cache write failure must not fail the fit"
+    assert not any("NASA POWER irradiance unavailable" in note for note in forecast.notes)
+    _, failed = load_capacity(settings, broken, http=NasaStub(error=ProviderError("offline")))
+    assert failed.ok and failed.detail["nasa_status"] == "failed"
+
+
+def test_nasa_failure_is_backed_off_between_refreshes(store):
+    settings = capacity_settings(store, **{"solar.nasa_irradiance": True})
+    first_fail = NasaStub(error=ProviderError("offline"))
+    _, status = load_capacity(settings, store, http=first_fail)
+    assert status.detail["nasa_status"] == "failed" and len(first_fail.urls) == 1
+    # Inside the backoff window the recorded failure answers: no request, no repeated warning.
+    blocked = NasaStub(error=AssertionError("a failed fetch must be backed off"))
+    _, cooled = load_capacity(settings, store, http=blocked)
+    assert cooled.ok and cooled.detail["nasa_status"] == "failed" and blocked.urls == []
+    retry = NasaStub(nasa_payload({12: NASA_RATIO}))
+    later = NOW + timedelta(hours=NASA_FAILURE_BACKOFF_HOURS + 0.5)
+    _, recovered = load_capacity(settings, store, http=retry, now=later)
+    assert recovered.detail["nasa_status"] == "fresh fit" and len(retry.urls) == 1
+
+
+def test_nasa_profile_cache_is_keyed_by_timezone(store):
+    settings = capacity_settings(store, **{"solar.nasa_irradiance": True})
+    first = NasaStub(nasa_payload({hour: NASA_RATIO for hour in range(8, 16)}))
+    _, status = load_capacity(settings, store, http=first)
+    assert status.detail["nasa_status"] == "fresh fit"
+    # The buckets are local hours, so another timezone must refit, not reuse the UTC profile.
+    other = NasaStub(nasa_payload({hour: NASA_RATIO for hour in range(8, 16)}))
+    _, switched = load_capacity(settings, store, http=other, location=(52, 5, "Europe/Amsterdam"))
+    assert switched.detail["nasa_status"] == "fresh fit" and len(other.urls) == 1
+
+
+def test_nasa_cache_ignores_a_timestamp_from_the_future(store):
+    fingerprint = "52.0000|5.0000|UTC"
+    store.profile_put(
+        NASA_KIND,
+        NASA_PROFILE_KEY,
+        {"fingerprint": fingerprint, "factors": [1.0] * 24, "hours": 8, "samples": 48},
+        NOW + timedelta(hours=2),
+    )
+    assert _nasa_cache(store, fingerprint, NOW) is None, "a clock change is not freshness"
 
 
 def test_implied_capacity_uses_nasa_clearness_to_undo_cloud_bias():

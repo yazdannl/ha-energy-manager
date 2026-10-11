@@ -564,11 +564,20 @@ def test_fleet_wear_is_the_usable_weighted_mean_and_the_override_wins():
         price_eur=9000.0,
         cycle_life=6000,
     )
-    assert cheap.wear_eur_per_kwh == pytest.approx(1000.0 / (2000 * 5.0))
-    assert costly.wear_eur_per_kwh == pytest.approx(9000.0 / (6000 * 15.0))
+    assert cheap.wear_eur_per_kwh == pytest.approx(1000.0 / (2000 * 5.0 * 0.95))
+    assert costly.wear_eur_per_kwh == pytest.approx(9000.0 / (6000 * 15.0 * 0.95))
     agg = dp.BatteryAggregate.from_configs([cheap, costly], 0.0)
-    expected = (5.0 * cheap.wear_eur_per_kwh + 15.0 * costly.wear_eur_per_kwh) / 20.0
+    # The fleet mean is weighted by delivered energy (usable x eta_discharge), not capacity alone.
+    delivered_cheap = 5.0 * cheap.eta_discharge
+    delivered_costly = 15.0 * costly.eta_discharge
+    expected = (
+        delivered_cheap * cheap.wear_eur_per_kwh + delivered_costly * costly.wear_eur_per_kwh
+    ) / (delivered_cheap + delivered_costly)
     assert agg.wear_eur_per_kwh == pytest.approx(expected)
+    for config in (cheap, costly):
+        assert config.wear_eur_per_kwh * config.usable_kwh() * config.eta_discharge == pytest.approx(
+            config.price_eur / config.cycle_life
+        ), "one full cycle costs price / cycle_life"
 
     slots = make_slots(8, 15, pv=0.0, load=0.0, buy=[0.10, 0.30, 0.20, 0.40, 0.20, 0.30, 0.10, 0.40])
     opts = dp.OptimizerOptions(slot_minutes=15, soc_step_kwh=0.5, power_steps=6, allow_export=True)

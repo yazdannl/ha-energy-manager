@@ -18,7 +18,8 @@
   // SPEC 5: wear is derived per battery from its own price and cycle life, per kWh delivered.
   var MOCK_PRICE_EUR = 3000.0;
   var MOCK_CYCLE_LIFE = 6000;
-  var MOCK_WEAR = round(MOCK_PRICE_EUR / (MOCK_CYCLE_LIFE * CAP_KWH * (90.0 - 10.0) / 100.0), 9);
+  // Delivered energy per full cycle is usable kWh x eta_discharge, so a full cycle costs price/life.
+  var MOCK_WEAR = round(MOCK_PRICE_EUR / (MOCK_CYCLE_LIFE * (CAP_KWH * (90.0 - 10.0) / 100.0) * MOCK_ETA), 9);
 
   /** Mirrors config.py: keep a derived round_trip_efficiency_pct and wear_eur_per_kwh on every
    *  read-back config. Both are derived, never stored (SPEC 5). */
@@ -32,16 +33,19 @@
     return config;
   }
 
-  /** Mirrors BatteryConfig.wear_eur_per_kwh: price / (cycle life x usable kWh); 0 when unknown. */
+  /** Mirrors BatteryConfig.wear_eur_per_kwh: price / (life x usable kWh x eta_discharge); 0 when
+   *  unknown. The eta term makes one full discharge cost exactly price / life (SPEC 5). */
   function derivedWearEur(config) {
     var price = Number((config || {}).price_eur);
     var life = Number((config || {}).cycle_life);
     var capacity = Number((config || {}).capacity_kwh);
     var minSoc = Number((config || {}).min_soc_pct);
     var maxSoc = Number((config || {}).max_soc_pct);
+    var etaDischarge = Number((config || {}).eta_discharge);
+    if (!(etaDischarge > 0) || etaDischarge > 1) etaDischarge = MOCK_ETA;
     var usable = capacity * (maxSoc - minSoc) / 100;
     if (!(price > 0) || !(life > 0) || !(usable > 0)) return 0;
-    return round(price / (life * usable), 9);
+    return round(price / (life * usable * etaDischarge), 9);
   }
 
   /** Mirrors config.py: a pct-only payload is split evenly; explicit etas win. */
@@ -413,7 +417,7 @@
     ["optimizer.soc_step_kwh", "float", 0.02, "SoC step", "kWh per DP state.", "optimizer", null],
     ["optimizer.power_steps", "int", 24, "Power steps", "Discrete actions per state.", "optimizer", null],
     ["optimizer.salvage_multiplier", "float", 1.0, "Salvage multiplier", "Terminal SoC valued at multiplier x median buy price.", "optimizer", null],
-    ["optimizer.cycle_cost_eur_per_kwh", "float", 0.0, "Wear override", "Advanced: a non-zero value replaces every battery's derived wear (price / (cycle life x usable kWh)) for planning and break-even. Leave 0 to use the derived per-fleet average wear.", "optimizer", null],
+    ["optimizer.cycle_cost_eur_per_kwh", "float", 0.0, "Wear override", "Advanced: a non-zero value replaces every battery's derived wear (price / (cycle life x usable kWh x discharge efficiency)) for planning and break-even. Leave 0 to use the derived per-fleet average wear.", "optimizer", null],
     ["optimizer.allow_grid_charge", "bool", true, "Allow grid charging", "", "optimizer", null],
     ["optimizer.allow_export", "bool", false, "Allow export", "Off until a feed-in tariff is configured; sell is then 0.00.", "optimizer", null],
     ["optimizer.reserve_soc_pct", "float", 0.0, "Reserve SoC", "Extra floor above battery min_soc.", "optimizer", null],

@@ -311,8 +311,10 @@ def test_plan_summary_matches_the_api_serializer(fixtures):
         rel=1e-12,
     )
     # The mock battery derives its wear from its own price and cycle life (SPEC 5):
-    # 3000 / (6000 cycles x 12 kWh x 80 % usable window).
-    assert summary["wear_eur_per_kwh"] == pytest.approx(3000.0 / (6000 * 12.0 * 0.8), abs=1e-9)
+    # 3000 / (6000 cycles x 12 kWh x 80 % usable window x sqrt(0.9) discharge efficiency).
+    assert summary["wear_eur_per_kwh"] == pytest.approx(
+        3000.0 / (6000 * 12.0 * 0.8 * 0.9 ** 0.5), abs=1e-9
+    )
     # objective = grid cost + cycle cost - salvage x terminal stored energy, rounded to cents
     expected_objective = round(
         summary["cost_estimate_eur"] + summary["cycle_cost_eur"]

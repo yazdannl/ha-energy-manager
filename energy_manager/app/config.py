@@ -257,7 +257,7 @@ SETTINGS_META: dict[str, _Meta] = {
     "optimizer.soc_step_kwh": _Meta("float", "optimizer", "SoC step", "kWh per DP state.", minimum=0.001, maximum=5.0, advanced=True),
     "optimizer.power_steps": _Meta("int", "optimizer", "Power steps", "Discrete actions per state.", minimum=3, maximum=200, advanced=True),
     "optimizer.salvage_multiplier": _Meta("float", "optimizer", "Salvage multiplier", "Terminal SoC valued at multiplier x median buy price.", minimum=0.0, maximum=3.0, advanced=True),
-    "optimizer.cycle_cost_eur_per_kwh": _Meta("float", "optimizer", "Wear override", "Advanced: a non-zero value replaces every battery's derived wear (price / (cycle life x usable kWh)) for planning and break-even. Leave 0 to use the derived per-fleet average wear.", minimum=0.0, maximum=1.0, advanced=True),
+    "optimizer.cycle_cost_eur_per_kwh": _Meta("float", "optimizer", "Wear override", "Advanced: a non-zero value replaces every battery's derived wear (price / (cycle life x usable kWh x discharge efficiency)) for planning and break-even. Leave 0 to use the derived per-fleet average wear.", minimum=0.0, maximum=1.0, advanced=True),
     "optimizer.allow_grid_charge": _Meta("bool", "optimizer", "Allow grid charging", ""),
     "optimizer.allow_export": _Meta("bool", "optimizer", "Allow export", "Off = never export on purpose. The feed-in price comes from the Price card."),
     "optimizer.reserve_soc_pct": _Meta("float", "optimizer", "Reserve SoC", "Extra floor above battery min_soc.", minimum=0.0, maximum=100.0),

@@ -190,20 +190,20 @@ class BatteryConfig:
 
     @property
     def wear_eur_per_kwh(self) -> float:
-        """Wear cost of one kWh **delivered** (AC): ``price / (cycle_life × usable kWh)``.
+        """Wear cost of one kWh **delivered** (AC): ``price / (cycle_life × usable kWh × η_dis)``.
 
-        A full cycle spreads the purchase price over its rated cycles, and each cycle delivers the
-        usable capacity, so the per-delivered-kWh figure needs no efficiency term (SPEC.md
-        section 5).
-        Returns 0.0 while either input is unset, which is exactly the old "no wear configured"
-        default; it never guesses a price or a life.
+        A full cycle spreads the purchase price over its rated cycles and delivers
+        ``usable_kwh × eta_discharge`` AC kWh, so dividing by that delivered energy makes one full
+        discharge cost exactly ``price / cycle_life`` (SPEC.md section 5). Returns 0.0 while either
+        input is unset, which is exactly the old "no wear configured" default; it never guesses a
+        price or a life.
         """
         if self.price_eur <= 0.0 or self.cycle_life <= 0.0:
             return 0.0
-        usable = self.usable_kwh()
-        if usable <= 0.0:
+        delivered = self.usable_kwh() * self.eta_discharge
+        if delivered <= 0.0:
             return 0.0
-        return self.price_eur / (self.cycle_life * usable)
+        return self.price_eur / (self.cycle_life * delivered)
 
     def break_even_sell_eur_per_kwh(
         self, buy_eur_per_kwh: float, wear_eur_per_kwh: float | None = None
@@ -236,10 +236,11 @@ class BatteryConfig:
             problems.append("at least one of max_charge_w / max_discharge_w must be > 0")
         if not 0 < self.eta_charge <= 1 or not 0 < self.eta_discharge <= 1:
             problems.append("efficiencies must be in (0, 1]")
-        if self.price_eur < 0:
-            problems.append("price_eur must be >= 0")
-        if self.cycle_life < 0:
-            problems.append("cycle_life must be >= 0")
+        for name, value in (("price_eur", self.price_eur), ("cycle_life", self.cycle_life)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                problems.append(f"{name} must be a finite number")
+            elif value < 0:
+                problems.append(f"{name} must be >= 0")
         if not self.mapping:
             problems.append("mapping is empty: confirm the entity mapping in the UI")
         return problems

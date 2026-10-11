@@ -402,7 +402,7 @@ def test_battery_break_even_maths():
     assert round(data["stored75"] * 100, 2) == 23.09, "stored kWh all-in = buy / eta_charge at zero wear"
     assert data["wearFromConfig"] == pytest.approx(0.05), "the derived per-battery wear is used"
     assert data["wearOverride"] == pytest.approx(0.02), "a positive override wins over derived wear"
-    assert data["derivedWear"] == pytest.approx(3000.0 / (6000 * 8.0)), "price / (cycles x usable kWh)"
+    assert data["derivedWear"] == pytest.approx(3000.0 / (6000 * 8.0 * 0.95)), "price / (cycles x usable kWh x eta_discharge)"
     assert data["derivedWearMissing"] is None, "unknown cycle life means no derived wear"
     assert data["unknownBuy"] is None
     assert abs(data["etaOnly"] - 81.0) < 1e-9

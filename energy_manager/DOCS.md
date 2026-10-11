@@ -39,15 +39,15 @@ Wear is derived from the pack's own price and cycle life (both optional fields o
 not typed in as a global number:
 
 ```
-wear = price / (cycle_life × usable kWh)          # EUR per kWh delivered
+wear = price / (cycle_life × usable kWh × η_dis)   # EUR per kWh delivered
 break_even_sell = buy / round_trip + wear
 ```
 
 Buying at 20 ct/kWh with a **75 %** round trip breaks even at **26.7 ct, not 25 ct** — 25 ct would be
-the 80 % case — plus the derived wear (for example 3000 EUR over 6000 cycles on 9.6 kWh usable is
-about 5.2 ct/kWh delivered). With no price or cycle life entered the wear is 0 and the formula
-reduces to `buy / round_trip`: 20 ct at 90 % breaks even at 22.2 ct. The advanced
-`optimizer.cycle_cost_eur_per_kwh` setting overrides the derived wear when non-zero.
+the 80 % case — plus the derived wear (for example 3000 EUR over 6000 cycles on 9.6 kWh usable at a
+95 % discharge efficiency is about 5.5 ct/kWh delivered). With no price or cycle life entered the
+wear is 0 and the formula reduces to `buy / round_trip`: 20 ct at 90 % breaks even at 22.2 ct. The
+advanced `optimizer.cycle_cost_eur_per_kwh` setting overrides the derived wear when non-zero.
 
 The add-on plans an arbitrage cycle only when the sell price clears that figure, values stored energy
 at `eta_discharge` (a stored kWh returns only part of itself to the house as AC, so it is not worth
@@ -56,10 +56,10 @@ face value), and reports a slot left idle because the spread does not cover the 
 `optimizer.min_spread_eur_per_kwh` floor (`spread_below_threshold`). Wear is charged per kWh
 delivered, so charging alone costs none.
 
-With several batteries the plan uses capacity-weighted mean efficiencies and usable-weighted mean
-wear (an approximation when the packs differ materially), spends the most efficient battery first,
-reports the aggregate round trip and wear it assumed, and computes each battery's break-even from
-that battery's own values.
+With several batteries the plan uses capacity-weighted mean efficiencies and delivered-energy-weighted
+mean wear (an approximation when the packs differ materially), spends the most efficient battery
+first, reports the aggregate round trip and wear it assumed, and computes each battery's break-even
+from that battery's own values.
 
 Where to look: the battery card shows the round trip, the derived wear and the break-even sale price
 that follows from it; the Plan view shows the assumed round trip and wear and draws the break-even

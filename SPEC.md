@@ -376,11 +376,13 @@ split evenly into `eta_charge = eta_discharge = sqrt(pct/100)`, and explicit per
 given) override the split, after which the round trip is their product.
 
 Wear is **derived per battery**, never typed in as a global number:
-`wear_eur_per_kwh = price_eur / (cycle_life × usable_kwh)` (0.0 while either input is unset; the UI
-states the derived value and a full cycle's cost). It is the cost of one kWh **delivered** to the
-house, so the plan uses the usable-weighted mean over the enabled fleet and the DP charges it on the
-discharge leg only. `optimizer.cycle_cost_eur_per_kwh` remains as an advanced **override**: a
-non-zero value replaces the derived wear for planning and break-even. `usable_kwh` is
+`wear_eur_per_kwh = price_eur / (cycle_life × usable_kwh × eta_discharge)` (0.0 while either input
+is unset; the UI states the derived value and a full cycle's cost). Dividing by the AC energy a full
+discharge actually delivers (`usable_kwh × eta_discharge`) is what makes one full cycle cost exactly
+`price_eur / cycle_life`. It is the cost of one kWh **delivered** to the house, so the plan uses the
+delivered-energy-weighted mean over the enabled fleet (`usable_kwh × eta_discharge` weights) and the
+DP charges it on the discharge leg only. `optimizer.cycle_cost_eur_per_kwh` remains as an advanced
+**override**: a non-zero value replaces the derived wear for planning and break-even. `usable_kwh` is
 `capacity_kwh × (max_soc_pct − min_soc_pct)/100`, the same window the planner cycles.
 
 The cost model uses `round_trip = eta_charge * eta_discharge`, so the break-even sale price for energy
@@ -482,9 +484,14 @@ Per 15-minute slot, with latitude/longitude and timezone from Home Assistant:
    sources only): observed hourly all-sky and clear-sky irradiance (W/m², keyless, ~2-3 days
    near-real-time latency) over the last 21 days ending before that latency are reduced to a median
    all-sky/clear-sky ratio per local hour-of-day — daylight samples only, at least 3 samples per
-   hour, clamped to `0.05…1.1`, cached daily per location. That ratio is applied to slots the weather
+   hour, clamped to `0.05…1.1`, cached daily per location and timezone (the buckets are local hours,
+   so the timezone is part of the cache identity). That ratio is applied to slots the weather
    entity does not cover (step 3 wins where it does), and it refines the derived fit (7.1.2). It is
-   an addition to the model, never a replacement: a failure is a note and the slot stays clear-sky.
+   an addition to the model, never a replacement: a failure is a note and the slot stays clear-sky,
+   and a failed fetch is remembered for 3 hours so an offline NASA costs one request, not one per
+   refresh. The learned per-hour bias (§7.1) is applied on top unchanged: it was fitted against the
+   NASA-free model, so an install with a trained bias may under-forecast for a few days until the
+   hourly EWMA adapts to the new baseline.
 4. **Power**: `pv_kw = (capacity_wp/1000)·(POA/1000)·performance_ratio`.
 
 Uncertainty is higher than an API forecast because the model is coarse: `35%` without cloud data,
@@ -525,8 +532,9 @@ samples are required; fewer is a status naming the meter, never a crash. The lea
 in the notes and in the status detail (`capacity_source`, `derived_samples`); it is not written back
 to the settings, and an explicit `solar.capacity_wp > 0` wins over it (the same "explicit beats
 derived" rule the load tier follows). The fit itself is cached in `learning_profiles`
-(`solar_derived`/`capacity`) with the entity mapping it was fitted from and is refit at most once a
-day, because it reads weeks of recorder history and the array size does not change between refreshes.
+(`solar_derived`/`capacity`) with the entity mapping it was fitted from and whether the NASA
+clearness was part of the fit, and is refit at most once a day, because it reads weeks of recorder
+history and the array size does not change between refreshes.
 The forecast itself is then the §7.1.1 capacity model, so
 `solar.tilt_deg`, `solar.azimuth_deg`, `solar.performance_ratio` and `solar.weather_entity` apply
 unchanged, and the forecast carries a note that the learned size is a conservative lower bound.
@@ -1241,9 +1249,11 @@ round, with the reason:
   solar capacity calculation take into account the solar irradiation data … at the specific
   time")** — the user reviewed the cost model and the forecast and asked for three changes.
   (a) Wear is no longer a global number typed into a settings field: each battery gains `price_eur`
-  and `cycle_life`, and `wear_eur_per_kwh = price / (cycle life × usable kWh)` is the cost of one
-  kWh **delivered**; the fleet plans with the usable-weighted mean, and `optimizer.cycle_cost_eur_per_kwh`
-  stays as an advanced override (user chose "keep as an advanced override" over removing it).
+  and `cycle_life`, and `wear_eur_per_kwh = price / (cycle life × usable kWh × eta_discharge)` is the
+  cost of one kWh **delivered** (the eta_discharge divisor was added after an independent review
+  showed the un-divided form charged a full cycle only `price/cycle_life × eta_discharge`); the fleet
+  plans with the delivered-energy-weighted mean, and `optimizer.cycle_cost_eur_per_kwh` stays as an
+  advanced override (user chose "keep as an advanced override" over removing it).
   (b) Because the wear term is now per delivered kWh, the break-even no longer needs a per-direction
   efficiency: `break_even_sell = buy / round_trip + wear` (the user's request: "we should just use
   roundtrip efficiency"). The DP objective charges wear on the discharge leg only (the user chose
@@ -1256,7 +1266,12 @@ round, with the reason:
   has no cloud coverage, and uses it in the derived watt-peak fit. Weather-entity cloud attenuation
   and the measured-PV bias keep priority; `forecast_solar` is unchanged. The user's other choices
   from the three options offered: per-battery fields with a fleet average, and keeping the global
-  setting as an override.
+  setting as an override. A later independent review (2026-10-11) added: a 3-hour failure backoff so
+  an unreachable NASA costs one request rather than one per refresh, the timezone in the profile's
+  cache identity, and the same cache-I/O tolerance the rest of the forecast has. Two review findings
+  are knowingly accepted rather than fixed: the fleet wears a single delivered-energy-weighted mean
+  although `allocate_power` favours particular packs, and the derived fit scales historical export
+  samples by the *recent* 21-day clearness median rather than the weather of each sample's own date.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

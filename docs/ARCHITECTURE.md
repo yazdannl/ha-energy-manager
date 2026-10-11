@@ -123,9 +123,10 @@ break_even_sell = buy / round_trip + wear_eur_per_kwh
 ```
 
 Wear is **derived per battery**, not typed in: `wear_eur_per_kwh = price_eur /
-(cycle_life × usable_kwh)` (`BatteryConfig.wear_eur_per_kwh`, 0.0 while either input is unset), the
-cost of one kWh **delivered** to the house. That unit is why the formula needs no per-direction
-efficiency: the energy term uses the round trip, the wear term is already per delivered kWh. The
+(cycle_life × usable_kwh × eta_discharge)` (`BatteryConfig.wear_eur_per_kwh`, 0.0 while either input
+is unset), the cost of one kWh **delivered** to the house. Because a full discharge delivers only
+`usable_kwh × eta_discharge` AC kWh, that divisor is what makes one full cycle cost exactly
+`price_eur / cycle_life`. The
 advanced `optimizer.cycle_cost_eur_per_kwh` override, when non-zero, replaces the derived value and
 is passed as the explicit `wear` argument. At a 20 ct buy price a 75 % round trip breaks even at
 26.7 ct — not 25 ct, which is the 80 % case — before wear. A degenerate efficiency returns `None`

@@ -100,7 +100,7 @@ solarSource})` and `SEM_APP.setupCardKeys({priceProvider, priceContract, solarSo
 - Battery efficiency/wear maths is client-side from values the API already returns (per-battery
   `eta_*`, `price_eur`, `cycle_life`, `wear_eur_per_kwh`, `/status` `price_now`, and the
   `optimizer.cycle_cost_eur_per_kwh` setting as the advanced override): round trip is
-  `eta_charge * eta_discharge`, derived wear is `price / (cycle_life × usable kWh)`, stored kWh
+  `eta_charge * eta_discharge`, derived wear is `price / (cycle_life × usable kWh × eta_discharge)`, stored kWh
   all-in is `buy / eta_charge + wear × eta_discharge`, and break-even is
   `buy / round_trip + wear`. The form's primary inputs are
   `round_trip_efficiency_pct` (split evenly into both directions) and the optional price/cycle life;

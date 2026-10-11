@@ -368,7 +368,7 @@ def test_wear_is_derived_from_price_and_cycle_life(store):
     assert plain.wear_eur_per_kwh == 0.0, "no price/life means no wear, never a guess"
     assert plain.break_even_sell_eur_per_kwh(0.20) == pytest.approx(0.2 / 0.9)
 
-    # 5 kWh x (100 - 10) % = 4.5 kWh usable; 2700 / (6000 x 4.5) = 0.1 EUR per delivered kWh
+    # 5 kWh x (100 - 10) % = 4.5 kWh usable; 2700 / (6000 x 4.5 x sqrt(0.9) discharge) per delivered kWh
     priced = settings.add_battery(
         _battery_payload(
             id="battery_2",
@@ -377,9 +377,12 @@ def test_wear_is_derived_from_price_and_cycle_life(store):
             cycle_life=6000,
         )
     )
-    assert priced.wear_eur_per_kwh == pytest.approx(0.1)
-    assert priced.break_even_sell_eur_per_kwh(0.20) == pytest.approx(0.2 / 0.9 + 0.1)
-    assert battery_payload(priced)["wear_eur_per_kwh"] == pytest.approx(0.1)
+    wear = 2700.0 / (6000.0 * 4.5 * math.sqrt(0.9))
+    assert priced.wear_eur_per_kwh == pytest.approx(wear)
+    # One full discharge delivers usable x eta_discharge and must cost exactly price / cycle_life.
+    assert priced.wear_eur_per_kwh * priced.usable_kwh() * priced.eta_discharge == pytest.approx(2700.0 / 6000.0)
+    assert priced.break_even_sell_eur_per_kwh(0.20) == pytest.approx(0.2 / 0.9 + wear)
+    assert battery_payload(priced)["wear_eur_per_kwh"] == pytest.approx(wear)
 
     # an explicit number is the advanced override; the derived value is the default
     assert priced.break_even_sell_eur_per_kwh(0.20, 0.0) == pytest.approx(0.2 / 0.9)
@@ -399,13 +402,17 @@ def test_wear_fields_round_trip_and_validate(store):
 
     # the derived wear is a read-only convenience: a PATCH accepting it must not persist it
     updated = settings.update_battery("battery_1", {"wear_eur_per_kwh": 0.5})
-    assert battery_payload(updated)["wear_eur_per_kwh"] == pytest.approx(1200.0 / (3000 * 4.5))
+    assert battery_payload(updated)["wear_eur_per_kwh"] == pytest.approx(1200.0 / (3000 * 4.5 * 0.95))
     assert "wear_eur_per_kwh" not in store.get_setting("batteries")[0]
 
     with pytest.raises(ConfigError):
         settings.update_battery("battery_1", {"price_eur": -1})
     with pytest.raises(ConfigError):
         settings.update_battery("battery_1", {"cycle_life": -1})
+    for field in ("price_eur", "cycle_life"):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ConfigError):
+                settings.update_battery("battery_1", {field: value})
     reloaded = Settings(store, options={}).battery("battery_1")
     assert (reloaded.price_eur, reloaded.cycle_life) == (1200.0, 3000.0)
 

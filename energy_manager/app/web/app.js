@@ -12,6 +12,8 @@
 
   var VIEW_DEFAULT = "/dashboard";
   var UNIT_EUR = "EUR";
+  //: Mirrors ``models.BatteryConfig.eta_discharge`` for a battery whose config carries no eta.
+  var DEFAULT_ETA_DISCHARGE = 0.95;
 
   var MOCK = (function () {
     try {
@@ -1736,7 +1738,8 @@
     return 0;
   }
 
-  /** Derived wear of a battery in the dialog: price / (cycle life x usable kWh), or null. */
+  /** Derived wear of a battery in the dialog: price / (cycle life x usable kWh x eta_discharge),
+   *  EUR per AC kWh delivered, or null. A full cycle therefore costs exactly price / cycle life. */
   function derivedWearEur(config) {
     var price = numeric((config || {}).price_eur);
     var life = numeric((config || {}).cycle_life);
@@ -1747,8 +1750,10 @@
     if (minSoc == null) minSoc = 0;
     if (maxSoc == null) maxSoc = 100;
     var usable = capacity * (maxSoc - minSoc) / 100;
+    var eff = batteryEfficiency(config || {});
+    var etaDischarge = eff && eff.eta_discharge > 0 ? eff.eta_discharge : DEFAULT_ETA_DISCHARGE;
     if (price == null || life == null || price <= 0 || life <= 0 || usable <= 0) return null;
-    return price / (life * usable);
+    return price / (life * usable * etaDischarge);
   }
 
   function batteryCycleCount(state) {
@@ -1909,7 +1914,7 @@
         eff
           ? el("p", { class: "card-sub" }, ["Charge ", fmtPct(eff.eta_charge * 100), " / discharge ", fmtPct(eff.eta_discharge * 100), eff.asymmetric ? " — advanced per-direction override" : " — split evenly from the round trip"])
           : el("p", { class: "field-error", text: "No usable efficiency on this battery: the stored-kWh and break-even maths is unavailable." }),
-        el("p", { class: "legend-note", text: "Stored kWh, all-in = buy ÷ charge efficiency + wear × discharge efficiency: the all-in cost of energy put into the pack. Break-even sale = the lowest sale price that covers the round trip: buy ÷ round trip + wear per delivered kWh. Wear is derived per battery from purchase price ÷ (cycle life × usable kWh)" + (isNum(config.price_eur) && config.price_eur > 0 ? " (" + fmtEur(config.price_eur) + " ÷ (" + (isNum(config.cycle_life) ? config.cycle_life : 0) + " cycles × " + fmtKwh(config.capacity_kwh * (config.max_soc_pct - config.min_soc_pct) / 100) + " usable))" : "") + "; the advanced wear override replaces it when set." + (buy != null ? " At the current buy price " + fmtPrice(buy) + " and wear " + fmtEur(wear) + "/kWh." : " The current buy price is unknown right now, so both show --.") }),
+        el("p", { class: "legend-note", text: "Stored kWh, all-in = buy ÷ charge efficiency + wear × discharge efficiency: the all-in cost of energy put into the pack. Break-even sale = the lowest sale price that covers the round trip: buy ÷ round trip + wear per delivered kWh. Wear is derived per battery from purchase price ÷ (cycle life × usable kWh × discharge efficiency), so a full cycle costs price ÷ cycle life" + (isNum(config.price_eur) && config.price_eur > 0 ? " (" + fmtEur(config.price_eur) + " ÷ (" + (isNum(config.cycle_life) ? config.cycle_life : 0) + " cycles × " + fmtKwh(config.capacity_kwh * (config.max_soc_pct - config.min_soc_pct) / 100) + " usable × " + fmtPct((batteryEfficiency(config) || { eta_discharge: DEFAULT_ETA_DISCHARGE }).eta_discharge * 100) + " discharge)" : "") + "; the advanced wear override replaces it when set." + (buy != null ? " At the current buy price " + fmtPrice(buy) + " and wear " + fmtEur(wear) + "/kWh." : " The current buy price is unknown right now, so both show --.") }),
         mappingList(config, record.mapping_resolved),
         Object.keys(capabilities).length ? el("p", { class: "legend-note", text: "Driver capabilities: " + Object.keys(capabilities).map(function (k) { return k + "=" + String(capabilities[k]); }).join(", ") }) : null,
         Array.isArray(record.discovery) && record.discovery.length ? el("p", { class: "legend-note", text: record.discovery.length + " entity candidate(s) available for the wizard." }) : null
@@ -2078,12 +2083,15 @@
     inputs.cycle_life = cycleLifeInput;
     var wearNote = el("p", { class: "muted" });
     function economicsInputs() {
+      var eff = batteryEfficiencyPayload(roundTripInput.value, etaChargeInput.value, etaDischargeInput.value);
       return {
         price_eur: numeric(priceInput.value),
         cycle_life: numeric(cycleLifeInput.value),
         capacity_kwh: numeric(inputs.capacity_kwh.value),
         min_soc_pct: numeric(inputs.min_soc_pct.value),
-        max_soc_pct: numeric(inputs.max_soc_pct.value)
+        max_soc_pct: numeric(inputs.max_soc_pct.value),
+        eta_charge: eff.payload ? eff.payload.eta_charge : null,
+        eta_discharge: eff.payload ? eff.payload.eta_discharge : null
       };
     }
     function updateWearNote() {
@@ -2094,16 +2102,18 @@
         wearNote.className = "muted";
         wearNote.textContent = oneSided
           ? "Fill in both the purchase price and the cycle life to derive wear; until then plans treat this battery as wear-free."
-          : "Optional. With a purchase price and a cycle life the add-on derives wear = price ÷ (cycle life × usable kWh) per kWh delivered — a full cycle costs price ÷ cycle life.";
+          : "Optional. With a purchase price and a cycle life the add-on derives wear = price ÷ (cycle life × usable kWh × discharge efficiency) per kWh delivered — a full cycle costs price ÷ cycle life.";
         return;
       }
       var usable = inputsNow.capacity_kwh * (inputsNow.max_soc_pct - inputsNow.min_soc_pct) / 100;
+      var etaDischarge = isNum(inputsNow.eta_discharge) && inputsNow.eta_discharge > 0 ? inputsNow.eta_discharge : DEFAULT_ETA_DISCHARGE;
       wearNote.className = "muted";
       wearNote.textContent = "Derived wear " + fmtEur(wear) + "/kWh delivered = " + fmtEur(inputsNow.price_eur) +
-        " ÷ (" + inputsNow.cycle_life + " cycles × " + fmtKwh(usable) + " usable). A full cycle costs " +
-        fmtEur(inputsNow.price_eur / inputsNow.cycle_life) + ". The advanced wear override in All settings replaces this when set.";
+        " ÷ (" + inputsNow.cycle_life + " cycles × " + fmtKwh(usable) + " usable × " + fmtPct(etaDischarge * 100) + " discharge efficiency). A full cycle delivers " +
+        fmtKwh(usable * etaDischarge) + " and costs " + fmtEur(inputsNow.price_eur / inputsNow.cycle_life) + ". The advanced wear override in All settings replaces this when set.";
     }
-    [priceInput, cycleLifeInput, inputs.capacity_kwh, inputs.min_soc_pct, inputs.max_soc_pct].forEach(function (input) {
+    [priceInput, cycleLifeInput, inputs.capacity_kwh, inputs.min_soc_pct, inputs.max_soc_pct,
+     roundTripInput, etaChargeInput, etaDischargeInput].forEach(function (input) {
       input.addEventListener("input", updateWearNote);
     });
     updateWearNote();

@@ -4,11 +4,12 @@
 
 - **Wear is derived from your battery, not typed in.** Each battery now takes an optional purchase
   price and cycle life; the add-on computes wear per kWh delivered as
-  `price / (cycle life × usable kWh)` (3000 EUR over 6000 cycles on 9.6 kWh usable ≈ 5.2 ct/kWh). A
-  full cycle costs `price / cycle_life`, and charging alone costs no wear because wear is charged on
-  the discharge leg only. The plan uses the usable-weighted mean over the fleet; the advanced
-  `optimizer.cycle_cost_eur_per_kwh` setting stays as an override and, when non-zero, replaces the
-  derived value. The battery card shows the derivation and the Plan summary shows the wear it used.
+  `price / (cycle life × usable kWh × discharge efficiency)`, so one full cycle costs exactly
+  `price / cycle_life` (3000 EUR over 6000 cycles on 9.6 kWh usable at 95 % discharge ≈ 5.5 ct/kWh).
+  Charging alone costs no wear because wear is charged on the discharge leg only. The plan uses the
+  delivered-energy-weighted mean over the fleet; the advanced `optimizer.cycle_cost_eur_per_kwh`
+  setting stays as an override and, when non-zero, replaces the derived value. The battery card shows
+  the derivation and the Plan summary shows the wear it used.
 - **The break-even is simpler: `buy / round trip + wear`.** Because wear is now stated per kWh
   delivered, the formula no longer needs the discharge efficiency; the chart line, the battery card,
   the idle-slot `efficiency_loss` reason and the docs all use the same expression.

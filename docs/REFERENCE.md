@@ -185,7 +185,7 @@ Panel: **Battery fleet**. Per battery card:
 | --- | --- |
 | Heading | name, driver badge, `enabled`/`disabled` badge, `stale state` badge |
 | Round trip | `Round trip` in percent — the single input, split evenly unless overridden |
-| Wear | `price / (cycle_life × usable kWh)` per kWh delivered, derived from the optional price/cycle-life inputs; the advanced `optimizer.cycle_cost_eur_per_kwh` override replaces it when non-zero |
+| Wear | `price / (cycle_life × usable kWh × η_dis)` per kWh delivered, derived from the optional price/cycle-life inputs so a full cycle costs exactly `price / cycle_life`; the advanced `optimizer.cycle_cost_eur_per_kwh` override replaces it when non-zero |
 | Effective stored-kWh cost | `buy / eta_charge + wear × eta_discharge` recomputed at the current buy price |
 | Break-even sale price | `buy / round_trip + wear` |
 | Cycle count | from `state.extra.cycles`, else `not reported` |
@@ -452,7 +452,7 @@ is the authority for the `advanced` classification (the test suite asserts the e
 | `solar.azimuth_deg` | float, nullable | `null` | 0…360 | **Azimuth** *(advanced)* — compass, unset assumes south |
 | `solar.performance_ratio` | float | `0.85` | 0.5…1.1 | **Performance ratio** *(advanced)* |
 | `solar.weather_entity` | str | `""` | — | **Weather entity** *(advanced)* — hourly cloud coverage |
-| `solar.nasa_irradiance` | bool | `true` | — | **NASA irradiance** *(advanced)* — observed NASA POWER clearness per hour-of-day where the weather entity has no cloud data, and in the derived fit |
+| `solar.nasa_irradiance` | bool | `true` | — | **NASA irradiance** *(advanced)* — observed NASA POWER clearness per hour-of-day where the weather entity has no cloud data, and in the derived fit; cached daily per location **and timezone**, with a 3-hour backoff after a failure |
 
 #### Load
 
@@ -591,7 +591,8 @@ Derived/validated helpers:
 usable_kwh()        = max(0, capacity_kwh * (max_soc_pct - min_soc_pct) / 100)
 energy_bounds_kwh() = (capacity_kwh * min_soc_pct / 100, capacity_kwh * max_soc_pct / 100)
 round_trip_efficiency = eta_charge * eta_discharge
-wear_eur_per_kwh    = price_eur / (cycle_life * usable_kwh)   (0.0 when either input is unset)
+wear_eur_per_kwh    = price_eur / (cycle_life * usable_kwh * eta_discharge)
+                                                              (0.0 when either input is unset)
 break_even_sell_eur_per_kwh(buy, wear=None)
                     = buy / round_trip + (wear or wear_eur_per_kwh)   (None if degenerate)
 validate()          -> list of human-readable problems; empty means usable
@@ -888,7 +889,7 @@ E_cap   = Σ capacity_kwh * (max_soc − min_soc)/100
 E_min   = strictest floor across enabled batteries, E_max = strictest ceiling
 P_chg   = Σ max_charge_w / 1000            P_dis = Σ max_discharge_w / 1000
 eta_chg, eta_dis = capacity-weighted means
-wear, EUR/kWh delivered = usable-weighted mean of each battery's derived wear
+wear, EUR/kWh delivered = delivered-energy-weighted mean (usable x eta_discharge) of each battery's wear
 round_trip = eta_chg * eta_dis             # the aggregate mean pair is a documented approximation
 soc_pct(e) = clamp(e / capacity_kwh * 100, 0, 100)
 ```
@@ -1208,13 +1209,13 @@ Used for the two dashboard window cards and the `sensor.sem_price_now` attribute
 ```
 eta_charge = eta_discharge = sqrt(round_trip_pct / 100)      # unless overridden
 round_trip = eta_charge * eta_discharge
-wear = price_eur / (cycle_life * usable_kwh)                 # EUR per kWh delivered; 0 if unset
+wear = price_eur / (cycle_life * usable_kwh * eta_discharge)  # EUR per kWh delivered; 0 if unset
 break_even_sell(buy, wear=None) = buy / round_trip + (wear or derived wear)
 ```
 
 Wear is stated per kWh **delivered** to the house, so the break-even needs no per-direction
 efficiency. The advanced `optimizer.cycle_cost_eur_per_kwh` override, when non-zero, replaces the
-derived value; the fleet plans with the usable-weighted mean.
+derived value; the fleet plans with the delivered-energy-weighted mean.
 
 | Buy price | Round trip | Wear (EUR/kWh delivered) | Break-even sell |
 | --- | --- | --- | --- |

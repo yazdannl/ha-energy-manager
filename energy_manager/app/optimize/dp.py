@@ -149,8 +149,10 @@ class BatteryAggregate:
     eta_discharge: float
     usable_kwh: float
     batteries: int = 0
-    #: Capacity/usable-weighted mean of the fleet's per-battery derived wear, EUR per delivered
-    #: kWh (SPEC 5). The DP plans one aggregated pack, so one wear constant represents it.
+    #: Delivered-energy-weighted mean of the fleet's per-battery derived wear, EUR per delivered
+    #: kWh (SPEC 5). Each battery contributes ``usable kWh × eta_discharge`` delivered per cycle,
+    #: so that delivered energy is also the weight. The DP plans one aggregated pack, so one wear
+    #: constant represents it.
     wear_eur_per_kwh: float = 0.0
 
     def soc_pct_for(self, energy_kwh: float) -> float | None:
@@ -183,9 +185,10 @@ class BatteryAggregate:
             c.capacity_kwh * max(c.min_soc_pct, reserve_soc_pct) / 100.0 for c in enabled
         )
         e_max = sum(c.capacity_kwh * c.max_soc_pct / 100.0 for c in enabled)
-        wear_weight_kwh = sum(c.usable_kwh() for c in enabled)
+        wear_weight_kwh = sum(c.usable_kwh() * c.eta_discharge for c in enabled)
         wear = (
-            sum(c.usable_kwh() * c.wear_eur_per_kwh for c in enabled) / wear_weight_kwh
+            sum(c.usable_kwh() * c.eta_discharge * c.wear_eur_per_kwh for c in enabled)
+            / wear_weight_kwh
             if wear_weight_kwh > 0
             else 0.0
         )
@@ -843,7 +846,7 @@ def solve(
     now = generated_at or utcnow()
     sources = dict(source_names or {})
     if options.wear_eur_per_kwh <= 0.0 and aggregate.wear_eur_per_kwh > 0.0:
-        # Zero means "derive it": the aggregate already carries the fleet's usable-weighted mean
+        # Zero means "derive it": the aggregate already carries the fleet's delivered-energy-weighted mean
         # of the per-battery derived wear (SPEC 5). A non-zero setting is the advanced override
         # and wins. Resolved here so every caller (API recompute, tests, selfcheck) agrees.
         options = replace(options, wear_eur_per_kwh=aggregate.wear_eur_per_kwh)

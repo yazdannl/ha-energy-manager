@@ -697,6 +697,10 @@ NASA_CLEARNESS_MAX = 1.1
 #: learning_profiles keys and the refit window (the archive advances nightly).
 NASA_KIND = "solar_nasa"
 NASA_PROFILE_KEY = "hourly"
+#: A failed fetch is remembered under its own key so an offline NASA adds one request, not one per
+#: plan refresh, and never a log line per refresh.
+NASA_FAILURE_KEY = "failure"
+NASA_FAILURE_BACKOFF_HOURS = 3.0
 NASA_REFIT_HOURS = 24.0
 NASA_APPLIED_NOTE = (
     "NASA POWER clearness applied where no cloud coverage is forecast"
@@ -817,7 +821,11 @@ def _nasa_cache(
     """The cached daily profile ``(factors, hours, samples)``, when it is fresh and local."""
     if store is None:
         return None
-    got = store.profile_get(NASA_KIND, NASA_PROFILE_KEY)
+    try:
+        got = store.profile_get(NASA_KIND, NASA_PROFILE_KEY)
+    except Exception as err:  # noqa: BLE001 - a cache read failure is a miss, not a failed forecast
+        log.debug("NASA POWER cache read failed: %s", err)
+        return None
     if not got or not isinstance(got[1], Mapping):
         return None
     updated_at, payload = got
@@ -828,7 +836,8 @@ def _nasa_cache(
             age_hours = (moment - updated_at).total_seconds() / 3600.0
         except TypeError:  # a naive timestamp cannot be trusted: refit instead of crashing
             age_hours = NASA_REFIT_HOURS + 1.0
-        if age_hours > NASA_REFIT_HOURS:
+        # A future timestamp is a clock change, not freshness: refit instead of trusting it.
+        if age_hours < 0.0 or age_hours > NASA_REFIT_HOURS:
             return None
     factors = payload.get("factors")
     if not isinstance(factors, list) or len(factors) != 24:
@@ -838,6 +847,42 @@ def _nasa_cache(
         return clean, int(payload.get("hours") or 0), int(payload.get("samples") or 0)
     except (TypeError, ValueError):
         return None
+
+
+def _nasa_failure_fresh(store: Any, fingerprint: str, moment: datetime) -> bool:
+    """True while a recent failed fetch is still cooled down, so a dead service costs one try."""
+    if store is None:
+        return False
+    try:
+        got = store.profile_get(NASA_KIND, f"{NASA_FAILURE_KEY}:{fingerprint}")
+    except Exception as err:  # noqa: BLE001 - cache I/O never fails the forecast
+        log.debug("NASA POWER failure-cache read failed: %s", err)
+        return False
+    if not got or not isinstance(got[1], Mapping):
+        return False
+    updated_at, payload = got
+    if payload.get("fingerprint") != fingerprint or not isinstance(updated_at, datetime):
+        return False
+    try:
+        age_hours = (moment - updated_at).total_seconds() / 3600.0
+    except TypeError:
+        return False
+    return 0.0 <= age_hours <= NASA_FAILURE_BACKOFF_HOURS
+
+
+def _store_nasa_failure(store: Any, fingerprint: str, moment: datetime) -> None:
+    """Remember a failed fetch (best effort) so the next refresh does not retry immediately."""
+    if store is None:
+        return
+    try:
+        store.profile_put(
+            NASA_KIND,
+            f"{NASA_FAILURE_KEY}:{fingerprint}",
+            {"fingerprint": fingerprint, "failed_at": to_iso(moment)},
+            moment,
+        )
+    except Exception as err:  # noqa: BLE001 - a cache write failure is not a forecast failure
+        log.debug("NASA POWER failure-cache write failed: %s", err)
 
 
 def _store_nasa_profile(
@@ -850,18 +895,21 @@ def _store_nasa_profile(
 ) -> None:
     if store is None:
         return
-    store.profile_put(
-        NASA_KIND,
-        NASA_PROFILE_KEY,
-        {
-            "factors": [round(float(value), 6) for value in factors],
-            "hours": hours,
-            "samples": samples,
-            "fingerprint": fingerprint,
-            "updated_at": to_iso(moment),
-        },
-        moment,
-    )
+    try:
+        store.profile_put(
+            NASA_KIND,
+            NASA_PROFILE_KEY,
+            {
+                "factors": [round(float(value), 6) for value in factors],
+                "hours": hours,
+                "samples": samples,
+                "fingerprint": fingerprint,
+                "updated_at": to_iso(moment),
+            },
+            moment,
+        )
+    except Exception as err:  # noqa: BLE001 - a cache write failure is not a forecast failure
+        log.debug("NASA POWER cache write failed: %s", err)
 
 
 def _nasa_profile(
@@ -882,11 +930,14 @@ def _nasa_profile(
     """
     if not bool(settings.get("solar.nasa_irradiance", True)):
         return None, "disabled", 0, 0
-    fingerprint = f"{latitude:.4f}|{longitude:.4f}"
+    # The per-hour buckets are local, so the timezone is part of the profile's identity.
+    fingerprint = f"{latitude:.4f}|{longitude:.4f}|{zone}"
     cached = _nasa_cache(store, fingerprint, moment)
     if cached is not None:
         factors, hours, samples = cached
         return factors, "cached daily fit", hours, samples
+    if _nasa_failure_fresh(store, fingerprint, moment):
+        return None, "failed", 0, 0
     end = moment - timedelta(days=NASA_LATENCY_DAYS)
     start = end - timedelta(days=NASA_WINDOW_DAYS)
     try:
@@ -894,8 +945,10 @@ def _nasa_profile(
         factors, hours, samples = nasa_clearness_profile(payload, zone)
     except Exception as err:  # noqa: BLE001 - optional refinement; a failure is a note, not an error
         log.warning("NASA POWER irradiance unavailable: %s", err)
+        _store_nasa_failure(store, fingerprint, moment)
         return None, "failed", 0, 0
     if not hours:
+        _store_nasa_failure(store, fingerprint, moment)
         return None, "no daylight samples", 0, samples
     _store_nasa_profile(store, fingerprint, factors, hours, samples, moment)
     return factors, "fresh fit", hours, samples
@@ -1007,7 +1060,9 @@ def _capacity_forecast(
     # forecast does not already cover every hour of the horizon, and it never overrides cloud
     # coverage. One keyless request per location per day (daily-cached).
     covered_hours = (
-        {slot.replace(minute=0, second=0, microsecond=0) for slot in cloud_map} if cloud_map else set()
+        {slot.astimezone(zone).replace(minute=0, second=0, microsecond=0) for slot in cloud_map}
+        if cloud_map
+        else set()
     )
     grid_hours = {
         slot.astimezone(zone).replace(minute=0, second=0, microsecond=0) for slot in grid
@@ -1067,6 +1122,9 @@ def _capacity_forecast(
     applied: list[float] = []
     slots: list[SolarSlot] = []
     for slot_time in grid:
+        # ``cloud_map`` is keyed by slot (15-minute steps); the hour-truncated local key is itself
+        # one of those slot keys because every timezone offset is a whole number of 15-minute steps,
+        # so the lookup returns that local hour's coverage for all four of its slots.
         hour_key = slot_time.astimezone(zone).replace(minute=0, second=0, microsecond=0)
         coverage = cloud_map.get(hour_key) if cloud_map else None
         if coverage is not None:
@@ -1279,7 +1337,10 @@ def _derived_forecast(
         status.last_error = f"meter-derived solar: {refusal}"
         forecast.notes.append(status.last_error)
         return forecast, status
+    # The learned watt peak depends on whether the NASA clearness layer was part of the fit, so that
+    # flag is part of the fit's identity: toggling it refits instead of reusing a stale watt peak.
     fingerprint = "|".join(f"{role}={roles[role]}" for role in sorted(roles))
+    fingerprint += f"|nasa={bool(settings.get('solar.nasa_irradiance', True))}"
     cached = _derived_cache(store, fingerprint, moment)
     if cached is not None:
         capacity_wp, usable, origin_note = (

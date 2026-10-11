@@ -73,7 +73,7 @@ lists active/healthy/freshness per provider.
 override the split and the round trip becomes their product), cycle count (from `state.extra.cycles`,
 "not reported" otherwise), limits, SoC window, mapping list and `mapping resolved` / `needs
 confirmation` badge. Three derived numbers sit beside the round trip: the **wear** (per kWh delivered,
-`price ÷ (cycle life × usable kWh)`, entered as the optional purchase price and cycle life in the
+`price ÷ (cycle life × usable kWh × η_dis)`, entered as the optional purchase price and cycle life in the
 edit dialog; 0 when either is unset), and — recomputed from the current
 buy price — the **effective cost of a stored kWh** (`buy / eta_charge + wear × eta_discharge`) and the
 **break-even sale price** (`buy / round_trip + wear`), each with its formula in the field help. The
