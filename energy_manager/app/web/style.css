@@ -855,7 +855,6 @@ tbody tr:hover { background: var(--panel-2); }
 
 /* uPlot needs to be told what to do at 360 px too */
 .uplot { max-width: 100%; }
-.u-legend { font-size: 0.8rem; }
 
 /* ---------- dialogs ---------- */
 
@@ -1273,3 +1272,59 @@ td, th { padding: var(--sp-2); }
   .btn { min-height: 2.75rem; }
   #nav .nav-primary a { min-height: 2.75rem; }
 }
+
+/* ---------- charts: plot, legend and caption are three flow siblings ---------- */
+/* uPlot's legend table used to share the plot's fixed pixel height, so it overflowed the chart box
+   and painted over the paragraph underneath (unreadable on a phone). The legend and the caption now
+   occupy their own rows, wrap as normal text and can never overlap the chart or the text below. */
+
+.chart-plot { position: relative; width: 100%; min-width: 0; }
+.chart-plot .uplot { max-width: 100%; }
+
+.chart-legend { margin-top: var(--sp-1); display: grid; gap: 2px; }
+.chart-legend:empty { display: none; }
+.chart-legend .u-legend {
+  font-size: var(--type-12);
+  line-height: 1.35;
+  text-align: left;
+  margin: 0;
+  width: 100%;
+}
+/* One wrapping row of entries, not one full-width row per series: five series then cost a
+   single line or two instead of five. */
+.chart-legend .u-legend tbody,
+.chart-legend .u-legend thead {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px var(--sp-3);
+}
+.chart-legend .u-legend tr {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.chart-legend .u-legend th {
+  font-weight: 500;
+  color: var(--text-muted);
+  text-align: left;
+  padding: 0;
+  margin: 0;
+  white-space: nowrap;
+}
+.chart-legend .u-legend .u-marker {
+  width: 0.7em;
+  height: 0.7em;
+  margin-right: 4px;
+  border-radius: 2px;
+}
+
+/* One short line per chart: what is plotted, on which axis, and what the signature means. */
+.chart-caption {
+  margin: var(--sp-1) 0 0;
+  color: var(--text-muted);
+  font-size: var(--type-12);
+  line-height: 1.4;
+  max-width: 70ch;
+}
+.chart-md { min-height: 0; }
+.chart-sm { min-height: 0; }

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.8.1
+
+- **The chart legend no longer lands on top of the text under it.** On a phone the legend was drawn
+  inside the chart's fixed height and overflowed onto the explanation below it, which made both
+  unreadable. The legend and the one-line chart caption are now their own rows under the plot and
+  wrap like normal text. Series names also say what they are without a colour word ("Stale price
+  slot", "Charge level", "Upper uncertainty (long dashes)").
+- **Axis numbers are consistent and carry their unit.** A percent axis used to mix "100" with
+  "75.00"; every tick now uses one precision, percent ticks read "25 %"–"100 %" and the rotated
+  percent label that collided with them is gone (the other axes keep a smaller gutter on a phone).
+- **Less prose, in the right place.** The long paragraph under the plan timeline (which repeated the
+  legend) is replaced by one short caption per chart plus a single line about the break-even line;
+  the worked break-even maths stays in "Why this plan?". The worked example now names what it
+  computes ("a break-even of 0.29 EUR/kWh, which includes 0.05 EUR of wear per kWh delivered").
+- **Plainer wording in the plan views.** "Discharge · 700 W" (not "-700 W discharge"), single-slot
+  action windows show one time and multi-slot windows end at the end of their last slot, the plan
+  summary rows name what they are ("Estimated net cost", "Saving vs baseline", "Energy charged"),
+  the stale-price warning says what staleness does to the plan, timestamps read "just now" instead
+  of "0 s ago" and whole minutes read "7 min" instead of "7 min 0 s".
+
 ## 0.8.0
 
 - **Every screen now answers first, then explains.** Today opens with the control authority, what the

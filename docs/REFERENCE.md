@@ -91,7 +91,7 @@ measurements** (quiet), **Next 24 hours**, **Batteries**.
 | --- | --- |
 | `.answer-authority` | `authorityText(status)` — the control authority in force (`Off` / `Advisory` / `Auto`, dry run on/off) with the dispatcher/Stop distinction |
 | `.answer-measured` | `Measured <battery>: charging/discharging/idle <power>` (or "unknown"), i.e. what the device is actually doing |
-| `.answer-planned` | `Planned now: <action> <power> — because: <reason>` from the current slot, or `no active plan slot`; explicitly "(a proposal, not the measured behaviour above)" |
+| `.answer-planned` | `Planned now: <action> <power> — because: <reason>` from the current slot, or `no active plan slot`; the power is unsigned because the action names the direction, and the line ends with "(a proposal, not the measured behaviour above)" |
 
 Then, still near the answer: the **Safety-state banner** (`pending_holds`,
 `mode_persisted: false`), the override banner with `Clear override`, and any connection issue
@@ -159,16 +159,18 @@ colour, and a slot whose sale price sits below break-even is explained by `effic
 
 **Plan summary** leads with the answer: one line naming the saving or the loss against the
 baseline (`answer-gain` / `answer-loss`), with the worked explanation behind a **Why this plan?**
-disclosure. Rows: `Estimated cost`, `Baseline (no battery)`, `Saving`, `Charged`,
-`Discharged`, `Cycles`, `Arbitrage energy`, `Assumed round trip` (or `not reported`),
+disclosure. Rows: `Estimated net cost`, `Baseline net cost (no battery)`, `Saving vs baseline`,
+`Energy charged`, `Energy discharged`, `Cycles`, `Arbitrage energy`, `Assumed round trip` (or `not reported`),
 `Assumed wear` per kWh delivered.
 Extra lines: `Charged from grid: … · charged from PV: …`, `Battery shares in this plan: <name> <W>…`,
 and the efficiency note with the break-even explanation and worked example. A negative saving adds
 `The plan is more expensive than doing nothing over this horizon; check the price source and settings.`
 
 **Next actions** — a vertical `.window-list` of the contiguous action windows (time range, action,
-signed power, `because:` reason and a `stale price` badge together), so a 360 px screen never splits
-the time/action/reason relationship.
+power, `because:` reason and a `stale price` badge together), so a 360 px screen never splits the
+time/action/reason relationship. The range ends when the window's last slot ends (a two-slot window
+is `06:45 PM – 07:15 PM`), a one-slot window shows a single time, and the power is unsigned beside
+the action word that already names the direction (`Discharge · 700 W`).
 
 **All slots** — headers: `Time`, `Buy`, `Sell`, `PV`, `Load`, `SoC`, `Battery power`,
 `Action`, `Reason`, `Flags` (`stale price` badge); PV/load are kW (`fmtKw`), never labelled as
@@ -376,7 +378,7 @@ Panel: **Decision log**.
 | `Refresh` | manual reload |
 | Note | "Every dispatch attempt is logged with requested vs applied power and the blocking reason, so 'why didn't it charge?' is always answerable here." |
 | Presets | segmented group `All` / `Dispatch` / `Warnings and errors` / `Events` (`aria-pressed`) |
-| Rows | message-first `.log-list`: the message, then badges (level, mode/dry-run context), local time + relative age, kind, code, `requested → applied` power and a collapsed JSON detail, newest first |
+| Rows | message-first `.log-list`: the message, then badges (level, mode/dry-run context), local time + relative age (`just now` under 5 s), kind, code, `requested → applied` power and a collapsed JSON detail, newest first |
 | While reading | an open detail is never rebuilt by a poll; a `New entries available` notice appears instead |
 
 ### 2.10 Cross-cutting UI rules
@@ -394,6 +396,9 @@ Panel: **Decision log**.
 - **Writes are pending → confirmed**: `performWrite()` disables the trigger, announces "pending",
   counts the in-flight write, then renders the server response or the server error and re-renders
   from a fresh `GET`. No optimistic UI.
+- **Charts**: `.chart-plot` + `.chart-legend` + `.chart-caption` as flow siblings (the legend is
+  mounted outside the plot box so it cannot overlap what follows); semantic series names with a line
+  signature in words; one tick precision and unit per axis.
 - **Navigation ≠ refresh**: a route change re-renders, scrolls to the top and focuses the route
   `h1`; background polls call the view's `state.refresh()` hook and update in place, and
   `refreshBlocked()` stops them while a dialog is open, a write is pending, the form is dirty or a

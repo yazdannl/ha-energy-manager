@@ -19,12 +19,12 @@ loopback addresses and placeholder coordinates.
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 91 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
-| Headless UI render check | `node tools/ui_render_check.js` | **44 passed, 0 failed**, exit 0 |
+| Headless UI render check | `node tools/ui_render_check.js` | **49 passed, 0 failed**, exit 0 |
 
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (77 files, documentation excluded)**:
-  `8ad4bb653b5b7589415e1453f7ba3b8e8ca498ec3e1a36b0f16aad42952b8fcd`
+  `fac4311fd139c5b182e09d492118f56ecda6cbdd1d513c59320e8fde2d65315c`
 * **path list of the same 77 files** (detects an added, removed or renamed file):
   `63e3910878cca4ec6ac8802e98b49448c7d6655eab98076ddfcf1d0140adf88b`
 
@@ -360,7 +360,8 @@ independently re-downloaded and compared, not just recorded).
 `tests/test_wp3_ui_render.py`, skipped when node is absent) renders the real `app.js` and `mock.js`
 through a dependency-free DOM shim (`tools/ui_dom_shim.js`, ~300 lines: elements, attributes,
 `classList`, `dataset`, `isConnected`, closed-`<details>` semantics) and asserts **44** properties of
-the result (42 at 0.7.0; §8.3 added the quiet-refresh pair). The load-bearing ones:
+the result (42 at 0.7.0; §8.3 added the quiet-refresh pair and §8.4 the chart-layout five). The
+load-bearing ones:
 
 * all seven views render from mock data with no `undefined` or `NaN` in the output;
 * every setting the API sends is reachable: selecting each group through the rail and scanning the
@@ -459,9 +460,8 @@ Two behaviours were added to make the cards real rather than decorative:
   bound and the forecast says so. An explicit `solar.capacity_wp` wins; no export history, fewer than
   24 usable daylight samples or an unmappable battery flow is a status, never a crash.
 
-What the gates prove here: the render check (44 properties at 0.8.0) asserts the cards, their key
-ownership and
-a real picker round-trip against the mock; `test_setup_card_keys_are_the_primary_surface` pins the pure
+What the gates prove here: the render check (49 properties at 0.8.1) asserts the cards, their key
+ownership, a real picker round-trip against the mock and the chart layout contract of §8.4; `test_setup_card_keys_are_the_primary_surface` pins the pure
 key table per provider/contract/solar source; `test_wp2a_price.py` covers the derived sell price, the
 tax-refund switch and the per-slot tax extraction; `test_wp2a_solar.py` covers the envelope fit, the
 export-derived samples, the explicit-watt-peak override and each refusal path; and the frozen
@@ -573,6 +573,49 @@ Not verified (the same limit as every wave: the ingress panel needs the owner's 
 this machine has none): the live HA layout above the fold at 360 px and 200 % zoom, real uPlot legend,
 cursor and touch behaviour, and what assistive technology announces for route focus, repeated live
 regions and sticky-bar occlusion. Those remain the review's §8 open questions 1, 2 and 7.
+
+### 8.4 Chart legend layout and reading copy (0.8.1)
+
+Reported from the owner's phone: on the Plan page the chart legend was drawn on top of the paragraph
+underneath it, and the two overlapped into unreadable text. Cause: `charts.js` pinned the chart host
+to a fixed pixel height and passed `opts.height`, so uPlot's legend table — which uPlot builds inside
+the plot root — had nowhere to go and overflowed the box onto the next element.
+
+The chart is now three flow siblings inside its host:
+
+1. `.chart-plot` — the canvas at its explicit pixel height;
+2. `.chart-legend` — uPlot's legend table, mounted there through `legend.mount` instead of inside the
+   plot box, styled as one wrapping row of entries at `--type-12`;
+3. `.chart-caption` — one short line saying what is plotted, on which axis, and what each line
+   signature means (the per-chart paragraphs that duplicated the legend are gone; the two-sentence
+   chart explanation on the Plan page is replaced by a single sentence about the break-even line, and
+   the worked maths stays in "Why this plan?").
+
+Alongside it, the reading defects the same screenshot showed:
+
+* **Axis ticks** carry one fixed precision and their unit: percent axes read `25 %`…`100 %` (they used
+  to mix `100` with `75.00`) and their rotated label is dropped, since the ticks already say it; the
+  narrow-host gutter grows to 46 px only when a rotated label is still drawn.
+* **Series names** avoid colour words and state their signature: "Stale price slot", "Charge level",
+  "Upper uncertainty (long dashes)", "Lower uncertainty (dotted)", "Load P90 (long dashes)".
+* **Plainer sentences**: "Discharge · 700 W" (not "−700 W discharge") in both the action windows and
+  the Today answer strip; a one-slot action window shows a single time and a multi-slot window ends
+  when its last slot ends (`06:45 PM – 07:15 PM`); plan summary rows are `Estimated net cost`,
+  `Baseline net cost (no battery)`, `Saving vs baseline`, `Energy charged`, `Energy discharged`; the
+  stale-price banner says what staleness does to the plan; `timeAgo()` says "just now" under 5 s
+  instead of "0 s ago"; `fmtDuration()` drops a zero remainder ("7 min", not "7 min 0 s"); and
+  "1 period has no baseline" instead of "1 period(s)".
+
+New gate: `tools/ui_render_check.js` §4 installs a minimal `uPlot` stub (root element, legend table,
+`legend.mount`) and asserts that each chart has a plot box with an explicit height, that the legend is
+mounted **outside** that box and immediately after it, and that every chart carries a caption under
+240 characters. That is a structural check, not a pixel check — the browser still decides the optical
+result, and the review's open questions 1, 2 and 7 (live HA layout at 360 px and zoom, real uPlot
+legend/cursor behaviour, screen-reader announcements) remain the not-verified list.
+
+The shim itself gained `element.style` as a real CSS declaration (property writes land in the
+serialized style attribute), `contains()`, and `previousElementSibling`/`nextElementSibling`, so the
+stub can exercise code paths the browser runs.
 
 ---
 

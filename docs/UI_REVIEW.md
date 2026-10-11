@@ -46,7 +46,7 @@ accessibility list, and the open questions follow.
 
 Every actionable finding below has been implemented in the web assets (`app.js`, `charts.js`,
 `index.html`, `style.css`, `mock.js`); the review text itself is unchanged, so §3.x still reads as
-the original critique. Verification at this revision: `node tools/ui_render_check.js` (44/44) and the
+the original critique. Verification at this revision: `node tools/ui_render_check.js` (49/49) and the
 full pytest suite (631 passing, including `test_wp3_ui_render.py`, `test_wp3_assets.py` and
 `test_wp3_mock_contract.py`).
 
@@ -307,7 +307,7 @@ Estimates are hands-on time for one developer familiar with this plain-JS app, i
 | Quiet refresh model preserving scroll, focus, form drafts, opened rows and result banners; independent retryable loading | 2–4 days | Shared lifecycle rework, not cosmetic CSS |
 | Savings coverage/comparable-cost presentation and forecast trust-first summaries | 1–3 days | Use existing bucket/report data where sufficient; do not invent unsupported metrics |
 | Touch/keyboard chart inspection plus accessible value alternatives | 1–2 days | Plain DOM controls and vendored uPlot hooks |
-| Browser acceptance in HA at 360/720/desktop, both themes, zoom and keyboard | 1–2 days | Owner/browser access required; not replaced by 44 shim checks |
+| Browser acceptance in HA at 360/720/desktop, both themes, zoom and keyboard | 1–2 days | Owner/browser access required; not replaced by 49 shim checks |
 
 A **1–2 day CSS-only pass** can improve tone, target size and contrast, but cannot solve authority ambiguity, setup dependencies or refresh data loss. A focused first redesign slice—safety/units first, then Today hierarchy, complete setup and phone navigation—is roughly **5–8 working days**; the broader structural work and browser acceptance are roughly **10–15 working days**, with overlapping work not counted twice. Stay within the existing stack throughout.
 

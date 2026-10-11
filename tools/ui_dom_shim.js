@@ -25,10 +25,30 @@ function makeDom() {
     get firstChild() {
       return this.childNodes.length ? this.childNodes[0] : null;
     }
+    get previousElementSibling() {
+      if (!this.parentNode) return null;
+      const siblings = this.parentNode.children;
+      const i = siblings.indexOf(this);
+      return i > 0 ? siblings[i - 1] : null;
+    }
+    get nextElementSibling() {
+      if (!this.parentNode) return null;
+      const siblings = this.parentNode.children;
+      const i = siblings.indexOf(this);
+      return i >= 0 && i + 1 < siblings.length ? siblings[i + 1] : null;
+    }
     get isConnected() {
       let node = this;
       while (node.parentNode) node = node.parentNode;
       return node === DOC_ROOT;
+    }
+    contains(other) {
+      let node = other;
+      while (node) {
+        if (node === this) return true;
+        node = node.parentNode;
+      }
+      return false;
     }
     append(...nodes) {
       nodes.forEach((n) => this.appendChild(typeof n === "string" ? new Text(n) : n));
@@ -172,8 +192,28 @@ function makeDom() {
     hasAttribute(name) {
       return Object.prototype.hasOwnProperty.call(this._attrs, name);
     }
+    /* A real CSSStyleDeclaration: property writes land in the serialized style attribute, so
+       app.js/charts.js can set `el.style.height` exactly as they do in the browser. */
     get style() {
-      return this._attrs.style || "";
+      if (!this._style) {
+        const attrs = this._attrs;
+        this._style = new Proxy({}, {
+          get: (target, prop) => {
+            if (prop === "cssText") return attrs.style || "";
+            const css = attrs.style || "";
+            const hit = new RegExp("(?:^|;)\\s*" + String(prop) + "\\s*:\\s*([^;]+)").exec(css);
+            return hit ? hit[1].trim() : "";
+          },
+          set: (target, prop, value) => {
+            if (prop === "cssText") { attrs.style = String(value); return true; }
+            const css = attrs.style || "";
+            const stripped = css.replace(new RegExp("(?:^|;)\\s*" + String(prop) + "\\s*:\\s*[^;]+;?"), "").trim();
+            attrs.style = (stripped ? stripped.replace(/;?$/, ";") + " " : "") + String(prop) + ": " + String(value);
+            return true;
+          },
+        });
+      }
+      return this._style;
     }
     set style(value) {
       this._attrs.style = String(value);

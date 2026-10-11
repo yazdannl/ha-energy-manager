@@ -360,6 +360,63 @@ function classTokens(text) {
     check("theme choice is persisted", [...storage.keys()].some((k) => /theme/i.test(k)), [...storage.keys()].join(","));
   }
 
+  /* ---------- 4. chart structure ---------- */
+  // The reported defect: uPlot's legend table shared the plot's fixed pixel height, so it overflowed
+  // and painted over the caption. The stub below is the minimum uPlot surface charts.js uses, which
+  // lets the harness assert the layout contract (plot, then legend, then caption, as siblings).
+  console.log("\n4. charts keep the legend out of the plot box");
+  if (!globalThis.uPlot) {
+    globalThis.uPlot = function (opts, data, target) {
+      this.opts = opts;
+      this.data = data;
+      this.root = target;
+      const plot = document.createElement("div");
+      plot.className = "uplot";
+      target.appendChild(plot);
+      if (opts.legend && opts.legend.show && typeof opts.legend.mount === "function") {
+        const table = document.createElement("table");
+        table.className = "u-legend";
+        const tbody = document.createElement("tbody");
+        (opts.series || []).slice(1).forEach((series) => {
+          const tr = document.createElement("tr");
+          const th = document.createElement("th");
+          th.textContent = series.label || "";
+          tr.appendChild(th);
+          tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        opts.legend.mount(this, table);
+      }
+      this.destroy = () => { target.textContent = ""; };
+      this.setSize = () => {};
+    };
+    globalThis.uPlot.paths = { bars: () => () => null };
+    globalThis.ResizeObserver = undefined;
+  }
+  const planFixture = await M.handle("GET", "/api/v1/plan?hours=36");
+  const chartHost = document.createElement("div");
+  chartHost.className = "chart chart-md";
+  view().appendChild(chartHost);
+  A && globalThis.SEMCharts.plan(chartHost, planFixture, { wear: 0.05, efficiency: null });
+  const plotBoxes = [...chartHost.querySelectorAll(".chart-plot")];
+  const legendBoxes = [...chartHost.querySelectorAll(".chart-legend")];
+  const captions = [...chartHost.querySelectorAll(".chart-caption")];
+  check("every chart has its own plot box", plotBoxes.length === 2, `plot boxes ${plotBoxes.length}`);
+  check("the legend is mounted outside the plot box", legendBoxes.length === 2
+    && legendBoxes.every((box) => box.querySelector(".u-legend"))
+    && legendBoxes.every((box) => !box.closest(".chart-plot")),
+    `legend boxes ${legendBoxes.length}`);
+  check("the legend follows its plot, in that order", legendBoxes.every((box) => {
+    const prev = box.previousElementSibling;
+    return prev && prev.classList.contains("chart-plot");
+  }), "legend is not a sibling right after the plot");
+  check("each chart carries a one-line caption", captions.length >= 2
+    && captions.every((c) => c.textContent.trim().length > 10 && c.textContent.length < 240),
+    captions.map((c) => c.textContent.length).join(","));
+  check("the plot box keeps an explicit height", plotBoxes.every((box) => /height/.test(box.getAttribute("style") || "")),
+    plotBoxes.map((b) => b.getAttribute("style")).join(" | "));
+  chartHost.remove();
+
   /* ---------- 5. shell ---------- */
   console.log("\n5. shell (index.html)");
   const index = fs.readFileSync(path.join(WEB, "index.html"), "utf8");

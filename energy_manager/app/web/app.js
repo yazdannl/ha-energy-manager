@@ -172,9 +172,9 @@
     var s = Math.max(0, Math.round(seconds));
     if (s < 60) return s + " s";
     var m = Math.floor(s / 60);
-    if (m < 60) return m + " min " + (s % 60) + " s";
+    if (m < 60) return m < 60 && s % 60 === 0 ? m + " min" : m + " min " + (s % 60) + " s";
     var h = Math.floor(m / 60);
-    return h + " h " + (m % 60) + " min";
+    return m % 60 === 0 ? h + " h" : h + " h " + (m % 60) + " min";
   }
 
   function timeAgo(value) {
@@ -182,6 +182,8 @@
     if (!d) return "unknown time";
     var delta = (Date.now() - d.getTime()) / 1000;
     if (delta < 0) return "in " + fmtDuration(-delta);
+    // A fresh reading reads "just now", never "0 s ago".
+    if (delta < 5) return "just now";
     return fmtDuration(delta) + " ago";
   }
 
@@ -897,7 +899,9 @@
 
   function plannedText(slot) {
     if (!slot) return "Planned now: no active plan slot";
-    return "Planned now: " + String(actionText(slot.action)).toLowerCase() + " " + fmtPower(slot.power_w) +
+    // The action word carries the direction, so the number beside it is unsigned.
+    var power = isNum(slot.power_w) ? fmtPower(Math.abs(slot.power_w)) : "power unknown";
+    return "Planned now: " + String(actionText(slot.action)).toLowerCase() + " " + power +
       " — because: " + reasonText(slot.reason) + " (a proposal, not the measured behaviour above)";
   }
 
@@ -1228,7 +1232,7 @@
         var chart = el("div", { class: "chart chart-sm" });
         target.appendChild(chart);
         root.SEMCharts.mini(chart, data.plan);
-        target.appendChild(el("p", { class: "legend-note", text: "Buy price: solid line (EUR/kWh, left axis). Battery charge: long-dashed line (%, right axis). Every slot value is also listed in the Plan view; hover shows exact figures." }));
+        target.appendChild(el("p", { class: "legend-note", text: "Every slot value is also listed in the Plan view; the legend follows the pointer or touch." }));
       });
     }
 
@@ -1301,7 +1305,14 @@
     var stale = slots.filter(function (s) { return s.price_stale; }).length;
     var flags = [];
     if (!plan.feasible) flags.push({ level: "error", title: "Plan is infeasible", text: plan.infeasible_reason || "The optimiser could not satisfy the constraints; the battery is held safe." });
-    if (stale) flags.push({ level: "warn", title: "Stale prices", text: stale + " of " + slots.length + " slots carry a stale price and are treated as flat by the optimiser." });
+    if (stale) {
+      var fresh = slots.length - stale;
+      flags.push({
+        level: "warn",
+        title: "Stale prices",
+        text: stale + " of " + slots.length + " price slots are stale (grey in the timeline). The optimiser treats a stale price as flat, so those slots cannot argue for or against a charge — this plan leans on the " + fresh + " slot" + (fresh === 1 ? "" : "s") + " with a fresh price."
+      });
+    }
     var sources = [];
     if (slots.length) {
       if (slots[0].price_source) sources.push("price: " + slots[0].price_source);
@@ -1331,11 +1342,12 @@
       " against doing nothing (the same consumption and tariffs, battery idle)."
     ]));
     var stats = [
-      ["Estimated cost", fmtEur(s.cost_estimate_eur)],
-      ["Baseline (no battery)", fmtEur(s.baseline_cost_eur)],
-      ["Saving", fmtEur(s.saved_eur)],
-      ["Charged", fmtKwh(s.charged_kwh)],
-      ["Discharged", fmtKwh(s.discharged_kwh)],
+      // "Net" because it can be negative: an export-heavy horizon earns more than it spends.
+      ["Estimated net cost", fmtEur(s.cost_estimate_eur)],
+      ["Baseline net cost (no battery)", fmtEur(s.baseline_cost_eur)],
+      ["Saving vs baseline", fmtEur(s.saved_eur)],
+      ["Energy charged", fmtKwh(s.charged_kwh)],
+      ["Energy discharged", fmtKwh(s.discharged_kwh)],
       ["Cycles", isNum(s.cycles) ? s.cycles.toFixed(2) + " cycles" : "--"],
       ["Arbitrage energy", fmtKwh(s.arbitrage_kwh)],
       ["Assumed round trip", efficiency ? fmtPct(efficiency.round_trip_pct) : "not reported"],
@@ -1361,8 +1373,8 @@
     var why = el("details", { class: "disclosure" }, [el("summary", { text: "Why this plan?" })]);
     var whyBody = el("div", { class: "disclosure-body" });
     if (efficiency) {
-      var example = buyNow != null ? " At the current buy price " + fmtPrice(buyNow) + " that is " + fmtPrice(planBreakEvenEur(buyNow, efficiency, wear)) + " with wear " + fmtEur(wear) + "/kWh delivered." : "";
-      whyBody.appendChild(el("p", { class: "field-help", text: "The optimiser assumed a " + fmtPct(efficiency.round_trip_pct) + " round trip (charge " + fmtPct(efficiency.eta_charge * 100) + " / discharge " + fmtPct(efficiency.eta_discharge * 100) + "). Break-even after round-trip loss = buy ÷ round trip + wear, so a discharge slot only pays when the sale price clears it. Wear is charged per kWh delivered, so charging alone costs none." + example }));
+      var example = buyNow != null ? " At the current buy price of " + fmtPrice(buyNow) + " that is a break-even of " + fmtPrice(planBreakEvenEur(buyNow, efficiency, wear)) + ", which includes " + fmtEur(wear) + " of wear per kWh delivered." : "";
+      whyBody.appendChild(el("p", { class: "field-help", text: "The dotted line on the timeline is the break-even after round-trip loss: buy ÷ round trip + wear, so a discharge slot only pays when the sale price clears it. The optimiser assumed a " + fmtPct(efficiency.round_trip_pct) + " round trip (charge " + fmtPct(efficiency.eta_charge * 100) + " / discharge " + fmtPct(efficiency.eta_discharge * 100) + "). Wear is charged per kWh delivered, so charging alone costs none." + example }));
     } else {
       whyBody.appendChild(el("p", { class: "field-help", text: "The plan summary did not report its aggregate efficiency, so the assumed round trip and the break-even curve are unavailable; the plan was still computed with the stored per-battery efficiencies." }));
     }
@@ -1382,6 +1394,7 @@
   // row, so a constraint change is never hidden inside a broad summary (UI_REVIEW §3.4). Pure data.
   function planActionWindows(plan) {
     var slots = Array.isArray(plan && plan.slots) ? plan.slots : [];
+    var stepMs = planSlotMinutes(plan) * 60000;
     var windows = [];
     slots.forEach(function (slot) {
       var previous = windows[windows.length - 1];
@@ -1389,13 +1402,19 @@
         !!previous.stale === !!slot.price_stale &&
         (isNum(previous.power_w) && isNum(slot.power_w) ? previous.power_w === slot.power_w : true);
       if (same) {
+        // `end` is the moment the last slot ends, so a two-slot window reads 06:45–07:15 rather
+        // than stopping at the last slot's start.
         previous.end = slot.t;
+        previous.endMs = parseDate(slot.t) ? parseDate(slot.t).getTime() + stepMs : null;
         previous.slots += 1;
         return;
       }
+      var startMs = parseDate(slot.t) ? parseDate(slot.t).getTime() : null;
       windows.push({
         start: slot.t,
         end: slot.t,
+        startMs: startMs,
+        endMs: startMs === null ? null : startMs + stepMs,
         slots: 1,
         action: slot.action,
         reason: slot.reason,
@@ -1448,11 +1467,14 @@
     }
     var list = el("ul", { class: "window-list" });
     windows.forEach(function (win) {
-      var power = isNum(win.power_w)
-        ? fmtPower(win.power_w) + (win.power_w > 0 ? " charge" : win.power_w < 0 ? " discharge" : "")
-        : "power unknown";
+      // The action names the direction, so the number beside it is unsigned: "Discharge · 700 W",
+      // never "Discharge · -700 W discharge" (UI_REVIEW follow-up).
+      var power = isNum(win.power_w) ? fmtPower(Math.abs(win.power_w)) : "power unknown";
+      var when = win.startMs != null && win.endMs != null && win.endMs > win.startMs
+        ? fmtTime(win.start) + " – " + fmtTime(new Date(win.endMs).toISOString())
+        : fmtTime(win.start);
       list.appendChild(el("li", { dataset: { stale: win.stale ? "true" : "false" } }, [
-        el("p", { class: "window-time" }, [fmtTime(win.start), " – ", fmtTime(win.end), " (", win.slots, win.slots === 1 ? " slot)" : " slots)"]),
+        el("p", { class: "window-time" }, [when, " (", win.slots, win.slots === 1 ? " slot)" : " slots)"]),
         el("p", { class: "window-action" }, [actionText(win.action), " · ", el("span", { class: "num", text: power })]),
         el("p", { class: "window-reason" }, ["because: ", reasonText(win.reason)]),
         win.stale ? badge("stale price", "stale") : null
@@ -1536,7 +1558,9 @@
           ? plan.summary.wear_eur_per_kwh
           : (isNum(data.cycleCost) ? data.cycleCost : 0);
         root.SEMCharts.plan(chart, plan, { wear: planWear, efficiency: efficiency });
-        body.appendChild(el("p", { class: "legend-note", text: "Top panel: buy price bars (EUR/kWh, left axis), the break-even after round-trip loss line, dotted (buy ÷ assumed round trip + wear per delivered kWh), the sell price, long-dashed, and the solid state-of-charge line (%, right axis); grey bars are stale prices. Bottom panel: PV and load forecast in kW and battery charging (positive) or discharging (negative) in kW." + (efficiency ? " A slot whose sale price sits below the break-even line would lose money, which is why it stays idle with reason “efficiency_loss”." : " The break-even after round-trip loss line is unavailable: the plan summary carries no aggregate efficiency.") }));
+        body.appendChild(el("p", { class: "legend-note", text: efficiency
+          ? "A slot whose sale price sits below the dotted break-even line would lose money, which is why it stays idle with reason “efficiency_loss”; the exact figures are in All slots."
+          : "The break-even after round-trip loss line is unavailable for this plan: the summary carries no aggregate efficiency." }));
       }
     });
 
@@ -1602,7 +1626,7 @@
     if (!(report.samples > 0)) return "not enough measured days yet";
     var parts = ["MAPE " + (isNum(report.mape_pct) ? fmtPct(report.mape_pct) : "--") + " over " + (report.days || "?") + " days"];
     if (isNum(report.bias_pct)) parts.push("bias " + fmtPct(report.bias_pct));
-    if (isNum(report.mae)) parts.push("MAE " + report.mae.toFixed(3) + " " + (report.kind === "price" ? "EUR/kWh" : "kW"));
+    if (isNum(report.mae)) parts.push("MAE " + report.mae.toFixed(2) + " " + (report.kind === "price" ? "EUR/kWh" : "kW"));
     parts.push(report.samples + " samples");
     return parts.join(" · ");
   }
@@ -1749,7 +1773,7 @@
     var chart = el("div", { class: "chart chart-sm" });
     body.appendChild(chart);
     root.SEMCharts.accuracy(chart, accuracy);
-    body.appendChild(el("p", { class: "legend-note", text: "Mean absolute percentage error per day: lower is better. The three series are told apart by line signature — solid, dashed and dotted — as well as by the legend, and every value is also in the per-kind cards above." }));
+    body.appendChild(el("p", { class: "legend-note", text: "Lower is better; every value is also in the per-kind cards above." }));
   }
 
   function viewForecasts(host) {
@@ -2510,7 +2534,7 @@
       ]),
       el("p", { class: "alert-meta", text: "id: " + config.id + " · last read " + timeAgo(st.read_at) + (st.available ? "" : " · unavailable") + (st.last_error ? " · last error: " + st.last_error : "") }),
       el("ul", { class: "stat-row" }, [
-        el("li", null, [el("span", { class: "stat-label", text: "Power" }), el("span", { class: "stat-value", text: fmtPower(st.power_w) + (isNum(st.power_w) ? (st.power_w > 0 ? " charging" : st.power_w < 0 ? " discharging" : " idle") : "") })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Power" }), el("span", { class: "stat-value", text: (isNum(st.power_w) ? fmtPower(Math.abs(st.power_w)) : fmtPower(st.power_w)) + (isNum(st.power_w) ? (st.power_w > 0 ? " charging" : st.power_w < 0 ? " discharging" : " idle") : "") })]),
         el("li", null, [el("span", { class: "stat-label", text: "Charge level" }), el("span", { class: "stat-value", text: fmtPct(st.soc_pct) })]),
         el("li", null, [el("span", { class: "stat-label", text: "Energy" }), el("span", { class: "stat-value", text: fmtKwh(st.energy_kwh) + " of " + fmtKwh(st.capacity_kwh || config.capacity_kwh) })]),
         el("li", null, [el("span", { class: "stat-label", text: "Round trip" }), el("span", { class: "stat-value", text: eff ? fmtPct(eff.round_trip_pct) : "--" })]),
@@ -3073,10 +3097,11 @@
     ]);
     body.appendChild(cards);
     // Coverage first: a partial baseline is scope, not a total (UI_REVIEW §3.6).
+    var missing = buckets.length - covered.length;
     if (buckets.length && covered.length && covered.length < buckets.length) {
       body.appendChild(el("div", { class: "banner banner-warn" }, [
         el("p", { class: "banner-title", text: "Baseline available for " + covered.length + " of " + buckets.length + " periods" }),
-        el("p", { text: "The saving and the baseline cost describe only the periods with a load forecast. " + (buckets.length - covered.length) + " period(s) have no baseline, so their cost is not part of the comparison — the whole-range import/export/PV figures below still cover every period." })
+        el("p", { text: "The saving and the baseline cost describe only the periods with a load forecast. " + missing + " period" + (missing === 1 ? " has" : "s have") + " no baseline, so " + (missing === 1 ? "its" : "their") + " cost is not part of the comparison — the whole-range import/export/PV figures below still cover every period." })
       ]));
     }
     if (!savingsKnown || !baselineKnown) {
@@ -3147,7 +3172,7 @@
         var chart = el("div", { class: "chart chart-md" });
         body.appendChild(chart);
         root.SEMCharts.savings(chart, payload.buckets || []);
-        body.appendChild(el("p", { class: "legend-note", text: "Bars: savings (EUR, left axis). Solid line: actual net cost (import cost minus export revenue). Dashed line: no-battery baseline cost (both EUR, right axis). Buckets with a null baseline (no load forecast) are skipped, not plotted as zero." }));
+        body.appendChild(el("p", { class: "legend-note", text: "Buckets with a null baseline (no load forecast) are skipped, not plotted as zero." }));
       }
     });
     asyncPanel(host, "Per-bucket detail", { load: load, render: renderSavingsBuckets });

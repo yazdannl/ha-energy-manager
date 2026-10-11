@@ -207,7 +207,8 @@ state explicitly says that a surprising situation with an empty log is a bug.
 
 ## Cross-cutting rules
 
-- **No colour-only meaning**: price bars/legend carry labels, stale slots show a `stale` badge plus
+- **No colour-only meaning**: each chart legend names its series in words ("Stale price slot",
+  "Upper uncertainty (long dashes)"), price bars carry labels, stale slots show a `stale` badge plus
   dashed borders and grey bars, alert levels are written out, and every chart series has a stable line
   signature named in its legend — solid = measurement/forecast, long dashes = the sell/baseline price,
   dotted = a threshold. Legend text is semantic ("Load error (long dashes)"), never a colour word.
@@ -250,7 +251,13 @@ state explicitly says that a surprising situation with an empty log is a bug.
 ## Charts (uPlot 1.6.32)
 
 `charts.js` wraps the vendored uPlot IIFE build. Colours are read from CSS custom properties
-(`--chart-*`), so light/dark both work. `SEMCharts.refresh()` re-reads them, and `applyTheme()` calls
+(`--chart-*`), so light/dark both work. Each chart is three flow siblings — `.chart-plot` (the canvas
+at a fixed pixel height), `.chart-legend` (uPlot's legend table mounted there rather than inside the
+plot box) and `.chart-caption` (one short line saying what is plotted and what each line signature
+means). Keeping the legend out of the plot box is what stopped it painting over the caption on a
+phone. Tick labels carry one fixed precision and their unit; a percent axis writes "25 %"…"100 %" in
+the ticks instead of a rotated label that collided with them.
+ `SEMCharts.refresh()` re-reads them, and `applyTheme()` calls
 it on an explicit theme change (not only on a `prefers-color-scheme` change), so a manual theme switch
 never leaves a chart in the old palette. Each series also has a non-colour signature (solid / long
 dash / dotted) so it is identifiable without colour, the y-axis gutters shrink below ~480 px host
