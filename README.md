@@ -63,7 +63,13 @@ no MQTT, no cloud account, and no YAML to install by hand.
   charge/discharge bars, plus a per-slot table with the reason for every slot and the plan summary.
   The price chart marks the break-even sale price for the round trip the plan assumed, so a sell price
   that looks like a profit but does not cover the conversion loss is visibly below the line; such a
-  slot stays idle and says `efficiency_loss`.
+  slot stays idle and says `efficiency_loss`. **Next actions** lists the coming action windows with
+  the data behind each one: the buy and sell price, the break-even and the margin above it, the kWh
+  in and out, the SoC path and the floor a reserve hold defends, the planned grid flow and what it
+  costs or earns — and what actually happened, from the measured 5-minute rows and the dispatch log
+  (applied vs requested, clamped, dry run, or why a slot was never dispatched). A window whose price
+  is stale says so and is never presented as dispatchable, because the dispatcher refuses a stale
+  slot rather than acting on a flat price.
 - **Forecasts** — three panels (price, solar, load) with source, freshness badge, greyed stale
   slots, a P10/P90 band for load, per-day totals, and the 14-day accuracy trend.
 - **Batteries** — one card per battery with live power, SoC, limits, mapping state and a bounded test

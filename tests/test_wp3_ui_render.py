@@ -53,5 +53,18 @@ def test_ui_renders_and_settings_ia_holds():
         "is never folded",
         "every emitted class is defined",
         "--chart-* variables survive the restyle",
+        # SPEC 10 plan execution: the window rows must keep stating the slot's own data, not just
+        # its action, and a stale or clamped slot must keep saying so.
+        "windows merge consecutive identical slots only",
+        "the plan payload carries its own resolution",
+        "a window states the prices behind the decision",
+        "a window states its break-even and the margin over it",
+        "a window states the battery energy and the SoC path",
+        "a window states its grid flow and what it earns",
+        "the join lands the dispatch and the measurement on the right window",
+        "a clamped dispatch states applied vs requested",
+        "a measured window compares measured with planned",
+        "a stale window says the dispatcher refuses it (stale_input)",
+        "the rendered rows carry facts, context, status and price provenance",
     ):
         assert needle in proc.stdout, f"the render check no longer reports {needle!r}:\n{proc.stdout}"

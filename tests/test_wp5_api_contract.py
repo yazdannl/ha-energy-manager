@@ -50,6 +50,7 @@ PLAN_FIELDS = {
     "generated_at",
     "horizon_start",
     "horizon_end",
+    "slot_minutes",
     "feasible",
     "summary",
     "slots",
@@ -259,6 +260,7 @@ def test_every_documented_route_answers(wired):
         ("GET", "/api/v1/health"),
         ("GET", "/api/v1/status"),
         ("GET", "/api/v1/plan?hours=36"),
+        ("GET", "/api/v1/plan/execution?hours=36"),
         ("POST", "/api/v1/plan/recompute"),
         ("GET", "/api/v1/forecast?kind=price&hours=36"),
         ("GET", "/api/v1/forecast?kind=solar&hours=36"),
@@ -348,6 +350,58 @@ def test_health_status_and_plan_fields(wired):
     if plan["batteries"]:
         assert {"id", "name", "share_w"} <= set(plan["batteries"][0])
     note(f"plan: {len(plan['slots'])} slots, slot keys ok, soc_pct/pv_source/price_source present")
+
+
+def test_plan_execution_route_reports_measured_and_applied(wired):
+    """GET /plan/execution: the same slot grid with what was measured and what was applied (SPEC 10)."""
+    status, _headers, plan = wired.json("GET", "/api/v1/plan?hours=36")
+    assert status == 200
+    # The plan's own resolution is part of the contract: the UI must not assume one.
+    assert plan["slot_minutes"] == wired.settings.get("optimizer.slot_minutes")
+    status, _headers, body = wired.json("GET", "/api/v1/plan/execution?hours=36")
+    assert status == 200
+    assert {
+        "generated_at",
+        "slot_minutes",
+        "now",
+        "floors",
+        "batteries",
+        "progress",
+        "slots",
+    } <= set(body)
+    assert body["generated_at"] == plan["generated_at"]
+    assert body["slot_minutes"] == plan["slot_minutes"]
+    assert len(body["slots"]) == len(plan["slots"])
+    assert [entry["t"] for entry in body["slots"]] == [slot["t"] for slot in plan["slots"]]
+    assert set(body["floors"]) == {"reserve_soc_pct", "min_soc_pct", "floor_soc_pct"}
+    assert body["batteries"] and {"id", "name", "min_soc_pct", "floor_soc_pct"} <= set(
+        body["batteries"][0]
+    )
+    progress = body["progress"]
+    assert progress["slots_total"] == len(plan["slots"])
+    assert 0 <= progress["slots_elapsed"] <= progress["slots_total"]
+    # The tick wrote one 5-minute actuals row in the slot containing `now`, and only there: a slot
+    # with no measurement stays null instead of a fabricated zero.
+    measured = [entry for entry in body["slots"] if entry["actual"]]
+    assert len(measured) == 1
+    assert measured[0]["t"] == plan["slots"][0]["t"]
+    actual = measured[0]["actual"]
+    assert {"samples", "coverage_pct", "import_kwh", "export_kwh", "charged_kwh", "discharged_kwh"} <= set(actual)
+    assert actual["samples"] == 1 and actual["coverage_pct"] <= 100.0
+    assert actual["import_kwh"] >= 0.0 and actual["export_kwh"] >= 0.0
+    assert actual["import_kwh"] * actual["export_kwh"] == 0.0, "one row cannot both import and export"
+    assert (progress["measured_import_kwh"] is not None) is True
+    # The advisory tick journaled a mode_not_auto row inside the slot containing `now`.
+    dispatched = [entry for entry in body["slots"] if entry["dispatch"]]
+    assert dispatched, "the advisory tick must show up as a dispatch attempt"
+    for entry in dispatched:
+        assert entry["dispatch"]["code"] == "mode_not_auto"
+        assert entry["dispatch"]["dry_run"] is True and entry["dispatch"]["applied_w"] == 0.0
+        assert entry["dispatch"]["batteries"][0]["id"] == "example_battery_1"
+    note(
+        f"plan execution: {len(body['slots'])} slots, {len(dispatched)} with a dispatch attempt, "
+        f"floors {body['floors']}"
+    )
 
 
 def test_forecast_endpoints(wired):

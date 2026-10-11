@@ -167,11 +167,26 @@ Extra lines: `Charged from grid: … · charged from PV: …`, `Battery shares i
 and the efficiency note with the break-even explanation and worked example. A negative saving adds
 `The plan is more expensive than doing nothing over this horizon; check the price source and settings.`
 
-**Next actions** — a vertical `.window-list` of the contiguous action windows (time range, action,
-power, `because:` reason and a `stale price` badge together), so a 360 px screen never splits the
-time/action/reason relationship. The range ends when the window's last slot ends (a two-slot window
-is `06:45 PM – 07:15 PM`), a one-slot window shows a single time, and the power is unsigned beside
-the action word that already names the direction (`Discharge · 700 W`).
+**Next actions** — a vertical `.window-list` of the contiguous action windows, so a 360 px screen
+never splits the time/action/reason relationship. One summary line above the list adds the windows
+up (`6 windows · 1.60 kWh out · 0.40 kWh in · costs 0.31 EUR on the grid · measured so far …`), then
+each window states, in this order:
+
+| Line | Content |
+| --- | --- |
+| Time | `06:45 PM – 07:15 PM (2 slots)` — the range ends when the window's last slot ends; a `now` badge marks the window containing the current time |
+| Action | `Discharge · 800 W` — the action word names the direction, so the power is unsigned |
+| Reason | `because: Peak discharge` (the frozen slug, rendered in words) |
+| Facts (`.window-facts`, `label`/`value` pairs) | `Buy → sell` (`20.0 ct/kWh → 30.0 ct/kWh (+10.0 ct/kWh)`), `Break-even` (`buy / round_trip + wear`, with the margin above it or `efficiency not reported`), `Battery` (planned kWh in/out for the window), `SoC` (first slot's SoC → last slot's SoC, plus the SoC floor a reserve hold defends), `Grid cost` (planned import/export kWh from `load − pv + power` and what that costs or earns at the slot's own tariff) |
+| Context | `PV 0.50 kW · load 0.80 kW (0.50 kW–1.10 kW band)` — the slot's forecast and the load band the optimiser saw |
+| Status | what actually happened: `applied 400 W of 800 W requested (clamped: Power clamped to limits) · battery_1 −400 W · last attempt 12 min ago`, `not written: the mode is not auto`, `dry run: simulated …`, `measured −0.70 kW vs −0.80 kW planned, 1 sample over 15 of 60 min`, `not reached yet, starts in …`, or `not dispatchable: this slot has no fresh price, so the dispatcher refuses it (stale_input)` |
+| Price provenance | `price from zonneplan_entity · updated 4 min ago · rank 1 of 36 by buy price (most expensive)`, or `no fresh price for this slot: the optimiser treats it as flat, and it is never dispatched` |
+
+A stale window keeps its `stale price` badge and is never presented as dispatchable: the dispatcher
+refuses a slot whose price is not fresh (`dispatcher._stale_input_reason`), so the row says so
+instead of showing a plan power as if it had been applied. Windows merge only while the action,
+reason, power and staleness stay identical, so a constraint change is never hidden inside a broad
+summary; each slot's full figures remain in **All slots**.
 
 **All slots** — headers: `Time`, `Buy`, `Sell`, `PV`, `Load`, `SoC`, `Battery power`,
 `Action`, `Reason`, `Flags` (`stale price` badge); PV/load are kW (`fmtKw`), never labelled as
@@ -1326,6 +1341,35 @@ battery's own efficiency and wear, so a cheap old pack and an efficient new one 
 into one misleading figure, while the *plan* reports the aggregate round trip and wear it actually
 assumed.
 
+### 4.15 Measured actuals onto the plan grid (`/plan/execution`, 0.10.0)
+
+The plan says what was intended; `GET /api/v1/plan/execution` joins the *same* slot grid with what
+was measured and what was applied, so a window can state both without the UI inventing anything.
+
+```
+bucket         = 5 min (engine.ACTUALS_MINUTES, the actuals row's own resolution)
+rows           = actuals rows in [plan.horizon_start, now + 5 min), deduplicated by ts, last row wins
+                 (the store upserts one row per bucket; the in-memory ring keeps every tick)
+slot aggregate = every surviving row in [slot.t, slot.t + slot_minutes) counts as 5 measured minutes
+coverage_pct   = min(100, 100 x samples x 5 / slot_minutes)
+energy_kwh     = sum(kW) x 5/60, split into magnitudes:
+                 charged/discharged from battery_kw (positive = charging),
+                 import/export from grid_kw (positive = importing)
+progress       = a fully elapsed slot counts whole; the slot in progress counts by coverage_pct,
+                 so the intended and measured sides cover the same span
+                 planned_cost  = sum of slot.cost_eur over that span
+                 measured_cost = sum(import_kwh x buy − export_kwh x sell) at the slot's own tariff
+                 measured_* stays null until something was measured
+clamped        = any battery with |applied_w| < |requested_w| − 1 W (engine.CLAMP_TOLERANCE_W)
+floor_soc_pct  = max(optimizer.reserve_soc_pct, every enabled battery's min_soc_pct)
+```
+
+A slot with no measurement reports `actual: null` and a window with no dispatch row reports
+`dispatch: null`; the UI renders "not reached yet", "no dispatch recorded" or the stale-price refusal
+from that absence rather than reading it as 0 W applied. The dispatch log is read from the store
+(everything since the plan was generated) and falls back to the in-memory journal ring, which only
+holds a few hours of ticks.
+
 ---
 
 ## 5. Published Home Assistant entities
@@ -1363,7 +1407,8 @@ supplies it (which is why publishing a port would hand battery control to anyone
 | --- | --- | --- |
 | `GET /api/v1/health` | — | `{status, version, uptime_s, commit}` |
 | `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]`, `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
-| `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, feasible, infeasible_reason, mode, dry_run, sources{}, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` |
+| `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, slot_minutes, feasible, infeasible_reason, mode, dry_run, sources{}, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; `slot_minutes` is the plan's own resolution (the UI never assumes one); with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` and `slot_minutes: null` |
+| `GET /api/v1/plan/execution` | `hours` | additive (0.10.0): `{generated_at, slot_minutes, now, floors{reserve_soc_pct, min_soc_pct, floor_soc_pct}, batteries[{id, name, min_soc_pct, floor_soc_pct, capacity_kwh}], progress{…}, slots[{t, dispatch, actual}]}` — the same slot grid as `/plan`, joined with the persisted 5-minute actuals and the dispatch log. `dispatch` is the last attempt per battery in that slot (`requested_w`, `applied_w`, `ok`, `dry_run`, `clamped`, `code`, `reason`, `message`, `records`, `batteries[]`) and `actual` the measured aggregate (`samples`, `coverage_pct`, `pv_kw`, `load_kw`, `grid_kw`, `battery_kw`, `planned_kw`, `measured_kw`, `import_kwh`, `export_kwh`, `charged_kwh`, `discharged_kwh`, `soc_kwh_start`, `soc_kwh_end`). Both are `null` for a slot nothing was measured or dispatched in — never a fabricated zero |
 | `POST /api/v1/plan/recompute` | — | `{queued: true}` (async; poll status) |
 | `GET /api/v1/forecast` | `kind=price\|solar\|load`, `hours` | `{kind, generated_at, source, stale, slots, provider, contract, notes[], reason, hint}` |
 | `GET /api/v1/batteries` | — | `{batteries: [{config, state, capabilities, mapping_resolved, discovery[]}]}` |

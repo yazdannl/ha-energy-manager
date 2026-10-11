@@ -36,6 +36,7 @@ from .models import (
     DispatchResult,
     Mode,
     Plan,
+    PlanSlot,
     PriceForecast,
     ProviderStatus,
     Reason,
@@ -83,6 +84,9 @@ MAX_REPLAN_BACKOFF_S = 900.0
 ALERT_DEDUPE_S = 900.0
 SAVINGS_FLUSH_S = 300.0
 DISCOVER_CACHE_S = 60.0
+#: Requested vs applied within this many watts is an idempotent re-write, not a clamp: a real cap
+#: (grid limit, SoC floor, battery ceiling) moves the setpoint by far more (SPEC 10 plan execution).
+CLAMP_TOLERANCE_W = 1.0
 #: Seconds a fetched device registry stays cached: the wizard's search box must not open a new
 #: WebSocket command per keystroke (names change far slower than the user types).
 DEVICE_CACHE_S = 5.0
@@ -2380,6 +2384,100 @@ class Engine:
         self._savings_cache = (now, range_key, totals)
         return totals
 
+    # ------------------------------------------------------------------ plan execution
+
+    def plan_execution(self, now: datetime | None = None, hours: int | None = None) -> dict[str, Any]:
+        """Per-slot execution evidence for the active plan (SPEC 10 route, additive).
+
+        The plan says what was *intended*; this joins the same slot grid with the persisted
+        5-minute actuals and the dispatch log, so a window can state what was measured and what
+        was actually applied.  Read-only, and empty (not broken) without a plan or without a store:
+        a slot nobody has reached yet carries ``actual: null`` rather than a fabricated zero.
+        """
+        moment = now or self._clock()
+        plan = self.active_plan()
+        floors = self._execution_floors()
+        batteries = [
+            {
+                "id": config.id,
+                "name": config.name,
+                "min_soc_pct": float(config.min_soc_pct),
+                "floor_soc_pct": max(float(config.min_soc_pct), floors["reserve_soc_pct"]),
+                "capacity_kwh": float(config.capacity_kwh),
+            }
+            for config in sorted(self.battery_configs(), key=lambda item: item.id)
+            if config.enabled
+        ]
+        if plan is None:
+            return {
+                "generated_at": None,
+                "slot_minutes": None,
+                "now": to_iso(moment),
+                "floors": floors,
+                "batteries": batteries,
+                "progress": _execution_progress([], [], moment, 0.0),
+                "slots": [],
+            }
+        minutes = float(plan.slot_minutes or 0)
+        limit = moment + timedelta(hours=hours) if hours else None
+        slots = [slot for slot in plan.slots if limit is None or slot.t < limit]
+        measured = analytics.measured_per_slot(
+            [slot.t for slot in slots],
+            minutes,
+            self._execution_actuals(plan, moment),
+            bucket_minutes=float(ACTUALS_MINUTES),
+            now=moment,
+        )
+        dispatches = self._execution_dispatches(plan)
+        return {
+            "generated_at": to_iso(plan.generated_at),
+            "slot_minutes": int(minutes),
+            "now": to_iso(moment),
+            "floors": floors,
+            "batteries": batteries,
+            "progress": _execution_progress(slots, measured, moment, minutes),
+            "slots": [
+                {
+                    "t": to_iso(slot.t),
+                    "dispatch": _dispatch_in_window(dispatches, slot.t, minutes),
+                    "actual": measured[index],
+                }
+                for index, slot in enumerate(slots)
+            ],
+        }
+
+    def _execution_floors(self) -> dict[str, float]:
+        """The SoC floor a reserve hold defends: the configured reserve above every battery minimum."""
+        reserve = float(self._settings.get("optimizer.reserve_soc_pct", 0.0) or 0.0)
+        minimums = [float(config.min_soc_pct) for config in self.battery_configs() if config.enabled]
+        lowest = min(minimums) if minimums else 0.0
+        return {
+            "reserve_soc_pct": max(0.0, reserve),
+            "min_soc_pct": max(0.0, lowest),
+            "floor_soc_pct": max(0.0, reserve, lowest),
+        }
+
+    def _execution_actuals(self, plan: Plan, moment: datetime) -> list[dict[str, Any]]:
+        """Measured 5-minute rows for the plan horizon, from the store with the ring as fallback."""
+        rows = self._store_call(
+            "actuals_range", plan.horizon_start, moment + timedelta(minutes=ACTUALS_MINUTES)
+        )
+        if rows:
+            return list(rows)
+        with self._lock:
+            return [dict(row) for row in self._actuals_ring]
+
+    def _execution_dispatches(self, plan: Plan) -> list[dict[str, Any]]:
+        """Dispatch rows since the plan was generated: the persistent log, else the in-memory ring.
+
+        The ring holds ``Journal(max_entries)`` rows -- a few hours of ticks -- while the store keeps
+        the whole horizon, so the store is preferred whenever it is bound.
+        """
+        rows = self._store_call("dispatch_log", limit=2000, since=plan.horizon_start)
+        if rows:
+            return list(rows)
+        return list(self._journal.dispatch_log(limit=600))
+
     # ------------------------------------------------------------------ log/export
 
     def log(self, limit: int = 100, level: str | None = None, kind: str | None = None) -> list[dict[str, Any]]:
@@ -2860,4 +2958,129 @@ def _battery_state_dict(config_id: str, battery: BatteryState | None) -> dict[st
         "stale": battery.stale,
         "last_error": battery.last_error,
         "extra": dict(battery.extra or {}),
+    }
+
+
+def _dispatch_in_window(
+    rows: Sequence[Mapping[str, Any]], start: datetime, minutes: float
+) -> dict[str, Any] | None:
+    """Last dispatch per battery inside one plan slot, or None (SPEC 10 plan execution).
+
+    A window with no dispatch row is *not dispatched* -- an advisory run, a stale slot the
+    dispatcher refused, or a slot nobody reached -- and the caller renders exactly that instead of
+    reading a missing row as "0 W applied".
+    """
+    end = start + timedelta(minutes=minutes)
+    latest: dict[str, Mapping[str, Any]] = {}
+    latest_stamp: datetime | None = None
+    last_row: Mapping[str, Any] | None = None
+    records = 0
+    for row in rows:
+        stamp = from_iso(row.get("ts"))
+        if stamp is None or not start <= stamp < end:
+            continue
+        records += 1
+        latest[str(row.get("battery_id") or "")] = row
+        if latest_stamp is None or stamp >= latest_stamp:
+            latest_stamp = stamp
+            last_row = row
+    if records == 0 or latest_stamp is None or last_row is None:
+        return None
+    batteries: list[dict[str, Any]] = []
+    requested = 0.0
+    applied = 0.0
+    ok = True
+    dry_run = False
+    for battery_id in sorted(latest):
+        row = latest[battery_id]
+        want = float(row.get("requested_w") or 0.0)
+        got = float(row.get("applied_w") or 0.0)
+        row_ok = bool(row["ok"]) if "ok" in row else str(row.get("result") or "") == "ok"
+        requested += want
+        applied += got
+        ok = ok and row_ok
+        dry_run = dry_run or bool(row.get("dry_run"))
+        batteries.append({"id": battery_id, "requested_w": want, "applied_w": got, "ok": row_ok})
+    last = last_row
+    return {
+        "ts": to_iso(latest_stamp),
+        "requested_w": requested,
+        "applied_w": applied,
+        "ok": ok,
+        "dry_run": dry_run,
+        "clamped": any(
+            abs(item["applied_w"]) < abs(item["requested_w"]) - CLAMP_TOLERANCE_W
+            for item in batteries
+        ),
+        "code": str(last.get("code") or ""),
+        "reason": str(last.get("reason") or last.get("code") or ""),
+        "message": str(last.get("message") or ""),
+        "records": records,
+        "batteries": batteries,
+    }
+
+
+def _execution_progress(
+    slots: Sequence[PlanSlot], measured: Sequence[Mapping[str, Any] | None], moment: datetime, minutes: float
+) -> dict[str, Any]:
+    """Plan-so-far totals: intended vs measured energy and grid cost over the reached slots.
+
+    A fully elapsed slot counts whole; the slot in progress counts by the share actually measured
+    (``coverage_pct``), so both sides cover the same span and the comparison stays apples to apples.
+    Measured totals stay ``None`` until something was really measured, so a fresh install never
+    reports a measured zero it did not observe.
+    """
+    step = timedelta(minutes=minutes)
+    hours = minutes / 60.0
+    elapsed = 0
+    reached = 0
+    samples = 0
+    span_minutes = 0.0
+    planned_charged = planned_discharged = planned_cost = 0.0
+    measured_charged = measured_discharged = imported = exported = measured_cost = 0.0
+    for slot, entry in zip(slots, measured):
+        if minutes <= 0:
+            continue
+        complete = slot.t + step <= moment
+        coverage = float(entry.get("coverage_pct") or 0.0) if entry else 0.0
+        share = 1.0 if complete else coverage / 100.0
+        if share <= 0.0:
+            continue
+        if complete:
+            elapsed += 1
+        span_minutes += minutes * share
+        planned_charged += max(0.0, float(slot.power_w)) / 1000.0 * hours * share
+        planned_discharged += max(0.0, -float(slot.power_w)) / 1000.0 * hours * share
+        planned_cost += slot.cost_eur(hours) * share
+        if entry is None:
+            continue
+        reached += 1
+        samples += int(entry.get("samples") or 0)
+        measured_charged += float(entry.get("charged_kwh") or 0.0)
+        measured_discharged += float(entry.get("discharged_kwh") or 0.0)
+        imported += float(entry.get("import_kwh") or 0.0)
+        exported += float(entry.get("export_kwh") or 0.0)
+        # Import is billed at the slot's buy price, export earns its sell price (the plan's own
+        # tariff for that slot), so measured and planned cost are compared at the same prices.
+        measured_cost += (
+            float(entry.get("import_kwh") or 0.0) * float(slot.buy)
+            - float(entry.get("export_kwh") or 0.0) * float(slot.sell)
+        )
+    coverage = 0.0
+    if span_minutes > 0:
+        coverage = min(100.0, 100.0 * samples * float(ACTUALS_MINUTES) / span_minutes)
+    return {
+        "slots_elapsed": elapsed,
+        "slots_measured": reached,
+        "slots_total": len(slots),
+        "samples": samples,
+        "coverage_pct": coverage,
+        "planned_charged_kwh": planned_charged,
+        "planned_discharged_kwh": planned_discharged,
+        "planned_cost_eur": planned_cost,
+        "measured_charged_kwh": measured_charged if reached else None,
+        "measured_discharged_kwh": measured_discharged if reached else None,
+        "measured_import_kwh": imported if reached else None,
+        "measured_export_kwh": exported if reached else None,
+        "measured_cost_eur": measured_cost if reached else None,
     }

@@ -152,6 +152,115 @@ function classTokens(text) {
     && (byClass(view(), "answer-authority")[0] || {}).textContent === authorityBefore,
     "the authority line changed or vanished");
 
+  /* ---------- 1c. next actions: the data behind each time slot (SPEC 10) ---------- */
+  // The window rows are the phone-first reading of the plan, so they are checked as data first
+  // (pure helpers, deterministic synthetic slots) and then as rendered structure.
+  console.log("\n1c. next actions: prices, energy, SoC, execution evidence");
+  const HOUR = 3600000;
+  const hourStart = Math.floor(Date.now() / HOUR) * HOUR;
+  function slotAt(index, overrides) {
+    return Object.assign({
+      t: new Date(hourStart + index * HOUR).toISOString(),
+      buy: 0.2, sell: 0.3, pv_kw: 0.5, load_kw: 0.8, load_p10: 0.5, load_p90: 1.1,
+      soc_kwh: 5.0, soc_pct: 50.0, power_w: -800.0, action: "discharge", reason: "peak_discharge",
+      price_stale: false, pv_source: "capacity", price_source: "zonneplan_entity",
+    }, overrides || {});
+  }
+  const syntheticPlan = {
+    slot_minutes: 60,
+    summary: { eta_charge: 0.95, eta_discharge: 0.95, round_trip_efficiency: 0.9025, wear_eur_per_kwh: 0.02 },
+    slots: [
+      slotAt(0),
+      slotAt(1, { soc_pct: 40.0 }),
+      slotAt(2, { power_w: 0.0, action: "hold", reason: "reserve_hold", price_stale: true, soc_pct: 40.0 }),
+    ],
+  };
+  const syntheticExecution = {
+    floors: { reserve_soc_pct: 20.0, min_soc_pct: 10.0, floor_soc_pct: 20.0 },
+    progress: { slots_elapsed: 0, slots_measured: 1, slots_total: 3, coverage_pct: 25.0, measured_discharged_kwh: 0.2, measured_charged_kwh: 0.0 },
+    slots: [
+      {
+        t: syntheticPlan.slots[0].t,
+        dispatch: { ts: syntheticPlan.slots[0].t, requested_w: -800.0, applied_w: -400.0, ok: true, dry_run: false, clamped: true, code: "power_clamp", reason: "power_clamp", message: "clamped", records: 1, batteries: [{ id: "battery_1", requested_w: -800.0, applied_w: -400.0, ok: true }] },
+        actual: { samples: 1, coverage_pct: 25.0, pv_kw: 0.5, load_kw: 0.8, grid_kw: -1.1, battery_kw: -0.7, planned_kw: -0.8, measured_kw: -0.7, import_kwh: 0.0, export_kwh: 0.27, charged_kwh: 0.0, discharged_kwh: 0.175, soc_kwh_start: 5.0, soc_kwh_end: 4.8 },
+      },
+      { t: syntheticPlan.slots[1].t, dispatch: null, actual: null },
+      { t: syntheticPlan.slots[2].t, dispatch: null, actual: null },
+    ],
+  };
+  const syntheticWindows = A.planActionWindows(syntheticPlan, syntheticExecution);
+  check("windows merge consecutive identical slots only", syntheticWindows.length === 2
+    && syntheticWindows[0].slots === 2 && syntheticWindows[1].slots === 1,
+    `${syntheticWindows.length} windows: ${syntheticWindows.map((w) => w.slots).join("+")}`);
+  check("every slot belongs to exactly one window",
+    syntheticWindows.reduce((sum, win) => sum + win.slots, 0) === syntheticPlan.slots.length);
+  check("the plan's own resolution drives the window end",
+    syntheticWindows[0].endMs === syntheticWindows[0].startMs + 2 * HOUR
+    && A.planSlotMinutes({ slot_minutes: 15 }) === 15 && A.planSlotMinutes({}) === 60);
+  const ctx = A.planWindowContext({
+    plan: syntheticPlan, execution: syntheticExecution, cycleCost: 0.02,
+    providers: { price: [{ name: "zonneplan_entity", active: true, stale: false, last_success: new Date().toISOString() }] },
+  });
+  const discharge = syntheticWindows[0];
+  const facts = A.windowFacts(discharge, ctx);
+  const labels = facts.map((fact) => fact.label).join(", ");
+  check("a window states the prices behind the decision", /Buy → sell/.test(labels) && /20\.0 ct\/kWh/.test(facts[0].value) && /30\.0 ct\/kWh/.test(facts[0].value) && /\+10\.0 ct\/kWh/.test(facts[0].value), facts[0] ? facts[0].value : "no facts");
+  check("a window states its break-even and the margin over it",
+    /Break-even/.test(labels) && /clear/.test(facts[1].value) && /24\.2 ct\/kWh/.test(facts[1].value), facts[1] ? facts[1].value : "no break-even");
+  check("a window states the battery energy and the SoC path",
+    /Battery/.test(labels) && /1\.60 kWh out/.test(facts[2].value)
+    && /SoC/.test(labels) && /50 % → 40 %/.test(facts[3].value) && /floor 20 %/.test(facts[3].value),
+    `${facts[2].value} / ${facts[3].value}`);
+  check("a window states its grid flow and what it earns",
+    /Grid cost/.test(labels) && /exports 1\.00 kWh/.test(facts[4].value) && /earns/.test(facts[4].value), facts[4] ? facts[4].value : "no grid fact");
+  check("the join lands the dispatch and the measurement on the right window",
+    discharge.dispatch && discharge.dispatch.clamped === true && discharge.dispatchSlots === 1
+    && discharge.actual && Math.abs(discharge.measured_discharged_kwh - 0.175) < 1e-9
+    && syntheticWindows[1].dispatch === null && syntheticWindows[1].actual === null);
+  check("a clamped dispatch states applied vs requested",
+    /applied 400 W of 800 W requested \(clamped: /.test(A.windowStatusText(discharge, ctx)), A.windowStatusText(discharge, ctx));
+  check("a measured window compares measured with planned",
+    /measured -0\.70 kW vs -0\.80 kW planned/.test(A.windowStatusText(discharge, ctx)), A.windowStatusText(discharge, ctx));
+  const staleWindow = syntheticWindows[1];
+  check("a stale window says the dispatcher refuses it (stale_input)",
+    /not dispatchable/.test(A.windowStatusText(staleWindow, ctx)) && /stale_input/.test(A.windowStatusText(staleWindow, ctx)));
+  check("a stale window's price is not presented as a fresh one",
+    /no fresh price/.test(A.windowPriceText(staleWindow, ctx)));
+  check("a fresh window names its price source and rank",
+    /zonneplan_entity/.test(A.windowPriceText(discharge, ctx)) && /rank 1 of 3/.test(A.windowPriceText(discharge, ctx)),
+    A.windowPriceText(discharge, ctx));
+  check("the horizon summary adds the windows up",
+    /2 windows/.test(A.windowSummary(syntheticWindows, ctx)) && /1\.60 kWh out/.test(A.windowSummary(syntheticWindows, ctx))
+    && /measured so far/.test(A.windowSummary(syntheticWindows, ctx)),
+    A.windowSummary(syntheticWindows, ctx));
+  check("a missing measurement is never reported as a zero",
+    /nothing measured yet/.test(A.windowSummary(syntheticWindows, { progress: { slots_elapsed: 0, slots_total: 3, coverage_pct: 0 } })));
+
+  await goto("/plan");
+  const livePlanFixture = await M.handle("GET", "/api/v1/plan?hours=36");
+  const executionFixture = await M.handle("GET", "/api/v1/plan/execution?hours=36");
+  check("the plan payload carries its own resolution",
+    livePlanFixture.slot_minutes > 0 && A.planSlotMinutes(livePlanFixture) === livePlanFixture.slot_minutes);
+  const mockWindows = A.planActionWindows(livePlanFixture, executionFixture);
+  check("the rendered window list matches the payload's windows",
+    byClass(view(), "window-list").length === 1 && byClass(view(), "window-facts").length === mockWindows.length,
+    `${byClass(view(), "window-facts").length} rows for ${mockWindows.length} windows`);
+  check("the rendered rows carry facts, context, status and price provenance",
+    byClass(view(), "window-context").length === mockWindows.length
+    && byClass(view(), "window-status").length === mockWindows.length
+    && byClass(view(), "window-price").length === mockWindows.length
+    && byClass(view(), "window-summary").length === 1);
+  const factText = byClass(view(), "window-facts").map((node) => node.textContent).join(" | ");
+  check("the rendered facts name the prices, break-even, energy, SoC and grid cost",
+    /Buy → sell/.test(factText) && /Break-even/.test(factText) && /Battery/.test(factText)
+    && /SoC/.test(factText) && /Grid cost/.test(factText), factText.slice(0, 160));
+  check("the rendered rows mark the window that is running now",
+    byClass(view(), "badge-info").length >= 1, `${byClass(view(), "badge-info").length} now badges`);
+  check("the rendered execution line states what happened",
+    mockWindows.some((win) => win.dispatch || win.actual)
+    && /(applied|not written|measured|not dispatchable|no dispatch recorded)/.test(byClass(view(), "window-status").map((n) => n.textContent).join(" | ")),
+    byClass(view(), "window-status").map((n) => n.textContent).join(" | ").slice(0, 160));
+
   /* ---------- 2. settings structure ---------- */
   console.log("\n2. settings IA (every key present, groups, folding)");
   await goto("/settings");

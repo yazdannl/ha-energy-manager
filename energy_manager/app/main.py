@@ -38,7 +38,7 @@ from .notify import Notifier
 
 log = logging.getLogger("app.main")
 
-APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.9.1"
+APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.10.0"
 COMMIT = os.environ.get("SEM_COMMIT") or os.environ.get("GITHUB_SHA") or ""
 DEFAULT_PORT = 8099
 DEFAULT_OPTIONS = "/data/options.json"
@@ -803,6 +803,7 @@ def _selfcheck_http(api: ApiServer, engine: Any) -> list[tuple[str, bool, str]]:
         "/api/v1/health",
         "/api/v1/status",
         "/api/v1/plan",
+        "/api/v1/plan/execution",
         "/api/v1/forecast?kind=price",
         "/api/v1/batteries",
         "/api/v1/config",
@@ -845,6 +846,19 @@ def _selfcheck_http(api: ApiServer, engine: Any) -> list[tuple[str, bool, str]]:
                 and all(slot.get("price_source") for slot in slots)
                 and all(slot.get("soc_pct") is not None for slot in slots),
                 f"{len(slots)} slots",
+            )
+        )
+
+        status, execution = request("GET", "/api/v1/plan/execution")
+        entries = (execution or {}).get("slots") or []
+        results.append(
+            (
+                "plan execution joins the same slot grid",
+                bool(entries)
+                and len(entries) == len(slots)
+                and [entry.get("t") for entry in entries] == [slot.get("t") for slot in slots]
+                and (execution or {}).get("slot_minutes") == (plan or {}).get("slot_minutes"),
+                f"{len(entries)} entries",
             )
         )
 

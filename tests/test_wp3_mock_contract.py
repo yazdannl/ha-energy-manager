@@ -62,6 +62,7 @@ DOCUMENTED_ROUTES = [
     "GET /api/v1/health",
     "GET /api/v1/status",
     "GET /api/v1/plan",
+    "GET /api/v1/plan/execution",
     "POST /api/v1/plan/recompute",
     "GET /api/v1/forecast",
     "GET /api/v1/batteries",
@@ -265,7 +266,8 @@ def test_health_and_status_payloads(fixtures):
 
 def test_plan_payload_matches_section_10(fixtures):
     plan = fixtures["fixtures"]["plan"]
-    assert_fields(plan, ["generated_at", "horizon_start", "horizon_end", "feasible", "summary", "slots", "batteries"], "GET /plan")
+    assert_fields(plan, ["generated_at", "horizon_start", "horizon_end", "slot_minutes", "feasible", "summary", "slots", "batteries"], "GET /plan")
+    assert plan["slot_minutes"] > 0
     # plan.summary is a CLOSED payload: no subset check here on purpose — its exact key set is
     # asserted against app/api.py.plan_summary_dict in test_plan_summary_matches_the_api_serializer,
     # which is what catches an added/dropped field (a subset check silently missed objective_eur).
@@ -279,6 +281,41 @@ def test_plan_payload_matches_section_10(fixtures):
         assert isinstance(slot["price_stale"], bool)
     for battery in plan["batteries"]:
         assert_fields(battery, ["id", "name", "share_w"], "plan batteries[]")
+
+
+def test_plan_execution_payload_matches_section_10(fixtures):
+    """The execution join mirrors api.py:plan_execution_dict: one entry per slot, null when unknown."""
+    execution = fixtures["fixtures"]["plan_execution"]
+    plan = fixtures["fixtures"]["plan"]
+    assert_fields(execution, ["generated_at", "slot_minutes", "now", "floors", "batteries", "progress", "slots"], "GET /plan/execution")
+    assert execution["generated_at"] == plan["generated_at"]
+    assert execution["slot_minutes"] == plan["slot_minutes"]
+    assert [entry["t"] for entry in execution["slots"]] == [slot["t"] for slot in plan["slots"]]
+    assert_fields(execution["floors"], ["reserve_soc_pct", "min_soc_pct", "floor_soc_pct"], "floors")
+    assert_fields(execution["batteries"][0], ["id", "name", "min_soc_pct", "floor_soc_pct", "capacity_kwh"], "execution batteries[]")
+    assert_fields(execution["progress"], [
+        "slots_elapsed", "slots_measured", "slots_total", "samples", "coverage_pct",
+        "planned_charged_kwh", "planned_discharged_kwh", "planned_cost_eur",
+        "measured_charged_kwh", "measured_discharged_kwh", "measured_import_kwh",
+        "measured_export_kwh", "measured_cost_eur",
+    ], "progress")
+    for entry in execution["slots"]:
+        assert_fields(entry, ["t", "dispatch", "actual"], "execution slots[]")
+        if entry["actual"]:
+            assert_fields(entry["actual"], [
+                "samples", "coverage_pct", "pv_kw", "load_kw", "grid_kw", "battery_kw", "planned_kw",
+                "measured_kw", "import_kwh", "export_kwh", "charged_kwh", "discharged_kwh",
+                "soc_kwh_start", "soc_kwh_end",
+            ], "execution actual")
+            assert 0.0 < entry["actual"]["coverage_pct"] <= 100.0
+        if entry["dispatch"]:
+            assert_fields(entry["dispatch"], [
+                "ts", "requested_w", "applied_w", "ok", "dry_run", "clamped", "code", "reason",
+                "message", "records", "batteries",
+            ], "execution dispatch")
+    # The demo plan starts at the slot containing `now`, so that slot is the one already reached.
+    reached = [entry for entry in execution["slots"] if entry["actual"] or entry["dispatch"]]
+    assert reached, "the mock must show at least the current slot's execution evidence"
 
 
 def test_plan_summary_matches_the_api_serializer(fixtures):

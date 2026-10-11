@@ -56,7 +56,9 @@ exceptional state.
 
 Navigation and data refresh are separate. A deliberate route change re-renders the view, scrolls to
 the top and focuses the route `h1`; a background poll calls the view's `state.refresh()` hook, which
-updates values in place and restores focus to the element that occupied the same position. Every
+updates values in place and restores focus to the element that occupied the same position. Views that
+can refresh quietly install that hook themselves (Dashboard, Plan, Savings); `asyncPanel` panels
+expose `reload()`, which re-fetches and redraws a panel body in place without flashing "Loading…". Every
 background refresh (15 s timer and the `visibilitychange` path) is blocked by `refreshBlocked()`
 while any dialog is open, a write is pending, the settings form is dirty or a stop result is on
 screen — so a poll can never discard an unsaved edit or a failed-stop banner. `once()` clears a
@@ -96,7 +98,14 @@ last setpoint if the stop were skipped. The banner states this explicitly and no
 `/status` (3 s, max 60 s) until `last_plan_at` changes. Warnings panel (infeasible plan, stale
 prices, sources), timeline chart, summary (cost, baseline, saving, charged/discharged, cycles,
 arbitrage, per-battery shares, and the aggregate **round trip** the plan assumed), slot table with
-action, reason and a `stale price` badge. The price chart draws the **break-even line**
+action, reason and a `stale price` badge. The **Next actions** list states each window's own data:
+the buy/sell prices and spread, the break-even and the margin over it, the planned kWh in/out, the
+SoC path and the floor it defends, the planned grid flow and what it costs or earns, the price
+provider's age and the window's rank in the horizon — plus what actually happened (applied vs
+requested, clamped/dry-run/advisory, measured vs planned, or why nothing was dispatched). It reads
+`GET /plan/execution` beside `/plan`; both are optional, so the rows state less rather than failing.
+The view installs `state.refresh`, so returning to the tab re-reads the plan, its execution join and
+the provider freshness in place — it keeps no timer of its own. The price chart draws the **break-even line**
 (`buy / round_trip + wear`, from the aggregate the plan assumed) across the
 sell prices, so a sell price that looks profitable but sits below the battery's conversion loss is
 visibly below the line; that slot stays idle and its reason is `efficiency_loss`, which is distinct
@@ -289,7 +298,14 @@ if they are absent:
 
 - `GET /api/v1/plan`: per-slot `soc_pct`, `pv_source`, `price_source` (now carried by
   `models.PlanSlot`; the chart and slot table read `soc_pct` straight from the payload and never
-  recompute it); `summary` fields per `PlanSummary`; `batteries[].share_w`.
+  recompute it); `summary` fields per `PlanSummary`; `batteries[].share_w`; `slot_minutes` (the
+  plan's own resolution — the window ranges, the `now` marker, the slot lookup and the "All slots"
+  caption all read it, and a missing value falls back to 60 rather than guessing per view).
+- `GET /api/v1/plan/execution` (additive, 0.10.0): `floors.floor_soc_pct` for the reserve line,
+  `progress` for the "measured so far" summary, and per slot `dispatch`/`actual` as documented in
+  REFERENCE §6. A missing or failing endpoint only removes those lines.
+- `GET /api/v1/providers`: the `price` list's `active` entry supplies the freshness line
+  (`stale` / `last_success`) beside each window's price source.
 - `GET /api/v1/config`: `settings[].type` ∈ `bool|int|float|str|password|json|list`, `choices` for
   enums/multi-selects, and a `Safety` group (or the key names listed above) for the confirm step.
 - `GET /api/v1/savings`: `totals.arbitrage_kwh` and `totals.self_consumption_kwh` for the split;

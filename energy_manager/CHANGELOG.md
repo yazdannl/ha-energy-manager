@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.10.0
+
+- **Every planned window now states the data behind it, not just its action.** The **Next actions**
+  list shows, per window: the buy and sell price with their spread, the break-even
+  (`buy / round_trip + wear`) and the margin above it, the planned kWh in and out, the SoC path and
+  the floor a reserve hold defends, the planned grid flow and what it costs or earns, the price
+  provider's age, and the window's rank by buy price in the horizon. One line above the list adds the
+  windows up. The figures come from the plan payload the UI already had - they were simply never
+  shown, which made a 15-minute grid and an hourly tariff look identical on screen.
+- **The plan now reports its own resolution, and the interface uses it.** `GET /api/v1/plan` carries
+  `slot_minutes` (SPEC 10, additive). Before this the UI assumed 60 minutes for every plan, so a
+  15-minute plan was captioned as hourly, window end times were up to an hour wrong, and the "now"
+  slot was looked up on the wrong grid. The offline render check now asserts the payload's own
+  resolution drives the window range.
+- **New additive route `GET /api/v1/plan/execution`.** It joins the plan's slot grid with the
+  persisted 5-minute actuals and the dispatch log: per slot, the last dispatch attempt per battery
+  (requested vs applied, clamped, dry run, mode, reason) and the measured aggregate (kWh in/out,
+  import/export, average power, SoC start/end, how much of the slot was actually observed). A window
+  therefore says "applied 400 W of 800 W requested (clamped)" or "measured -0.70 kW vs -0.80 kW
+  planned" instead of only what was intended, and a slot nobody reached reports nothing rather than a
+  fabricated zero.
+- **A stale window says what it means: it is never dispatched.** The dispatcher refuses a slot whose
+  price forecast is not fresh, so the window now states `not dispatchable: this slot has no fresh
+  price (stale_input)` instead of presenting its plan power as if it had been applied. With an hourly
+  tariff on a 15-minute plan grid this is the difference between three quarters of every hour looking
+  scheduled and being visibly blocked.
+- The Plan view refreshes in place when you return to the tab (`state.refresh`), so the "now" marker,
+  the measured figures and the price age no longer sit on a screen that was opened hours ago. Panels
+  reload without flashing "Loading…".
+
 ## 0.9.1
 
 - **The Meter card now shows where the grid meter comes from.** With every `grid.*` key empty it

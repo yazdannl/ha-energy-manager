@@ -100,7 +100,11 @@ next to it.
 4. **Feedback.** Measurements become `actuals` rows; `analytics` compares realised PV/load/price
    with what was forecast, keeps the learned corrections, and accumulates savings per day.
 5. **Presentation.** The API serialises `SystemState`, plan, forecasts, savings, accuracy and log
-   from the store and the engine's shared state; the UI polls it. `Status` also carries
+   from the store and the engine's shared state; the UI polls it. Beside the plan itself,
+   `GET /plan/execution` joins the same slot grid with the stored `actuals` rows and the
+   `dispatch_log` (requested vs applied, clamped, dry run, measured kWh and SoC), so a planned window
+   can be read against what was really measured and written without either side being recomputed in
+   the browser. `Status` also carries
    `pending_holds` (batteries whose neutralising hold is still outstanding) and `mode_persisted`
    (false when a mode change could not be written to the settings file and a restart would come up
    in the old mode), so the UI never has to guess what is really in force. `notify.py` publishes the

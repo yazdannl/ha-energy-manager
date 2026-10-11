@@ -1114,9 +1114,20 @@ h1.route-title:focus { outline: none; }
   padding-left: var(--sp-3);
   border-left: 3px solid var(--accent);
 }
-.window-time { font-weight: 650; font-variant-numeric: tabular-nums; font-size: var(--type-13); }
+.window-time { font-weight: 650; font-variant-numeric: tabular-nums; font-size: var(--type-13); display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-2); align-items: baseline; }
 .window-action { margin: 0; font-size: var(--type-15); }
 .window-reason { margin: 0; color: var(--text-muted); font-size: var(--type-13); }
+/* The horizon's own totals above the list: the windows' sum, not another headline. */
+.window-summary { margin: 0; font-size: var(--type-13); }
+/* Per-window facts reuse .stat-row/.stat-label/.stat-value; only the density is local. */
+.window-facts { gap: var(--sp-1) var(--sp-3); }
+.window-facts li { min-width: 9rem; }
+.window-facts .stat-label { font-size: var(--type-11); }
+.window-facts .stat-value { font-size: var(--type-13); }
+.window-context { margin: 0; color: var(--text-muted); font-size: var(--type-12); font-variant-numeric: tabular-nums; }
+/* Dispatched/measured evidence reads as a result line, not as another muted hint. */
+.window-status { margin: 0; font-size: var(--type-13); }
+.window-price { margin: 0; color: var(--text-muted); font-size: var(--type-11); }
 
 /* ---------- log: message first ---------- */
 

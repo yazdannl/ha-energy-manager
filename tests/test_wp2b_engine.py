@@ -384,6 +384,126 @@ def test_savings_accumulate_into_daily_rows():
     assert engine.savings_totals("month")["savings_eur"] == totals["savings_eur"]
 
 
+def test_plan_execution_joins_measured_actuals_and_dispatches():
+    """GET /plan/execution: measured energy and applied setpoints per slot, future slots empty (SPEC 10)."""
+    clock = Clock(datetime(2026, 1, 1, 12, 20, tzinfo=timezone.utc))
+    engine, store, _ha, _clock, _settings = build_engine(clock=clock)
+    engine.plan_now("test")
+    plan = engine.active_plan()
+    minutes = plan.slot_minutes
+    step = timedelta(minutes=minutes)
+    # The plan grid starts at the slot containing `now`, so only a later `now` makes a slot complete.
+    clock.advance(minutes=50)
+    elapsed = [slot for slot in plan.slots if slot.t + step <= clock.now]
+    assert len(elapsed) == 1, "the selfcheck plan must have exactly one complete slot by now"
+    slot = elapsed[0]
+    # Two 5-minute rows inside that slot: charging 800 W, importing 1.8 kW, SoC rising 1.0 kWh.
+    for index in range(2):
+        store.upsert_actuals(
+            slot.t + timedelta(minutes=5 * index),
+            pv_kw=0.0,
+            load_kw=1.0,
+            grid_kw=1.8,
+            battery_kw=0.8,
+            soc_kwh=3.0 + 0.5 * index,
+            price_buy=slot.buy,
+            plan_power_w=800.0,
+            dispatch_power_w=800.0,
+        )
+    engine._journal.dispatch(  # noqa: SLF001 - the journal is the engine's own dispatch log
+        {
+            "ts": slot.t + timedelta(minutes=1),
+            "battery_id": "example_battery_1",
+            "requested_w": 800.0,
+            "applied_w": 400.0,
+            "soc_pct": 55.0,
+            "mode": Mode.AUTO.value,
+            "dry_run": False,
+            "result": "ok",
+            "code": Reason.POWER_CLAMP,
+            "message": "clamped by the import limit",
+            "reason": Reason.POWER_CLAMP,
+            "writes": [],
+        }
+    )
+    payload = engine.plan_execution()
+    assert payload["slot_minutes"] == minutes
+    assert payload["generated_at"] == plan.generated_at.isoformat()
+    by_time = {entry["t"]: entry for entry in payload["slots"]}
+    measured = by_time[slot.t.isoformat()]["actual"]
+    assert measured["samples"] == 2
+    assert measured["coverage_pct"] == 100.0 * 2 * 5 / minutes
+    # Every row stands for five measured minutes: 0.8 kW x 10 min = 0.133 kWh in, 1.8 kW x 10 min
+    # = 0.3 kWh imported, and the SoC runs from the first to the last row.
+    assert abs(measured["charged_kwh"] - 0.8 * 10 / 60) < 1e-9
+    assert abs(measured["discharged_kwh"]) < 1e-9
+    assert abs(measured["import_kwh"] - 1.8 * 10 / 60) < 1e-9
+    assert abs(measured["export_kwh"]) < 1e-9
+    assert measured["measured_kw"] == 0.8 and measured["planned_kw"] == 0.8
+    assert measured["soc_kwh_start"] == 3.0 and measured["soc_kwh_end"] == 3.5
+    dispatch = by_time[slot.t.isoformat()]["dispatch"]
+    assert dispatch["requested_w"] == 800.0 and dispatch["applied_w"] == 400.0
+    assert dispatch["clamped"] is True and dispatch["dry_run"] is False and dispatch["ok"] is True
+    assert dispatch["code"] == Reason.POWER_CLAMP and dispatch["records"] == 1
+    assert [item["id"] for item in dispatch["batteries"]] == ["example_battery_1"]
+    # No other slot has been measured or dispatched, and a slot nobody reached reports nothing at
+    # all -- never a zero (the slot containing `now` is one of them).
+    for entry in payload["slots"]:
+        if entry["t"] == slot.t.isoformat():
+            continue
+        assert entry["actual"] is None and entry["dispatch"] is None
+    assert payload["slots"][0]["t"] == plan.slots[0].t.isoformat()
+    assert len(payload["slots"]) == len(plan.slots)
+
+
+def test_plan_execution_progress_counts_only_elapsed_slots():
+    clock = Clock(datetime(2026, 1, 1, 12, 20, tzinfo=timezone.utc))
+    engine, store, _ha, _clock, _settings = build_engine(clock=clock)
+    engine.plan_now("test")
+    plan = engine.active_plan()
+    step = timedelta(minutes=plan.slot_minutes)
+    clock.advance(minutes=50)
+    elapsed = [slot for slot in plan.slots if slot.t + step <= clock.now]
+    slot = elapsed[0]
+    store.upsert_actuals(slot.t + timedelta(minutes=5), grid_kw=-2.0, battery_kw=-0.5, soc_kwh=4.0)
+    progress = engine.plan_execution()["progress"]
+    assert progress["slots_total"] == len(plan.slots)
+    assert progress["slots_elapsed"] == len(elapsed)
+    assert progress["samples"] == 1
+    assert abs(progress["measured_export_kwh"] - 2.0 * 5 / 60) < 1e-9
+    assert abs(progress["measured_discharged_kwh"] - 0.5 * 5 / 60) < 1e-9
+    assert progress["measured_import_kwh"] == 0.0
+    expected_planned = sum(
+        max(0.0, float(item.power_w)) / 1000.0 * (plan.slot_minutes / 60.0) for item in elapsed
+    )
+    assert abs(progress["planned_charged_kwh"] - expected_planned) < 1e-9
+    expected_cost = sum(item.cost_eur(plan.slot_minutes / 60.0) for item in elapsed)
+    assert abs(progress["planned_cost_eur"] - expected_cost) < 1e-9
+    # The measured cost is the slot's own tariff: export earns the sell price.
+    assert abs(progress["measured_cost_eur"] - (-(2.0 * 5 / 60) * slot.sell)) < 1e-9
+
+
+def test_plan_execution_is_empty_without_a_plan_or_a_store():
+    clock = Clock(datetime(2026, 1, 1, 12, 20, tzinfo=timezone.utc))
+    engine, _store, _ha, _clock, _settings = build_engine(clock=clock)
+    empty = engine.plan_execution()
+    assert empty["slots"] == [] and empty["generated_at"] is None and empty["slot_minutes"] is None
+    assert empty["progress"]["measured_charged_kwh"] is None
+    assert set(empty["floors"]) == {"reserve_soc_pct", "min_soc_pct", "floor_soc_pct"}
+    engine.plan_now("test")
+    payload = engine.plan_execution()
+    assert payload["slots"] and payload["progress"]["slots_elapsed"] >= 0
+    # Without measured rows nothing is claimed: a measured total stays null, not 0.0.
+    assert payload["progress"]["measured_import_kwh"] is None
+    assert payload["batteries"] and payload["batteries"][0]["id"] == "example_battery_1"
+    assert payload["batteries"][0]["floor_soc_pct"] == max(
+        payload["floors"]["reserve_soc_pct"], payload["batteries"][0]["min_soc_pct"]
+    )
+    short = engine.plan_execution(hours=12)["slots"]
+    assert 0 < len(short) < len(payload["slots"])
+    assert short == payload["slots"][: len(short)]
+
+
 def test_journal_entries_have_the_api_shape():
     engine, _store, _ha, _clock, _settings = build_engine()
     engine.plan_now("test")

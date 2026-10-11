@@ -405,3 +405,96 @@ def _percentile(values: Sequence[float], fraction: float) -> float:
     low = int(index)
     high = min(low + 1, len(ordered) - 1)
     return ordered[low] + (index - low) * (ordered[high] - ordered[low])
+
+
+# ---------------------------------------------------------------------------------------------
+# Measured actuals onto the plan grid (SPEC 10, additive: GET /api/v1/plan/execution)
+# ---------------------------------------------------------------------------------------------
+
+#: Bucket length of the persisted ``actuals`` rows (``engine.ACTUALS_MINUTES``).  Passed in by the
+#: caller rather than imported, so this module keeps no dependency on the engine.
+ACTUALS_BUCKET_MINUTES = 5.0
+
+#: Columns aggregated per slot.  ``signed`` fields are averaged, the rest are turned into energy.
+_SIGNED_ACTUALS = ("pv_kw", "load_kw", "grid_kw", "battery_kw")
+
+
+def measured_per_slot(
+    slot_times: Sequence[datetime],
+    slot_minutes: float,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    bucket_minutes: float = ACTUALS_BUCKET_MINUTES,
+    now: datetime | None = None,
+) -> list[dict[str, Any] | None]:
+    """5-minute ``actuals`` rows aggregated onto a plan's slot grid, one entry per slot time.
+
+    ``None`` for a slot with no measurement (a future slot reports nothing, never a zero).  Rows are
+    deduplicated by ``ts`` with the last row winning -- the store's ``ON CONFLICT(ts) DO UPDATE``
+    keeps one row per bucket, while the in-memory ring keeps every tick.  Every surviving row stands
+    for one ``bucket_minutes`` of measured time, so ``coverage_pct`` states how much of the slot was
+    observed instead of counting the gaps as zero power.
+
+    Signs follow the engine's actuals convention: ``battery_kw`` and ``plan_power_w`` positive =
+    charging, ``grid_kw`` positive = importing.  Energy is returned as positive magnitudes
+    (``charged_kwh``/``discharged_kwh``/``import_kwh``/``export_kwh``).
+    """
+    step = float(slot_minutes)
+    empty: list[dict[str, Any] | None] = [None] * len(slot_times)
+    if step <= 0 or not slot_times:
+        return empty
+    hours = float(bucket_minutes) / 60.0
+    latest: dict[datetime, Mapping[str, Any]] = {}
+    for row in rows:
+        try:
+            stamp = from_iso(row.get("ts"))
+        except ValueError:  # a corrupt row must not take the whole panel down
+            continue
+        if stamp is None:
+            continue
+        if now is not None and stamp > now:
+            continue
+        latest[stamp] = row  # last write wins
+    if not latest:
+        return empty
+    ordered = sorted(latest.items())
+    out: list[dict[str, Any] | None] = []
+    for start in slot_times:
+        end = start + timedelta(minutes=step)
+        selected = [row for stamp, row in ordered if start <= stamp < end]
+        if not selected:
+            out.append(None)
+            continue
+        entry: dict[str, Any] = {
+            "samples": len(selected),
+            "coverage_pct": min(100.0, 100.0 * len(selected) * float(bucket_minutes) / step),
+        }
+        for field in _SIGNED_ACTUALS:
+            entry[field] = _mean([row.get(field) for row in selected])
+        power = _mean([row.get("plan_power_w") for row in selected])
+        entry["planned_kw"] = None if power is None else power / 1000.0
+        entry["measured_kw"] = entry["battery_kw"]
+        entry["import_kwh"] = _positive_energy(selected, "grid_kw", hours)
+        entry["export_kwh"] = _negative_energy(selected, "grid_kw", hours)
+        entry["charged_kwh"] = _positive_energy(selected, "battery_kw", hours)
+        entry["discharged_kwh"] = _negative_energy(selected, "battery_kw", hours)
+        soc = [row.get("soc_kwh") for row in selected if row.get("soc_kwh") is not None]
+        entry["soc_kwh_start"] = float(soc[0]) if soc else None
+        entry["soc_kwh_end"] = float(soc[-1]) if soc else None
+        out.append(entry)
+    return out
+
+
+def _mean(values: Iterable[Any]) -> float | None:
+    numbers = [float(value) for value in values if value is not None]
+    if not numbers:
+        return None
+    return sum(numbers) / len(numbers)
+
+
+def _positive_energy(rows: Sequence[Mapping[str, Any]], field: str, hours: float) -> float:
+    return sum(max(0.0, float(row[field])) for row in rows if row.get(field) is not None) * hours
+
+
+def _negative_energy(rows: Sequence[Mapping[str, Any]], field: str, hours: float) -> float:
+    return sum(max(0.0, -float(row[field])) for row in rows if row.get(field) is not None) * hours

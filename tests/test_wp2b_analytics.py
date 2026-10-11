@@ -255,3 +255,70 @@ def test_percentile_rank_bounds():
     assert analytics.percentile_rank(values, 0.4) == 100.0
     assert analytics.percentile_rank([], 1.0) == 0.0
     assert analytics.percentile_rank(values, -1.0) == 0.0
+
+
+def test_measured_per_slot_uses_five_minute_buckets():
+    """Measured actuals onto a plan slot grid: last write wins, energies are magnitudes (SPEC 10)."""
+    start = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    slots = [start, start + timedelta(minutes=15)]
+    rows = [
+        {
+            "ts": (start + timedelta(minutes=5)).isoformat(),
+            "grid_kw": 2.0,
+            "battery_kw": 1.0,
+            "pv_kw": 0.5,
+            "load_kw": 1.5,
+            "soc_kwh": 2.0,
+            "plan_power_w": 1000.0,
+        },
+        # The same bucket written twice: the last row wins, exactly like the store's upsert.
+        {
+            "ts": (start + timedelta(minutes=5)).isoformat(),
+            "grid_kw": 2.0,
+            "battery_kw": 1.0,
+            "pv_kw": 0.5,
+            "load_kw": 1.5,
+            "soc_kwh": 2.4,
+            "plan_power_w": 1000.0,
+        },
+        {
+            "ts": (start + timedelta(minutes=10)).isoformat(),
+            "grid_kw": -1.0,
+            "battery_kw": -0.5,
+            "pv_kw": 1.0,
+            "load_kw": 0.5,
+            "soc_kwh": 2.0,
+            "plan_power_w": -500.0,
+        },
+    ]
+    first, second = analytics.measured_per_slot(slots, 15.0, rows)
+    assert first["samples"] == 2
+    assert first["coverage_pct"] == 100.0 * 2 * 5 / 15
+    # Two distinct 5-minute buckets (the duplicate write is one of them), so each row contributes
+    # exactly five measured minutes.
+    assert abs(first["charged_kwh"] - 1.0 * 5 / 60) < 1e-9
+    assert abs(first["discharged_kwh"] - 0.5 * 5 / 60) < 1e-9
+    assert abs(first["import_kwh"] - 2.0 * 5 / 60) < 1e-9
+    assert abs(first["export_kwh"] - 1.0 * 5 / 60) < 1e-9
+    assert first["soc_kwh_start"] == 2.4 and first["soc_kwh_end"] == 2.0
+    assert first["measured_kw"] == (1.0 + -0.5) / 2
+    assert first["planned_kw"] == (1000.0 + -500.0) / 2000.0
+    assert first["pv_kw"] == (0.5 + 1.0) / 2 and first["load_kw"] == (1.5 + 0.5) / 2
+    # A slot with no measurement reports nothing rather than a fabricated zero.
+    assert second is None
+
+
+def test_measured_per_slot_ignores_unusable_rows_and_unreachable_slots():
+    start = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    rows = [
+        {"ts": "not-a-timestamp", "grid_kw": 1.0},
+        {"ts": (start - timedelta(minutes=5)).isoformat(), "grid_kw": 1.0},
+        {"ts": (start + timedelta(minutes=5)).isoformat(), "grid_kw": 1.0},
+    ]
+    # The future row is excluded while `now` has not reached it, so the slot stays unmeasured.
+    assert analytics.measured_per_slot([start], 15.0, rows, now=start + timedelta(minutes=1)) == [None]
+    measured = analytics.measured_per_slot([start], 15.0, rows, now=start + timedelta(minutes=6))[0]
+    assert measured["samples"] == 1 and measured["import_kwh"] == 1.0 * 5 / 60
+    assert analytics.measured_per_slot([], 15.0, rows) == []
+    assert analytics.measured_per_slot([start], 0.0, rows) == [None]
+    assert analytics.measured_per_slot([start], 15.0, []) == [None]

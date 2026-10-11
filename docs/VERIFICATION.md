@@ -15,18 +15,22 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **668 passed** (two consecutive runs) |
+| Test suite | `python3 -m pytest tests -q` | **675 passed** (two consecutive runs) |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 93 files scanned`, exit 0 |
-| Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
+| Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
-| Headless UI render check | `node tools/ui_render_check.js` | **54 passed, 0 failed**, exit 0 |
+| Headless UI render check | `node tools/ui_render_check.js` | **75 passed, 0 failed**, exit 0 |
 
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (79 files, documentation excluded)**:
-  `fc5f9d440dfa55655aeea5a9f0e6e66b61dffdbad82f6380ff16852344fc24b8`
+  `784dbf04149edf58640ed0f3f320f5181a8161c7eceb8021a972befad2c6d9f9`
 * **path list of the same 79 files** (detects an added, removed or renamed file):
   `999c72a0ad237efad84631e1c196871fbab19aaf4e46b1e3e55f351c7c988ad5`
+
+The 0.9.1 tree's code + tests digest was `fc5f9d44…`; 0.10.0 (§8.8) changed file contents only - it
+added no file, so the path-list digest above is the same one, which is exactly what that recipe is
+for.
 
 The recipe sorts the file list **and** the per-file manifest under `LC_ALL=C`, so the digest is
 independent of `find` order and of the locale; a single `sort` is not enough. An earlier revision of
@@ -735,6 +739,69 @@ New tests: `tests/test_wp2a_grid.py` (+1, `dashboard_roles` under an override), 
 the older-engine `{}` fallback) and the updated route-contract assertion in
 `tests/test_wp5_api_contract.py`. The suite went from 663 to 668 passing tests.
 
+### 8.8 Per-window plan evidence: measured, dispatched, priced (0.10.0)
+
+Requested from a phone screenshot of the 0.9.0 **Next actions** list: "enrich this section with more
+data about that time slot". The list rendered time, action, power, reason and a `stale price` badge,
+while the payload already carried the prices, the forecast and the SoC path, and the store already
+held the measured rows and the dispatch log. Two defects surfaced while wiring it:
+
+* **The plan's own resolution never reached the interface.** `plan_dict` omitted `slot_minutes`, so
+  `planSlotMinutes()` fell back to 60 for every plan: a 15-minute plan was captioned as hourly, the
+  window end was up to an hour wrong and `slotAt()` looked the "now" slot up on a 60-minute grid.
+  The mock set the field, which is why no test caught it. `slot_minutes` is now part of the `/plan`
+  contract (`PLAN_FIELDS`, the mock contract and the selfcheck all assert it).
+* **A stale slot looked scheduled.** The dispatcher refuses a slot whose price is not fresh
+  (`_stale_input_reason`), but the list showed the plan power and a badge, so a blocked window read
+  like a pending one. With an hourly tariff on a 15-minute plan grid that is three quarters of every
+  hour silently blocked.
+
+What 0.10.0 adds:
+
+* `GET /api/v1/plan/execution` (additive, SPEC 10): the plan's slot grid joined with the persisted
+  5-minute `actuals` rows and the `dispatch_log`. Per slot, `dispatch` is the last attempt per battery
+  (`requested_w`, `applied_w`, `ok`, `dry_run`, `clamped`, `code`, `reason`, `records`, `batteries[]`)
+  and `actual` the measured aggregate (`samples`, `coverage_pct`, `pv_kw`, `load_kw`, `grid_kw`,
+  `battery_kw`, `planned_kw`, `measured_kw`, `import_kwh`, `export_kwh`, `charged_kwh`,
+  `discharged_kwh`, `soc_kwh_start`, `soc_kwh_end`). A slot nothing reached carries `null` for both -
+  never a fabricated zero - and `progress` reports the plan so far (intended vs measured kWh and grid
+  cost, `slots_elapsed`, `slots_measured`, `coverage_pct`). `floors.floor_soc_pct` is
+  `max(optimizer.reserve_soc_pct, min over enabled batteries)`.
+* `analytics.measured_per_slot()` (pure): rows deduplicated by `ts` (last wins, like the store's
+  upsert), every surviving row standing for its own 5 measured minutes, energies returned as
+  magnitudes and `coverage_pct` stating how much of the slot was actually observed.
+* `Engine.plan_execution()` reads the dispatch log from the store (the whole horizon) and falls back
+  to the in-memory journal ring; `_execution_progress()` counts a fully elapsed slot whole and the
+  slot in progress by its measured share, so both sides cover the same span.
+* The window rows now state the prices (`Buy → sell` in ct/kWh with the spread), the break-even and
+  the margin over it, the planned kWh in/out, the SoC path and the floor, the planned grid flow and
+  what it costs or earns, the provider's age and the window's rank - plus the execution line
+  ("applied 400 W of 800 W requested (clamped: …)", "measured -0.70 kW vs -0.80 kW planned, 1 sample
+  over 15 of 60 min", "not dispatchable: this slot has no fresh price (stale_input)"). One summary
+  line above the list adds the windows up. The Plan view installs `state.refresh`, so returning to the
+  tab re-reads the plan, the join and the providers in place; `asyncPanel.reload()` redraws a panel
+  without flashing "Loading…".
+
+Gates: the suite went from 668 to **675 passing** (analytics +2, engine +3, the API route contract +1,
+the mock contract +1), the headless render check from 54 to **75 checks, 0 failed** (21 new, of which
+12 are the load-bearing ones `tests/test_wp3_ui_render.py` now requires), the selfcheck from 31 to
+**33/33** (the new route and the slot-grid join), `tools/audit.sh` still clean over 93 files, and
+`compileall` clean. The new tests are
+`tests/test_wp2b_analytics.py::test_measured_per_slot_uses_five_minute_buckets`,
+`::test_measured_per_slot_ignores_unusable_rows_and_unreachable_slots`,
+`tests/test_wp2b_engine.py::test_plan_execution_joins_measured_actuals_and_dispatches`,
+`::test_plan_execution_progress_counts_only_elapsed_slots`,
+`::test_plan_execution_is_empty_without_a_plan_or_a_store`,
+`tests/test_wp5_api_contract.py::test_plan_execution_route_reports_measured_and_applied` and
+`tests/test_wp3_mock_contract.py::test_plan_execution_payload_matches_section_10`.
+
+Honest limits: a plan's slots start at the slot containing `now`, so only the current slot (and any
+fully elapsed slot when the plan is older than one slot) can carry measurements - the join is not a
+history of past plans. The per-window money is the plan's own cost model (`load − pv + power` at the
+slot's tariff), and the measured side re-prices the measured import/export at the same tariff, so the
+two are comparable but neither is a bill. `clamped` uses a 1 W tolerance (`CLAMP_TOLERANCE_W`), so an
+idempotent re-write is not reported as a clamp.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
@@ -828,14 +895,14 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 668 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 675 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 
 # 3. R1 tripwire (expect: "audit: clean — 93 files scanned", exit 0)
 sh tools/audit.sh
 
-# 4. End-to-end selfcheck (expect: 31/31 checks passed, exit 0)
+# 4. End-to-end selfcheck (expect: 33/33 checks passed, exit 0)
 PYTHONPATH=energy_manager python3 -m app.main --selfcheck
 
 # 5. Render the front-end headless and check its structure (expect: "0 failed", exit 0; also run by

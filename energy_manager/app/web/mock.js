@@ -141,6 +141,111 @@
     return out;
   }
 
+  // GET /api/v1/plan/execution (SPEC 10, additive): the plan grid joined with the 5-minute actuals
+  // and the dispatch log. The demo plan starts at the slot containing `now`, so only that slot has
+  // been reached: it carries partial measured rows and the dispatch attempt the mode would produce.
+  function executionPayload(hours) {
+    var plan = planPayload(hours);
+    var slots = plan.slots;
+    var nowMs = Date.now();
+    var stepMs = plan.slot_minutes * 60000;
+    var floors = { reserve_soc_pct: 10.0, min_soc_pct: 10.0, floor_soc_pct: 10.0 };
+    var charged = 0.0, discharged = 0.0, imported = 0.0, exported = 0.0, cost = 0.0, samples = 0;
+    var reached = 0, spanMinutes = 0.0;
+    var out = slots.map(function (slot) {
+      var startMs = new Date(slot.t).getTime();
+      var endMs = startMs + stepMs;
+      if (startMs >= nowMs) return { t: slot.t, dispatch: null, actual: null };
+      // Measured minutes so far in this slot: a 5-minute grid, capped at the slot length.
+      var measuredMinutes = Math.max(0, Math.min(plan.slot_minutes, Math.floor((nowMs - startMs) / 300000) * 5));
+      if (measuredMinutes <= 0) return { t: slot.t, dispatch: dispatchFor(slot), actual: null };
+      var coverage = round(100.0 * measuredMinutes / plan.slot_minutes, 1);
+      var gridKw = slot.load_kw - slot.pv_kw + slot.power_w / 1000;
+      var batteryKw = slot.power_w / 1000;
+      var actual = {
+        samples: measuredMinutes / 5,
+        coverage_pct: coverage,
+        pv_kw: slot.pv_kw,
+        load_kw: slot.load_kw,
+        grid_kw: round(gridKw, 4),
+        battery_kw: round(batteryKw, 4),
+        planned_kw: round(batteryKw, 4),
+        measured_kw: round(batteryKw, 4),
+        import_kwh: round(Math.max(0, gridKw) * measuredMinutes / 60, 4),
+        export_kwh: round(Math.max(0, -gridKw) * measuredMinutes / 60, 4),
+        charged_kwh: round(Math.max(0, batteryKw) * measuredMinutes / 60, 4),
+        discharged_kwh: round(Math.max(0, -batteryKw) * measuredMinutes / 60, 4),
+        soc_kwh_start: slot.soc_kwh,
+        soc_kwh_end: slot.soc_kwh
+      };
+      reached += 1;
+      samples += actual.samples;
+      spanMinutes += measuredMinutes;
+      charged += actual.charged_kwh;
+      discharged += actual.discharged_kwh;
+      imported += actual.import_kwh;
+      exported += actual.export_kwh;
+      cost += actual.import_kwh * slot.buy - actual.export_kwh * slot.sell;
+      return { t: slot.t, dispatch: dispatchFor(slot), actual: actual };
+    });
+    var plannedCharged = 0.0, plannedDischarged = 0.0, plannedCost = 0.0;
+    var elapsed = 0;
+    slots.forEach(function (slot) {
+      var startMs = new Date(slot.t).getTime();
+      var share = startMs + stepMs <= nowMs ? 1.0 : 0.0;
+      if (startMs + stepMs <= nowMs) elapsed += 1;
+      plannedCharged += Math.max(0, slot.power_w) / 1000 * share;
+      plannedDischarged += Math.max(0, -slot.power_w) / 1000 * share;
+      var grid = slot.load_kw - slot.pv_kw + slot.power_w / 1000;
+      plannedCost += (grid >= 0 ? grid * slot.buy : grid * slot.sell) * share;
+    });
+    return {
+      generated_at: plan.generated_at,
+      slot_minutes: plan.slot_minutes,
+      now: iso(nowMs),
+      floors: floors,
+      batteries: [{ id: "battery_1", name: "Example Battery 1", min_soc_pct: 10.0, floor_soc_pct: 10.0, capacity_kwh: CAP_KWH }],
+      progress: {
+        slots_elapsed: elapsed,
+        slots_measured: reached,
+        slots_total: slots.length,
+        samples: samples,
+        coverage_pct: spanMinutes > 0 ? round(100.0 * samples * 5 / spanMinutes, 1) : 0.0,
+        planned_charged_kwh: round(plannedCharged, 4),
+        planned_discharged_kwh: round(plannedDischarged, 4),
+        planned_cost_eur: round(plannedCost, 4),
+        measured_charged_kwh: reached ? round(charged, 4) : null,
+        measured_discharged_kwh: reached ? round(discharged, 4) : null,
+        measured_import_kwh: reached ? round(imported, 4) : null,
+        measured_export_kwh: reached ? round(exported, 4) : null,
+        measured_cost_eur: reached ? round(cost, 4) : null
+      },
+      slots: out
+    };
+  }
+
+  // What the dispatcher would have written for this slot in the demo's mode: advisory/dry-run
+  // skip the write, auto applies the setpoint. A stale slot is refused, so it gets no attempt.
+  function dispatchFor(slot) {
+    if (slot.price_stale) return null;
+    var requested = slot.power_w;
+    var auto = db.mode === "auto";
+    var applied = auto && !db.dry_run ? requested : 0.0;
+    return {
+      ts: iso(Math.min(Date.now(), new Date(slot.t).getTime() + 60000)),
+      requested_w: requested,
+      applied_w: applied,
+      ok: true,
+      dry_run: !!db.dry_run,
+      clamped: false,
+      code: auto ? "ok" : "mode_not_auto",
+      reason: auto ? slot.reason : "mode_not_auto",
+      message: auto ? "" : "Write skipped: mode is advisory",
+      records: 1,
+      batteries: [{ id: "battery_1", requested_w: requested, applied_w: applied, ok: true }]
+    };
+  }
+
   function windowSlots(hours) {
     var n = clamp(parseInt(hours, 10) || 36, 1, 48);
     return planSlots().slice(0, n);
@@ -791,6 +896,7 @@
     },
     "GET /api/v1/status": function () { return statusPayload(); },
     "GET /api/v1/plan": function (ctx) { return planPayload(ctx.params.hours); },
+    "GET /api/v1/plan/execution": function (ctx) { return executionPayload(ctx.params.hours); },
     "POST /api/v1/plan/recompute": function () { return { queued: true }; },
     "GET /api/v1/forecast": function (ctx) {
       var kind = ctx.params.kind || "price";
@@ -1021,6 +1127,7 @@
     var out = { health: routes["GET /api/v1/health"]({ params: {} }) };
     out.status = routes["GET /api/v1/status"]({ params: {} });
     out.plan = routes["GET /api/v1/plan"]({ params: { hours: "36" } });
+    out.plan_execution = routes["GET /api/v1/plan/execution"]({ params: { hours: "36" } });
     out.price = routes["GET /api/v1/forecast"]({ params: { kind: "price", hours: "36" } });
     out.solar = routes["GET /api/v1/forecast"]({ params: { kind: "solar", hours: "36" } });
     out.load = routes["GET /api/v1/forecast"]({ params: { kind: "load", hours: "36" } });

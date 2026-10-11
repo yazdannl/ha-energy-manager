@@ -347,9 +347,13 @@
     var actions = options.actions || [];
     var p = panel(host, title, actions);
     var token = state.viewToken;
-    function run() {
-      p.section.setAttribute("data-state", "loading");
-      panelStatus(p.body, "loading", options.loadingText || "Loading…");
+    // A quiet reload (background refresh) must not flash "Loading…" over figures the user is
+    // reading; the panel body is redrawn in place when the new data arrives (UI_REVIEW §3.5).
+    function run(quiet) {
+      if (!quiet) {
+        p.section.setAttribute("data-state", "loading");
+        panelStatus(p.body, "loading", options.loadingText || "Loading…");
+      }
       options.load().then(function (data) {
         if (token !== state.viewToken || !p.body.isConnected) return;
         p.section.removeAttribute("data-state");
@@ -363,6 +367,7 @@
       });
     }
     run();
+    p.reload = function () { run(true); };
     return p;
   }
 
@@ -1392,12 +1397,80 @@
     return Math.round(minutes);
   }
 
+  // Cents per kWh, the vocabulary the battery cards already use ("20 ct/kWh"): "0.2810 EUR/kWh"
+  // beside "0.5120 EUR/kWh" is unreadable on a 360 px screen.
+  function fmtCt(value, digits) {
+    if (!isNum(value)) return "--";
+    return (value * 100).toFixed(digits === undefined ? 1 : digits) + " ct/kWh";
+  }
+
+  // Rank of one buy price inside the plan horizon: 1 = the most expensive slot. `/status` reports
+  // the same idea for "now" as `price_rank_pct` (SPEC 4.13); this is its per-window form.
+  function priceRank(values, value) {
+    if (!isNum(value) || !Array.isArray(values) || !values.length) return null;
+    var above = 0;
+    values.forEach(function (candidate) { if (isNum(candidate) && candidate > value) above += 1; });
+    return { rank: above + 1, total: values.length };
+  }
+
   // Action windows: consecutive slots with the same action, reason, power and staleness become one
-  // row, so a constraint change is never hidden inside a broad summary (UI_REVIEW §3.4). Pure data.
-  function planActionWindows(plan) {
+  // row, so a constraint change is never hidden inside a broad summary (UI_REVIEW §3.4).
+  //
+  // The window also carries everything the row states about that time slot: the prices behind the
+  // decision, the energy and SoC it moves, the planned grid flow, and the per-slot execution
+  // evidence joined from GET /plan/execution (what was dispatched and what was measured). Pure
+  // data: no DOM, so the offline render check can assert the numbers directly.
+  function planActionWindows(plan, execution) {
     var slots = Array.isArray(plan && plan.slots) ? plan.slots : [];
-    var stepMs = planSlotMinutes(plan) * 60000;
+    var minutes = planSlotMinutes(plan);
+    var stepMs = minutes * 60000;
+    var hours = minutes / 60;
+    var byTime = {};
+    ((execution && execution.slots) || []).forEach(function (entry) {
+      if (entry && entry.t) byTime[entry.t] = entry;
+    });
     var windows = [];
+
+    function add(win, slot) {
+      var exec = byTime[slot.t] || {};
+      var power = isNum(slot.power_w) ? slot.power_w : 0;
+      win.last = slot;
+      win.buySum += isNum(slot.buy) ? slot.buy : 0;
+      win.sellSum += isNum(slot.sell) ? slot.sell : 0;
+      win.pvSum += isNum(slot.pv_kw) ? slot.pv_kw : 0;
+      win.loadSum += isNum(slot.load_kw) ? slot.load_kw : 0;
+      win.charged_kwh += Math.max(0, power) / 1000 * hours;
+      win.discharged_kwh += Math.max(0, -power) / 1000 * hours;
+      // The plan's own grid model (models.PlanSlot.grid_kw): positive = importing.
+      var grid = (isNum(slot.load_kw) ? slot.load_kw : 0) - (isNum(slot.pv_kw) ? slot.pv_kw : 0) + power / 1000;
+      win.grid_import_kwh += Math.max(0, grid) * hours;
+      win.grid_export_kwh += Math.max(0, -grid) * hours;
+      win.cost_eur += (grid >= 0 ? grid * (slot.buy || 0) : grid * (slot.sell || 0)) * hours;
+      if (isNum(slot.load_p10)) win.bandLow = win.bandLow == null ? slot.load_p10 : Math.min(win.bandLow, slot.load_p10);
+      if (isNum(slot.load_p90)) win.bandHigh = win.bandHigh == null ? slot.load_p90 : Math.max(win.bandHigh, slot.load_p90);
+      if (isNum(slot.soc_pct)) {
+        if (win.socStart == null) win.socStart = slot.soc_pct;
+        win.socEnd = slot.soc_pct;
+      }
+      if (exec.dispatch) {
+        win.dispatch = exec.dispatch;   // the most recent attempt in the window
+        win.dispatchSlots += 1;
+        if (!exec.dispatch.ok || exec.dispatch.clamped) win.dispatchProblems += 1;
+      }
+      if (exec.actual) {
+        win.actual = exec.actual;
+        win.actualSlots += 1;
+        win.actualSamples += exec.actual.samples || 0;
+        win.actualMinutes += (exec.actual.coverage_pct || 0) / 100 * minutes;
+        win.measured_charged_kwh += exec.actual.charged_kwh || 0;
+        win.measured_discharged_kwh += exec.actual.discharged_kwh || 0;
+        win.measured_import_kwh += exec.actual.import_kwh || 0;
+        win.measured_export_kwh += exec.actual.export_kwh || 0;
+        win.measured_cost_eur += (exec.actual.import_kwh || 0) * (slot.buy || 0)
+          - (exec.actual.export_kwh || 0) * (slot.sell || 0);
+      }
+    }
+
     slots.forEach(function (slot) {
       var previous = windows[windows.length - 1];
       var same = previous && previous.action === slot.action && previous.reason === slot.reason &&
@@ -1409,10 +1482,11 @@
         previous.end = slot.t;
         previous.endMs = parseDate(slot.t) ? parseDate(slot.t).getTime() + stepMs : null;
         previous.slots += 1;
+        add(previous, slot);
         return;
       }
       var startMs = parseDate(slot.t) ? parseDate(slot.t).getTime() : null;
-      windows.push({
+      var win = {
         start: slot.t,
         end: slot.t,
         startMs: startMs,
@@ -1421,12 +1495,255 @@
         action: slot.action,
         reason: slot.reason,
         power_w: slot.power_w,
-        stale: !!slot.price_stale
-      });
+        stale: !!slot.price_stale,
+        first: slot,
+        last: slot,
+        buySum: 0,
+        sellSum: 0,
+        pvSum: 0,
+        loadSum: 0,
+        bandLow: null,
+        bandHigh: null,
+        charged_kwh: 0,
+        discharged_kwh: 0,
+        grid_import_kwh: 0,
+        grid_export_kwh: 0,
+        cost_eur: 0,
+        socStart: null,
+        socEnd: null,
+        dispatch: null,
+        dispatchSlots: 0,
+        dispatchProblems: 0,
+        actual: null,
+        actualSlots: 0,
+        actualSamples: 0,
+        actualMinutes: 0,
+        measured_charged_kwh: 0,
+        measured_discharged_kwh: 0,
+        measured_import_kwh: 0,
+        measured_export_kwh: 0,
+        measured_cost_eur: 0
+      };
+      add(win, slot);
+      windows.push(win);
+    });
+    windows.forEach(function (win) {
+      win.buy = win.buySum / win.slots;
+      win.sell = win.sellSum / win.slots;
+      win.pv_kw = win.pvSum / win.slots;
+      win.load_kw = win.loadSum / win.slots;
+      win.spread = win.sell - win.buy;
+      win.minutes = win.slots * minutes;
+      win.hours = win.minutes / 60;
     });
     return windows;
   }
 
+  // A window's numbers as label/value facts. Pure: the renderer only wraps these in elements, and
+  // the offline check asserts them without a browser.
+  function windowFacts(win, ctx) {
+    ctx = ctx || {};
+    var facts = [];
+    var margin = null;
+    var breakEven = planBreakEvenEur(win.buy, ctx.efficiency, ctx.wear);
+    if (isNum(breakEven) && isNum(win.sell)) margin = win.sell - breakEven;
+    var energy = [];
+    if (win.charged_kwh > 0) energy.push(fmtKwh(win.charged_kwh) + " in");
+    if (win.discharged_kwh > 0) energy.push(fmtKwh(win.discharged_kwh) + " out");
+    var cost = win.cost_eur;
+    var grid = win.grid_export_kwh > 0 && win.grid_import_kwh <= 0
+      ? "exports " + fmtKwh(win.grid_export_kwh)
+      : win.grid_import_kwh > 0 && win.grid_export_kwh <= 0
+        ? "imports " + fmtKwh(win.grid_import_kwh)
+        : "imports " + fmtKwh(win.grid_import_kwh) + ", exports " + fmtKwh(win.grid_export_kwh);
+    facts.push({
+      label: "Buy → sell",
+      value: fmtCt(win.buy) + " → " + fmtCt(win.sell) +
+        (isNum(win.spread) ? " (" + (win.spread >= 0 ? "+" : "−") + fmtCt(Math.abs(win.spread)) + ")" : "")
+    });
+    facts.push({
+      label: "Break-even",
+      value: isNum(breakEven)
+        ? fmtCt(breakEven) + (isNum(margin) ? " · " + (margin >= 0 ? "+" : "−") + fmtCt(Math.abs(margin)) + " clear" : "")
+        : "efficiency not reported"
+    });
+    facts.push({ label: "Battery", value: energy.length ? energy.join(" · ") : "no battery energy" });
+    facts.push({
+      label: "SoC",
+      value: isNum(win.socStart) && isNum(win.socEnd)
+        ? fmtPct(win.socStart, 0) + " → " + fmtPct(win.socEnd, 0) + (isNum(ctx.floorPct) ? " · floor " + fmtPct(ctx.floorPct, 0) : "")
+        : "not reported"
+    });
+    facts.push({
+      label: "Grid cost",
+      value: grid + " · " + (cost < 0 ? "earns " + fmtEur(Math.abs(cost)) : "costs " + fmtEur(cost))
+    });
+    return facts;
+  }
+
+  // What actually happened in the window: dispatched vs applied vs measured, or why nothing was.
+  // Pure text so the same sentence can be asserted offline (SPEC 10 plan execution).
+  function windowStatusText(win, ctx) {
+    ctx = ctx || {};
+    var nowMs = isNum(ctx.nowMs) ? ctx.nowMs : Date.now();
+    var parts = [];
+    // A stale slot is refused before anything else is said about it: the dispatcher never executes
+    // a slot without a fresh price, so "why 0 W?" is answered by the staleness, not by the row it
+    // leaves behind (dispatcher._stale_input_reason).
+    if (win.stale) parts.push("not dispatchable: this slot has no fresh price, so the dispatcher refuses it (stale_input)");
+    var dispatch = win.dispatch;
+    if (dispatch) {
+      var applied = fmtPower(Math.abs(isNum(dispatch.applied_w) ? dispatch.applied_w : 0));
+      var requested = fmtPower(Math.abs(isNum(dispatch.requested_w) ? dispatch.requested_w : 0));
+      var who = (dispatch.batteries || []).map(function (item) {
+        return (item.id || "battery") + " " + (item.applied_w < 0 ? "−" : "") + fmtPower(Math.abs(item.applied_w || 0));
+      }).join(", ");
+      if (dispatch.code === "mode_not_auto") parts.push("not written: the mode is not auto (mode_not_auto)");
+      else if (dispatch.dry_run) parts.push("dry run: simulated " + applied + " of " + requested);
+      else if (!dispatch.ok) parts.push("dispatch failed (" + reasonText(dispatch.code) + ")");
+      else if (dispatch.clamped) parts.push("applied " + applied + " of " + requested + " requested (clamped: " + reasonText(dispatch.code) + ")");
+      else parts.push("applied " + applied + " of " + requested + " requested");
+      if (who && dispatch.code !== "mode_not_auto") parts.push(who);
+      parts.push("last attempt " + timeAgo(dispatch.ts));
+      if (win.dispatchProblems && win.dispatchSlots > 1) parts.push(win.dispatchProblems + " of " + win.dispatchSlots + " slots clamped or failed");
+    }
+    if (win.actual) {
+      var measuredKw = win.actualMinutes > 0
+        ? (win.measured_charged_kwh - win.measured_discharged_kwh) / (win.actualMinutes / 60)
+        : null;
+      parts.push("measured " + fmtKw(measuredKw) + " vs " + fmtKw(isNum(win.power_w) ? win.power_w / 1000 : null) + " planned, " +
+        win.actualSamples + (win.actualSamples === 1 ? " sample" : " samples") + " over " +
+        Math.round(win.actualMinutes) + " of " + win.minutes + " min");
+    }
+    if (!parts.length) {
+      if (isNum(ctx.nowMs) && isNum(win.startMs) && win.startMs > ctx.nowMs) parts.push("not reached yet, starts in " + fmtDuration((win.startMs - ctx.nowMs) / 1000));
+      else if (ctx.mode && ctx.mode !== "auto") parts.push("nothing was dispatched: the mode is " + ctx.mode);
+      else parts.push("no dispatch recorded for this slot");
+    }
+    return parts.join(" · ");
+  }
+
+  // The provenance of the price behind the window: which provider, how old, and where the window
+  // sits in the horizon's price order.
+  function windowPriceText(win, ctx) {
+    ctx = ctx || {};
+    var parts = [];
+    if (win.stale) parts.push("no fresh price for this slot: the optimiser treats it as flat, and it is never dispatched");
+    else parts.push("price from " + (win.first && win.first.price_source ? win.first.price_source : "unknown source"));
+    var provider = ctx.priceProvider;
+    if (provider) {
+      parts.push(provider.stale ? "provider stale" : "updated " + timeAgo(provider.last_success));
+    }
+    var rank = priceRank(ctx.buyValues, win.buy);
+    if (rank) parts.push("rank " + rank.rank + " of " + rank.total + " by buy price" + (rank.rank === 1 ? " (most expensive)" : ""));
+    return parts.join(" · ");
+  }
+
+  // The horizon's own answer above the window list: what the windows do in total, and how much of
+  // it has already been measured (never a plan figure dressed up as a measurement).
+  function windowSummary(windows, ctx) {
+    ctx = ctx || {};
+    var charged = 0;
+    var discharged = 0;
+    var cost = 0;
+    windows.forEach(function (win) {
+      charged += win.charged_kwh;
+      discharged += win.discharged_kwh;
+      cost += win.cost_eur;
+    });
+    var parts = [
+      windows.length + (windows.length === 1 ? " window" : " windows"),
+      fmtKwh(discharged) + " out",
+      fmtKwh(charged) + " in",
+      cost < 0 ? "earns " + fmtEur(Math.abs(cost)) + " on the grid" : "costs " + fmtEur(cost) + " on the grid"
+    ];
+    var progress = ctx.progress;
+    if (progress && isNum(progress.measured_discharged_kwh)) {
+      parts.push("measured so far " + fmtKwh(progress.measured_discharged_kwh) + " out, " +
+        fmtKwh(progress.measured_charged_kwh) + " in over " + progress.slots_measured + " of " +
+        progress.slots_total + " slots (" + fmtPct(progress.coverage_pct, 0) + " of the reached grid observed)");
+    } else if (progress) {
+      parts.push("nothing measured yet over the " + progress.slots_elapsed + " fully elapsed slots");
+    }
+    return parts.join(" · ");
+  }
+
+  // Phone-first action windows: one vertical row per window with time, action, signed power,
+  // reason, the prices behind the decision, the energy and SoC it moves, and what was actually
+  // dispatched and measured -- so a 360 px screen never splits the time/action/reason
+  // relationship (UI_REVIEW §3.4, SPEC 10 plan execution).
+  function renderPlanWindows(body, plan, execution, ctx) {
+    var windows = planActionWindows(plan, execution);
+    if (!windows.length) {
+      body.appendChild(el("p", { class: "muted", text: "No plan slots yet. Recompute the plan." }));
+      return;
+    }
+    ctx = ctx || {};
+    ctx.minutes = planSlotMinutes(plan);
+    ctx.buyValues = ctx.buyValues || (plan.slots || []).map(function (slot) { return slot.buy; });
+    ctx.nowMs = Date.now();
+    body.appendChild(el("p", { class: "window-summary", text: windowSummary(windows, ctx) }));
+    var list = el("ul", { class: "window-list" });
+    windows.forEach(function (win) {
+      // The action names the direction, so the number beside it is unsigned: "Discharge · 700 W",
+      // never "Discharge · -700 W discharge" (UI_REVIEW follow-up).
+      var power = isNum(win.power_w) ? fmtPower(Math.abs(win.power_w)) : "power unknown";
+      var when = win.startMs != null && win.endMs != null && win.endMs > win.startMs
+        ? fmtTime(win.start) + " – " + fmtTime(new Date(win.endMs).toISOString())
+        : fmtTime(win.start);
+      var current = isNum(ctx.nowMs) && isNum(win.startMs) && isNum(win.endMs) &&
+        ctx.nowMs >= win.startMs && ctx.nowMs < win.endMs;
+      var band = isNum(win.bandLow) && isNum(win.bandHigh)
+        ? " (" + fmtKw(win.bandLow) + "–" + fmtKw(win.bandHigh) + " band)"
+        : "";
+      list.appendChild(el("li", { dataset: { stale: win.stale ? "true" : "false" } }, [
+        el("p", { class: "window-time" }, [
+          when, " (", win.slots, win.slots === 1 ? " slot)" : " slots)",
+          current ? el("span", { class: "badge badge-info", text: "now" }) : null
+        ]),
+        el("p", { class: "window-action" }, [actionText(win.action), " · ", el("span", { class: "num", text: power })]),
+        el("p", { class: "window-reason" }, ["because: ", reasonText(win.reason)]),
+        el("ul", { class: "stat-row window-facts" }, windowFacts(win, ctx).map(function (fact) {
+          return el("li", null, [
+            el("span", { class: "stat-label", text: fact.label }),
+            el("span", { class: "stat-value", text: fact.value })
+          ]);
+        })),
+        el("p", { class: "window-context" }, [
+          "PV " + fmtKw(win.pv_kw) + " · load " + fmtKw(win.load_kw) + band
+        ]),
+        el("p", { class: "window-status" }, [windowStatusText(win, ctx)]),
+        el("p", { class: "window-price" }, [windowPriceText(win, ctx)]),
+        win.stale ? badge("stale price", "stale") : null
+      ]));
+    });
+    body.appendChild(list);
+    body.appendChild(el("p", { class: "legend-note", text: "Windows merge only while the action, reason, power and staleness stay the same, so every change is visible; each slot's full figures are in All slots. A stale slot has no fresh price, so the dispatcher refuses it rather than acting on a flat price." }));
+  }
+
+  // Everything the window rows state about a time slot, gathered once: the efficiency and wear the
+  // optimiser assumed, the SoC floor a reserve hold defends, the price provider's freshness and the
+  // plan-so-far progress. Missing pieces stay null so a fact is omitted, never invented.
+  function planWindowContext(data) {
+    var plan = (data && data.plan) || {};
+    var summary = plan.summary || {};
+    var execution = (data && data.execution) || {};
+    var providers = ((data && data.providers) || {}).price || [];
+    var provider = null;
+    providers.forEach(function (item) { if (item && item.active) provider = item; });
+    var floors = execution.floors || {};
+    return {
+      efficiency: planEfficiency(summary),
+      wear: isNum(summary.wear_eur_per_kwh) ? summary.wear_eur_per_kwh : (isNum(data && data.cycleCost) ? data.cycleCost : 0),
+      floorPct: isNum(floors.floor_soc_pct) ? floors.floor_soc_pct : null,
+      // Every buy price in the horizon, so a window can say where it ranks (SPEC 4.13).
+      buyValues: (plan.slots || []).map(function (slot) { return slot.buy; }),
+      mode: plan.mode,
+      dry_run: plan.dry_run,
+      priceProvider: provider,
+      progress: execution.progress || null
+    };
+  }
 
   function renderPlanSlots(body, plan) {
     var slots = Array.isArray(plan.slots) ? plan.slots : [];
@@ -1458,42 +1775,36 @@
     draw(slots.slice(0, 48), false);
   }
 
-  // Phone-first action windows: one vertical row per window with time, action, signed power,
-  // reason and stale state together, so a 360 px screen never splits the time/action/reason
-  // relationship (UI_REVIEW §3.4).
-  function renderPlanWindows(body, plan) {
-    var windows = planActionWindows(plan);
-    if (!windows.length) {
-      body.appendChild(el("p", { class: "muted", text: "No plan slots yet. Recompute the plan." }));
-      return;
-    }
-    var list = el("ul", { class: "window-list" });
-    windows.forEach(function (win) {
-      // The action names the direction, so the number beside it is unsigned: "Discharge · 700 W",
-      // never "Discharge · -700 W discharge" (UI_REVIEW follow-up).
-      var power = isNum(win.power_w) ? fmtPower(Math.abs(win.power_w)) : "power unknown";
-      var when = win.startMs != null && win.endMs != null && win.endMs > win.startMs
-        ? fmtTime(win.start) + " – " + fmtTime(new Date(win.endMs).toISOString())
-        : fmtTime(win.start);
-      list.appendChild(el("li", { dataset: { stale: win.stale ? "true" : "false" } }, [
-        el("p", { class: "window-time" }, [when, " (", win.slots, win.slots === 1 ? " slot)" : " slots)"]),
-        el("p", { class: "window-action" }, [actionText(win.action), " · ", el("span", { class: "num", text: power })]),
-        el("p", { class: "window-reason" }, ["because: ", reasonText(win.reason)]),
-        win.stale ? badge("stale price", "stale") : null
-      ]));
-    });
-    body.appendChild(list);
-    body.appendChild(el("p", { class: "legend-note", text: "Windows merge only while the action, reason, power and staleness stay the same, so every change is visible; each slot's full figures are in All slots." }));
-  }
-
   function viewPlan(host, query) {
     var hours = horizonFrom(query);
-    var load = once(function () {
-      return Promise.all([get("/plan", { hours: hours }), get("/config")]).then(function (rows) {
-        return { plan: rows[0], cycleCost: cycleCostFromConfig(rows[1]) };
+    var cached = null;
+    function fetchAll() {
+      // The execution join and the provider freshness are supporting evidence: if either is
+      // unavailable the plan still renders and the rows simply state less.
+      return Promise.all([
+        get("/plan", { hours: hours }),
+        get("/config"),
+        get("/plan/execution", { hours: hours }).catch(function () { return null; }),
+        get("/providers").catch(function () { return null; })
+      ]).then(function (rows) {
+        return {
+          plan: rows[0],
+          config: rows[1],
+          execution: rows[2],
+          providers: rows[3],
+          cycleCost: cycleCostFromConfig(rows[1])
+        };
       });
-    });
+    }
+    function load() {
+      if (!cached) cached = fetchAll();
+      return cached;
+    }
     var pollTimer = null;
+    var panels = [];
+    function addPanel(title, render) {
+      panels.push(asyncPanel(host, title, { load: load, render: render }));
+    }
 
     routeTitle(host, "Plan", "What the optimiser intends to do with the batteries, and why.");
     var controls = panel(host, "Plan controls");
@@ -1534,9 +1845,7 @@
     ]));
     controls.body.appendChild(el("p", { class: "legend-note", text: "Exports download from the add-on directly (no data leaves your instance)." }));
 
-    asyncPanel(host, "Plan warnings", {
-      load: load,
-      render: function (body, data) {
+    addPanel("Plan warnings", function (body, data) {
         var plan = data.plan;
         var info = planFlags(plan);
         if (!info.flags.length) body.appendChild(el("p", { class: "muted", text: "No feasibility warnings. " + (info.sources.length ? "Sources — " + info.sources.join(", ") + "." : "") }));
@@ -1546,12 +1855,9 @@
           ]));
         });
         body.appendChild(el("p", { class: "legend-note", text: "Plan generated " + timeAgo(plan.generated_at) + " for " + fmtDateTime(plan.horizon_start) + " – " + fmtDateTime(plan.horizon_end) + "." }));
-      }
     });
 
-    asyncPanel(host, "Timeline", {
-      load: load,
-      render: function (body, data) {
+    addPanel("Timeline", function (body, data) {
         var plan = data.plan;
         var chart = el("div", { class: "chart chart-md" });
         body.appendChild(chart);
@@ -1563,22 +1869,26 @@
         body.appendChild(el("p", { class: "legend-note", text: efficiency
           ? "A slot whose sale price sits below the dotted break-even line would lose money, which is why it stays idle with reason “efficiency_loss”; the exact figures are in All slots."
           : "The break-even after round-trip loss line is unavailable for this plan: the summary carries no aggregate efficiency." }));
-      }
     });
 
-    asyncPanel(host, "Plan summary", {
-      load: load,
-      render: renderPlanSummary
+    addPanel("Plan summary", renderPlanSummary);
+    addPanel("Next actions", function (body, data) {
+      renderPlanWindows(body, data.plan, data.execution, planWindowContext(data));
     });
-    asyncPanel(host, "Next actions", {
-      load: load,
-      render: function (body, data) { renderPlanWindows(body, data.plan); }
-    });
-    asyncPanel(host, "All slots", {
-      load: load,
-      render: function (body, data) { renderPlanSlots(body, data.plan); }
-    });
-    return function () { if (pollTimer) { root.clearInterval(pollTimer); pollTimer = null; } };
+    addPanel("All slots", function (body, data) { renderPlanSlots(body, data.plan); });
+
+    // Returning to the tab re-reads the plan, its execution join and the providers in place: the
+    // "now" marker, the measured figures and the price age must not sit on a screen opened hours
+    // ago, and a background refresh must never scroll or rebuild the route (UI_REVIEW §3.5).
+    state.refresh = function () {
+      if (refreshBlocked()) return;
+      cached = null;
+      panels.forEach(function (p) { p.reload(); });
+    };
+    return function () {
+      if (pollTimer) { root.clearInterval(pollTimer); pollTimer = null; }
+      if (state.refresh) state.refresh = null;
+    };
   }
 
   /* ------------------------------------------------------------------ view: forecasts */
@@ -4442,6 +4752,15 @@
     breakEvenSellEur: breakEvenSellEur,
     planEfficiency: planEfficiency,
     planBreakEvenEur: planBreakEvenEur,
+    planSlotMinutes: planSlotMinutes,
+    planActionWindows: planActionWindows,
+    windowFacts: windowFacts,
+    windowStatusText: windowStatusText,
+    windowPriceText: windowPriceText,
+    windowSummary: windowSummary,
+    planWindowContext: planWindowContext,
+    priceRank: priceRank,
+    fmtCt: fmtCt,
     cycleCostFromConfig: cycleCostFromConfig,
     batteryGroupsFromCandidates: batteryGroupsFromCandidates,
     batteryGroupMatchesQuery: batteryGroupMatchesQuery,

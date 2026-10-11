@@ -282,6 +282,7 @@ def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dic
             "generated_at": None,
             "horizon_start": None,
             "horizon_end": None,
+            "slot_minutes": None,
             "feasible": False,
             "infeasible_reason": "no_plan",
             "summary": plan_summary_dict(PlanSummary()),
@@ -294,6 +295,9 @@ def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dic
         "generated_at": to_iso(plan.generated_at),
         "horizon_start": to_iso(plan.horizon_start),
         "horizon_end": to_iso(plan.horizon_end),
+        # The plan's own resolution (SPEC 10): the UI draws its windows, captions and "now" slot
+        # from this instead of assuming one, so a 15-minute grid is never read as an hourly one.
+        "slot_minutes": int(plan.slot_minutes),
         "feasible": plan.feasible,
         "infeasible_reason": plan.infeasible_reason,
         "mode": plan.mode,
@@ -346,6 +350,94 @@ def _plan_soc_pct(plan: Plan, soc_kwh: float) -> float | None:
     if capacity <= 0:
         return None
     return round(max(0.0, min(100.0, soc_kwh / capacity * 100.0)), 2)
+
+
+def plan_execution_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Rounded, JSON-ready form of ``Engine.plan_execution`` (SPEC 10 additive route).
+
+    Rounding happens here so the engine keeps raw arithmetic: the UI only ever formats these
+    numbers, and a slot with no measurement keeps ``actual: null`` instead of a zero.
+    """
+    slots = [
+        {
+            "t": entry.get("t"),
+            "dispatch": _rounded_dispatch(entry.get("dispatch")),
+            "actual": _rounded_actual(entry.get("actual")),
+        }
+        for entry in payload.get("slots") or []
+    ]
+    progress = {
+        key: (_round(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else value)
+        for key, value in (payload.get("progress") or {}).items()
+    }
+    floors = {
+        key: (_round(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else value)
+        for key, value in (payload.get("floors") or {}).items()
+    }
+    return {
+        "generated_at": payload.get("generated_at"),
+        "slot_minutes": payload.get("slot_minutes"),
+        "now": payload.get("now"),
+        "floors": floors,
+        "batteries": [
+            {
+                "id": item.get("id"),
+                "name": item.get("name"),
+                "min_soc_pct": _round(item.get("min_soc_pct")),
+                "floor_soc_pct": _round(item.get("floor_soc_pct")),
+                "capacity_kwh": _round(item.get("capacity_kwh")),
+            }
+            for item in payload.get("batteries") or []
+        ],
+        "progress": progress,
+        "slots": slots,
+    }
+
+
+def _rounded_dispatch(dispatch: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not dispatch:
+        return None
+    return {
+        "ts": dispatch.get("ts"),
+        "requested_w": _round(dispatch.get("requested_w")),
+        "applied_w": _round(dispatch.get("applied_w")),
+        "ok": bool(dispatch.get("ok")),
+        "dry_run": bool(dispatch.get("dry_run")),
+        "clamped": bool(dispatch.get("clamped")),
+        "code": dispatch.get("code") or "",
+        "reason": dispatch.get("reason") or "",
+        "message": dispatch.get("message") or "",
+        "records": int(dispatch.get("records") or 0),
+        "batteries": [
+            {
+                "id": item.get("id"),
+                "requested_w": _round(item.get("requested_w")),
+                "applied_w": _round(item.get("applied_w")),
+                "ok": bool(item.get("ok")),
+            }
+            for item in dispatch.get("batteries") or []
+        ],
+    }
+
+
+def _rounded_actual(actual: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not actual:
+        return None
+    return {
+        key: (_round(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else value)
+        for key, value in actual.items()
+    }
+
+
+def _round(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        return round(float(value), 4)
+    except (TypeError, ValueError):
+        return value
 
 
 def forecast_dict(kind: str, forecast: Any, now: datetime, hours: int | None = None) -> dict[str, Any]:
@@ -699,6 +791,16 @@ class ApiServer:
 
         if route == "plan/recompute" and method == "POST":
             return self._json(engine.request_replan("api"))
+
+        if route == "plan/execution" and method == "GET":
+            # What the plan intended against what was measured and applied (SPEC 10, additive).
+            return self._json(
+                plan_execution_dict(
+                    engine.plan_execution(
+                        now, hours=_hours(query.get("hours"), self._default_hours())
+                    )
+                )
+            )
 
         if route == "forecast" and method == "GET":
             kind = str(query.get("kind") or "price")
