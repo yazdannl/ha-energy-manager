@@ -28,13 +28,54 @@ Hash routing (`app.js: splitHash()`), seven views, all rendered client-side:
 Unknown routes fall back to `#/dashboard`. Query options: `#/plan?hours=12|24|36|48`,
 `#/savings?range=day|week|month|year|all`.
 
+## Navigation and reading hierarchy
+
+`index.html` renders **four primary destinations** (Today, Plan, Savings, Manage) as a row that fits
+360 px, plus one contextual sub-row that `setNav()` shows only for the current area (Plan →
+Plan/Forecasts; Manage → Batteries/Settings/Log). All seven hash routes stay real links, so every
+view is reachable and deep-linkable; `#nav a[aria-current="page"]` marks the active entry and the
+primary item stays marked while its sub-row is open. Keyboard users get ≥44 px targets.
+
+Each view answers in the same three levels:
+
+1. **Answer** — Today: the control authority, what was measured and what is planned. Plan: the
+   saving/loss versus the baseline. Forecasts: measured error and freshness. Batteries: fleet
+   readiness. Savings: the comparable saving/loss and its baseline coverage. Settings: the safety
+   summary. Log: the latest dispatch outcome.
+2. **Short qualification** — one line of context (assumptions, coverage, stale state, the disabled
+   prerequisite text beside a test action).
+3. **Evidence** — worked examples, raw capabilities, mappings, all slots and JSON live behind named
+   native disclosures ("Why this plan?", "Efficiency and wear", "Source details", "Entity mapping",
+   "All slots").
+
+`routeTitle()` gives every view one `h1` and one short subtitle; panels are the single surface and
+routine metric cards inside them are borderless, so a border means an actionable form, a chart or an
+exceptional state.
+
+## Refresh model
+
+Navigation and data refresh are separate. A deliberate route change re-renders the view, scrolls to
+the top and focuses the route `h1`; a background poll calls the view's `state.refresh()` hook, which
+updates values in place and restores focus to the element that occupied the same position. Every
+background refresh (15 s timer and the `visibilitychange` path) is blocked by `refreshBlocked()`
+while any dialog is open, a write is pending, the settings form is dirty or a stop result is on
+screen — so a poll can never discard an unsaved edit or a failed-stop banner. `once()` clears a
+rejected cache slot, so a Retry always makes a fresh request.
+
 ## Panels and interactions
 
-**Dashboard** — `Autopilot` panel (mode Off/Advisory/Auto buttons with `aria-pressed`, dry-run checkbox, `Stop now`), alert list (level badge + shape cue + text), `Right now` cards (SoC, PV,
-load, grid, price + rank, current action + reason, autopilot state, next cheap and next expensive
-window), `Next 24 hours` mini-chart (price line + SoC line), battery summary cards. Polls itself
-every 15 s while the tab is visible; paused while a dialog is open, and paused while a stop-result
-banner is on screen so a failed stop stays visible until dismissed. One compact **Safety state**
+**Dashboard (Today)** — the `Autopilot` panel leads with the answer: the control-authority sentence,
+what was **measured** and what is **planned**, then the mode Off/Advisory/Auto buttons with
+`aria-pressed`, the dry-run checkbox and `Stop now`. The mode buttons are built once outside the
+re-rendered area, so the first click applies (an earlier re-render could swallow it) and a refused or
+cancelled dry-run change restores the server's confirmed state. Warnings and errors follow first;
+informational activity is demoted behind a `Recent activity` disclosure. Then the three primary
+cards (battery charge, grid power, price now), the quiet supporting row (PV, load, cheapest/next
+expensive window) and the `Next 24 hours` mini-chart (price line + SoC line).
+
+Polls itself every 15 s while the tab is visible; paused while a dialog is open, a write is pending,
+the settings form is dirty or a stop-result banner is on screen, so a failed stop stays visible until
+dismissed (or the result is dismissed explicitly). One compact **Safety state**
 banner appears when `/status` reports a non-empty `pending_holds` (a battery whose last real setpoint
 is still live, so the add-on cannot claim it is idle) or `mode_persisted: false` (the running process
 has the new mode but a restart would come up in the old one). After a stop the panel re-fetches
@@ -121,11 +162,15 @@ forecast for that interval — is rendered as unknown (`--`), including its savi
 zero. When every bucket is unknown the totals show `--` and the chart shows a plain-text fallback;
 chart series skip nulls instead of plotting them as 0, and the legend says so.
 
-**Settings** — the page opens on four setup cards, each carrying only the primary choice of its
-topic: **Price** (`price.provider`, the provider-specific fields, the feed-in cost and the energy-tax
-refund toggle), **Meter** (`grid.power_entity`, a searchable picker), **Solar** (`solar.source` plus a
-measured-PV picker unless the source is `derived`) and **Battery** (the configured batteries plus a
-link into the wizard). The pickers ask `GET /api/v1/discover` and write the candidate row's
+**Settings** — an always-visible toolbar holds the search field and the `Show all advanced` switch,
+and an always-visible **Safety summary** states the authority in force (mode · dry run) with links to
+the Safety group and to Today's `Stop now`. Below that the page opens on four dependency-complete
+setup cards, each carrying every input the selected option needs: **Price** (`price.provider`, the
+provider-specific fields — including the fixed day/night start hours and the day-ahead VAT, energy-tax
+and import-fee adders — the feed-in cost and the energy-tax refund toggle), **Meter**
+(`grid.power_entity`, a searchable picker), **Solar** (`solar.source` plus a measured-PV picker unless
+the source is `derived`, `solar.capacity_wp` for `capacity`, `solar.planes` for `forecast_solar`) and
+**Battery** (the fleet from the canonical `GET /api/v1/batteries`, plus a link into the wizard). The pickers ask `GET /api/v1/discover` and write the candidate row's
 `setting_key`, falling back to the card's own key; a typed entity id can always be used directly.
 `SEM_APP.setupCardKeys({priceProvider, priceContract, solarSource})` is the pure table of which keys
 the cards own, and the groups below skip exactly those keys, so every key is rendered once. While a
@@ -136,7 +181,11 @@ Everything else lives in the collapsed **All settings** drawer, generated from t
 `bool`, `int`, `float`, `str`, `password`, `json`, `list` (+ `choices` for enums and multi-selects).
 Search filters by key/label/help/group. Changes are collected and sent as one `PATCH /api/v1/config`;
 the response `{applied, errors}` is displayed verbatim and the form reloads from the server on success
-(no optimistic UI). Groups are shown in a stable reading order (General, Price, Solar, Load, Grid,
+(no optimistic UI). Pending, success and rejected values are shown in the always-visible save bar, not
+inside the drawer: a rejected key is attached to its own field with `aria-describedby` and
+`aria-invalid`, the field is scrolled into view and focused. The rail and the drawer form sit side by
+side from 720 px. Each rail entry counts keys that **differ from their default** ("3 customised");
+the save bar counts **unsaved edits**, and a legend line says which is which. Groups are shown in a stable reading order (General, Price, Solar, Load, Grid,
 Optimizer, Control, Safety, Notify, Batteries) even though the API sorts rows by key. Groups whose name
 matches `safety`/`limit`, and keys matching
 `reserve_soc_pct|max_grid_import_w|max_grid_export_w|allow_export|control.failsafe_on_error`,
@@ -146,27 +195,34 @@ them elsewhere) and require a confirmation dialog before saving. New schema in t
 `Control` group; `price.export_fee_eur_per_kwh` is presented as the **feed-in cost**. When export is
 enabled the drawer states which basis prices the sell side (explicit tariff/entity, or the derived
 `buy − feed-in cost`). Password fields are never echoed: an existing value shows as "(a value is set;
-leave empty to keep it)" and is only sent when the user types a new one. `batteries` is edited in the
-Batteries view via a link. An `Add-on options` panel shows the read-only option layer (UI settings win).
+leave empty to keep it)" and is only sent when the user types a new one. `batteries` is server-managed by the wizard and is rendered as a read-only provenance line linking
+to the Batteries view, never as an editable JSON field. An `Add-on options` panel shows the read-only option layer (UI settings win).
 
-**Log** — level filter, free-text `kind` filter (e.g. `dispatch`, `event`, `alert`), row limit,
-manual refresh and an auto-refresh checkbox (15 s). Rows show local time + relative age, kind,
-level badge, code, message, requested → applied power and a collapsible JSON detail. The empty
+**Log** — message-first rows: the message is the row, with badges (level, mode/dry-run context),
+local time + relative age, kind, code, requested → applied power and a collapsible JSON detail beneath
+it. A segmented preset group (All / Dispatch / Warnings and errors / Events) sits beside the
+free-text `kind` filter, row limit, manual refresh and the auto-refresh checkbox (15 s). While a
+detail is open a poll never rebuilds the list: it shows a "New entries available" notice instead. The empty
 state explicitly says that a surprising situation with an empty log is a bug.
 
 ## Cross-cutting rules
 
 - **No colour-only meaning**: price bars/legend carry labels, stale slots show a `stale` badge plus
-  dashed borders and grey bars, alert levels are written out, chart series use distinct colours and
-  each has a legend label. SoC/price lines are distinguishable by position and legend text.
-- **Every number has a unit**: `fmtPower` (W/kW), `fmtKwh`, `fmtPrice` (EUR/kWh), `fmtEur`,
-  `fmtPct`, `fmtDuration`, cycle counts, `°C`. Unknown values render `--`.
+  dashed borders and grey bars, alert levels are written out, and every chart series has a stable line
+  signature named in its legend — solid = measurement/forecast, long dashes = the sell/baseline price,
+  dotted = a threshold. Legend text is semantic ("Load error (long dashes)"), never a colour word.
+- **Every number has a unit**: `fmtPower` (W/kW), `fmtKw` for forecast PV/load **power** (never
+  `fmtKwh`, which is energy), `fmtKwh`, `fmtPrice` (EUR/kWh), `fmtEur`, `fmtPct`, `fmtDuration`, cycle
+  counts, `°C`. Forecast MAPE is shown in the metric's own unit — kW for PV/load, EUR/kWh for price.
+  Unknown values render `--`, a missing daily total is left blank and labelled as uncovered rather
+  than zero-filled, and partial baselines carry a visible "Baseline available for N of M periods".
 - **Stale data is visibly stale**: `staleBadge()` plus `.card-stale`/`[data-stale]` styling, and
   warnings when the last control tick is older than 180 s or HA is disconnected.
 - **Loading/error per panel**: `asyncPanel()` gives every panel its own loading text, error message
   and retry button; view data is fetched once per view via `once()`.
 - **Writes are pending → confirmed**: `performWrite()` disables the trigger, announces "pending",
-  then shows the server response or the server error and re-renders from a fresh `GET`.
+  counts the write so background refreshes wait for it, then shows the server response or the server
+  error and re-renders from a fresh `GET`.
 - **No watchdog, honest copy**: dry run is labelled "the plan dispatcher writes nothing", never "no
   hardware writes", and the autopilot note plus the auto/dry-run confirms say that advisory/off and
   dry run stop *new* writes but do not neutralise a setpoint already written — Stop now (a real
@@ -175,7 +231,15 @@ state explicitly says that a surprising situation with an empty log is a bug.
   default focus (Cancel), Esc to cancel, and an optional checkbox acknowledgement. Used for:
   enabling auto, turning dry-run off, Stop now, test discharge, enabling a battery, deleting a
   battery, safety settings, saving a battery mapping. `Stop now` additionally requires the checkbox
-  because it is a real hardware write even in dry run.
+  because it is a real hardware write even in dry run. If a browser cannot show a modal `<dialog>`,
+  checkbox-required actions fail closed instead of falling back to a bare `window.confirm`.
+- **Contrast and type**: `--text-muted` carries meaningful metadata (labels, help, picker metadata,
+  footer) and meets 4.5:1 in both themes; `--text-dim` is only used for genuinely decorative/secondary
+  state and is tuned to pass as well. The token type scale (`--type-11` … `--type-28`) is
+  used instead of ad-hoc sizes; spacing reuses the 4/8/16/24/32 scale.
+- **Touch and focus**: primary navigation, buttons, segmented controls, picker rows and disclosure
+  summaries are ≥44 px tall; destructive actions have 8 px separation. `Skip to content` focuses
+  `#view` without changing the route hash, and a deliberate route change focuses the new `h1`.
 - **Relative URLs only**: the API base is derived from `location.pathname`, so the app works under
   any ingress sub-path. No network at runtime.
 
@@ -186,7 +250,12 @@ state explicitly says that a surprising situation with an empty log is a bug.
 ## Charts (uPlot 1.6.32)
 
 `charts.js` wraps the vendored uPlot IIFE build. Colours are read from CSS custom properties
-(`--chart-*`), so light/dark both work; a `prefers-color-scheme` change re-renders live charts.
+(`--chart-*`), so light/dark both work. `SEMCharts.refresh()` re-reads them, and `applyTheme()` calls
+it on an explicit theme change (not only on a `prefers-color-scheme` change), so a manual theme switch
+never leaves a chart in the old palette. Each series also has a non-colour signature (solid / long
+dash / dotted) so it is identifiable without colour, the y-axis gutters shrink below ~480 px host
+width without dropping the unit label, and the plan chart keeps its break-even threshold dotted and
+its sell price long-dashed.
 Charts have `role="img"` plus an `aria-label` summary; the numeric detail is always available in the
 accompanying tables/cards. Empty series produce a plain-text fallback instead of an empty canvas,
 and a missing `uPlot` global produces "Chart library unavailable" rather than a broken page.

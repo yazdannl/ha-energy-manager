@@ -190,12 +190,20 @@
     return opts;
   }
 
-  function axisFor(scale, label, side, p) {
+  // A chart host narrower than ~480 px (a phone in the HA sidebar) gets tighter axis gutters.
+  function narrowHost(host) {
+    var width = host && host.clientWidth ? host.clientWidth : (host.parentNode && host.parentNode.clientWidth) || 0;
+    return width > 0 && width < 480;
+  }
+
+  function axisFor(scale, label, side, p, narrow) {
     return {
       scale: scale, side: side, label: label,
-      stroke: p.axis, font: "11px system-ui, sans-serif",
-      labelFont: "10px system-ui, sans-serif", labelSize: label ? 14 : 0,
-      size: 58,
+      stroke: p.axis, font: narrow ? "10px system-ui, sans-serif" : "11px system-ui, sans-serif",
+      labelFont: "10px system-ui, sans-serif", labelSize: label ? (narrow ? 11 : 14) : 0,
+      // A 360 px viewport cannot afford 58 px per y axis; the gutter shrinks, the units stay
+      // (UI_REVIEW §3.10).
+      size: narrow ? 40 : 58,
       grid: scale === "y" ? { show: true, stroke: p.grid, width: 1 } : { show: false },
       ticks: { stroke: p.grid, width: 1 },
       border: { stroke: p.grid, width: 1 },
@@ -218,10 +226,29 @@
     return { stroke: color, fill: withAlpha(color, alpha), width: 1.5, points: { show: false } };
   }
 
+  /* Line signatures are the non-colour identification: a solid line is a measurement/forecast, a
+   * long dash is a price series that may sit beside it, and a dotted line is a threshold
+   * (UI_REVIEW §3.10). Colour alone never carries meaning. */
+  var DASH = { long: [8, 4], dotted: [2, 3] };
+
   function line(color, dashed) {
     return {
       stroke: color, width: dashed ? 1 : 1.5, points: { show: false },
-      dash: dashed ? [5, 4] : undefined
+      dash: dashed ? DASH.long : undefined
+    };
+  }
+
+  function lineDashed(color) { return line(color, true); }
+  function lineDotted(color) {
+    return {
+      stroke: color, width: 1, points: { show: false },
+      dash: DASH.dotted
+    };
+  }
+  function thresholdLine(color) {
+    return {
+      stroke: color, width: 1.5, points: { show: false },
+      dash: DASH.dotted
     };
   }
 
@@ -273,12 +300,12 @@
         fill: withAlpha(p.stale, 0.9), width: 0, points: { show: false },
         value: function (u, v) { return v == null ? "not stale" : "stale"; }
       },
-      Object.assign(line(p.sell, true), { label: "Sell price", scale: "y", value: unitFmt(4, "EUR/kWh") })
+      Object.assign(line(p.sell, true), { label: "Sell price (long dashes)", scale: "y", value: unitFmt(4, "EUR/kWh") })
     ];
     var dataA = [xs, buy, staleBuy, sell];
     if (showBreakEven) {
-      seriesA.push(Object.assign(line(p.breakEven, true), {
-        label: "break-even after round-trip loss", scale: "y",
+      seriesA.push(Object.assign(thresholdLine(p.breakEven), {
+        label: "break-even after round-trip loss (dotted)", scale: "y",
         value: unitFmt(4, "EUR/kWh")
       }));
       dataA.push(breakEven);
@@ -286,9 +313,10 @@
     seriesA.push(Object.assign(line(p.soc), { label: "SoC", scale: "soc", value: unitFmt(1, "%") }));
     dataA.push(soc);
 
+    var narrow = narrowHost(host);
     var opts = baseOpts(p, {
       scales: { x: { time: true }, y: { auto: true }, soc: { auto: true } },
-      axes: [timeAxis(p), axisFor("y", "EUR/kWh", 3, p), axisFor("soc", "%", 1, p)],
+      axes: [timeAxis(p), axisFor("y", "EUR/kWh", 3, p, narrow), axisFor("soc", "%", 1, p, narrow)],
       series: seriesA
     });
 
@@ -297,7 +325,7 @@
 
     var optsB = baseOpts(p, {
       scales: { x: { time: true }, y: { auto: true } },
-      axes: [timeAxis(p), axisFor("y", "kW", 3, p)],
+      axes: [timeAxis(p), axisFor("y", "kW", 3, p, narrow)],
       series: [
         {},
         Object.assign(area(p.pv, 0.22), { label: "PV forecast", value: unitFmt(2, "kW") }),
@@ -331,9 +359,10 @@
       price.push(num(s.buy));
       soc.push(num(s.soc_pct));
     });
+    var narrow = narrowHost(host);
     var opts = baseOpts(p, {
       scales: { x: { time: true }, y: { auto: true }, soc: { auto: true } },
-      axes: [timeAxis(p), axisFor("y", "EUR/kWh", 3, p), axisFor("soc", "%", 1, p)],
+      axes: [timeAxis(p), axisFor("y", "EUR/kWh", 3, p, narrow), axisFor("soc", "%", 1, p, narrow)],
       series: [
         {},
         Object.assign(line(p.price), { label: "Buy price", scale: "y", fill: withAlpha(p.price, 0.16), value: function (u, v) { return fmt(v, 4, "EUR/kWh"); } }),
@@ -357,14 +386,15 @@
       var sell = slots.map(function (s) { return num(s.sell); });
       var stale = slots.map(function (s) { return s.stale ? num(s.buy) : null; });
       var staleAny = stale.some(function (v) { return v != null; });
+      var narrow = narrowHost(host);
       opts = baseOpts(p, {
         scales: { x: { time: true }, y: { auto: true } },
-        axes: [timeAxis(p), axisFor("y", "EUR/kWh", 3, p)],
+        axes: [timeAxis(p), axisFor("y", "EUR/kWh", 3, p, narrow)],
         series: [
           {},
           Object.assign(line(p.price), { label: "Buy price", paths: barsPath(), fill: withAlpha(p.price, 0.8), value: function (u, v) { return fmt(v, 4, "EUR/kWh"); } }),
           { label: "Stale (grey)", paths: barsPath(), stroke: p.stale, fill: withAlpha(p.stale, 0.9), width: 0, points: { show: false }, value: function (u, v) { return v == null ? "no" : "stale"; } },
-          Object.assign(line(p.sell, true), { label: "Sell price", value: function (u, v) { return fmt(v, 4, "EUR/kWh"); } })
+          Object.assign(line(p.sell, true), { label: "Sell price (long dashes)", value: function (u, v) { return fmt(v, 4, "EUR/kWh"); } })
         ]
       });
       data = [xs, buy, stale, sell];
@@ -382,13 +412,13 @@
       });
       opts = baseOpts(p, {
         scales: { x: { time: true }, y: { auto: true } },
-        axes: [timeAxis(p), axisFor("y", "kW", 3, p)],
+        axes: [timeAxis(p), axisFor("y", "kW", 3, p, narrow)],
         bands: [{ series: [2, 3], fill: withAlpha(p.pv, 0.14), dir: -1 }],
         series: [
           {},
-          Object.assign(area(p.pv, 0.22), { label: "PV forecast", value: function (u, v) { return fmt(v, 2, "kW"); } }),
-          Object.assign(line(p.pv), { label: "Upper (forecast + uncertainty)", stroke: withAlpha(p.pv, 0.5), value: function (u, v) { return fmt(v, 2, "kW"); } }),
-          Object.assign(line(p.pv), { label: "Lower (forecast − uncertainty)", stroke: withAlpha(p.pv, 0.5), value: function (u, v) { return fmt(v, 2, "kW"); } })
+          Object.assign(area(p.pv, 0.22), { label: "PV forecast (solid)", value: function (u, v) { return fmt(v, 2, "kW"); } }),
+          Object.assign(lineDashed(p.pv), { label: "Upper (forecast + uncertainty)", stroke: withAlpha(p.pv, 0.55), value: function (u, v) { return fmt(v, 2, "kW"); } }),
+          Object.assign(lineDotted(p.pv), { label: "Lower (forecast − uncertainty)", stroke: withAlpha(p.pv, 0.55), value: function (u, v) { return fmt(v, 2, "kW"); } })
         ]
       });
       data = [xs, pv, hi, lo];
@@ -399,13 +429,13 @@
       var p90 = slots.map(function (s) { return num(s.p90_kw); });
       opts = baseOpts(p, {
         scales: { x: { time: true }, y: { auto: true } },
-        axes: [timeAxis(p), axisFor("y", "kW", 3, p)],
+        axes: [timeAxis(p), axisFor("y", "kW", 3, p, narrow)],
         bands: [{ series: [2, 3], fill: withAlpha(p.load, 0.14), dir: -1 }],
         series: [
           {},
-          Object.assign(line(p.load), { label: "Load P50", value: function (u, v) { return fmt(v, 2, "kW"); } }),
-          Object.assign(line(p.load), { label: "Load P90", stroke: withAlpha(p.load, 0.5), value: function (u, v) { return fmt(v, 2, "kW"); } }),
-          Object.assign(line(p.load), { label: "Load P10", stroke: withAlpha(p.load, 0.5), value: function (u, v) { return fmt(v, 2, "kW"); } })
+          Object.assign(line(p.load), { label: "Load P50 (solid)", value: function (u, v) { return fmt(v, 2, "kW"); } }),
+          Object.assign(lineDashed(p.load), { label: "Load P90", stroke: withAlpha(p.load, 0.55), value: function (u, v) { return fmt(v, 2, "kW"); } }),
+          Object.assign(lineDotted(p.load), { label: "Load P10", stroke: withAlpha(p.load, 0.55), value: function (u, v) { return fmt(v, 2, "kW"); } })
         ]
       });
       data = [xs, p50, p90, p10];
@@ -440,14 +470,15 @@
         grid: { show: true, stroke: p.grid, width: 1 }, ticks: { stroke: p.grid, width: 1 },
         values: function (u, vals) { return vals.map(function (v) { return keys[v] || ""; }); } };
     }
+    var narrow = narrowHost(host);
     var opts = baseOpts(p, {
       scales: { x: { time: allTimed }, savings: { auto: true }, cost: { auto: true } },
-      axes: [xAxis, axisFor("savings", "EUR saved", 3, p), axisFor("cost", "EUR cost", 1, p)],
+      axes: [xAxis, axisFor("savings", "EUR saved", 3, p, narrow), axisFor("cost", "EUR cost", 1, p, narrow)],
       series: [
         {},
         { label: "Savings", scale: "savings", paths: barsPath(), stroke: p.savings, fill: withAlpha(p.savings, 0.8), width: 0, points: { show: false }, value: function (u, v) { return fmt(v, 2, "EUR"); } },
-        Object.assign(line(p.cost, true), { label: "Actual net cost", scale: "cost", value: function (u, v) { return fmt(v, 2, "EUR"); } }),
-        Object.assign(line(p.baseline, true), { label: "Baseline cost (no battery)", scale: "cost", value: function (u, v) { return fmt(v, 2, "EUR"); } })
+        Object.assign(line(p.cost), { label: "Actual net cost (solid)", scale: "cost", value: function (u, v) { return fmt(v, 2, "EUR"); } }),
+        Object.assign(line(p.baseline, true), { label: "Baseline cost, no battery (long dashes)", scale: "cost", value: function (u, v) { return fmt(v, 2, "EUR"); } })
       ]
     });
     var draw = function (el) { mount(el, opts, [xs, savings, cost, baseline], 175, draw, "Savings per period in EUR, with actual net cost and no-battery baseline cost lines in EUR."); };
@@ -487,12 +518,18 @@
       return out;
     }
     var colors = { pv: p.pv, load: p.load, price: p.price };
-    var labels = { pv: "PV MAPE error", load: "Load MAPE error", price: "Price MAPE error" };
+    var signatures = { pv: line, load: lineDashed, price: lineDotted };
+    var labels = {
+      pv: "PV error (solid)",
+      load: "Load error (long dashes)",
+      price: "Price error (dotted)"
+    };
+    var narrow = narrowHost(host);
     var opts = baseOpts(p, {
       scales: { x: { time: true }, y: { auto: true } },
-      axes: [timeAxis(p), axisFor("y", "% error (MAPE)", 3, p)],
+      axes: [timeAxis(p), axisFor("y", "% error (MAPE)", 3, p, narrow)],
       series: [{}].concat(kinds.map(function (k) {
-        return Object.assign(line(colors[k]), {
+        return Object.assign(signatures[k](colors[k]), {
           label: labels[k],
           value: function (u, v) { return fmt(v, 1, "%"); }
         });

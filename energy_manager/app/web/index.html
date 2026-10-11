@@ -16,7 +16,6 @@
 <header class="topbar">
   <p class="brand">
     <span class="brand-title">Smart Energy Manager</span>
-    <span class="brand-sub" id="build-info">&nbsp;</span>
   </p>
   <div class="topbar-actions">
     <p class="conn" id="conn-status" role="status" aria-live="polite">Connecting&hellip;</p>
@@ -27,15 +26,22 @@
   </div>
 </header>
 
+<!-- Four primary destinations fit a 360 px row without sideways navigation (UI_REVIEW §3.4). The
+     secondary row is contextual: Plan/Forecasts under Plan, Batteries/Settings/Log under Manage.
+     app.js shows the group that belongs to the current route; every hash route stays a real link. -->
 <nav id="nav" aria-label="Views">
-  <ul>
-    <li><a href="#/dashboard">Dashboard</a></li>
+  <ul class="nav-primary">
+    <li><a href="#/dashboard">Today</a></li>
     <li><a href="#/plan">Plan</a></li>
-    <li><a href="#/forecasts">Forecasts</a></li>
-    <li><a href="#/batteries">Batteries</a></li>
     <li><a href="#/savings">Savings</a></li>
-    <li><a href="#/settings">Settings</a></li>
-    <li><a href="#/log">Log</a></li>
+    <li><a href="#/batteries">Manage</a></li>
+  </ul>
+  <ul class="nav-sub" hidden>
+    <li data-sub="plan"><a href="#/plan">Plan</a></li>
+    <li data-sub="plan"><a href="#/forecasts">Forecasts</a></li>
+    <li data-sub="manage"><a href="#/batteries">Batteries</a></li>
+    <li data-sub="manage"><a href="#/settings">Settings</a></li>
+    <li data-sub="manage"><a href="#/log">Log</a></li>
   </ul>
 </nav>
 
@@ -44,10 +50,14 @@
 </main>
 
 <footer class="footer">
-  <p>
-    Prices, energies and powers are shown with explicit units. Times are rendered in this
-    browser&rsquo;s local timezone; the server sends ISO-8601 timestamps with offset.
-  </p>
+  <p>Times: local. <button id="help-toggle" class="btn btn-ghost" type="button" aria-expanded="false">About units and time</button></p>
+  <div id="help" class="footer-help" hidden>
+    <p id="build-info" class="brand-sub"></p>
+    <p>Prices, energies and powers are shown with explicit units on every value. Times are rendered in
+    this browser&rsquo;s local timezone; the server sends ISO-8601 timestamps with offset.</p>
+    <p>Commit detail is build metadata, not a live guarantee; the add-on version is reported by the
+    server. Home Assistant supplies the surrounding application identity.</p>
+  </div>
 </footer>
 
 <p id="live" class="sr-live" role="status" aria-live="polite"></p>

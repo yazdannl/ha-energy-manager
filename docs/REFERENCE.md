@@ -1,7 +1,7 @@
 # Smart Energy Manager — complete reference
 
 One document listing **every field, setting, tab/item and formula** of the `ha-energy-manager`
-add-on (shipped version **0.7.0**), as implemented in `energy_manager/app/`.
+add-on (shipped version **0.8.0**), as implemented in `energy_manager/app/`.
 
 Sources, in order of authority:
 
@@ -54,13 +54,14 @@ Single-page app in `energy_manager/app/web/` (`index.html`, `app.js`, `charts.js
 
 | Item | Detail |
 | --- | --- |
-| Skip link | `Skip to content` → `#view` |
-| Top bar — brand | `Smart Energy Manager` + build/version line (`#build-info`) |
-| Top bar — connection | `#conn-status`, live region: `Connecting…` / connected / disconnected |
-| Top bar — theme button | `Theme: dark` / `Theme: light`; sets `data-bs-theme` on `<html>`, persisted in localStorage |
-| Nav | Seven links: Dashboard, Plan, Forecasts, Batteries, Savings, Settings, Log (`aria-current` on the active one) |
-| Main | `#view`, `tabindex="-1"` (skip-link target) |
-| Footer | Unit/timestamp note: numerics always carry units; times render in the browser's local timezone, the server sends ISO-8601 with offset |
+| Skip link | `Skip to content` — focuses `#view` directly (no hash change, so it never changes route) |
+| Top bar — brand | `Smart Energy Manager` (compact; the build/version line now lives in the footer About disclosure as `#build-info`) |
+| Top bar — connection | `#conn-status`, live region: `Connecting…` / `HA connected` / `HA unreachable` (mode and dry run are answered on Today, not repeated here) |
+| Top bar — theme button | `Theme: dark` / `Theme: light`; sets `data-bs-theme` on `<html>`, persisted in localStorage, and calls `SEMCharts.refresh()` |
+| Nav — primary | Four links: Today (`#/dashboard`), Plan, Savings, Manage (`#/batteries`); ≥44 px tall |
+| Nav — contextual sub-row | Shown only for the current area: Plan → Plan, Forecasts; Manage → Batteries, Settings, Log; all seven routes stay real links (`aria-current` marks the exact route, the area entry stays marked) |
+| Main | `#view`, `tabindex="-1"`; every view renders one `h1.route-title` + `.route-sub` via `routeTitle()` |
+| Footer | `Times: local` plus an About disclosure (`#help-toggle`/`#help`): units, ISO-8601 timestamps and the build line |
 | Live region | `#live`, `role="status"`, used by `performWrite()` to announce pending/confirmed writes |
 | Confirm dialog | Native `<dialog>` `#confirm-dialog` — title, body, optional checkbox acknowledgement, Cancel (safe default) / Confirm |
 
@@ -79,52 +80,64 @@ Single-page app in `energy_manager/app/web/` (`index.html`, `app.js`, `charts.js
 Unknown routes fall back to `#/dashboard`. Unknown paths are normalised by
 `SEM_APP.normalizeRoute()`.
 
-### 2.3 Dashboard
+### 2.3 Dashboard (Today)
 
-Panels: **Autopilot**, **Alerts**, **Right now**, **Next 24 hours**, **Batteries**.
+Panels: **Now** (the answer strip), **Warnings and activity**, **Right now**, **Supporting
+measurements** (quiet), **Next 24 hours**, **Batteries**.
 
-**Autopilot panel**
+**Now panel — the answer first**, in `.answer-dynamic` (re-rendered in place on every refresh):
+
+| Line | Content |
+| --- | --- |
+| `.answer-authority` | `authorityText(status)` — the control authority in force (`Off` / `Advisory` / `Auto`, dry run on/off) with the dispatcher/Stop distinction |
+| `.answer-measured` | `Measured <battery>: charging/discharging/idle <power>` (or "unknown"), i.e. what the device is actually doing |
+| `.answer-planned` | `Planned now: <action> <power> — because: <reason>` from the current slot, or `no active plan slot`; explicitly "(a proposal, not the measured behaviour above)" |
+
+Then, still near the answer: the **Safety-state banner** (`pending_holds`,
+`mode_persisted: false`), the override banner with `Clear override`, and any connection issue
+(HA unreachable, unhealthy scheduler, missing/stale control tick).
+
+**Controls** (`.answer-controls`, built once outside the re-rendered area so a poll cannot replace a
+button mid-write):
 
 | Item | Detail |
 | --- | --- |
-| Mode buttons | `off`, `advisory`, `auto` — `aria-pressed` marks the current one; switch to `auto` asks for confirmation |
-| Dry-run checkbox | `Dry run (the plan dispatcher writes nothing)`; turning it off asks for confirmation |
+| Mode buttons | `off`, `advisory`, `auto` — `aria-pressed` marks the current one; `auto` asks for confirmation |
+| Dry-run checkbox | `Dry run (the plan dispatcher writes nothing)`; turning it off asks for confirmation, and a refused/cancelled change restores the server's confirmed state |
 | Stop now | `btn-danger`; confirmation dialog **with checkbox acknowledgement**; posts `POST /api/v1/stop` |
-| Safety-state banner | Shown when `/status` reports non-empty `pending_holds` or `mode_persisted: false` |
-| Override banner | When an override is live: power, target battery (or "all batteries"), expiry, remaining time, `Clear override` button |
-| Stop result box | Server response rendered verbatim: resulting mode, mode-persisted line, outstanding holds, plus a per-battery table |
-| Polling | Every 15 s while the tab is visible; paused while a dialog is open and while a stop-result banner is on screen |
+| Confirmed line | `.control-state`: `Confirmed by the server: mode <m> · dry run on/off` |
+| Notes / results | `.answer-notes` (pending, errors, clear-override feedback) and `.answer-results` (`data-stop-result-host`, holds the stop result until dismissed) |
+| Polling | Every 15 s while the tab is visible; `refreshBlocked()` pauses it while a dialog is open, a write is pending, the settings form is dirty or a stop-result banner is on screen |
 
-Stop-result table headers: `Battery`, `Result`, `Applied power`, `Code`, `Message`, `Dry run`.
+Stop-result box — server response rendered verbatim: resulting mode, mode-persisted line,
+outstanding holds, plus a per-battery `Battery`, `Result`, `Applied power`, `Code`, `Message`,
+`Dry run` table and a `Dismiss` button.
 
-**Alerts panel** — alert list; each row has a level badge plus a non-colour shape cue and the text.
+**Warnings and activity panel** — warning/error alerts first, each with a level badge and text;
+informational entries are demoted behind a `Recent activity` disclosure.
 
-**Right now — nine cards** (`statCard(label, value, sub, stale)`):
+**Right now — three primary cards**: `Battery charge` (mean SoC of available batteries),
+`Grid power` (`fmtPower(grid_now_w)` + importing/exporting/balanced/unknown), `Price now`
+(`fmtPrice(price_now)` + the rank line). Each card can carry a visible `.card-flag` label
+(`Loss` / `Unknown` / `Stale`) instead of relying on colour.
 
-| Card | Value | Sub-line |
-| --- | --- | --- |
-| Battery SoC | mean SoC of available batteries, `%` | "1 battery reported" / "n batteries reported" |
-| PV power | `fmtPower(pv_now_w)` | `production now` |
-| Load power | `fmtPower(load_now_w)` | `household consumption now` |
-| Grid power | `fmtPower(grid_now_w)` | `importing` / `exporting` / `balanced` / `unknown` + " at the meter" |
-| Price now | `fmtPrice(price_now)` | rank line: `rank n % (cheapest third / middle third / most expensive third)` or `rank unknown` |
-| Plan action | action slug of the current slot | `because: <reason> · target <power>` or `no active plan slot` |
-| Autopilot | `mode` (+ ` (dry run)`) | `last plan <relative age>` |
-| Next cheap window | start–end, `local` | `not known` when absent |
-| Next expensive window | start–end, `local` | `not known` when absent |
+**Supporting measurements — quiet cards** (`.cards.supporting`, `panel-quiet`): PV power, load power,
+next cheap window, next expensive window; `Stale prices` / `Measurements are stale` stay visible.
 
 **Next 24 hours** — mini chart: price line + SoC line.
 
 **Batteries panel** — one card per battery: name, SoC %, power and direction
 (charging/discharging/idle/unknown), energy of capacity, temperature (°C), read age, and
-`available` / `unavailable` / `stale` badges (stale also greys the card).
+`available` / `unavailable` / `stale` badges (flattened individually at the call site, stale also
+greys the card).
 
-Warnings surfaced as alert rows when: last control tick older than **180 s**
-("Measurements are stale"), or HA is disconnected.
+Warnings surfaced when the last control tick is older than **180 s**
+("Measurements are stale") or HA is disconnected.
 
 ### 2.4 Plan
 
-Panels: **Plan controls**, **Plan warnings**, **Timeline**, **Plan summary**, **Plan slots**.
+Panels: **Plan controls**, **Plan warnings**, **Timeline**, **Plan summary**, **Next actions**,
+**All slots**.
 
 **Plan controls**
 
@@ -139,27 +152,39 @@ Panels: **Plan controls**, **Plan warnings**, **Timeline**, **Plan summary**, **
 **Plan warnings** — flags: `Plan is infeasible` (with `infeasible_reason`), `Stale prices`
 ("n of m slots carry a stale price and are treated as flat by the optimiser"), source warnings.
 
-**Timeline** — two aligned uPlot panels: (a) price bars + sell line with the **break-even line**
-`buy / round_trip + wear`; (b) PV/load areas and battery power, plus the SoC
-line. Stale slots are dashed/grey and labelled.
+**Timeline** — two aligned uPlot panels: (a) price bars + long-dashed sell line with the **dotted
+break-even line** `buy / round_trip + wear`; (b) PV/load areas and battery power, plus the solid SoC
+line. Stale slots are dashed/grey and labelled. The legend names each signature in words, never by
+colour, and a slot whose sale price sits below break-even is explained by `efficiency_loss`.
 
-**Plan summary rows**: `Estimated cost`, `Baseline (no battery)`, `Saving`, `Charged`,
+**Plan summary** leads with the answer: one line naming the saving or the loss against the
+baseline (`answer-gain` / `answer-loss`), with the worked explanation behind a **Why this plan?**
+disclosure. Rows: `Estimated cost`, `Baseline (no battery)`, `Saving`, `Charged`,
 `Discharged`, `Cycles`, `Arbitrage energy`, `Assumed round trip` (or `not reported`),
 `Assumed wear` per kWh delivered.
 Extra lines: `Charged from grid: … · charged from PV: …`, `Battery shares in this plan: <name> <W>…`,
 and the efficiency note with the break-even explanation and worked example. A negative saving adds
 `The plan is more expensive than doing nothing over this horizon; check the price source and settings.`
 
-**Plan slots table** — headers: `Time`, `Buy`, `Sell`, `PV`, `Load`, `SoC`, `Battery power`,
-`Action`, `Reason`, `Flags` (`stale price` badge). Rows carry `data-stale` for styling. Long plans
+**Next actions** — a vertical `.window-list` of the contiguous action windows (time range, action,
+signed power, `because:` reason and a `stale price` badge together), so a 360 px screen never splits
+the time/action/reason relationship.
+
+**All slots** — headers: `Time`, `Buy`, `Sell`, `PV`, `Load`, `SoC`, `Battery power`,
+`Action`, `Reason`, `Flags` (`stale price` badge); PV/load are kW (`fmtKw`), never labelled as
+energy. Rows carry `data-stale` for styling. Long plans
 render the first 48 rows with `Show all n slots` / `Show first 48 slots` toggles. Legend lists the
 action vocabulary: hold, charge, discharge, pv_charge, export, self_consumption, reserve.
 
 ### 2.5 Forecasts
 
 Panels: **Price forecast**, **Solar forecast**, **Load forecast**, **Forecast accuracy**,
-**Providers**. Each forecast panel shows: kind, source badge, `generated_at` age, `stale` /
-confidence badges, the provider's `notes`, a chart, and a per-day totals table.
+**Providers**. Each forecast panel leads with a **trust line** (`Measured error: MAPE … · bias … ·
+MAE … (unit) · N samples`, the MAE carrying the metric's own unit), then one quiet metadata line
+(`Source: … · provider: … · contract: … · generated …`) — badges are reserved for stale/limitation
+state — then the chart and a per-day totals table. A stale source is promoted to a visible banner;
+load confidence is neutral text; the provider's full `notes` sit behind a **Source details**
+disclosure. A day with no coverage is left blank and labelled rather than zero-filled.
 
 | Panel | Chart | Per-day table headers |
 | --- | --- | --- |
@@ -171,8 +196,9 @@ Empty forecasts render the server's `reason` slug plus its `hint` sentence; if t
 explanation the panel says so instead of pretending the source returned nothing.
 
 **Forecast accuracy** — three cards (`PV forecast`, `Load forecast`, `Price forecast`) each showing
-MAPE over N days, `bias`, `MAE`, `samples`; plus a 14-day MAPE trend chart (green PV, blue load,
-orange price) and the "not enough measured days" empty state.
+MAPE over N days, `bias`, `MAE` **in that kind's unit** (kW for PV/load, EUR/kWh for price),
+`samples`; plus a 14-day MAPE trend chart with one signature per series (PV solid, load long dashes,
+price dotted) and the "not enough measured days" empty state.
 
 **Providers table** — headers: `Kind`, `Provider`, `Active`, `Healthy`, `Freshness`, `Last success`,
 `Last error`.
@@ -183,7 +209,9 @@ Panel: **Battery fleet**. Per battery card:
 
 | Element | Detail |
 | --- | --- |
-| Heading | name, driver badge, `enabled`/`disabled` badge, `stale state` badge |
+| Heading | name, driver as quiet monospace text, `enabled` as quiet text (a `disabled` badge), `stale state` / `unavailable` badges |
+| Card surface | one separator-separated `.battery-card` inside the fleet panel — no nested panel; `Edit`/`Disable`/`Enable` sit in the heading actions |
+| Disclosures | `Device actions (test and delete)` (with the prerequisite as real text), `Efficiency and wear`, `Entity mapping`, `Driver details` |
 | Round trip | `Round trip` in percent — the single input, split evenly unless overridden |
 | Wear | `price / (cycle_life × usable kWh × η_dis)` per kWh delivered, derived from the optional price/cycle-life inputs so a full cycle costs exactly `price / cycle_life`; the advanced `optimizer.cycle_cost_eur_per_kwh` override replaces it when non-zero |
 | Effective stored-kWh cost | `buy / eta_charge + wear × eta_discharge` recomputed at the current buy price |
@@ -254,26 +282,32 @@ Panels: **Savings range** (controls), **Totals**, **Savings vs baseline**, **Per
 | --- | --- |
 | Range select | `day`, `week`, `month`, `year`, `all` |
 | Totals cards | `Savings` (baseline minus actual, net), `Import cost`, `Baseline cost`, `Import`, `Export`, `PV`, `Cycles` |
-| Unknown handling | `--` and an explicit warning banner when `savings_eur` / `baseline_cost_eur` are `null`; unknown is never rendered as zero |
+| Answer first | the saving/loss line, then `Baseline available for N of M periods`; the comparable baseline and actual net cost cover **the same periods** |
+| Unknown handling | `--`, a distinct `Unknown` card flag and an explicit banner when `savings_eur` / `baseline_cost_eur` are `null`; `Loss` and `Stale` are separate flags; unknown is never rendered as zero |
 | Split row | `Battery energy for arbitrage` and `Battery energy for self-consumption`, or a note that the backend does not report the split |
 | Baseline banner | `How the baseline is defined` — server `baseline_note`, plus the counterfactual re-pricing caveat |
-| Chart | savings bars + actual net cost / baseline cost lines; null series are skipped, not plotted as 0 |
+| Chart | savings bars + solid actual net cost / long-dashed baseline cost lines; null series are skipped, not plotted as 0 |
 | Per-bucket table | `Bucket`, `Period`, `Import`, `Export`, `PV`, `Cost`, `Revenue`, `Baseline`, `Savings`, `Cycles` |
 
 ### 2.8 Settings
 
-Panels: **Settings** (four setup cards + collapsed **All settings** drawer) and **Add-on options**
-(read-only, `Option`/`Value` table).
+Panels: **Settings** (always-visible toolbar + Safety summary, four setup cards, collapsed
+**All settings** drawer) and **Add-on options** (read-only, `Option`/`Value` table).
+
+Always visible above the cards: the `.settings-toolbar` (`settings-search` + `settings-show-advanced`)
+and the **Safety summary** (`Control authority: <mode> · dry run on/off — <authorityNote>`, a
+`Review safety limits` control that opens the Safety group, and `Stop now is on Today`).
 
 **Setup cards** — the default surface; `SEM_APP.setupCardKeys({priceProvider, priceContract, solarSource})`
-is the pure table of keys a card owns for the current selection:
+is the pure table of keys a card owns for the current selection (every input the selection needs is
+on the card):
 
 | Card | Keys it renders |
 | --- | --- |
-| Price | `price.provider`, `price.export_fee_eur_per_kwh`, `price.feed_in_energy_tax_refund`; plus `price.entity` (`provider=entity`), `price.bzn` (`day_ahead`), `price.contract` + `price.fixed_price_eur_per_kwh` (`fixed`, single) or `price.fixed_day_price_eur_per_kwh` + `price.fixed_night_price_eur_per_kwh` (`fixed_day_night`) |
+| Price | `price.provider`, `price.export_fee_eur_per_kwh`, `price.feed_in_energy_tax_refund`; plus `price.entity` (`provider=entity`), `price.bzn` + `price.vat_pct` + `price.energy_tax_eur_per_kwh` + `price.import_fee_eur_per_kwh` (`day_ahead`), `price.contract` + `price.fixed_price_eur_per_kwh` (`fixed`, single) or the two day/night rates **and** the two window hours (`fixed_day_night`) |
 | Meter | `grid.power_entity` (searchable picker) |
-| Solar | `solar.enabled`, `solar.source`, and `solar.measured_entity` unless the source is `derived` |
-| Battery | the configured batteries plus a link into the wizard |
+| Solar | `solar.enabled`, `solar.source`, `solar.measured_entity` unless the source is `derived`, `solar.capacity_wp` (`capacity`), `solar.planes` (`forecast_solar`) |
+| Battery | the fleet from `GET /api/v1/batteries` (the canonical inventory) plus a link into the wizard |
 
 Entity pickers ask `GET /api/v1/discover` and write the candidate row's `setting_key`
 (`grid.export_entity` for an export-only sensor, and so on), falling back to the card's own key; a
@@ -281,20 +315,28 @@ typed entity id is always accepted.
 
 **All settings drawer** — collapsed by default (`sem.settings.allOpen`), holds:
 
-- the group rail, one group at a time, with the changed-key count per group, ordered
-  `General, Price, Solar, Load, Grid, Optimizer, Control, Safety, Notify, Batteries`;
+- the group rail (`.settings-rail`, side by side with the form above 720 px via
+  `.settings-columns`), one group at a time, ordered
+  `General, Price, Solar, Load, Grid, Optimizer, Control, Safety, Notify, Batteries`, with each
+  entry counting keys that **differ from their default** (`n customised` / `defaults`) and a legend
+  line saying that unsaved edits are counted in the save bar instead;
 - `search` (matches key, label, help, group); while a query is active the cards hide and every match
   is listed once;
 - per-group `Advanced (n)` disclosure, collapsed by default, state remembered per group;
 - `Show all advanced` switch (remembered);
-- a sticky `save-bar` with the changed-key count, `Save` and `Revert`;
+- a sticky `save-bar` with the **unsaved** change count, `Save` and `Revert`;
+- `.settings-feedback` beside the save bar (outside the drawer) for pending/success/server-rejected
+  results; a rejected key is attached to its field with `aria-describedby` + `aria-invalid` and
+  focused, the field message coming from the server;
 - navigation-away with unsaved changes asks first.
 
 **Safety handling** — the `Safety` group never folds. Keys matching
 `reserve_soc_pct|max_grid_import_w|max_grid_export_w|allow_export|control.failsafe_on_error` are
 flagged with a `money/safety` badge and require a confirmation dialog before saving. Password fields
 are never echoed: an existing value shows `(a value is set; leave empty to keep it)` and is only sent
-when a new value is typed. `batteries` is edited in the Batteries view; the drawer links there.
+when a new value is typed. `batteries` is server-managed by the wizard: the drawer renders it as a
+read-only provenance line (with the fleet count) linking to the Batteries view, never as an editable
+JSON field.
 
 **Provider/source-dependent visibility** (pure tables, so hidden fields never take effect silently —
 a hidden field holding a non-default value is still surfaced):
@@ -333,24 +375,34 @@ Panel: **Decision log**.
 | Auto-refresh | checkbox, 15 s, paused while the tab is hidden or a dialog is open |
 | `Refresh` | manual reload |
 | Note | "Every dispatch attempt is logged with requested vs applied power and the blocking reason, so 'why didn't it charge?' is always answerable here." |
-| Table | `Time` (local time + relative age), `Kind`, `Level` (badge), `Code`, `Message`, `Power` (`requested → applied`), `Detail` (collapsible JSON), newest first |
+| Presets | segmented group `All` / `Dispatch` / `Warnings and errors` / `Events` (`aria-pressed`) |
+| Rows | message-first `.log-list`: the message, then badges (level, mode/dry-run context), local time + relative age, kind, code, `requested → applied` power and a collapsed JSON detail, newest first |
+| While reading | an open detail is never rebuilt by a poll; a `New entries available` notice appears instead |
 
 ### 2.10 Cross-cutting UI rules
 
 - **No colour-only meaning**: badges carry text, stale slots carry a `stale` badge plus dashed
-  borders, alerts write the level out, and every chart series has a legend label.
-- **Every number has a unit**: `fmtPower` (W/kW), `fmtKwh`, `fmtPrice` (EUR/kWh), `fmtEur`, `fmtPct`,
-  `fmtDuration`, cycles, `°C`. Unknown values render `--`.
+  borders, alerts write the level out, and every chart series has a stable line signature named in
+  words in its legend (solid = measurement/forecast, long dashes = sell/baseline, dotted = threshold).
+- **Every number has a unit**: `fmtPower` (W/kW), `fmtKw` (forecast PV/load **power**), `fmtKwh`
+  (energy), `fmtPrice` (EUR/kWh), `fmtEur`, `fmtPct`, `fmtDuration`, cycles, `°C`. Unknown values
+  render `--`; a partial baseline states its coverage; forecast MAE uses the metric's own unit.
 - **Stale data is visibly stale**: `staleBadge()` plus `.card-stale` / `[data-stale]` styling, and
   banner warnings for a control tick older than 180 s or a disconnected HA.
 - **Loading and error per panel**: `asyncPanel()` gives every panel its own loading text, error
   message and retry button; each view fetches its data once via `once()`.
 - **Writes are pending → confirmed**: `performWrite()` disables the trigger, announces "pending",
-  then renders the server response or the server error and re-renders from a fresh `GET`. No
-  optimistic UI.
+  counts the in-flight write, then renders the server response or the server error and re-renders
+  from a fresh `GET`. No optimistic UI.
+- **Navigation ≠ refresh**: a route change re-renders, scrolls to the top and focuses the route
+  `h1`; background polls call the view's `state.refresh()` hook and update in place, and
+  `refreshBlocked()` stops them while a dialog is open, a write is pending, the form is dirty or a
+  stop result is on screen. `once()` clears a rejected cache so `Retry` re-requests.
 - **Dangerous actions are confirmed** via `confirmAction()` (native `<dialog>`, focus on Cancel, Esc
   cancels, optional checkbox): enabling `auto`, turning dry run off, Stop now, test discharge,
-  enabling a battery, deleting a battery, safety settings, saving a battery mapping.
+  enabling a battery, deleting a battery, safety settings, saving a battery mapping. A browser
+  without `showModal` **fails closed** for checkbox-required actions instead of falling back to a
+  bare `window.confirm`.
 - **Honest copy about writes**: dry run is described as "the plan dispatcher writes nothing", never
   as "no hardware writes"; the autopilot note and the auto/dry-run confirms state that advisory/off
   and dry run stop *new* writes but do not neutralise a setpoint already written — Stop now is the
@@ -1380,5 +1432,5 @@ into the caller. Messages contain generic text plus numbers — never entity ids
 
 ---
 
-*Generated from the 0.7.0 source tree. Contains no instance-specific values: entity ids, zones and
+*Generated from the 0.8.0 source tree. Contains no instance-specific values: entity ids, zones and
 prices in this document are settings keys, placeholders or worked examples.*

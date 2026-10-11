@@ -70,12 +70,18 @@
     return el("span", { class: "badge" + (kind ? " badge-" + kind : ""), text: text });
   }
 
-  function table(caption, headers, rows, rowAttrs) {
+  // Numeric columns are declared metadata, never a blanket "everything after the first
+  // column": prose columns (messages, reasons, names) must stay left-aligned (UI_REVIEW §3.11).
+  // opts = {rowAttrs, numeric}; numeric = null (default) = every column after the first.
+  function table(caption, headers, rows, opts) {
+    opts = opts || {};
+    var numeric = opts.numeric === undefined ? null : opts.numeric;
     var head = el("tr", null, headers.map(function (h) { return el("th", { scope: "col", text: h }); }));
     var body = el("tbody", null, rows.map(function (cells, r) {
-      var row = el("tr", rowAttrs && rowAttrs[r] ? rowAttrs[r] : null);
+      var row = el("tr", opts.rowAttrs && opts.rowAttrs[r] ? opts.rowAttrs[r] : null);
       cells.forEach(function (cell, i) {
-        var td = el("td", i > 0 ? { class: "num" } : null);
+        var numericColumn = numeric ? numeric.indexOf(i) >= 0 : i > 0;
+        var td = el("td", numericColumn ? { class: "num" } : null);
         append(td, cell);
         row.appendChild(td);
       });
@@ -89,11 +95,18 @@
     return el("span", null, [String(text), " ", el("span", { class: "unit", text: unit })]);
   }
 
-  function statCard(label, value, sub, stale) {
-    return el("div", { class: "card" + (stale ? " card-stale" : "") }, [
+  // A metric card. `state` is false (a normal reading), "stale", "loss" or "unknown": each
+  // gets its own visible flag, so a negative result, missing data and a stale reading never share
+  // one treatment (UI_REVIEW §3.6). A plain `true` means "stale", which is what the dashboard
+  // cards pass.
+  function statCard(label, value, sub, state) {
+    var kind = state === true ? "stale" : typeof state === "string" && state ? state : false;
+    var flags = { stale: "Stale reading", loss: "Loss", unknown: "Unknown" };
+    return el("div", { class: "card" + (kind ? " card-" + kind : "") }, [
       el("p", { class: "card-label", text: label }),
       el("p", { class: "card-value" }, value),
-      sub ? el("p", { class: "card-sub" }, sub) : null
+      sub ? el("p", { class: "card-sub" }, sub) : null,
+      kind ? el("p", { class: "card-flag", text: flags[kind] || kind }) : null
     ]);
   }
 
@@ -113,6 +126,12 @@
   function fmtKwh(kwh, digits) {
     if (!isNum(kwh)) return "--";
     return kwh.toFixed(digits === undefined ? 2 : digits) + " kWh";
+  }
+
+  // Power in kW, so a kW payload is never labelled as an energy (UI_REVIEW §3.6).
+  function fmtKw(kw, digits) {
+    if (!isNum(kw)) return "--";
+    return kw.toFixed(digits === undefined ? 2 : digits) + " kW";
   }
 
   function fmtPrice(value) {
@@ -284,7 +303,7 @@
 
   /* ------------------------------------------------------------------ shared state, panels, notes */
 
-  var state = { status: null, health: null, viewToken: 0, cleanup: null };
+  var state = { status: null, health: null, viewToken: 0, cleanup: null, refresh: null };
 
   function setNote(container, text, isError) {
     var live = document.getElementById("live");
@@ -308,6 +327,12 @@
     var section = el("section", { class: "panel" }, [head, body]);
     host.appendChild(section);
     return { section: section, body: body, head: head };
+  }
+
+  // The route title: one visible H1 per view, and the element intentional navigation focuses.
+  function routeTitle(host, title, sub) {
+    host.appendChild(el("h1", { class: "route-title", tabindex: "-1", text: title }));
+    if (sub) host.appendChild(el("p", { class: "route-sub", text: sub }));
   }
 
   function panelStatus(body, kind, message, onRetry) {
@@ -342,14 +367,95 @@
   /* ------------------------------------------------------------------ confirm dialog + write helpers */
 
   function anyDialogOpen() {
-    var dlg = document.getElementById("confirm-dialog");
-    return !!(dlg && dlg.open);
+    var dialogs = document.querySelectorAll ? document.querySelectorAll("dialog") : [];
+    for (var i = 0; i < dialogs.length; i++) {
+      if (dialogs[i] && dialogs[i].open) return true;
+    }
+    return false;
+  }
+
+  // In-flight writes and unresolved stop results are evidence, not stale data: a background
+  // refresh must never discard them (UI_REVIEW §3.5).
+  var pendingWrites = 0;
+
+  /* One guard for every background refresh: an open dialog, a pending write, a dirty form or an
+   * unresolved stop result blocks it. Deliberate navigation does not use this guard. */
+  function refreshBlocked() {
+    if (anyDialogOpen()) return true;
+    if (pendingWrites > 0) return true;
+    if (state.navGuard && typeof state.navGuard.dirty === "function" && state.navGuard.dirty()) return true;
+    if (document.querySelector && document.querySelector("[data-stop-result]")) return true;
+    return false;
+  }
+
+  /* ------------------------------------------------------------------ quiet refresh helpers
+   * A background data refresh must not scroll, destroy the focused control, or discard rows the
+   * reader expanded (UI_REVIEW §3.5): re-render into the existing host and then put focus back
+   * on the element that occupied the same position before the update. */
+
+  function within(node, container) {
+    var current = node;
+    while (current) {
+      if (current === container) return true;
+      current = current.parentNode;
+    }
+    return false;
+  }
+
+  function childElements(node) {
+    if (!node) return [];
+    if (node.children) return Array.prototype.slice.call(node.children);
+    return Array.prototype.filter.call(node.childNodes || [], function (kid) { return kid.nodeType === 1; });
+  }
+
+  function focusPath(node, stop) {
+    var steps = [];
+    var current = node;
+    while (current && current !== stop && current.tagName) {
+      var parent = current.parentNode;
+      if (!parent) return null;
+      var same = childElements(parent).filter(function (kid) { return kid.tagName === current.tagName; });
+      steps.unshift(current.tagName + ":" + same.indexOf(current) + "/" + same.length);
+      current = parent;
+    }
+    return steps.length ? steps : null;
+  }
+
+  function elementAtPath(root, steps) {
+    var node = root;
+    for (var i = 0; i < steps.length; i++) {
+      if (!node) return null;
+      var match = /^([A-Z]+):(\d+)\/(\d+)$/.exec(steps[i]);
+      if (!match) return null;
+      var same = childElements(node).filter(function (kid) { return kid.tagName === match[1]; });
+      node = same.length === Number(match[3]) ? same[Number(match[2])] : null;
+    }
+    return node || null;
+  }
+
+  // Draw into `target` (which draw() fills itself) and restore focus to the equivalent element.
+  function renderInto(target, draw) {
+    var active = document.activeElement;
+    var path = active && within(active, target) ? focusPath(active, null) : null;
+    clear(target);
+    draw(target);
+    if (path) {
+      var again = elementAtPath(document.body || document.documentElement, path);
+      if (again && typeof again.focus === "function") again.focus();
+    }
   }
 
   function confirmAction(options) {
     return new Promise(function (resolve) {
       var dlg = document.getElementById("confirm-dialog");
       if (!dlg || typeof dlg.showModal !== "function") {
+        // Fail closed: a bare window.confirm cannot carry the acknowledgement checkbox, so an
+        // action that needs a barrier must not proceed without one (UI_REVIEW §8.6).
+        if (options.requireCheck) {
+          setNote(null, "This browser cannot show the acknowledgement dialog, so nothing was applied.");
+          resolve(false);
+          return;
+        }
         resolve(root.confirm ? root.confirm(options.title + "\n\n" + options.body) : false);
         return;
       }
@@ -394,27 +500,40 @@
     });
   }
 
+  // A cached failure must not poison a Retry: clear the slot so the next call re-requests
+  // (UI_REVIEW §3.11).
   function once(factory) {
     var promise = null;
-    return function () { if (!promise) promise = factory(); return promise; };
+    return function () {
+      if (!promise) {
+        promise = factory().catch(function (err) { promise = null; throw err; });
+      }
+      return promise;
+    };
   }
 
-  function performWrite(trigger, target, requestFn, successText, onDone) {
+  // Every dialog counts, not only the shared confirmation one: an open battery wizard or test
+  // dialog must also pause background refresh (UI_REVIEW §3.11).
+  function performWrite(trigger, target, requestFn, successText, onDone, onError) {
     trigger.disabled = true;
     trigger.setAttribute("aria-busy", "true");
     if (trigger.classList) trigger.classList.add("pending");
     setNote(target, "Pending… (waiting for the server)", false);
+    pendingWrites++;
     requestFn().then(function (result) {
+      pendingWrites--;
       if (trigger.classList) trigger.classList.remove("pending");
       trigger.removeAttribute("aria-busy");
       trigger.disabled = false;
       setNote(target, successText ? successText(result) : "Confirmed by the server.", false);
       if (onDone) onDone(result);
     }).catch(function (err) {
+      pendingWrites--;
       if (trigger.classList) trigger.classList.remove("pending");
       trigger.removeAttribute("aria-busy");
       trigger.disabled = false;
       setNote(target, "Error: " + (err && err.message ? err.message : String(err)), true);
+      if (onError) onError(err);
     });
   }
 
@@ -423,14 +542,50 @@
     var target = options.noteContainer || btn.parentNode;
     btn.addEventListener("click", function () {
       if (!options.confirm) {
-        performWrite(btn, target, options.request, options.successText, options.onDone);
+        performWrite(btn, target, options.request, options.successText, options.onDone, options.onError);
         return;
       }
       confirmAction(options.confirm).then(function (ok) {
-        if (ok) performWrite(btn, target, options.request, options.successText, options.onDone);
+        if (ok) performWrite(btn, target, options.request, options.successText, options.onDone, options.onError);
       });
     });
     return btn;
+  }
+
+  /* ---- control-authority policy (UI_REVIEW §3.3) --------------------------------------------
+   * The two transitions that can let the plan dispatcher write to the batteries get the same
+   * acknowledgement wherever they are triggered from: the Dashboard control settings and the
+   * Settings General group share these descriptors, so the safety barrier cannot depend on the
+   * route the user happened to take. */
+
+  function modeChangeConfirm(mode) {
+    if (mode === "auto") {
+      return {
+        title: "Enable automatic control?",
+        body: "Auto lets the add-on write power setpoints to the batteries. Keep dry run on to log the writes without performing them. There is no device watchdog: switching away from auto later does not neutralise a setpoint that was already written — use Stop now for that.",
+        confirmLabel: "Enable auto",
+        requireCheck: true,
+        checkLabel: "I understand the battery can be controlled"
+      };
+    }
+    return null;
+  }
+
+  function dryRunOffConfirm() {
+    return {
+      title: "Turn dry run off?",
+      body: "With dry run off and mode auto, the add-on performs real writes to your batteries. The device has no watchdog, so a written setpoint stays in force until something else changes it.",
+      confirmLabel: "Turn dry run off",
+      requireCheck: true,
+      checkLabel: "I understand writes will be real"
+    };
+  }
+
+  // The exact dispatcher/Stop distinction, shared by the answer strip and the Settings help text.
+  function authorityNote(dryRun) {
+    return dryRun
+      ? "Dry run on: the plan dispatcher writes nothing — it logs what it would send. Stop now still writes 0 W to the hardware, even in dry run."
+      : "Dry run off: the plan dispatcher writes setpoints to the batteries. Stop now still writes 0 W to the hardware.";
   }
 
   /* ------------------------------------------------------------------ router */
@@ -466,18 +621,36 @@
   }
 
   function setNav(route) {
+    var area = NAV_AREAS[route];
+    var subVisible = area === "plan" || area === "manage";
     Array.prototype.forEach.call(document.querySelectorAll("#nav a"), function (link) {
-      var href = link.getAttribute("href") || "";
-      if (href === "#" + route) link.setAttribute("aria-current", "page");
+      var href = (link.getAttribute("href") || "").replace(/^#/, "");
+      var group = link.closest ? link.closest("[data-sub]") : null;
+      var current;
+      if (group) {
+        // The contextual row marks the exact route; the primary pill stays on the area entry.
+        group.hidden = !subVisible || group.getAttribute("data-sub") !== area;
+        current = href === route;
+      } else {
+        current = NAV_AREAS[href] === area && (!subVisible || href !== route);
+      }
+      if (current) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
+    });
+    Array.prototype.forEach.call(document.querySelectorAll("#nav .nav-sub"), function (list) {
+      list.hidden = !subVisible;
     });
   }
 
+  // A route render is always intentional here (background updates use state.refresh instead),
+  // so scrolling to the top and focusing the route title is the deliberate behaviour. The H1 each
+  // view renders is the focus target; without one the <main> takes focus.
   function renderRoute() {
     var parsed = splitHash(root.location ? root.location.hash : "");
     var host = document.getElementById("view");
     if (!host) return;
     state.viewToken++;
+    state.refresh = null;
     if (state.cleanup) {
       try { state.cleanup(); } catch (err) { /* cleanup is best effort */ }
       state.cleanup = null;
@@ -487,12 +660,12 @@
     setNav(parsed.route);
     state.cleanup = VIEWS[parsed.route](host, parsed.query) || null;
     if (root.scrollTo) root.scrollTo(0, 0);
+    var target = host.querySelector("h1") || host;
+    if (typeof target.focus === "function") target.focus({ preventScroll: true });
   }
 
-  function safeRefresh() {
-    if (document.hidden || anyDialogOpen()) return;
-    renderRoute();
-  }
+  /* Deliberate navigation is the only thing that re-renders a route; background updates go through
+   * a view's quiet refresh() instead, and are blocked while evidence is on screen. */
 
   function refreshHeader() {
     var chip = document.getElementById("conn-status");
@@ -501,8 +674,10 @@
       state.status = status;
       if (chip) {
         chip.className = "conn " + (status.ha_connected ? "ok" : "warn");
-        chip.textContent = (status.ha_connected ? "Home Assistant connected" : "Home Assistant unreachable") +
-          " · " + status.mode + (status.dry_run ? " · dry run" : "");
+        chip.textContent = status.ha_connected ? "HA connected" : "HA unreachable";
+        chip.title = status.ha_connected
+          ? "Home Assistant connected; control authority is on Today"
+          : "Home Assistant is unreachable, so no reading here is live";
       }
       if (build) build.textContent = "v" + (status.version || "?") + (status.commit ? " · " + status.commit : "");
     }).catch(function (err) {
@@ -526,6 +701,9 @@
     if (!rootEl) return;
     if (mode === "auto") delete rootEl.dataset.bsTheme;
     else rootEl.dataset.bsTheme = mode;
+    // Charts read their colours from CSS custom properties, so an explicit theme change has to
+    // re-render them or the UI and the plot disagree until the next mount (UI_REVIEW §3.10).
+    if (root.SEMCharts && typeof root.SEMCharts.refresh === "function") root.SEMCharts.refresh();
   }
 
   function wireThemeToggle() {
@@ -551,6 +729,28 @@
     });
   }
 
+  /* ------------------------------------------------------------------ navigation and refresh
+   * Intentional navigation (a hash change or a view link) may scroll to the route heading and
+   * focus it; a background data update may not. Views that can refresh quietly install
+   * state.refresh, so returning to a visible tab updates values in place instead of rebuilding
+   * the route — which is what protects unsaved settings, expanded rows and stop results
+   * (UI_REVIEW §3.5). */
+
+  var NAV_AREAS = {
+    "/dashboard": "today",
+    "/plan": "plan",
+    "/forecasts": "plan",
+    "/savings": "savings",
+    "/batteries": "manage",
+    "/settings": "manage",
+    "/log": "manage"
+  };
+
+  function refreshCurrentView() {
+    if (!state.refresh) return;
+    state.refresh();
+  }
+
   // The router asks a view's guard before it re-renders, so a cancelled navigation keeps the
   // current DOM (and its unsaved edits) instead of rebuilding it from the API.
   var skipNextHash = false;
@@ -573,12 +773,35 @@
   function boot() {
     wireThemeToggle();
     root.addEventListener("hashchange", onHashChange);
+    // The footer's About disclosure replaces the two-sentence policy that every route repeated
+    // (UI_REVIEW §3.12); "Times: local" stays visible.
+    var helpToggle = document.getElementById("help-toggle");
+    var help = document.getElementById("help");
+    if (helpToggle && help) {
+      helpToggle.addEventListener("click", function () {
+        var open = help.hidden;
+        help.hidden = !open;
+        helpToggle.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+    }
+    // Skip to content must move focus, not the route: a hash of #view used to fall through the
+    // router to the Dashboard (UI_REVIEW §3.11).
+    var skip = document.querySelector(".skip-link");
+    if (skip) {
+      skip.addEventListener("click", function (event) {
+        if (event && event.preventDefault) event.preventDefault();
+        var host = document.getElementById("view");
+        if (!host) return;
+        if (!host.getAttribute("tabindex")) host.setAttribute("tabindex", "-1");
+        host.focus();
+      });
+    }
     if (!root.location.hash) root.location.hash = VIEW_DEFAULT;
     else renderRoute();
     refreshHeader();
     root.setInterval(function () { if (!document.hidden && !anyDialogOpen()) refreshHeader(); }, 15000);
     document.addEventListener("visibilitychange", function () {
-      if (!document.hidden) { refreshHeader(); safeRefresh(); }
+      if (!document.hidden) { refreshHeader(); refreshCurrentView(); }
     });
   }
 
@@ -622,7 +845,7 @@
       if (failed.length) box.appendChild(el("p", { class: "field-error", text: failed.length + " of " + stopped.length + " batteries did NOT confirm the stop. Check them in Home Assistant before trusting the safe state." }));
       box.appendChild(table("Per-battery stop result (server response)", ["Battery", "Result", "Applied power", "Code", "Message", "Dry run"], stopped.map(function (row) {
         return [row.battery_id || "?", row.ok ? badge("stopped", "ok") : badge("FAILED", "err"), fmtPower(row.applied_w), row.code || "—", row.message || "—", row.dry_run ? "yes (still wrote)" : "no"];
-      })));
+      }), { numeric: [2] }));
     }
     box.appendChild(button("Dismiss", "", function () { box.remove(); }));
     body.appendChild(box);
@@ -647,56 +870,247 @@
     body.appendChild(box);
   }
 
-  function renderAutopilot(body, status) {
-    var toolbar = el("div", { class: "toolbar" });
+  // Who is in control, and whether the dispatcher writes (UI_REVIEW §3.1). The wording is the
+  // same one the confirmation dialogs use, so the answer strip and the acknowledgement can never
+  // disagree.
+  function authorityText(status) {
+    var mode = { off: "Off", advisory: "Advisory", auto: "Auto" }[status.mode] || String(status.mode || "unknown");
+    return mode + " · " + (status.dry_run
+      ? "dry run: the plan dispatcher writes nothing"
+      : "dry run off: the plan dispatcher writes to the batteries");
+  }
+
+  function batteryName(battery) {
+    return (battery.extra && battery.extra.name) || battery.id || "battery";
+  }
+
+  // Measured behaviour, stated separately from the plan, so a proposal can never be read as what
+  // the battery actually did.
+  function measuredText(batteries) {
+    var rows = (Array.isArray(batteries) ? batteries : []).filter(function (b) { return isNum(b.power_w); });
+    if (!rows.length) return "Measured battery: power unknown";
+    var total = rows.reduce(function (sum, b) { return sum + b.power_w; }, 0);
+    var who = rows.length === 1 ? batteryName(rows[0]) : rows.length + " batteries";
+    var direction = total > 0 ? "charging" : total < 0 ? "discharging" : "idle";
+    return "Measured " + who + ": " + direction + " " + fmtPower(Math.abs(total));
+  }
+
+  function plannedText(slot) {
+    if (!slot) return "Planned now: no active plan slot";
+    return "Planned now: " + String(actionText(slot.action)).toLowerCase() + " " + fmtPower(slot.power_w) +
+      " — because: " + reasonText(slot.reason) + " (a proposal, not the measured behaviour above)";
+  }
+
+  // A dashboard panel body that can be re-drawn in place: quiet refresh re-renders it without
+  // touching the rest of the route, so scroll, focus and the stop-result banner survive.
+  function dashboardPanel(host, title, cls) {
+    var section = el("section", { class: "panel" + (cls ? " " + cls : "") });
+    section.appendChild(el("div", { class: "panel-head" }, [el("h2", { text: title })]));
+    var body = el("div", { class: "panel-body" });
+    section.appendChild(body);
+    host.appendChild(section);
+    return body;
+  }
+
+  function renderAutopilot(draw, status, plan, handles) {
+    // 1) the operational answer: authority, measured behaviour, planned behaviour.
+    draw(el("p", { class: "answer-authority", text: authorityText(status) }));
+    draw(el("p", { class: "answer-measured", text: measuredText(status.batteries) }));
+    draw(el("p", { class: "answer-planned", text: plannedText(slotAt(plan, status.now || new Date())) }));
+    // 2) unresolved safety conditions directly beside the answer, never below routine metrics.
+    renderSafetyState(draw, status);
+    if (status.override) {
+      var until = status.override.expires_at ? fmtTime(status.override.expires_at) : "?";
+      var overrideBox = el("div", { class: "banner banner-warn" }, [
+        el("p", { class: "banner-title", text: "Manual override active" }),
+        el("p", { text: fmtPower(status.override.power_w) + (status.override.battery_id ? " on " + status.override.battery_id : " on all batteries") + " until " + until + "." })
+      ]);
+      var clear = button("Clear override", "btn-danger");
+      writeAction({
+        button: clear, noteContainer: handles.notes,
+        confirm: { title: "Clear override?", body: "Normal plan dispatch resumes.", confirmLabel: "Clear override" },
+        request: function () { return del("/override"); },
+        successText: function () { return "Override cleared (confirmed by the server)."; },
+        onDone: function () { handles.refresh(); }
+      });
+      overrideBox.appendChild(clear);
+      draw(overrideBox);
+    }
+    connectionIssues(status).forEach(function (issue) {
+      draw(el("div", { class: "banner banner-" + (issue.level === "error" ? "error" : "warn") }, [
+        el("p", { class: "banner-title", text: issue.level === "error" ? "Error" : "Warning" }),
+        el("p", { text: issue.text })
+      ]));
+    });
+    draw(el("p", { class: "legend-note", text: "Last plan " + timeAgo(status.last_plan_at) + ", last tick " + timeAgo(status.last_tick_at) + ". The device has no watchdog: advisory/off and dry run stop new writes, but a setpoint written earlier in a live session stays in force — use Stop now to neutralise it (Stop writes to the hardware even in dry run)." }));
+  }
+
+  function renderAlerts(body, status) {
+    var alerts = Array.isArray(status.alerts) ? status.alerts : [];
+    var actionable = alerts.filter(function (alert) { return (alert.level || "info") !== "info"; });
+    var activity = alerts.filter(function (alert) { return (alert.level || "info") === "info"; });
+    if (!actionable.length) {
+      body.appendChild(el("p", { class: "muted", text: "No warnings or errors." }));
+    } else {
+      var list = el("ul", { class: "alert-list" });
+      actionable.forEach(function (alert) {
+        var level = alert.level || "warning";
+        list.appendChild(el("li", { dataset: { level: level } }, [
+          el("p", { class: "alert-meta" }, [badge(level, level === "warning" ? "warn" : "err"), " ", fmtDateTime(alert.ts), " (", timeAgo(alert.ts), ")"]),
+          el("p", { class: "wrap-anywhere", text: alert.message || alert.code || "(no message)" })
+        ]));
+      });
+      body.appendChild(list);
+    }
+    // Routine informational events ("a new plan was published") are activity history, not alerts.
+    if (activity.length) {
+      var details = el("details", { class: "disclosure" }, [el("summary", { text: "Recent activity (" + activity.length + ")" })]);
+      var items = el("ul", { class: "alert-list" });
+      activity.forEach(function (alert) {
+        items.appendChild(el("li", { dataset: { level: "info" } }, [
+          el("p", { class: "alert-meta" }, [badge("info", "info"), " ", fmtDateTime(alert.ts), " (", timeAgo(alert.ts), ")"]),
+          el("p", { class: "wrap-anywhere", text: alert.message || alert.code || "(no message)" })
+        ]));
+      });
+      details.appendChild(items);
+      body.appendChild(details);
+    }
+  }
+
+  // Primary metrics only: charge, grid direction, price. PV/load and the next windows are the
+  // quieter supporting row, so a future expensive window cannot compete with the control state.
+  function renderNow(body, data) {
+    var status = data.status, plan = data.plan;
+    var batteries = Array.isArray(status.batteries) ? status.batteries : [];
+    var available = batteries.filter(function (b) { return b.available && isNum(b.soc_pct); });
+    var avgSoc = available.length ? available.reduce(function (sum, b) { return sum + b.soc_pct; }, 0) / available.length : null;
+    var anyStale = batteries.some(function (b) { return b.stale; });
+    var grid = status.grid_now_w;
+    var gridText = isNum(grid) ? (grid > 0 ? "importing" : grid < 0 ? "exporting" : "balanced") : "unknown";
+    var rank = status.price_rank_pct;
+    var rankText = isNum(rank) ? "rank " + rank.toFixed(0) + " % (" + (rank <= 33 ? "cheapest third" : rank <= 66 ? "middle third" : "most expensive third") + ")" : "rank unknown";
+    var slot = slotAt(plan, status.now || new Date());
+    body.appendChild(el("div", { class: "cards" }, [
+      statCard("Battery charge", withUnit(isNum(avgSoc) ? avgSoc.toFixed(1) : "--", "%"), batteries.length === 1 ? "1 battery reported" : batteries.length + " batteries reported", anyStale),
+      statCard("Grid power", fmtPower(grid), gridText + " at the meter"),
+      statCard("Price now", fmtPrice(status.price_now), rankText, slot ? slot.price_stale : false)
+    ]));
+  }
+
+  function renderSupporting(body, data) {
+    var status = data.status;
+    var cheap = fmtWindow(status.next_cheap_window);
+    var expensive = fmtWindow(status.next_expensive_window);
+    body.appendChild(el("div", { class: "cards supporting" }, [
+      statCard("PV power", fmtPower(status.pv_now_w), "production now"),
+      statCard("Load power", fmtPower(status.load_now_w), "household consumption now"),
+      statCard("Next cheap window", cheap ? cheap.split(" (")[0] : "--", cheap ? cheap.split(" (")[1] || "" : "not known", false),
+      statCard("Next expensive window", expensive ? expensive.split(" (")[0] : "--", expensive ? expensive.split(" (")[1] || "" : "not known", false)
+    ]));
+  }
+
+  function renderBatteryCards(body, status) {
+    var batteries = Array.isArray(status.batteries) ? status.batteries : [];
+    if (!batteries.length) {
+      body.appendChild(el("p", { class: "muted", text: "No batteries configured. Add one in the Batteries view." }));
+      return;
+    }
+    var grid = el("div", { class: "cards" });
+    batteries.forEach(function (battery) {
+      var name = batteryName(battery);
+      var direction = isNum(battery.power_w) ? (battery.power_w > 0 ? "charging" : battery.power_w < 0 ? "discharging" : "idle") : "power unknown";
+      // Badges are flattened at the call site: a nested array stringified to [object Object]
+      // (UI_REVIEW §3.6).
+      var badges = [];
+      if (battery.available) badges.push(badge("available", "ok"));
+      else badges.push(badge("unavailable", "err"));
+      if (battery.stale) badges.push(badge("stale", "stale"));
+      grid.appendChild(el("div", { class: "card" + (battery.stale ? " card-stale" : "") }, [
+        el("p", { class: "card-label", text: name }),
+        el("p", { class: "card-value" }, withUnit(isNum(battery.soc_pct) ? battery.soc_pct.toFixed(1) : "--", "%")),
+        el("p", { class: "card-sub" }, [fmtPower(battery.power_w) + " (" + direction + ")"]),
+        el("p", { class: "card-sub" }, [fmtKwh(battery.energy_kwh) + " of " + fmtKwh(battery.capacity_kwh), isNum(battery.temperature_c) ? " · " + battery.temperature_c.toFixed(1) + " °C" : ""]),
+        el("p", { class: "card-sub" }, ["read " + timeAgo(battery.read_at), " "].concat(badges)),
+        battery.last_error ? el("p", { class: "field-error", text: battery.last_error }) : null
+      ]));
+    });
+    body.appendChild(grid);
+  }
+
+  function viewDashboard(host) {
+    var data = { status: null, plan: null };
     var modeButtons = {};
-    [["off", "Off"], ["advisory", "Advisory"], ["auto", "Auto"]].forEach(function (m) {
-      var active = status.mode === m[0];
-      var b = button(m[1], active ? "btn-primary" : "");
-      modeButtons[m[0]] = b;
+    var confirmed = el("p", { class: "control-state" });
+    var notes = el("div", { class: "answer-notes" });
+    var results = el("div", { class: "answer-results", dataset: { stopResultHost: "1" } });
+
+    function setConfirmed(status) {
+      confirmed.textContent = "Confirmed by the server: mode " + status.mode + (status.dry_run ? " · dry run on" : " · dry run off") + ".";
+    }
+    function modeLabel(mode) { return { off: "Off", advisory: "Advisory", auto: "Auto" }[mode] || mode; }
+    function syncButton(b, active, mode) {
       b.setAttribute("aria-pressed", active ? "true" : "false");
-      b.setAttribute("aria-label", "Set mode to " + m[1] + (active ? " (current)" : ""));
+      b.setAttribute("aria-label", "Set mode to " + modeLabel(mode) + (active ? " (current)" : ""));
+      if (active) b.classList.add("btn-primary");
+      else b.classList.remove("btn-primary");
+    }
+    function syncModeButtons(status) {
+      Object.keys(modeButtons).forEach(function (mode) { syncButton(modeButtons[mode], status.mode === mode, mode); });
+    }
+
+    // ---- the panels ------------------------------------------------------------------------
+    var answerDynamic = el("div", { class: "answer-dynamic" });
+    var controls = el("div", { class: "answer-controls" });
+    var answerBody = dashboardPanel(host, "Now", "panel-answer");
+    answerBody.appendChild(answerDynamic);
+    answerBody.appendChild(notes);
+
+    function drawAnswer() {
+      renderInto(answerDynamic, function (target) {
+        renderAutopilot(function (node) { target.appendChild(node); }, data.status, data.plan, { notes: notes, refresh: refresh });
+      });
+    }
+    function paintAnswer() { if (data.status) { drawAnswer(); setConfirmed(data.status); } }
+
+    var alertsBody = dashboardPanel(host, "Warnings and activity");
+    var nowBody = dashboardPanel(host, "Right now");
+    var supportBody = dashboardPanel(host, "Supporting measurements", "panel-quiet");
+    var chartBody = dashboardPanel(host, "Next 24 hours");
+    var batteryBody = dashboardPanel(host, "Batteries");
+    [alertsBody, nowBody, supportBody, chartBody, batteryBody].forEach(function (body) {
+      panelStatus(body, "loading", "Loading…");
+    });
+
+    // The controls are built once and survive every quiet refresh, so a poll can never replace a
+    // button mid-write; each button binds exactly one handler (UI_REVIEW §3.3: the old code bound
+    // writeAction inside the click, so the first Off/Advisory/Auto press only installed it).
+    ["off", "advisory", "auto"].forEach(function (mode) {
+      var b = button(modeLabel(mode), "");
+      modeButtons[mode] = b;
+      syncButton(b, false, mode);
       b.addEventListener("click", function () {
-        var confirmOptions = m[0] === "auto" ? {
-          title: "Enable automatic control?",
-          body: "Auto lets the add-on write power setpoints to the batteries. Keep dry run on to log the writes without performing them. There is no device watchdog: switching away from auto later does not neutralise a setpoint that was already written — use Stop now for that.",
-          confirmLabel: "Enable auto",
-          requireCheck: true,
-          checkLabel: "I understand the battery can be controlled"
-        } : null;
         writeAction({
-          button: b, noteContainer: body, confirm: confirmOptions,
-          request: function () { return post("/mode", { mode: m[0], dry_run: status.dry_run }); },
+          button: b, noteContainer: notes, confirm: modeChangeConfirm(mode),
+          request: function () { return post("/mode", { mode: mode, dry_run: data.status ? data.status.dry_run : true }); },
           successText: function (res) { return "Mode is now " + res.mode + " (confirmed by the server)."; },
-          onDone: function () { renderRoute(); }
+          onDone: function (res) {
+            var fresh = data.status || {};
+            fresh.mode = res.mode;
+            if (typeof res.dry_run === "boolean") fresh.dry_run = res.dry_run;
+            data.status = fresh;
+            state.status = fresh;
+            syncModeButtons(fresh);
+            if (dryBox) dryBox.checked = !!fresh.dry_run;
+            setConfirmed(fresh);
+            paintAnswer();
+            refreshHeader();
+          }
         });
       });
-      toolbar.appendChild(b);
+      controls.appendChild(b);
     });
 
-    var dry = el("input", { type: "checkbox", id: "dry-run-toggle", checked: status.dry_run });
-    dry.addEventListener("change", function () {
-      var next = dry.checked;
-      function apply() {
-        performWrite(dry, body, function () {
-          return post("/mode", { mode: status.mode, dry_run: next });
-        }, function (res) {
-          return "Dry run is now " + (res.dry_run ? "on" : "off") + " (confirmed by the server).";
-        }, function () { renderRoute(); });
-      }
-      if (!next) {
-        confirmAction({
-          title: "Turn dry run off?",
-          body: "With dry run off and mode auto, the add-on performs real writes to your batteries. The device has no watchdog, so a written setpoint stays in force until something else changes it.",
-          confirmLabel: "Turn dry run off", requireCheck: true,
-          checkLabel: "I understand writes will be real"
-        }).then(function (ok) { if (ok) apply(); else dry.checked = true; });
-      } else {
-        apply();
-      }
-    });
-    toolbar.appendChild(el("label", { class: "muted", for: "dry-run-toggle" }, [dry, " Dry run (the plan dispatcher writes nothing)"]));
-
+    var dryBox = null;
     var stop = button("Stop now", "btn-danger");
     stop.addEventListener("click", function () {
       confirmAction({
@@ -710,162 +1124,169 @@
         stop.disabled = true;
         stop.setAttribute("aria-busy", "true");
         stop.classList.add("pending");
-        setNote(body, "Pending… sending a real 0 W stop to every battery", false);
+        setNote(notes, "Pending… sending a real 0 W stop to every battery", false);
         post("/stop").then(function (res) {
           stop.classList.remove("pending");
           stop.removeAttribute("aria-busy");
           stop.disabled = false;
-          setNote(body, "Stop confirmed by the server: mode is now " + res.mode + ".", false);
-          renderStopResults(body, res, status);
-          Object.keys(modeButtons).forEach(function (mode) {
-            modeButtons[mode].setAttribute("aria-pressed", mode === res.mode ? "true" : "false");
-          });
+          setNote(notes, "Stop confirmed by the server: mode is now " + res.mode + ".", false);
+          renderStopResults(results, res, data.status || {});
+          var fresh = data.status || {};
+          fresh.mode = res.mode;
+          data.status = fresh;
+          syncModeButtons(fresh);
+          if (dryBox) dryBox.checked = !!fresh.dry_run;
           refreshHeader();
-          get("/status").then(function (fresh) {
-            state.status = fresh;
-            var resultsBox = body.querySelector("[data-stop-result]");
+          get("/status").then(function (status) {
+            data.status = status;
+            state.status = status;
+            var resultsBox = results.querySelector("[data-stop-result]");
             if (!resultsBox) return;
-            resultsBox.appendChild(el("p", { class: fresh.mode_persisted ? "muted" : "field-error", text: fresh.mode_persisted ? "Mode persisted to the settings file." : "Mode NOT persisted: after a restart the add-on would return to the previous mode." }));
-            var pending = Array.isArray(fresh.pending_holds) ? fresh.pending_holds : [];
+            resultsBox.appendChild(el("p", { class: status.mode_persisted ? "muted" : "field-error", text: status.mode_persisted ? "Mode persisted to the settings file." : "Mode NOT persisted: after a restart the add-on would return to the previous mode." }));
+            var pending = Array.isArray(status.pending_holds) ? status.pending_holds : [];
             if (pending.length) resultsBox.appendChild(el("p", { class: "field-error", text: "Still awaiting a neutral hold: " + pending.join(", ") + " — a real setpoint may still be in force." }));
+            setConfirmed(status);
+            syncModeButtons(status);
+            if (dryBox) dryBox.checked = !!status.dry_run;
+            paintAnswer();
           }).catch(function () { /* the box already shows the stop response */ });
         }).catch(function (err) {
           stop.classList.remove("pending");
           stop.removeAttribute("aria-busy");
           stop.disabled = false;
-          setNote(body, "Error: " + (err && err.message ? err.message : String(err)), true);
+          setNote(notes, "Error: " + (err && err.message ? err.message : String(err)), true);
         });
       });
     });
-    toolbar.appendChild(stop);
-    body.appendChild(toolbar);
-    renderSafetyState(body, status);
+    controls.appendChild(stop);
 
-    if (status.override) {
-      var until = status.override.expires_at ? fmtTime(status.override.expires_at) : "?",
-          left = status.override.expires_at ? timeAgo(status.override.expires_at).replace("in ", "in ") : "unknown";
-      var overrideBox = el("div", { class: "banner banner-warn" }, [
-        el("p", { class: "banner-title", text: "Manual override active" }),
-        el("p", { text: fmtPower(status.override.power_w) + (status.override.battery_id ? " on " + status.override.battery_id : " on all batteries") + " until " + until + " (" + left + ")." })
-      ]);
-      var clear = button("Clear override", "btn-danger");
-      writeAction({
-        button: clear, noteContainer: overrideBox,
-        confirm: { title: "Clear override?", body: "Normal plan dispatch resumes.", confirmLabel: "Clear override" },
-        request: function () { return del("/override"); },
-        successText: function () { return "Override cleared (confirmed by the server)."; },
-        onDone: function () { renderRoute(); }
-      });
-      overrideBox.appendChild(clear);
-      body.appendChild(overrideBox);
-    }
-
-    connectionIssues(status).forEach(function (issue) {
-      body.appendChild(el("div", { class: "banner banner-" + (issue.level === "error" ? "error" : "warn") }, [
-        el("p", { class: "banner-title", text: issue.level === "error" ? "Error" : "Warning" }),
-        el("p", { text: issue.text })
-      ]));
-    });
-    body.appendChild(el("p", { class: "legend-note", text: "Last plan " + timeAgo(status.last_plan_at) + ", last tick " + timeAgo(status.last_tick_at) + ". The device has no watchdog: advisory/off and dry run stop new writes, but a setpoint written earlier in a live session stays in force — use Stop now to neutralise it (Stop writes to the hardware even in dry run)." }));
-  }
-
-  function renderAlerts(body, status) {
-    var alerts = Array.isArray(status.alerts) ? status.alerts : [];
-    if (!alerts.length) {
-      body.appendChild(el("p", { class: "muted", text: "No alerts." }));
-      return;
-    }
-    var list = el("ul", { class: "alert-list" });
-    alerts.forEach(function (alert) {
-      var level = alert.level || "info";
-      list.appendChild(el("li", { dataset: { level: level } }, [
-        el("p", { class: "alert-meta" }, [badge(level, level === "warning" ? "warn" : level === "error" ? "err" : "info"), " ", fmtDateTime(alert.ts), " (", timeAgo(alert.ts), ")"]),
-        el("p", { class: "wrap-anywhere", text: alert.message || alert.code || "(no message)" })
-      ]));
-    });
-    body.appendChild(list);
-  }
-
-  function renderNow(body, data) {
-    var status = data.status, plan = data.plan;
-    var batteries = Array.isArray(status.batteries) ? status.batteries : [];
-    var available = batteries.filter(function (b) { return b.available && isNum(b.soc_pct); });
-    var avgSoc = available.length ? available.reduce(function (sum, b) { return sum + b.soc_pct; }, 0) / available.length : null;
-    var anyStale = batteries.some(function (b) { return b.stale; });
-    var slot = slotAt(plan, status.now || new Date());
-    var grid = status.grid_now_w;
-    var gridText = isNum(grid) ? (grid > 0 ? "importing" : grid < 0 ? "exporting" : "balanced") : "unknown";
-    var rank = status.price_rank_pct;
-    var rankText = isNum(rank) ? "rank " + rank.toFixed(0) + " % (" + (rank <= 33 ? "cheapest third" : rank <= 66 ? "middle third" : "most expensive third") + ")" : "rank unknown";
-
-    var cards = el("div", { class: "cards" }, [
-      statCard("Battery SoC", withUnit(isNum(avgSoc) ? avgSoc.toFixed(1) : "--", "%"), batteries.length === 1 ? "1 battery reported" : batteries.length + " batteries reported", anyStale),
-      statCard("PV power", fmtPower(status.pv_now_w), "production now"),
-      statCard("Load power", fmtPower(status.load_now_w), "household consumption now"),
-      statCard("Grid power", fmtPower(grid), gridText + " at the meter"),
-      statCard("Price now", fmtPrice(status.price_now), rankText, slot ? slot.price_stale : false),
-      statCard("Plan action", slot ? actionText(slot.action) : "--", slot ? "because: " + reasonText(slot.reason) + " · target " + fmtPower(slot.power_w) : "no active plan slot"),
-      statCard("Autopilot", status.mode + (status.dry_run ? " (dry run)" : ""), "last plan " + timeAgo(status.last_plan_at)),
-      statCard("Next cheap window", fmtWindow(status.next_cheap_window) ? withUnit(fmtWindow(status.next_cheap_window).split(" (")[0], "local") : "--", fmtWindow(status.next_cheap_window) || "not known"),
-      statCard("Next expensive window", fmtWindow(status.next_expensive_window) ? withUnit(fmtWindow(status.next_expensive_window).split(" (")[0], "local") : "--", fmtWindow(status.next_expensive_window) || "not known")
-    ]);
-    body.appendChild(cards);
-  }
-
-  function renderBatteryCards(body, status) {
-    var batteries = Array.isArray(status.batteries) ? status.batteries : [];
-    if (!batteries.length) {
-      body.appendChild(el("p", { class: "muted", text: "No batteries configured. Add one in the Batteries view." }));
-      return;
-    }
-    var grid = el("div", { class: "cards" });
-    batteries.forEach(function (battery) {
-      var name = (battery.extra && battery.extra.name) || battery.id;
-      var direction = isNum(battery.power_w) ? (battery.power_w > 0 ? "charging" : battery.power_w < 0 ? "discharging" : "idle") : "power unknown";
-      var identity = [battery.id];
-      if (battery.available) identity.push(badge("available", "ok"));
-      else identity.push(badge("unavailable", "err"));
-      if (battery.stale) identity.push(badge("stale", "stale"));
-      grid.appendChild(el("div", { class: "card" + (battery.stale ? " card-stale" : "") }, [
-        el("p", { class: "card-label", text: name }),
-        el("p", { class: "card-value" }, withUnit(isNum(battery.soc_pct) ? battery.soc_pct.toFixed(1) : "--", "%")),
-        el("p", { class: "card-sub" }, [fmtPower(battery.power_w) + " (" + direction + ")"]),
-        el("p", { class: "card-sub" }, [fmtKwh(battery.energy_kwh) + " of " + fmtKwh(battery.capacity_kwh), isNum(battery.temperature_c) ? " · " + battery.temperature_c.toFixed(1) + " °C" : ""]),
-        el("p", { class: "card-sub" }, ["read " + timeAgo(battery.read_at), " ", identity.slice(1)]),
-        battery.last_error ? el("p", { class: "field-error", text: battery.last_error }) : null
-      ]));
-    });
-    body.appendChild(grid);
-  }
-
-  function viewDashboard(host) {
-    var load = once(function () {
-      return Promise.all([get("/status"), get("/plan", { hours: 24 })]).then(function (rows) {
-        state.status = rows[0];
-        return { status: rows[0], plan: rows[1] };
-      });
-    });
-
-    asyncPanel(host, "Autopilot", { load: load, render: function (body, data) { renderAutopilot(body, data.status); } });
-    asyncPanel(host, "Alerts", { load: load, render: function (body, data) { renderAlerts(body, data.status); } });
-    asyncPanel(host, "Right now", { load: load, render: renderNow });
-    asyncPanel(host, "Next 24 hours", {
-      load: load,
-      render: function (body, data) {
-        var chart = el("div", { class: "chart chart-sm" });
-        body.appendChild(chart);
-        root.SEMCharts.mini(chart, data.plan);
-        body.appendChild(el("p", { class: "legend-note", text: "Orange line: buy price (EUR/kWh, left axis). Purple line: battery SoC (%, right axis). Hover for per-slot values." }));
+    dryBox = el("input", { type: "checkbox", id: "dry-run-toggle", checked: true });
+    var dryLabel = el("label", { class: "switch-label", for: "dry-run-toggle" }, [dryBox, " Dry run (the plan dispatcher writes nothing)"]);
+    dryBox.addEventListener("change", function () {
+      var next = dryBox.checked;
+      function apply() {
+        performWrite(dryBox, notes, function () {
+          return post("/mode", { mode: data.status ? data.status.mode : "advisory", dry_run: next });
+        }, function (res) {
+          return "Dry run is now " + (res.dry_run ? "on" : "off") + " (confirmed by the server).";
+        }, function (res) {
+          var fresh = data.status || {};
+          fresh.dry_run = res.dry_run;
+          if (res.mode) fresh.mode = res.mode;
+          data.status = fresh;
+          setConfirmed(fresh);
+          paintAnswer();
+          refreshHeader();
+        }, function () {
+          // The requested checkbox state is not the confirmed control state: undo the preview
+          // (UI_REVIEW §3.3).
+          dryBox.checked = !!(data.status && data.status.dry_run);
+        });
+      }
+      if (!next) {
+        confirmAction(dryRunOffConfirm()).then(function (ok) {
+          if (ok) apply();
+          else dryBox.checked = !!(data.status && data.status.dry_run);
+        });
+      } else {
+        apply();
       }
     });
-    asyncPanel(host, "Batteries", { load: load, render: function (body, data) { renderBatteryCards(body, data.status); } });
+    var modeToolbar = el("div", { class: "toolbar" }, Object.keys(modeButtons).map(function (mode) { return modeButtons[mode]; }).concat([dryLabel]));
+    var controlDisclosure = el("details", { class: "disclosure", dataset: { controlSettings: "1" } }, [
+      el("summary", { text: "Control settings (mode and dry run)" }),
+      el("div", { class: "disclosure-body" }, [
+        modeToolbar,
+        confirmed,
+        el("p", { class: "field-help", text: "Routine mode editing lives here; Stop now stays in the status strip above." }),
+        el("p", { class: "field-help", text: authorityNote(data.status ? data.status.dry_run : true) })
+      ])
+    ]);
+    controls.appendChild(controlDisclosure);
+    answerBody.appendChild(controls);
+    answerBody.appendChild(results);
 
+    function paintAlerts() {
+      renderInto(alertsBody, function (target) { clear(target); renderAlerts(target, data.status); });
+    }
+    function paintNow() {
+      renderInto(nowBody, function (target) { clear(target); renderNow(target, data); });
+    }
+    function paintSupporting() {
+      renderInto(supportBody, function (target) { clear(target); renderSupporting(target, data); });
+    }
+    function paintBatteries() {
+      renderInto(batteryBody, function (target) { renderBatteryCards(target, data.status); });
+    }
+    function paintChart() {
+      renderInto(chartBody, function (target) {
+        clear(target);
+        if (!data.plan) {
+          panelStatus(target, "error", "The next-24-hours chart needs the plan, which could not be loaded. The live readings above still update.", function () { refresh(); });
+          return;
+        }
+        var chart = el("div", { class: "chart chart-sm" });
+        target.appendChild(chart);
+        root.SEMCharts.mini(chart, data.plan);
+        target.appendChild(el("p", { class: "legend-note", text: "Buy price: solid line (EUR/kWh, left axis). Battery charge: long-dashed line (%, right axis). Every slot value is also listed in the Plan view; hover shows exact figures." }));
+      });
+    }
+
+    // ---- quiet refresh: data updates in place, never a route rebuild (UI_REVIEW §3.5) --------
+    function refresh() {
+      get("/status").then(function (status) {
+        data.status = status;
+        state.status = status;
+        paintAnswer();
+        paintAlerts();
+        paintNow();
+        paintSupporting();
+        paintBatteries();
+        setConfirmed(status);
+        syncModeButtons(status);
+        if (dryBox) dryBox.checked = !!status.dry_run;
+      }, function () { /* keep the last confirmed readings on screen; the header reports the error */ });
+      get("/plan", { hours: 24 }).then(function (plan) {
+        data.plan = plan;
+        paintAnswer();
+        paintChart();
+      }, function () { /* the chart panel keeps its own retry; live readings still update */ });
+    }
+
+    get("/status").then(function (status) {
+      data.status = status;
+      state.status = status;
+      paintAnswer();
+      setConfirmed(status);
+      paintAlerts();
+      paintNow();
+      paintSupporting();
+      paintBatteries();
+      syncModeButtons(status);
+      dryBox.checked = !!status.dry_run;
+    }, function (err) {
+      panelStatus(answerDynamic, "error", "Could not load the live status: " + (err && err.message ? err.message : err), function () { refresh(); });
+    });
+    get("/plan", { hours: 24 }).then(function (plan) {
+      data.plan = plan;
+      paintAnswer();
+      paintChart();
+    }, function (err) {
+      panelStatus(chartBody, "error", "Could not load the 24-hour plan: " + (err && err.message ? err.message : err), function () { refresh(); });
+    });
+
+    state.refresh = function () {
+      if (refreshBlocked()) return;
+      refresh();
+    };
     var timer = root.setInterval(function () {
-      if (document.hidden || anyDialogOpen()) return;
-      if (document.querySelector("[data-stop-result]")) return; // keep stop results visible until dismissed
-      renderRoute();
+      if (document.hidden || refreshBlocked()) return;
+      refresh();
     }, 15000);
-    return function () { root.clearInterval(timer); };
+    return function () {
+      root.clearInterval(timer);
+      if (state.refresh) state.refresh = null;
+    };
   }
 
   /* ------------------------------------------------------------------ view: plan */
@@ -898,6 +1319,17 @@
     // The plan reports the wear it actually assumed; the configured value is only a fallback for
     // older payloads (the advanced override is already baked into the reported value).
     var wear = isNum(s.wear_eur_per_kwh) ? s.wear_eur_per_kwh : cycleCost;
+    // The horizon's answer first: saving (or loss) against the do-nothing baseline. A loss is a
+    // result, never a stale reading (UI_REVIEW §3.6/§3.7).
+    var savingKnown = isNum(s.saved_eur);
+    var savingText = savingKnown
+      ? (s.saved_eur < 0 ? "a loss of " + fmtEur(Math.abs(s.saved_eur)) : fmtEur(s.saved_eur) + " saved")
+      : "not reported for this horizon";
+    body.appendChild(el("p", { class: "plan-answer" }, [
+      "Estimated over this horizon: ",
+      el("strong", { class: savingKnown && s.saved_eur < 0 ? "answer-loss" : "answer-gain", text: savingText }),
+      " against doing nothing (the same consumption and tariffs, battery idle)."
+    ]));
     var stats = [
       ["Estimated cost", fmtEur(s.cost_estimate_eur)],
       ["Baseline (no battery)", fmtEur(s.baseline_cost_eur)],
@@ -921,22 +1353,68 @@
         return (b.name || b.id) + " " + fmtPower(b.share_w);
       }).join(" · ") + "." }));
     }
+    if (s.saved_eur < 0) {
+      body.appendChild(el("p", { class: "field-error", text: "The plan is more expensive than doing nothing over this horizon; check the price source and settings." }));
+    }
+    // Worked examples and model assumptions are evidence behind a named disclosure, not the first
+    // reading (UI_REVIEW §3.7).
+    var why = el("details", { class: "disclosure" }, [el("summary", { text: "Why this plan?" })]);
+    var whyBody = el("div", { class: "disclosure-body" });
     if (efficiency) {
       var example = buyNow != null ? " At the current buy price " + fmtPrice(buyNow) + " that is " + fmtPrice(planBreakEvenEur(buyNow, efficiency, wear)) + " with wear " + fmtEur(wear) + "/kWh delivered." : "";
-      body.appendChild(el("p", { class: "legend-note", text: "The optimiser assumed a " + fmtPct(efficiency.round_trip_pct) + " round trip (charge " + fmtPct(efficiency.eta_charge * 100) + " / discharge " + fmtPct(efficiency.eta_discharge * 100) + "). Break-even after round-trip loss = buy ÷ round trip + wear, so a discharge slot only pays when the sale price clears it. Wear is charged per kWh delivered, so charging alone costs none." + example }));
+      whyBody.appendChild(el("p", { class: "field-help", text: "The optimiser assumed a " + fmtPct(efficiency.round_trip_pct) + " round trip (charge " + fmtPct(efficiency.eta_charge * 100) + " / discharge " + fmtPct(efficiency.eta_discharge * 100) + "). Break-even after round-trip loss = buy ÷ round trip + wear, so a discharge slot only pays when the sale price clears it. Wear is charged per kWh delivered, so charging alone costs none." + example }));
     } else {
-      body.appendChild(el("p", { class: "legend-note", text: "The plan summary did not report its aggregate efficiency, so the assumed round trip and the break-even curve are unavailable; the plan was still computed with the stored per-battery efficiencies." }));
+      whyBody.appendChild(el("p", { class: "field-help", text: "The plan summary did not report its aggregate efficiency, so the assumed round trip and the break-even curve are unavailable; the plan was still computed with the stored per-battery efficiencies." }));
     }
-    if (s.saved_eur < 0) body.appendChild(el("p", { class: "field-error", text: "The plan is more expensive than doing nothing over this horizon; check the price source and settings." }));
+    whyBody.appendChild(el("p", { class: "field-help", text: "Every slot carries its action and reason in the tables below; a slot that would lose money to the round trip stays idle with reason “efficiency_loss”, which is distinct from “below the spread floor you set” (your own minimum spread)." }));
+    why.appendChild(whyBody);
+    body.appendChild(why);
   }
+
+  // Slot length comes from the payload, never assumed: a 5-minute plan must not be captioned as
+  // 15-minute resolution (UI_REVIEW §3.5/§3.6).
+  function planSlotMinutes(plan) {
+    var minutes = plan && isNum(plan.slot_minutes) && plan.slot_minutes > 0 ? plan.slot_minutes : 15;
+    return Math.round(minutes);
+  }
+
+  // Action windows: consecutive slots with the same action, reason, power and staleness become one
+  // row, so a constraint change is never hidden inside a broad summary (UI_REVIEW §3.4). Pure data.
+  function planActionWindows(plan) {
+    var slots = Array.isArray(plan && plan.slots) ? plan.slots : [];
+    var windows = [];
+    slots.forEach(function (slot) {
+      var previous = windows[windows.length - 1];
+      var same = previous && previous.action === slot.action && previous.reason === slot.reason &&
+        !!previous.stale === !!slot.price_stale &&
+        (isNum(previous.power_w) && isNum(slot.power_w) ? previous.power_w === slot.power_w : true);
+      if (same) {
+        previous.end = slot.t;
+        previous.slots += 1;
+        return;
+      }
+      windows.push({
+        start: slot.t,
+        end: slot.t,
+        slots: 1,
+        action: slot.action,
+        reason: slot.reason,
+        power_w: slot.power_w,
+        stale: !!slot.price_stale
+      });
+    });
+    return windows;
+  }
+
 
   function renderPlanSlots(body, plan) {
     var slots = Array.isArray(plan.slots) ? plan.slots : [];
+    var minutes = planSlotMinutes(plan);
     var headers = ["Time", "Buy", "Sell", "PV", "Load", "SoC", "Battery power", "Action", "Reason", "Flags"];
     function rowsFor(list) {
       return list.map(function (slot) {
         return [
-          fmtDateTime(slot.t), fmtPrice(slot.buy), fmtPrice(slot.sell), fmtKwh(slot.pv_kw, 2), fmtKwh(slot.load_kw, 2),
+          fmtDateTime(slot.t), fmtPrice(slot.buy), fmtPrice(slot.sell), fmtKw(slot.pv_kw, 2), fmtKw(slot.load_kw, 2),
           fmtPct(slot.soc_pct), fmtPower(slot.power_w), actionText(slot.action), reasonText(slot.reason),
           slot.price_stale ? badge("stale price", "stale") : "—"
         ];
@@ -948,7 +1426,7 @@
     function draw(list, showAll) {
       clear(body);
       body.appendChild(el("p", { class: "legend-note", text: "Actions: " + ["hold", "charge", "discharge", "pv_charge", "export", "self_consumption", "reserve"].map(actionText).join(", ") + ". Reasons explain every slot." }));
-      body.appendChild(table("Plan slots, 15 minute resolution, times in local timezone", headers, rowsFor(list), attrsFor(list)));
+      body.appendChild(table("Plan slots, " + minutes + "-minute resolution, times in local timezone", headers, rowsFor(list), { rowAttrs: attrsFor(list) }));
       if (slots.length > list.length) body.appendChild(button("Show all " + slots.length + " slots", "", function () { draw(slots, true); }));
       else if (showAll && slots.length > 48) body.appendChild(button("Show first 48 slots", "", function () { draw(slots.slice(0, 48), false); }));
     }
@@ -957,6 +1435,31 @@
       return;
     }
     draw(slots.slice(0, 48), false);
+  }
+
+  // Phone-first action windows: one vertical row per window with time, action, signed power,
+  // reason and stale state together, so a 360 px screen never splits the time/action/reason
+  // relationship (UI_REVIEW §3.4).
+  function renderPlanWindows(body, plan) {
+    var windows = planActionWindows(plan);
+    if (!windows.length) {
+      body.appendChild(el("p", { class: "muted", text: "No plan slots yet. Recompute the plan." }));
+      return;
+    }
+    var list = el("ul", { class: "window-list" });
+    windows.forEach(function (win) {
+      var power = isNum(win.power_w)
+        ? fmtPower(win.power_w) + (win.power_w > 0 ? " charge" : win.power_w < 0 ? " discharge" : "")
+        : "power unknown";
+      list.appendChild(el("li", { dataset: { stale: win.stale ? "true" : "false" } }, [
+        el("p", { class: "window-time" }, [fmtTime(win.start), " – ", fmtTime(win.end), " (", win.slots, win.slots === 1 ? " slot)" : " slots)"]),
+        el("p", { class: "window-action" }, [actionText(win.action), " · ", el("span", { class: "num", text: power })]),
+        el("p", { class: "window-reason" }, ["because: ", reasonText(win.reason)]),
+        win.stale ? badge("stale price", "stale") : null
+      ]));
+    });
+    body.appendChild(list);
+    body.appendChild(el("p", { class: "legend-note", text: "Windows merge only while the action, reason, power and staleness stay the same, so every change is visible; each slot's full figures are in All slots." }));
   }
 
   function viewPlan(host, query) {
@@ -968,6 +1471,7 @@
     });
     var pollTimer = null;
 
+    routeTitle(host, "Plan", "What the optimiser intends to do with the batteries, and why.");
     var controls = panel(host, "Plan controls");
     var select = el("select", { id: "plan-horizon" });
     [12, 24, 36, 48].forEach(function (h) {
@@ -1032,7 +1536,7 @@
           ? plan.summary.wear_eur_per_kwh
           : (isNum(data.cycleCost) ? data.cycleCost : 0);
         root.SEMCharts.plan(chart, plan, { wear: planWear, efficiency: efficiency });
-        body.appendChild(el("p", { class: "legend-note", text: "Top panel: buy price bars (EUR/kWh, left axis), the dashed red break-even after round-trip loss line (buy ÷ assumed round trip + wear per delivered kWh) and the SoC line (%, right axis); grey bars are stale prices. Bottom panel: PV and load forecast (kW) and battery charging (positive, blue) or discharging (negative, orange) in kW." + (efficiency ? " Slots whose sale price sits below the break-even line would lose money, which is why they stay idle with reason “efficiency_loss”." : " The break-even line is unavailable: the plan summary carries no aggregate efficiency.") }));
+        body.appendChild(el("p", { class: "legend-note", text: "Top panel: buy price bars (EUR/kWh, left axis), the break-even after round-trip loss line, dotted (buy ÷ assumed round trip + wear per delivered kWh), the sell price, long-dashed, and the solid state-of-charge line (%, right axis); grey bars are stale prices. Bottom panel: PV and load forecast in kW and battery charging (positive) or discharging (negative) in kW." + (efficiency ? " A slot whose sale price sits below the break-even line would lose money, which is why it stays idle with reason “efficiency_loss”." : " The break-even after round-trip loss line is unavailable: the plan summary carries no aggregate efficiency.") }));
       }
     });
 
@@ -1040,7 +1544,11 @@
       load: load,
       render: renderPlanSummary
     });
-    asyncPanel(host, "Plan slots", {
+    asyncPanel(host, "Next actions", {
+      load: load,
+      render: function (body, data) { renderPlanWindows(body, data.plan); }
+    });
+    asyncPanel(host, "All slots", {
       load: load,
       render: function (body, data) { renderPlanSlots(body, data.plan); }
     });
@@ -1086,25 +1594,45 @@
     };
   }
 
-  function renderForecastPanel(body, kind, payload) {
+  // Measured error of one forecast kind, or null when there is not enough measured data. MAE
+  // carries the kind's own unit — the contract does not name one (UI_REVIEW §3.6): pv/load are kW,
+  // price is EUR/kWh, so guessing across kinds is never done.
+  function forecastAccuracyLine(report) {
+    if (!report) return "not measured yet";
+    if (!(report.samples > 0)) return "not enough measured days yet";
+    var parts = ["MAPE " + (isNum(report.mape_pct) ? fmtPct(report.mape_pct) : "--") + " over " + (report.days || "?") + " days"];
+    if (isNum(report.bias_pct)) parts.push("bias " + fmtPct(report.bias_pct));
+    if (isNum(report.mae)) parts.push("MAE " + report.mae.toFixed(3) + " " + (report.kind === "price" ? "EUR/kWh" : "kW"));
+    parts.push(report.samples + " samples");
+    return parts.join(" · ");
+  }
+
+  function renderForecastPanel(body, kind, payload, accuracy) {
     var slots = Array.isArray(payload.slots) ? payload.slots : [];
+    // Source metadata is one quiet line; only a limitation (stale) keeps a badge, so ordinary
+    // provider names do not read as actionable state (UI_REVIEW §3.12).
     var meta = el("p", { class: "alert-meta" }, [
-      badge("source: " + (payload.source || "unknown"), "info"),
+      "Source: " + (payload.source || "unknown"),
       // Effective provider + configured contract (SPEC §4.1), next to the resolved source so the
       // empty-state hint below can be read against what was actually configured.
-      payload.provider ? badge("provider: " + payload.provider, "info") : null,
-      payload.contract ? badge("contract: " + payload.contract, "info") : null,
-      " generated " + timeAgo(payload.generated_at),
+      payload.provider ? " · provider: " + payload.provider : null,
+      payload.contract ? " · contract: " + payload.contract : null,
+      " · generated " + timeAgo(payload.generated_at),
+      payload.stale ? " " : null,
       payload.stale ? badge("stale", "stale") : null,
-      kind === "load" && payload.confidence ? " " : null,
-      kind === "load" && payload.confidence ? badge("confidence: " + payload.confidence, payload.confidence === "low" ? "warn" : "ok") : null,
-      kind === "solar" && isNum(payload.correction_applied) ? " bias correction ×" + payload.correction_applied.toFixed(2) : null
+      kind === "load" && payload.confidence ? " · confidence: " + payload.confidence : null,
+      kind === "solar" && isNum(payload.correction_applied) ? " · bias correction ×" + payload.correction_applied.toFixed(2) : null
     ]);
     body.appendChild(meta);
-    if (payload.stale) body.appendChild(el("p", { class: "legend-note", text: "This forecast is stale: values are re-used and greyed in the chart." }));
-    (Array.isArray(payload.notes) ? payload.notes : []).forEach(function (note) {
-      body.appendChild(el("p", { class: "legend-note", text: note }));
-    });
+    body.appendChild(el("p", { class: "trust-line" }, ["Measured error: ", forecastAccuracyLine(accuracy)]));
+    // A material limitation stays visible; ordinary model explanation moves behind the chart's
+    // Source details disclosure (UI_REVIEW §3.7).
+    if (payload.stale) {
+      body.appendChild(el("div", { class: "banner banner-warn" }, [
+        el("p", { class: "banner-title", text: "Using cached data" }),
+        el("p", { text: "This forecast is stale: values are re-used and greyed in the chart." })
+      ]));
+    }
     var chart = el("div", { class: "chart chart-md" });
     body.appendChild(chart);
     root.SEMCharts.forecast(chart, kind, payload);
@@ -1117,6 +1645,7 @@
         el("p", { class: "banner-title" }, [empty.text, empty.reason ? " " : null, empty.reason ? badge(empty.reason, "warn") : null]),
         empty.hint ? null : el("p", { class: "field-help", text: "The server did not explain why this forecast is empty; check the log for the failing source." })
       ]));
+      body.appendChild(forecastNotes(payload));
       return;
     }
     var step = slotHours(slots);
@@ -1138,26 +1667,59 @@
     } else if (kind === "solar") {
       headers = ["Day", "Forecast energy", "Peak power", "Peak at"];
       rows = groups.map(function (group) {
-        var total = group.slots.reduce(function (sum, s) { return sum + Math.max(0, numOrNull(s.pv_kw) || 0); }, 0) * step;
-        var peak = group.slots.reduce(function (best, s) {
+        // Missing values are never summed as zero: the total states how many slots it covers
+        // (UI_REVIEW §3.6).
+        var have = 0, missing = 0, total = 0;
+        var peak = null;
+        group.slots.forEach(function (s) {
           var value = numOrNull(s.pv_kw);
-          return value != null && (!best || value > best.value) ? { value: value, t: s.t } : best;
-        }, null);
-        return [group.key, fmtKwh(total), peak ? fmtPower(peak.value * 1000) : "--", peak ? fmtTime(peak.t) : "--"];
+          if (value == null) { missing++; return; }
+          have++;
+          total += Math.max(0, value);
+          if (!peak || value > peak.value) peak = { value: value, t: s.t };
+        });
+        return [group.key,
+          have ? fmtKwh(total * step) + (missing ? " (over " + have + " of " + group.slots.length + " slots)" : "") : "--",
+          peak ? fmtPower(peak.value * 1000) : "--",
+          peak ? fmtTime(peak.t) : "--"];
       });
     } else {
       headers = ["Day", "P50 energy", "P10 energy", "P90 energy"];
       rows = groups.map(function (group) {
-        var total = function (pick) {
-          return group.slots.reduce(function (sum, s) { return sum + (numOrNull(pick(s)) || 0); }, 0) * step;
-        };
-        return [group.key, fmtKwh(total(function (s) { return s.load_kw; })), fmtKwh(total(function (s) { return s.p10_kw; })), fmtKwh(total(function (s) { return s.p90_kw; }))];
+        function totalFor(pick) {
+          var have = 0, missing = 0, sum = 0;
+          group.slots.forEach(function (s) {
+            var value = numOrNull(pick(s));
+            if (value == null) { missing++; return; }
+            have++;
+            sum += value;
+          });
+          return have ? fmtKwh(sum * step) + (missing ? " (over " + have + " of " + group.slots.length + " slots)" : "") : "--";
+        }
+        return [group.key,
+          totalFor(function (s) { return s.load_kw; }),
+          totalFor(function (s) { return s.p10_kw; }),
+          totalFor(function (s) { return s.p90_kw; })];
       });
     }
     body.appendChild(table("Per-day totals (times and days in local timezone)", headers, rows));
+    body.appendChild(forecastNotes(payload));
   }
 
   function numOrNull(value) { return typeof value === "number" && isFinite(value) ? value : null; }
+
+  // Ordinary model explanation and geometry notes are evidence: reachable, but not the first
+  // reading. The server sends an untyped string array, so nothing here is classified as
+  // non-material by the UI (UI_REVIEW §3.7 / open question 8).
+  function forecastNotes(payload) {
+    var notes = Array.isArray(payload.notes) ? payload.notes.filter(function (note) { return !!note; }) : [];
+    if (!notes.length) return null;
+    var details = el("details", { class: "disclosure" }, [el("summary", { text: "Source details (" + notes.length + " note" + (notes.length === 1 ? "" : "s") + ")" })]);
+    var noteBody = el("div", { class: "disclosure-body" });
+    notes.forEach(function (note) { noteBody.appendChild(el("p", { class: "field-help", text: String(note) })); });
+    details.appendChild(noteBody);
+    return details;
+  }
 
   function renderAccuracy(body, accuracy) {
     var kinds = [["pv", "PV forecast"], ["load", "Load forecast"], ["price", "Price forecast"]];
@@ -1169,7 +1731,14 @@
         return;
       }
       var value = isNum(report.mape_pct) ? fmtPct(report.mape_pct) : "--";
-      var sub = ["MAPE over " + (report.days || "?") + " days", isNum(report.bias_pct) ? "bias " + fmtPct(report.bias_pct) : null, isNum(report.mae) ? "MAE " + report.mae.toFixed(3) : null, (report.samples || 0) + " samples"].filter(Boolean).join(" · ");
+      // MAE carries the kind's own unit (UI_REVIEW §3.6): power forecasts in kW, price in EUR/kWh.
+      var maeUnit = pair[0] === "price" ? "EUR/kWh" : "kW";
+      var sub = [
+        "MAPE over " + (report.days || "?") + " days",
+        isNum(report.bias_pct) ? "bias " + fmtPct(report.bias_pct) : null,
+        isNum(report.mae) ? "MAE " + report.mae.toFixed(3) + " " + maeUnit : null,
+        (report.samples || 0) + " samples"
+      ].filter(Boolean).join(" · ");
       cards.appendChild(statCard(pair[1], value, sub, report.samples === 0));
     });
     body.appendChild(cards);
@@ -1180,7 +1749,7 @@
     var chart = el("div", { class: "chart chart-sm" });
     body.appendChild(chart);
     root.SEMCharts.accuracy(chart, accuracy);
-    body.appendChild(el("p", { class: "legend-note", text: "Mean absolute percentage error per day: lower is better. Green PV, blue load, orange price. Hover for exact values." }));
+    body.appendChild(el("p", { class: "legend-note", text: "Mean absolute percentage error per day: lower is better. The three series are told apart by line signature — solid, dashed and dotted — as well as by the legend, and every value is also in the per-kind cards above." }));
   }
 
   function viewForecasts(host) {
@@ -1194,9 +1763,10 @@
         return { price: rows[0], solar: rows[1], load: rows[2], accuracy: rows[3] };
       });
     });
-    asyncPanel(host, "Price forecast", { load: load, render: function (body, data) { renderForecastPanel(body, "price", data.price); } });
-    asyncPanel(host, "Solar forecast", { load: load, render: function (body, data) { renderForecastPanel(body, "solar", data.solar); } });
-    asyncPanel(host, "Load forecast", { load: load, render: function (body, data) { renderForecastPanel(body, "load", data.load); } });
+    routeTitle(host, "Forecasts", "How much to trust each source, then what it expects.");
+    asyncPanel(host, "Price forecast", { load: load, render: function (body, data) { renderForecastPanel(body, "price", data.price, data.accuracy.price); } });
+    asyncPanel(host, "Solar forecast", { load: load, render: function (body, data) { renderForecastPanel(body, "solar", data.solar, data.accuracy.pv); } });
+    asyncPanel(host, "Load forecast", { load: load, render: function (body, data) { renderForecastPanel(body, "load", data.load, data.accuracy.load); } });
     asyncPanel(host, "Forecast accuracy", { load: load, render: function (body, data) { renderAccuracy(body, data.accuracy); } });
     asyncPanel(host, "Providers", {
       load: once(function () { return get("/providers"); }),
@@ -1208,7 +1778,7 @@
           });
         });
         if (!rows.length) { body.appendChild(el("p", { class: "muted", text: "No provider status reported." })); return; }
-        body.appendChild(table("Forecast providers", ["Kind", "Provider", "Active", "Healthy", "Freshness", "Last success", "Last error"], rows));
+        body.appendChild(table("Forecast providers", ["Kind", "Provider", "Active", "Healthy", "Freshness", "Last success", "Last error"], rows, { numeric: [] }));
       }
     });
     return null;
@@ -1814,13 +2384,16 @@
       });
     });
     append(dlg, [
-      el("h2", { text: "Test discharge — " + config.name }),
-      el("p", { class: "muted", text: "Writes a real, bounded discharge setpoint (no dry-run suppression). Discharge power up to " + fmtPower(maxPower) + ", duration 1–60 s at the exact seconds asked for. The server clamps the request to the battery's own limits and reports what was really applied. Available only when mode is auto and dry run is off." }),
-      el("div", { class: "fields" }, [
-        el("label", { class: "field", for: "test-power" }, [el("span", { text: "Discharge power (W)" }), el("span", { class: "field-help", text: "1 to " + fmtPower(maxPower) }), power]),
-        el("label", { class: "field", for: "test-seconds" }, [el("span", { text: "Duration (s, exact)" }), el("span", { class: "field-help", text: "1 to 60 s, no rounding up" }), seconds])
+      el("div", { class: "dialog-body" }, [
+        el("h2", { text: "Test discharge — " + config.name }),
+        el("p", { class: "muted", text: "Writes a real, bounded discharge setpoint (no dry-run suppression). Discharge power up to " + fmtPower(maxPower) + ", duration 1–60 s at the exact seconds asked for. The server clamps the request to the battery's own limits and reports what was really applied. Available only when mode is auto and dry run is off." }),
+        el("div", { class: "fields" }, [
+          el("label", { class: "field", for: "test-power" }, [el("span", { text: "Discharge power (W)" }), el("span", { class: "field-help", text: "1 to " + fmtPower(maxPower) }), power]),
+          el("label", { class: "field", for: "test-seconds" }, [el("span", { text: "Duration (s, exact)" }), el("span", { class: "field-help", text: "1 to 60 s, no rounding up" }), seconds])
+        ]),
+        note
       ]),
-      note, save,
+      save,
       el("div", { class: "dialog-actions" }, [button("Close", "", function () { dlg.close(); })])
     ]);
     document.body.appendChild(dlg);
@@ -1841,12 +2414,45 @@
     var storedCost = storedKwhCostEur(buy, config, wear);
     var breakEven = breakEvenSellEur(buy, config, wear);
     var canTest = status.mode === "auto" && !status.dry_run;
-    var actions = el("div", { class: "battery-actions" });
+    // The disabled prerequisite is real text next to the action, never a hover-only title
+    // (UI_REVIEW §3.4).
+    var testBlockedReason = "Requires Auto and dry run off — currently mode is " + status.mode +
+      " and dry run is " + (status.dry_run ? "on" : "off") + ".";
 
+    var edit = button("Edit", "", function () { openBatteryDialog(record, reload, takenIds); });
     var toggle = button(config.enabled ? "Disable" : "Enable", config.enabled ? "" : "btn-primary");
+    var note = el("div", { class: "battery-note" });
+
+    // Device actions sit in one labelled section, so tests and deletion are not equal peers of Edit
+    // on every header (UI_REVIEW §3.7 / per-view notes).
+    var actions = el("div", { class: "battery-actions" }, [edit, toggle, note]);
+
+    var test = button("Test discharge", "btn-danger");
+    test.disabled = !canTest;
+    test.setAttribute("aria-disabled", canTest ? "false" : "true");
+    if (!canTest) test.setAttribute("title", "Requires mode auto with dry run off");
+    test.addEventListener("click", function () {
+      if (!canTest) return;
+      testDischargeDialog(record, status);
+    });
+    var remove = button("Delete", "btn-danger");
+    remove.addEventListener("click", function () {
+      confirmAction({
+        title: "Delete " + config.name + "?",
+        body: "Removes the battery configuration. Dispatch stops immediately; measurements keep working.",
+        confirmLabel: "Delete battery", requireCheck: true,
+        checkLabel: "I understand this cannot be undone"
+      }).then(function (ok) {
+        if (!ok) return;
+        performWrite(remove, note, function () {
+          return del("/batteries/" + encodeURIComponent(config.id));
+        }, function () { return "Battery deleted (confirmed by the server)."; }, reload);
+      });
+    });
+
     toggle.addEventListener("click", function () {
       function apply() {
-        performWrite(toggle, card, function () {
+        performWrite(toggle, note, function () {
           return patch("/batteries/" + encodeURIComponent(config.id), { patch: { enabled: !config.enabled } });
         }, function (res) { return "Battery " + config.id + " is now " + (res && res.config && res.config.enabled ? "enabled" : "disabled") + " (confirmed by the server)."; }, reload);
       }
@@ -1861,65 +2467,66 @@
         apply();
       }
     });
-    actions.appendChild(toggle);
 
-    var test = button("Test discharge", "btn-danger");
-    test.disabled = !canTest;
-    test.setAttribute("aria-disabled", canTest ? "false" : "true");
-    if (!canTest) test.setAttribute("title", "Requires mode auto with dry run off");
-    test.addEventListener("click", function () {
-      if (!canTest) return;
-      testDischargeDialog(record, status);
-    });
-    actions.appendChild(test);
-
-    var edit = button("Edit", "", function () { openBatteryDialog(record, reload, takenIds); });
-    actions.appendChild(edit);
-
-    var remove = button("Delete", "btn-danger");
-    remove.addEventListener("click", function () {
-      confirmAction({
-        title: "Delete " + config.name + "?",
-        body: "Removes the battery configuration. Dispatch stops immediately; measurements keep working.",
-        confirmLabel: "Delete battery", requireCheck: true,
-        checkLabel: "I understand this cannot be undone"
-      }).then(function (ok) {
-        if (!ok) return;
-        performWrite(remove, card, function () {
-          return del("/batteries/" + encodeURIComponent(config.id));
-        }, function () { return "Battery deleted (confirmed by the server)."; }, reload);
-      });
-    });
-    actions.appendChild(remove);
-
-    var card = el("section", { class: "panel battery-card", dataset: { battery: config.id } }, [
-      el("div", { class: "panel-head" }, [
-        el("h3", null, [config.name || config.id, " ", badge(config.driver || "driver?", "info"), " ", config.enabled ? badge("enabled", "ok") : badge("disabled", "warn"), " ", st.stale ? badge("stale state", "stale") : null]),
-        actions
-      ]),
-      el("div", { class: "panel-body" }, [
-        el("p", { class: "alert-meta", text: "id: " + config.id + " · last read " + timeAgo(st.read_at) + (st.available ? "" : " · unavailable") + (st.last_error ? " · last error: " + st.last_error : "") }),
-        el("ul", { class: "stat-row" }, [
-          el("li", null, [el("span", { class: "stat-label", text: "Power" }), el("span", { class: "stat-value", text: fmtPower(st.power_w) + (isNum(st.power_w) ? (st.power_w > 0 ? " charging" : st.power_w < 0 ? " discharging" : " idle") : "") })]),
-          el("li", null, [el("span", { class: "stat-label", text: "SoC" }), el("span", { class: "stat-value", text: fmtPct(st.soc_pct) })]),
-          el("li", null, [el("span", { class: "stat-label", text: "Energy" }), el("span", { class: "stat-value", text: fmtKwh(st.energy_kwh) + " of " + fmtKwh(st.capacity_kwh || config.capacity_kwh) })]),
-          el("li", null, [el("span", { class: "stat-label", text: "Round trip" }), el("span", { class: "stat-value", text: eff ? fmtPct(eff.round_trip_pct) : "--" })]),
-          el("li", null, [el("span", { class: "stat-label", text: "Cycles" }), el("span", { class: "stat-value", text: cycles == null ? "not reported" : cycles.toFixed(1) + " cycles" })]),
-          el("li", null, [el("span", { class: "stat-label", text: "Limits" }), el("span", { class: "stat-value", text: fmtPower(config.max_charge_w) + " charge / " + fmtPower(config.max_discharge_w) + " discharge" })]),
-          el("li", null, [el("span", { class: "stat-label", text: "SoC window" }), el("span", { class: "stat-value", text: fmtPct(config.min_soc_pct, 0) + " to " + fmtPct(config.max_soc_pct, 0) })]),
-          el("li", null, [el("span", { class: "stat-label", text: "Wear" }), el("span", { class: "stat-value", text: fmtEur(wear) + "/kWh delivered" + (wearOverride > 0 ? " (override)" : "") })]),
-          el("li", null, [el("span", { class: "stat-label", text: "Stored kWh, all-in" }), el("span", { class: "stat-value", text: fmtPrice(storedCost) })]),
-          el("li", null, [el("span", { class: "stat-label", text: "Break-even sale" }), el("span", { class: "stat-value", text: fmtPrice(breakEven) })])
-        ]),
+    // Economics and mappings are evidence behind named disclosures; unresolved mappings and stale
+    // state stay in the header block (UI_REVIEW §3.7).
+    var economics = el("details", { class: "disclosure" }, [
+      el("summary", { text: "Efficiency and wear" }),
+      el("div", { class: "disclosure-body" }, [
         eff
-          ? el("p", { class: "card-sub" }, ["Charge ", fmtPct(eff.eta_charge * 100), " / discharge ", fmtPct(eff.eta_discharge * 100), eff.asymmetric ? " — advanced per-direction override" : " — split evenly from the round trip"])
+          ? el("p", { class: "field-help", text: "Charge " + fmtPct(eff.eta_charge * 100) + " / discharge " + fmtPct(eff.eta_discharge * 100) + (eff.asymmetric ? " — advanced per-direction override" : " — split evenly from the round trip") + "." })
           : el("p", { class: "field-error", text: "No usable efficiency on this battery: the stored-kWh and break-even maths is unavailable." }),
-        el("p", { class: "legend-note", text: "Stored kWh, all-in = buy ÷ charge efficiency + wear × discharge efficiency: the all-in cost of energy put into the pack. Break-even sale = the lowest sale price that covers the round trip: buy ÷ round trip + wear per delivered kWh. Wear is derived per battery from purchase price ÷ (cycle life × usable kWh × discharge efficiency), so a full cycle costs price ÷ cycle life" + (isNum(config.price_eur) && config.price_eur > 0 ? " (" + fmtEur(config.price_eur) + " ÷ (" + (isNum(config.cycle_life) ? config.cycle_life : 0) + " cycles × " + fmtKwh(config.capacity_kwh * (config.max_soc_pct - config.min_soc_pct) / 100) + " usable × " + fmtPct((batteryEfficiency(config) || { eta_discharge: DEFAULT_ETA_DISCHARGE }).eta_discharge * 100) + " discharge)" : "") + "; the advanced wear override replaces it when set." + (buy != null ? " At the current buy price " + fmtPrice(buy) + " and wear " + fmtEur(wear) + "/kWh." : " The current buy price is unknown right now, so both show --.") }),
-        mappingList(config, record.mapping_resolved),
-        Object.keys(capabilities).length ? el("p", { class: "legend-note", text: "Driver capabilities: " + Object.keys(capabilities).map(function (k) { return k + "=" + String(capabilities[k]); }).join(", ") }) : null,
-        Array.isArray(record.discovery) && record.discovery.length ? el("p", { class: "legend-note", text: record.discovery.length + " entity candidate(s) available for the wizard." }) : null
+        el("p", { class: "field-help", text: "Stored kWh, all-in = buy ÷ charge efficiency + wear × discharge efficiency: the all-in cost of energy put into the pack. Break-even sale = the lowest sale price that covers the round trip: buy ÷ round trip + wear per delivered kWh. Wear is derived per battery from purchase price ÷ (cycle life × usable kWh × discharge efficiency), so a full cycle costs price ÷ cycle life" + (isNum(config.price_eur) && config.price_eur > 0 ? " (" + fmtEur(config.price_eur) + " ÷ (" + (isNum(config.cycle_life) ? config.cycle_life : 0) + " cycles × " + fmtKwh(config.capacity_kwh * (config.max_soc_pct - config.min_soc_pct) / 100) + " usable × " + fmtPct((batteryEfficiency(config) || { eta_discharge: DEFAULT_ETA_DISCHARGE }).eta_discharge * 100) + " discharge)" : "") + "; the advanced wear override replaces it when set." + (buy != null ? " At the current buy price " + fmtPrice(buy) + " and wear " + fmtEur(wear) + "/kWh." : " The current buy price is unknown right now, so both show --.") }),
+        el("p", { class: "field-help", text: "Cost of a stored kWh: " + fmtPrice(storedCost) + " · lowest sale price that covers the round trip: " + fmtPrice(breakEven) + "." })
       ])
     ]);
+
+    var detailsBlocks = [
+      economics,
+      el("details", { class: "disclosure" }, [
+        el("summary", { text: "Entity mapping" }),
+        el("div", { class: "disclosure-body" }, [mappingList(config, record.mapping_resolved)])
+      ]),
+      Object.keys(capabilities).length ? el("details", { class: "disclosure" }, [
+        el("summary", { text: "Driver details" }),
+        el("div", { class: "disclosure-body" }, [
+          el("p", { class: "field-help", text: "Driver capabilities: " + Object.keys(capabilities).map(function (k) { return k + "=" + String(capabilities[k]); }).join(", ") }),
+          Array.isArray(record.discovery) && record.discovery.length ? el("p", { class: "field-help", text: record.discovery.length + " entity candidate(s) available for the wizard." }) : null
+        ])
+      ]) : null
+    ];
+
+    var card = el("section", { class: "battery-card", dataset: { battery: config.id } }, [
+      el("div", { class: "battery-head" }, [
+        el("h3", null, [
+          config.name || config.id, " ",
+          el("span", { class: "battery-driver", text: config.driver || "driver?" }), " ",
+          config.enabled ? el("span", { class: "muted", text: "enabled" }) : badge("disabled", "warn"),
+          " ",
+          st.stale ? badge("stale state", "stale") : null,
+          st.available ? null : badge("unavailable", "err")
+        ]),
+        actions
+      ]),
+      el("p", { class: "alert-meta", text: "id: " + config.id + " · last read " + timeAgo(st.read_at) + (st.available ? "" : " · unavailable") + (st.last_error ? " · last error: " + st.last_error : "") }),
+      el("ul", { class: "stat-row" }, [
+        el("li", null, [el("span", { class: "stat-label", text: "Power" }), el("span", { class: "stat-value", text: fmtPower(st.power_w) + (isNum(st.power_w) ? (st.power_w > 0 ? " charging" : st.power_w < 0 ? " discharging" : " idle") : "") })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Charge level" }), el("span", { class: "stat-value", text: fmtPct(st.soc_pct) })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Energy" }), el("span", { class: "stat-value", text: fmtKwh(st.energy_kwh) + " of " + fmtKwh(st.capacity_kwh || config.capacity_kwh) })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Round trip" }), el("span", { class: "stat-value", text: eff ? fmtPct(eff.round_trip_pct) : "--" })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Cycles" }), el("span", { class: "stat-value", text: cycles == null ? "not reported" : cycles.toFixed(1) + " cycles" })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Limits" }), el("span", { class: "stat-value", text: fmtPower(config.max_charge_w) + " charge / " + fmtPower(config.max_discharge_w) + " discharge" })]),
+        el("li", null, [el("span", { class: "stat-label", text: "SoC window" }), el("span", { class: "stat-value", text: fmtPct(config.min_soc_pct, 0) + " to " + fmtPct(config.max_soc_pct, 0) })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Wear" }), el("span", { class: "stat-value", text: fmtEur(wear) + "/kWh delivered" + (wearOverride > 0 ? " (override)" : "") })])
+      ]),
+      el("details", { class: "disclosure" }, [
+        el("summary", { text: "Device actions (test and delete)" }),
+        el("div", { class: "disclosure-body" }, [
+          el("p", { class: "field-help", text: canTest ? "A test discharge writes a real, bounded setpoint (no dry-run suppression) and the server reports what was really applied." : "Test discharge is unavailable: " + testBlockedReason }),
+          el("div", { class: "battery-actions" }, [test, remove])
+        ])
+      ])
+    ].concat(detailsBlocks));
     body.appendChild(card);
   }
 
@@ -1943,6 +2550,7 @@
         return { batteries: rows[0].batteries || [], status: rows[1], cycleCost: cycleCostFromConfig(rows[2]) };
       });
     });
+    routeTitle(host, "Batteries", "Fleet readiness, measured state and the mapping each device dispatches through.");
     asyncPanel(host, "Battery fleet", {
       load: load,
       render: function (body, data) {
@@ -2184,7 +2792,7 @@
         });
         return [candidate.entity_id, candidate.name || "", candidate.platform || "", candidate.suggested_role + (matched ? " (suggested)" : ""), isNum(candidate.confidence) ? candidate.confidence.toFixed(2) : "--", select];
       });
-      discoveryHost.appendChild(table("Entity candidates", ["Entity", "Name", "Platform", "Suggested role", "Confidence", "Assign"], rows));
+      discoveryHost.appendChild(table("Entity candidates", ["Entity", "Name", "Platform", "Suggested role", "Confidence", "Assign"], rows, { numeric: [4] }));
     }
 
     // ---- discovery picker: find a battery and fill the form in one click ---------------------
@@ -2228,7 +2836,7 @@
           ]),
           button("Select", "btn-primary", function () { selectBattery(group); })
         ];
-      }))]));
+      })), { numeric: [] }]));
     }
 
     /** Selecting a battery fills id, name, driver, roles and every number discovery states. */
@@ -2394,7 +3002,7 @@
 
     append(body, [
       el("h2", { text: editing ? "Edit battery" : "Add battery" }),
-      el("p", { class: "muted", text: "Discovery only suggests; the mapping is stored after your explicit confirmation." }),
+      el("p", { class: "muted", text: "Discovery only suggests; the mapping is stored after your explicit confirmation. Read it as: find a battery, review the device and its mapping, then add the optional economics." }),
       el("h3", { text: "Find a battery" }),
       el("p", { class: "field-help", text: "Pick a discovered battery to fill the id, name, driver, roles and every number Home Assistant states. Only groups that could be a battery are listed — devices that merely mention a battery level are not — and nothing is chosen until you press Select." }),
       el("div", { class: "toolbar" }, [
@@ -2404,18 +3012,30 @@
       pickerNotes,
       pickerHost,
       identity,
-      efficiencyBlock,
-      economicsBlock,
+      el("details", { class: "disclosure", open: true }, [
+        el("summary", { text: editing ? "Review charge limits, efficiency and mapping" : "Review the mapping" }),
+        el("div", { class: "disclosure-body" }, [
+          efficiencyBlock,
+          el("h3", { text: "Entity mapping" }),
+          mappingHost
+        ])
+      ]),
+      el("details", { class: "disclosure" }, [
+        el("summary", { text: "Optional economics (wear)" }),
+        el("div", { class: "disclosure-body" }, [economicsBlock])
+      ]),
+      el("details", { class: "disclosure" }, [
+        el("summary", { text: "Discovery" }),
+        el("div", { class: "disclosure-body" }, [
+          el("div", { class: "toolbar" }, [searchInput, discover]),
+          discoveryNote,
+          discoveryHost
+        ])
+      ]),
       el("p", null, [enabledInput, el("label", { for: "battery-enabled", text: " Enabled for dispatch" })]),
-      el("h3", { text: "Entity mapping" }),
-      mappingHost,
-      el("h3", { text: "Discovery" }),
-      el("div", { class: "toolbar" }, [searchInput, discover]),
-      discoveryNote,
-      discoveryHost,
       errorHost
     ]);
-    append(dlg, [body, el("div", { class: "dialog-actions" }, [button("Cancel", "", function () { dlg.close(); }), save])]);
+    append(dlg, [el("div", { class: "dialog-body" }, [body]), el("div", { class: "dialog-actions" }, [button("Cancel", "", function () { dlg.close(); }), save])]);
     document.body.appendChild(dlg);
     dlg.addEventListener("close", function () { dlg.remove(); });
     loadBatteryCandidates();
@@ -2430,24 +3050,50 @@
 
   function renderSavingsTotals(body, payload) {
     var t = payload.totals || {};
+    var buckets = Array.isArray(payload.buckets) ? payload.buckets : [];
+    var covered = buckets.filter(function (b) { return b.baseline_cost_eur != null; });
     var savingsKnown = isNum(t.savings_eur);
     var baselineKnown = isNum(t.baseline_cost_eur);
     var reason = (!savingsKnown || !baselineKnown) ? "unknown — no load forecast for this range" : "";
+    // Loss, unknown and stale are three different states and never share one visual treatment
+    // (UI_REVIEW §3.6).
+    function savingsCard() {
+      if (!savingsKnown) return statCard("Savings", "--", reason, "unknown");
+      if (t.savings_eur < 0) return statCard("Savings", fmtEur(t.savings_eur), "a loss: the battery cost more than doing nothing", "loss");
+      return statCard("Savings", fmtEur(t.savings_eur), "baseline minus actual (net)", false);
+    }
     var cards = el("div", { class: "cards" }, [
-      statCard("Savings", fmtEur(t.savings_eur), savingsKnown ? "baseline minus actual (net)" : reason, !savingsKnown || t.savings_eur < 0),
+      savingsCard(),
       statCard("Import cost", fmtEur(t.cost_eur), "grid import cost before export revenue"),
-      statCard("Baseline cost", fmtEur(t.baseline_cost_eur), baselineKnown ? "same load and tariffs, battery idle (net)" : reason, !baselineKnown),
+      statCard("Baseline cost", fmtEur(t.baseline_cost_eur), baselineKnown ? "same load and tariffs, battery idle (net)" : reason, baselineKnown ? false : "unknown"),
       statCard("Import", fmtKwh(t.import_kwh), "from the grid"),
       statCard("Export", fmtKwh(t.export_kwh), "to the grid"),
       statCard("PV", fmtKwh(t.pv_kwh), "produced"),
       statCard("Cycles", isNum(t.cycles) ? t.cycles.toFixed(2) + " cycles" : "--", "battery throughput")
     ]);
     body.appendChild(cards);
+    // Coverage first: a partial baseline is scope, not a total (UI_REVIEW §3.6).
+    if (buckets.length && covered.length && covered.length < buckets.length) {
+      body.appendChild(el("div", { class: "banner banner-warn" }, [
+        el("p", { class: "banner-title", text: "Baseline available for " + covered.length + " of " + buckets.length + " periods" }),
+        el("p", { text: "The saving and the baseline cost describe only the periods with a load forecast. " + (buckets.length - covered.length) + " period(s) have no baseline, so their cost is not part of the comparison — the whole-range import/export/PV figures below still cover every period." })
+      ]));
+    }
     if (!savingsKnown || !baselineKnown) {
       body.appendChild(el("div", { class: "banner banner-warn" }, [
         el("p", { class: "banner-title", text: "Baseline and savings are unknown for this range" }),
         el("p", { text: "The server reports null because there is no load forecast to re-price the metered intervals against. Unknown is not zero: the add-on will not guess a saving without the load. Buckets that are knowable are still summed and shown." })
       ]));
+    }
+    // Comparable figures: baseline and actual net cost over the same covered periods.
+    if (covered.length) {
+      var baselineSum = covered.reduce(function (sum, b) { return sum + (b.baseline_cost_eur || 0); }, 0);
+      var netSum = covered.reduce(function (sum, b) { return sum + ((b.cost_eur || 0) - (b.revenue_eur || 0)); }, 0);
+      body.appendChild(el("ul", { class: "stat-row" }, [
+        el("li", null, [el("span", { class: "stat-label", text: "Baseline cost (covered periods)" }), el("span", { class: "stat-value", text: fmtEur(baselineSum) })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Actual net cost (same periods)" }), el("span", { class: "stat-value", text: fmtEur(netSum) })])
+      ]));
+      body.appendChild(el("p", { class: "legend-note", text: "Actual net cost is import cost minus export revenue over the same covered periods, so the two figures are comparable; the whole-range import/export/PV figures above are kept separately labelled." }));
     }
     if (isNum(t.arbitrage_kwh) || isNum(t.self_consumption_kwh)) {
       body.appendChild(el("ul", { class: "stat-row" }, [
@@ -2467,8 +3113,12 @@
   function renderSavingsBuckets(body, payload) {
     var buckets = Array.isArray(payload.buckets) ? payload.buckets : [];
     if (!buckets.length) { body.appendChild(el("p", { class: "muted", text: "No buckets in this range yet." })); return; }
+    var covered = buckets.filter(function (b) { return b.baseline_cost_eur != null; }).length;
+    if (covered < buckets.length) {
+      body.appendChild(el("p", { class: "legend-note", text: covered + " of " + buckets.length + " buckets have a baseline (a load forecast to re-price against). A bucket without one shows -- for baseline and savings: unknown, not zero." }));
+    }
     var rows = buckets.map(function (b) {
-      return [b.key || "", fmtDateTime(b.start) + " – " + fmtDateTime(b.end), fmtKwh(b.import_kwh), fmtKwh(b.export_kwh), fmtKwh(b.pv_kwh), fmtEur(b.cost_eur), fmtEur(b.revenue_eur), fmtEur(b.baseline_cost_eur), fmtEur(b.savings_eur), isNum(b.cycles) ? b.cycles.toFixed(2) + " cycles" : "--"];
+      return [b.key || "", fmtDateTime(b.start) + " – " + fmtDateTime(b.end), fmtKwh(b.import_kwh), fmtKwh(b.export_kwh), fmtKwh(b.pv_kwh), fmtEur(b.cost_eur), fmtEur(b.revenue_eur), b.baseline_cost_eur == null ? "--" : fmtEur(b.baseline_cost_eur), b.savings_eur == null ? "--" : fmtEur(b.savings_eur), isNum(b.cycles) ? b.cycles.toFixed(2) + " cycles" : "--"];
     });
     body.appendChild(table("Buckets for range " + payload.range, ["Bucket", "Period", "Import", "Export", "PV", "Cost", "Revenue", "Baseline", "Savings", "Cycles"], rows));
   }
@@ -2478,6 +3128,7 @@
     var range = ranges.indexOf(query.range) >= 0 ? query.range : "month";
     var load = once(function () { return get("/savings", { range: range }); });
 
+    routeTitle(host, "Savings", "Counterfactual saving against doing nothing — an estimate, not a bill change.");
     var controls = panel(host, "Savings range");
     var select = el("select", { id: "savings-range" });
     ranges.forEach(function (r) {
@@ -2496,7 +3147,7 @@
         var chart = el("div", { class: "chart chart-md" });
         body.appendChild(chart);
         root.SEMCharts.savings(chart, payload.buckets || []);
-        body.appendChild(el("p", { class: "legend-note", text: "Green bars: savings (EUR, left axis). Dashed lines: actual net cost (import cost minus export revenue) and no-battery baseline cost (EUR, right axis). Buckets with a null baseline (no load forecast) are skipped, not plotted as zero." }));
+        body.appendChild(el("p", { class: "legend-note", text: "Bars: savings (EUR, left axis). Solid line: actual net cost (import cost minus export revenue). Dashed line: no-battery baseline cost (both EUR, right axis). Buckets with a null baseline (no load forecast) are skipped, not plotted as zero." }));
       }
     });
     asyncPanel(host, "Per-bucket detail", { load: load, render: renderSavingsBuckets });
@@ -2507,11 +3158,44 @@
 
   var SAFETY_KEY_RE = /(reserve_soc_pct|max_grid_import_w|max_grid_export_w|target_soc_pct_end|allow_grid_charge|allow_export|min_spread_eur_per_kwh|grid_follow_max_w|^control\.|^price\.feed_in_)/;
 
+  // Control authority is safety-relevant wherever it is edited: enabling auto, and turning dry run
+  // off, are acknowledged exactly like any other barrier-bearing change (UI_REVIEW §3.3).
+  var AUTHORITY_KEYS = ["mode", "dry_run"];
+
+  // Friendly text for technical enum values; the value saved to the API is unchanged (UI_REVIEW §3.7).
+  var CHOICE_LABELS = {
+    "price.provider": {
+      entity: "Your own price entity",
+      zonneplan: "Zonneplan (found automatically)",
+      day_ahead: "Wholesale day-ahead",
+      fixed: "Fixed tariff"
+    },
+    "price.contract": {
+      dynamic_quarter_hourly: "Dynamic (quarter-hourly)",
+      dynamic_hourly: "Dynamic (hourly)",
+      fixed_single: "One fixed price",
+      fixed_day_night: "Day and night prices"
+    },
+    "solar.source": {
+      forecast_solar: "Forecast.Solar (per plane)",
+      capacity: "Array capacity (watt peak)",
+      derived: "Learn from the meter"
+    },
+    mode: { off: "Off", advisory: "Advisory", auto: "Auto" },
+    log_level: { debug: "Debug", info: "Info", warning: "Warning", error: "Error" }
+  };
+
+  function choiceText(key, value) {
+    var map = CHOICE_LABELS[key];
+    return map && Object.prototype.hasOwnProperty.call(map[value]) ? map[value] : String(value);
+  }
+
   // The API returns settings sorted by key, which interleaves groups; present them in a stable
   // reading order instead (unknown groups go last, alphabetically).
   var GROUP_ORDER = ["General", "Price", "Solar", "Load", "Grid", "Optimizer", "Control", "Safety", "Notify", "Batteries"];
 
   function isSafetySetting(descriptor) {
+    if (descriptor && AUTHORITY_KEYS.indexOf(descriptor.key) >= 0) return true;
     return /safety|limit/i.test(String(descriptor.group || "")) || SAFETY_KEY_RE.test(descriptor.key);
   }
 
@@ -2706,12 +3390,17 @@
     return { fields: keys, note: note || null };
   }
 
-  /* ---- setup cards (SPEC 13.2, amended) -------------------------------------------------------
-   * The settings page opens on four setup cards — Price, Meter, Solar, Battery — that carry only
-   * the primary choice each; every other key (including the rest of a card's own group) lives in
-   * the "All settings" drawer behind the existing rail. A key rendered on a card is *not* rendered
-   * again in its group, so every key still appears exactly once. Pure (no DOM): the tested surface
-   * for which keys the cards own at the current provider/contract/solar-source selection. */
+  /* ---- setup cards (SPEC 13.2, amended) ---------------------------------------------------------------------
+   * The settings page opens on four setup cards that carry the primary choice of each topic *and
+   * the fields that choice needs to be complete*: the capacity estimate needs the array's watt
+   * peak, Forecast.Solar needs its plane, a fixed day/night tariff needs both rates and both window
+   * start hours, and wholesale day-ahead prices need the adders that turn them into a consumer
+   * price. "Advanced" therefore means "optional for this user's chosen source", not "not on the
+   * first screen" (UI_REVIEW §3.2). Every other key (including the rest of a card's own group)
+   * lives in the "All settings" drawer behind the existing rail, and a key rendered on a card is
+   * *not* rendered again in its group, so every key still appears exactly once. Pure (no DOM): the
+   * tested surface for which keys the cards own at the current provider/contract/solar-source
+   * selection. */
   function setupCardKeys(opts) {
     opts = opts || {};
     var provider = String(opts.priceProvider || "entity");
@@ -2726,11 +3415,19 @@
     if (provider === "fixed") {
       keys.push("price.contract");
       if (contract === "fixed_day_night") {
-        keys.push("price.fixed_day_price_eur_per_kwh", "price.fixed_night_price_eur_per_kwh");
+        keys.push("price.fixed_day_price_eur_per_kwh", "price.fixed_night_price_eur_per_kwh",
+          "price.fixed_day_start_hour", "price.fixed_night_start_hour");
       } else {
         keys.push("price.fixed_price_eur_per_kwh");
       }
     }
+    // Day-ahead prices are wholesale: without VAT, energy tax or a fee they are not a consumer
+    // price, so those adders belong on the card that chose the source, not behind a disclosure.
+    if (provider === "day_ahead") {
+      keys.push("price.vat_pct", "price.energy_tax_eur_per_kwh", "price.import_fee_eur_per_kwh");
+    }
+    if (source === "capacity") keys.push("solar.capacity_wp");
+    if (source === "forecast_solar") keys.push("solar.planes");
     if (source !== "derived") keys.push("solar.measured_entity");
     return keys;
   }
@@ -2740,6 +3437,14 @@
   // fitted to, and what the weather entity has to support for cloud attenuation to work at all.
   var SOLAR_MEASURED_NOTE = "solar.measured_entity must be the inverter's AC output: a meter's export register under-reports, because self-consumed energy never reaches the meter, so the learned per-hour correction would come out low. It is what makes the forecast more accurate over time.";
   var SOLAR_WEATHER_NOTE = "solar.weather_entity must support the weather.get_forecasts action (Met.no's forecast entity does; some integrations, including the OpenWeatherMap entity on this install, only publish a current cloud_coverage and support no forecast type) — without a forecast type the add-on holds the current cloud cover flat and says so in the forecast notes, so the field is still worth setting.";
+
+  // Two keys whose backend help understates the safety model: the UI states the exact
+  // dispatcher/Stop distinction here — the same wording the Dashboard answer strip uses
+  // (UI_REVIEW §3.3).
+  var KEY_HELP = {
+    mode: "off = no dispatch; advisory = plan and log but never write; auto = the plan dispatcher writes setpoints. Advisory and off stop new writes, but a setpoint already written is only neutralised by Stop now (a real write, even in dry run).",
+    dry_run: "On: the plan dispatcher writes nothing — it logs what it would send. Stop now still writes 0 W to the hardware, even in dry run."
+  };
 
   function settingsField(descriptor, dirty) {
     var key = descriptor.key;
@@ -2803,7 +3508,7 @@
       // ponytail: the API always sends choices, as [] when there is no enum, so empty means free text.
       input = el("select", { id: "set-" + key });
       descriptor.choices.forEach(function (choice) {
-        var option = el("option", { value: choice, text: choice });
+        var option = el("option", { value: choice, text: choiceText(key, choice) });
         if (String(value) === String(choice)) option.selected = true;
         input.appendChild(option);
       });
@@ -2818,16 +3523,35 @@
       wrap.appendChild(el("span", { class: "field-key", text: key }));
       wrap.appendChild(input);
     }
-    if (descriptor.help) wrap.appendChild(el("p", { class: "field-help", text: descriptor.help }));
+    if (KEY_HELP[key] || descriptor.help) wrap.appendChild(el("p", { class: "field-help", text: KEY_HELP[key] || descriptor.help }));
     if (descriptor.key === "batteries") wrap.appendChild(el("p", { class: "field-help" }, [el("a", { href: "#/batteries", text: "Edit batteries in the Batteries view" })]));
     return wrap;
   }
 
   function showFieldError(wrap, message) {
     var existing = wrap.querySelector(".field-error");
-    if (!message) { if (existing) existing.remove(); return; }
-    if (existing) { existing.textContent = message; return; }
-    wrap.appendChild(el("p", { class: "field-error", text: message }));
+    var input = wrap.querySelector("input, select, textarea");
+    if (!message) {
+      if (existing) existing.remove();
+      if (input) {
+        input.removeAttribute("aria-describedby");
+        input.setAttribute("aria-invalid", "false");
+      }
+      return;
+    }
+    if (existing) existing.textContent = message;
+    else {
+      existing = el("p", { class: "field-error", text: message });
+      wrap.appendChild(existing);
+    }
+    // A field error is announced with its own control, not only somewhere else on the page
+    // (UI_REVIEW §3.11).
+    if (input) {
+      var errorId = "err-" + String(wrap.dataset && wrap.dataset.key ? wrap.dataset.key : "field").replace(/[^a-z0-9_-]+/gi, "-");
+      existing.id = errorId;
+      input.setAttribute("aria-describedby", errorId);
+      input.setAttribute("aria-invalid", "true");
+    }
   }
 
   /* ---- entity picker (SPEC 10 discovery, used by the setup cards) -----------------------------
@@ -2904,7 +3628,12 @@
     return wrap;
   }
 
-  function renderSettings(body, config) {
+  function renderSettings(body, data) {
+    var config = data.config || {};
+    // The canonical inventory is GET /batteries, not the `batteries` settings descriptor: the two
+    // can disagree, and a descriptor that reads as an empty fleet must never answer the question
+    // (UI_REVIEW §3.2 / open question 3).
+    var fleet = Array.isArray(data.fleet) ? data.fleet : [];
     var descriptors = Array.isArray(config.settings) ? config.settings : [];
     if (!descriptors.length) { body.appendChild(el("p", { class: "muted", text: "The server sent no setting descriptors." })); return; }
     var dirtyValues = {};
@@ -2977,7 +3706,14 @@
     // (muted, "not used by the current selection"); a search match also labels its group.
     function renderRow(item, opts, searching) {
       var row;
-      if (settingHiddenBySource(item, opts)) {
+      if (item.key === "batteries") {
+        // Server-managed inventory (the battery wizard owns it): showing an editable JSON field
+        // here could only ever be rejected by the server, so it is a provenance line instead.
+        row = el("p", { class: "muted", dataset: { key: item.key } }, [
+          item.key + " — managed in the Batteries view (", fleet.length, " battery", fleet.length === 1 ? "" : "s", " configured). ",
+          el("a", { href: "#/batteries", text: "Open the Batteries view" })
+        ]);
+      } else if (settingHiddenBySource(item, opts)) {
         row = el("p", { class: "muted", dataset: { key: item.key } }, [
           "Hidden " + item.key + " = " + settingValueText(settingEffectiveValue(item)) +
             " — not used by the current " + ((item.group || "") === "Solar" ? "solar source" : "provider/contract") + ", but still set."
@@ -3116,12 +3852,21 @@
         if (contract === "fixed_day_night") {
           children.push(cardField("price.fixed_day_price_eur_per_kwh"));
           children.push(cardField("price.fixed_night_price_eur_per_kwh"));
+          children.push(cardField("price.fixed_day_start_hour"));
+          children.push(cardField("price.fixed_night_start_hour"));
         } else {
           children.push(cardField("price.fixed_price_eur_per_kwh"));
         }
       }
       children.push(cardField("price.export_fee_eur_per_kwh"));
       children.push(cardField("price.feed_in_energy_tax_refund"));
+      // Wholesale day-ahead prices only become consumer prices through these adders, so they are
+      // on the card that chose the source (UI_REVIEW §3.2).
+      if (provider === "day_ahead") {
+        children.push(cardField("price.vat_pct"));
+        children.push(cardField("price.energy_tax_eur_per_kwh"));
+        children.push(cardField("price.import_fee_eur_per_kwh"));
+      }
       var note = priceFieldVisibility(provider, contract).note;
       if (note) children.push(el("p", { class: "field-help", text: note }));
       return setupCard(
@@ -3147,15 +3892,21 @@
       } else {
         children.push(cardPicker("solar.measured_entity", "solar", "PV power sensor name or entity id"));
       }
+      // The input the chosen source needs to be complete: the array's watt peak for the capacity
+      // estimate, the plane list for Forecast.Solar (UI_REVIEW §3.2).
+      if (source === "capacity") children.push(cardField("solar.capacity_wp"));
+      if (source === "forecast_solar") children.push(cardField("solar.planes"));
       var note = solarFieldVisibility(source).note;
       if (note) children.push(el("p", { class: "field-help", text: note }));
       return setupCard("Solar", "Optional. How the add-on should know your production.", children);
     }
 
     function batteryCard() {
-      var list = settingValue("batteries");
+      // The canonical inventory is the /batteries endpoint, so a stale or empty descriptor can
+      // never answer the question (UI_REVIEW §3.2 / open question 3).
+      var list = fleet.map(function (record) { return record && record.config ? record.config : record; });
       var children = [];
-      if (Array.isArray(list) && list.length) {
+      if (list.length) {
         children.push(el("ul", { class: "setup-list" }, list.map(function (battery) {
           var parts = [String((battery && battery.name) || (battery && battery.id) || "battery")];
           if (battery && isNum(battery.capacity_kwh)) parts.push(fmtKwh(battery.capacity_kwh));
@@ -3166,18 +3917,20 @@
         children.push(el("p", { class: "muted", text: "No battery configured yet." }));
       }
       children.push(el("p", {}, [
-        el("a", { class: "btn btn-primary", href: "#/batteries", text: list && list.length ? "Manage batteries" : "Add a battery" }),
+        el("a", { class: "btn btn-primary", href: "#/batteries", text: list.length ? "Manage batteries" : "Add a battery" }),
         " ",
         el("span", { class: "muted", text: "Batteries are searched, picked and confirmed in the Batteries view." })
       ]));
       return setupCard("Battery", "Which battery the plan may drive; the wizard finds the device and fills in the entities.", children);
     }
 
+    // A rail count is how many keys differ from their default — a configuration fact, not a warning
+    // and not the unsaved-edit count, which the save bar owns (UI_REVIEW §3.9).
     function renderRail(groups, active) {
       clear(railHost);
       railEntries = {};
       groups.forEach(function (group) {
-        var count = el("span", { class: "badge " + (group.changedCount ? "badge-warn" : "badge-info"), text: String(group.changedCount) });
+        var count = el("span", { class: "badge badge-info", text: group.changedCount ? group.changedCount + " customised" : "defaults" });
         var entry = el("button", { type: "button", class: "chip" }, [group.name, " ", count]);
         if (group.name === active) entry.setAttribute("aria-current", "true");
         entry.addEventListener("click", function () {
@@ -3189,17 +3942,51 @@
         railEntries[group.name] = { button: entry, count: count };
         railHost.appendChild(entry);
       });
+      railHost.appendChild(el("p", { class: "legend-note", text: "Counts are keys that differ from their default; unsaved edits are counted in the save bar below." }));
     }
     function updateCounts(groups) {
       groups = groups || settingsGroups(mergedItems());
       groups.forEach(function (group) {
         var entry = railEntries[group.name];
         if (!entry) return;
-        entry.count.textContent = String(group.changedCount);
-        entry.count.className = "badge " + (group.changedCount ? "badge-warn" : "badge-info");
+        entry.count.textContent = group.changedCount ? group.changedCount + " customised" : "defaults";
       });
-      saveNote.textContent = dirtyCount ? dirtyCount + " key" + (dirtyCount === 1 ? "" : "s") + " changed, not saved yet" : "No unsaved changes";
+      saveNote.textContent = dirtyCount
+        ? dirtyCount + " unsaved change" + (dirtyCount === 1 ? "" : "s") + " — not saved yet"
+        : "No unsaved changes";
       saveButtons.forEach(function (b) { b.textContent = "Save changes (" + dirtyCount + ")"; b.disabled = dirtyCount === 0; });
+    }
+
+    // An always-visible safety summary: the authority in force right now, and direct links to the
+    // Safety group and to Stop now (UI_REVIEW §3.2). Stop now lives on Today, not here.
+    function authoritySummary() {
+      var mode = settingValue("mode");
+      var dry = settingValue("dry_run");
+      var modeText = { off: "Off", advisory: "Advisory", auto: "Auto" }[mode] || String(mode || "unknown");
+      var groups = settingsGroups(mergedItems());
+      var hasSafety = groups.some(function (group) { return group.name === "Safety"; });
+      return el("div", { class: "banner banner-safety" }, [
+        el("p", { class: "banner-title", text: "Safety summary" }),
+        el("p", {}, [
+          "Control authority: ",
+          el("strong", { text: modeText + (dry ? " · dry run on" : " · dry run off") }),
+          " — " + authorityNote(!!dry)
+        ]),
+        el("p", { class: "banner-actions" }, [
+          hasSafety ? (function () {
+            var link = button("Review safety limits", "");
+            link.addEventListener("click", function () {
+              activeGroup = "Safety";
+              writeStored(STORE_GROUP, activeGroup);
+              if (search.value) search.value = "";
+              if (drawer && !drawer.open) drawer.open = true;
+              draw();
+            });
+            return link;
+          })() : null,
+          el("a", { class: "btn", href: "#/dashboard", text: "Stop now is on Today" })
+        ])
+      ]);
     }
 
     var search = el("input", { type: "search", id: "settings-search", placeholder: "filter settings by key, label or help", "aria-label": "Filter settings" });
@@ -3207,6 +3994,9 @@
     var railHost = el("nav", { class: "settings-rail", "aria-label": "Settings groups" });
     var listHost = el("div");
     var cardsHost = el("div", { class: "setup-cards" });
+    // Feedback is always visible: the drawer may be closed, so pending/success/error and rejected
+    // values never live inside it (UI_REVIEW §3.11).
+    var feedback = el("div", { class: "settings-feedback" });
     var saveNote = el("span", { class: "muted", text: "No unsaved changes" });
     var saveButtons = [];
     function saveButton() {
@@ -3280,7 +4070,7 @@
         if (dirtyValues[key].invalid) reject = true;
         else settings[key] = dirtyValues[key].value;
       });
-      if (reject) { setNote(listHost, "There are invalid values; fix them before saving.", true); return; }
+      if (reject) { setNote(feedback, "There are invalid values; fix them before saving.", true); return; }
       var keys = Object.keys(settings);
       if (!keys.length) return;
       var safety = keys.filter(function (key) {
@@ -3297,7 +4087,7 @@
       var onDone = function (res) {
         var errors = (res && res.errors) || [];
         if (errors.length) {
-          renderPatchErrors(listHost, errors);
+          renderPatchErrors(feedback, errors);
           return;
         }
         state.navGuard = null;
@@ -3309,18 +4099,27 @@
           body: "These keys can change how the battery is controlled: " + safety.join(", ") + ".",
           confirmLabel: "Save safety settings", requireCheck: true,
           checkLabel: "I understand the effect on battery control"
-        }).then(function (ok) { if (ok) performWrite(saveButtons[0], listHost, requestFn, successText, onDone); });
+        }).then(function (ok) { if (ok) performWrite(saveButtons[0], feedback, requestFn, successText, onDone); });
       } else {
-        performWrite(saveButtons[0], listHost, requestFn, successText, onDone);
+        performWrite(saveButtons[0], feedback, requestFn, successText, onDone);
       }
     }
 
     function renderPatchErrors(host, errors) {
       var box = el("div", { class: "banner banner-error" }, [el("p", { class: "banner-title", text: "Server rejected some values" })]);
       var list = el("ul");
+      var focused = false;
       errors.forEach(function (error) {
         var text = typeof error === "string" ? error : (error.key ? error.key + ": " : "") + (error.message || "invalid value");
         list.appendChild(el("li", { text: text }));
+        var key = typeof error === "string" ? null : error.key;
+        if (!key) return;
+        var field = listHost.querySelector('[data-key="' + key + '"]') || cardsHost.querySelector('[data-key="' + key + '"]');
+        if (!field) return;
+        var message = typeof error === "string" ? null : error.message;
+        showFieldError(field, message || "The server rejected this value.");
+        var input = field.querySelector("input, select, textarea");
+        if (input && !focused) { input.focus(); focused = true; }
       });
       box.appendChild(list);
       host.appendChild(box);
@@ -3332,22 +4131,24 @@
       writeStored(STORE_SHOW_ALL, showAllAdvanced);
       draw();
     });
-    var drawerBody = el("div", { class: "disclosure-body" }, [
-      el("div", { class: "toolbar" }, [
-        el("label", { for: "settings-search" }, [el("span", { text: "Search" }), search]),
-        el("label", { class: "switch", for: "settings-show-advanced" }, [showAllBox, " Show all advanced"])
-      ]),
-      railHost,
-      listHost
-    ]);
+    var columns = el("div", { class: "settings-columns" }, [railHost, listHost]);
+    var drawerBody = el("div", { class: "disclosure-body" }, [columns]);
     var drawer = el("details", { class: "disclosure all-settings" }, [
       el("summary", { text: "All settings (" + descriptors.length + ")" }),
       drawerBody
     ]);
     if (readStored(STORE_ALL_OPEN, false) === true) drawer.open = true;
     drawer.addEventListener("toggle", function () { writeStored(STORE_ALL_OPEN, drawer.open); });
+    // Search and the advanced switch sit in the settings header, so filtering never requires
+    // opening a drawer first (UI_REVIEW §3.2).
+    body.appendChild(el("div", { class: "settings-toolbar" }, [
+      el("label", { class: "field", for: "settings-search" }, [el("span", { text: "Search settings" }), search]),
+      el("label", { class: "switch", for: "settings-show-advanced" }, [showAllBox, " Show all advanced"])
+    ]));
+    body.appendChild(authoritySummary());
     body.appendChild(cardsHost);
     body.appendChild(drawer);
+    body.appendChild(feedback);
     var saveBar = el("div", { class: "save-bar" }, [
       saveNote,
       el("div", { class: "save-bar-actions" }, [
@@ -3379,11 +4180,22 @@
       return [key, value === null || value === undefined ? "(unset — read from Home Assistant)" : String(value)];
     });
     body.appendChild(el("p", { class: "muted", text: "Add-on options are set in the add-on configuration. Settings saved here override them at runtime." }));
-    body.appendChild(table("Add-on options", ["Option", "Value"], rows.length ? rows : [["(none)", ""]]));
+    body.appendChild(table("Add-on options", ["Option", "Value"], rows.length ? rows : [["(none)", ""]], { numeric: [] }));
   }
 
   function viewSettings(host) {
-    var load = once(function () { return get("/config"); });
+    var load = once(function () {
+      return Promise.all([get("/config"), get("/batteries")]).then(function (rows) {
+        return { config: rows[0], fleet: (rows[1] && Array.isArray(rows[1].batteries) ? rows[1].batteries : []) };
+      }, function (err) {
+        // The config is the required read; without the fleet the Battery card says so rather than
+        // guessing an empty inventory.
+        return get("/config").then(function (config) {
+          return { config: config, fleet: [], fleetError: err };
+        });
+      });
+    });
+    routeTitle(host, "Settings", "Four setup cards for the choices that matter, then every key behind them.");
     asyncPanel(host, "Settings", { load: load, render: renderSettings });
     asyncPanel(host, "Add-on options", { load: load, render: renderOptions });
     return null;
@@ -3392,23 +4204,51 @@
   /* ------------------------------------------------------------------ view: log */
 
   var LOG_LEVELS = ["", "info", "warning", "error"];
+  // Presets answer the common question without typing a kind slug; the raw kind filter stays
+  // for everything else (UI_REVIEW §5, per-view notes).
+  var LOG_PRESETS = [
+    { id: "all", text: "All", kind: "", level: "" },
+    { id: "dispatch", text: "Dispatch", kind: "dispatch", level: "" },
+    { id: "warnings", text: "Warnings and errors", kind: "", level: "warning" },
+    { id: "events", text: "Events", kind: "event", level: "" }
+  ];
+
+  // Message first: what happened, then battery/time, requested → applied power, the plain-language
+  // blocking reason and the exact code. Mode/dry-run context is promoted out of the JSON so an
+  // "applied" row can never imply a real hardware write when it was a simulation (UI_REVIEW §5).
+  function logRowMessage(entry) {
+    var detail = entry.detail || {};
+    var context = [];
+    if (detail.mode) context.push("mode " + detail.mode);
+    if (detail.dry_run === true) context.push("dry run");
+    var requested = numOrNull(detail.requested_w);
+    var applied = numOrNull(detail.applied_w);
+    var power = requested == null && applied == null ? "" : [fmtPower(requested) + " requested", fmtPower(applied) + " applied"].join(" → ");
+    return el("li", { dataset: { level: entry.level || "info" } }, [
+      el("p", { class: "log-message", text: entry.message || entry.code || "(no message)" }),
+      el("p", { class: "alert-meta" }, [
+        badge(entry.level || "info", entry.level === "error" ? "err" : entry.level === "warning" ? "warn" : "info"),
+        " ", fmtDateTime(entry.ts), " (", timeAgo(entry.ts), ")",
+        detail.battery_id ? " · " + detail.battery_id : "",
+        entry.kind ? " · " + entry.kind : "",
+        entry.code ? " · code " + entry.code : "",
+        power ? " · " + power : "",
+        context.length ? " · " + context.join(" · ") : ""
+      ]),
+      detail && Object.keys(detail).length
+        ? el("details", { class: "log-detail" }, [el("summary", { text: "detail" }), el("pre", { text: JSON.stringify(detail, null, 2) })])
+        : null
+    ]);
+  }
 
   function renderLogEntries(host, entries) {
     clear(host);
     if (!entries.length) {
-      host.appendChild(el("p", { class: "muted", text: "No entries for these filters. If something surprising happened and this stays empty, that is a bug worth reporting." }));
+      host.appendChild(el("p", { class: "muted", text: "No matching entries. Clear the filters or widen the preset to see more." }));
+      host.appendChild(el("p", { class: "legend-note", text: "If something surprising happened and every filter shows nothing, that is a bug worth reporting." }));
       return;
     }
-    var rows = entries.map(function (entry) {
-      var detail = entry.detail && Object.keys(entry.detail).length
-        ? el("details", { class: "log-detail" }, [el("summary", { text: "detail" }), el("pre", { text: JSON.stringify(entry.detail, null, 2) })])
-        : "—";
-      var requested = entry.detail ? numOrNull(entry.detail.requested_w) : null;
-      var applied = entry.detail ? numOrNull(entry.detail.applied_w) : null;
-      var power = requested == null && applied == null ? "" : [fmtPower(requested) + " requested", fmtPower(applied) + " applied"].join(" → ");
-      return [fmtDateTime(entry.ts) + " (" + timeAgo(entry.ts) + ")", entry.kind || "", badge(entry.level || "info", entry.level === "error" ? "err" : entry.level === "warning" ? "warn" : "info"), entry.code || "", entry.message || "", power, detail];
-    });
-    host.appendChild(table("Newest first", ["Time", "Kind", "Level", "Code", "Message", "Power", "Detail"], rows));
+    host.appendChild(el("ul", { class: "log-list" }, entries.map(logRowMessage)));
   }
 
   function viewLog(host) {
@@ -3422,34 +4262,71 @@
     var auto = el("input", { type: "checkbox", id: "log-auto", checked: true });
     var refresh = button("Refresh", "");
     var entriesHost = el("div");
+    var notice = el("p", { class: "legend-note", hidden: true });
     var timer = null;
 
     function reload(showLoading) {
       if (showLoading) panelStatus(entriesHost, "loading", "Loading log…");
       get("/log", { limit: filters.limit, level: filters.level, kind: filters.kind }).then(function (payload) {
         renderLogEntries(entriesHost, Array.isArray(payload.entries) ? payload.entries : []);
+        notice.hidden = true;
       }).catch(function (err) {
         panelStatus(entriesHost, "error", "Could not load the log: " + (err && err.message ? err.message : err), function () { reload(true); });
       });
     }
+    // Auto-refresh preserves what the reader is looking at: while a detail is open, or the reader
+    // has focus inside the list, it offers a "new entries available" action instead of rebuilding
+    // the evidence on screen (UI_REVIEW §3.5).
+    function readingDetail() {
+      return !!entriesHost.querySelector("details[open]");
+    }
+    function autoRefresh() {
+      if (!auto.checked || document.hidden || anyDialogOpen()) return;
+      if (readingDetail()) {
+        notice.textContent = "New entries are available — Refresh to show them, or close the open detail to keep updating automatically.";
+        notice.hidden = false;
+        return;
+      }
+      reload(false);
+    }
+    function applyPreset(preset) {
+      filters.kind = preset.kind;
+      filters.level = preset.level;
+      levelSelect.value = preset.level;
+      kindInput.value = preset.kind;
+      reload(true);
+    }
+    var presetButtons = LOG_PRESETS.map(function (preset) {
+      var b = button(preset.text, preset.id === "all" ? "btn-primary" : "");
+      b.setAttribute("aria-pressed", preset.id === "all" ? "true" : "false");
+      b.addEventListener("click", function () {
+        presetButtons.forEach(function (other) {
+          other.classList.remove("btn-primary");
+          other.setAttribute("aria-pressed", other === b ? "true" : "false");
+        });
+        b.classList.add("btn-primary");
+        applyPreset(preset);
+      });
+      return b;
+    });
     levelSelect.addEventListener("change", function () { filters.level = levelSelect.value; reload(true); });
     limitSelect.addEventListener("change", function () { filters.limit = limitSelect.value; reload(true); });
     kindInput.addEventListener("change", function () { filters.kind = kindInput.value.trim(); reload(true); });
     refresh.addEventListener("click", function () { reload(false); });
 
     p.body.appendChild(el("div", { class: "log-filters" }, [
+      el("div", { class: "segmented", role: "group", "aria-label": "Log presets" }, presetButtons),
       el("label", { for: "log-level" }, [el("span", { class: "stat-label", text: "Level" }), levelSelect]),
       el("label", { for: "log-kind" }, [el("span", { class: "stat-label", text: "Kind" }), kindInput]),
       el("label", { for: "log-limit" }, [el("span", { class: "stat-label", text: "Rows" }), limitSelect]),
-      el("label", { class: "muted", for: "log-auto" }, [auto, " auto-refresh"]),
+      el("label", { class: "switch", for: "log-auto" }, [auto, " auto-refresh"]),
       refresh
     ]));
-    p.body.appendChild(el("p", { class: "legend-note", text: "Every dispatch attempt is logged with requested vs applied power and the blocking reason, so “why didn't it charge?” is always answerable here." }));
+    p.body.appendChild(el("p", { class: "legend-note", text: "Every dispatch attempt is logged with requested vs applied power and the blocking reason, so “why didn't it charge?” is always answerable here. An applied row in dry run was simulated: the dispatcher wrote nothing." }));
+    p.body.appendChild(notice);
     p.body.appendChild(entriesHost);
     reload(true);
-    timer = root.setInterval(function () {
-      if (auto.checked && !document.hidden && !anyDialogOpen()) reload(false);
-    }, 15000);
+    timer = root.setInterval(autoRefresh, 15000);
     return function () { root.clearInterval(timer); };
   }
 

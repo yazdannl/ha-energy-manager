@@ -8,9 +8,9 @@ with `<script defer>` in `index.html`.
 
 | File | Role |
 | --- | --- |
-| `index.html` | Shell: topbar (with the theme control), nav, `<main id="view">`, live region, confirm `<dialog>`, script tags |
+| `index.html` | Shell: compact topbar (theme control), four-item primary nav plus a contextual sub-row, `<main id="view">`, footer About disclosure, live region, confirm `<dialog>`, script tags |
 | `style.css` | Design layer over Bootstrap's `--bs-*` tokens: palette, spacing/radius scales, every component, motion/focus rules |
-| `app.js` | State, hash router, API client, all seven views, confirm + pending/confirmed write handling |
+| `app.js` | State, hash router, API client, all seven views, the quiet-refresh lifecycle (`state.refresh`/`refreshBlocked()`), confirm + pending/confirmed write handling |
 | `charts.js` | uPlot wrappers (`SEMCharts.plan/mini/forecast/savings/accuracy`) with graceful fallbacks |
 | `mock.js` | Synthetic fixtures for `?mock=1`; also loadable in Node for the static test suite |
 | `vendor/bootstrap.min.css` | Vendored Bootstrap 5.3.3 CSS (MIT) - the reset, grid, utilities, form controls and design tokens. Its JavaScript is **not** vendored; interactions live in `app.js` |
@@ -49,14 +49,25 @@ The `--chart-*` custom properties are a frozen interface - `charts.js` reads the
 `settings-rail`, `settings-group`, `settings-group-body`, `disclosure`, `disclosure-body`, `save-bar`,
 `save-bar-actions`, `segmented`, `switch`, `unit-input`, `theme-state`, plus the setup-card and picker
 vocabulary `setup-cards`, `setup-card`, `setup-list`, `picker`, `picker-current`, `picker-search`,
-`picker-results`, `picker-row`, `picker-text`, `picker-name`, `picker-meta`, `all-settings`. The theme
+`picker-results`, `picker-row`, `picker-text`, `picker-name`, `picker-meta`, `all-settings`, plus the
+layout/answer vocabulary `route-title`, `route-sub`, `answer-authority`, `answer-measured`,
+`answer-planned`, `answer-controls`, `answer-notes`, `answer-results`, `answer-dynamic`, `card-flag`,
+`supporting`, `trust-line`, `window-list`, `log-list`, `log-message`, `settings-toolbar`,
+`settings-columns`, `settings-feedback`, `banner-safety`, `banner-actions`, `dialog-body`,
+`dialog-actions`. The type scale is `--type-11` … `--type-28`; every interactive control is
+≥44 px tall. The theme
 control cycles auto -> dark -> light and persists the choice in `localStorage`.
 
 ## Settings information architecture (SPEC 13.2)
 
-The Settings page opens on **four setup cards** - Price, Meter, Solar, Battery - carrying only the
-primary choice of each topic, with the full form in one collapsed **All settings** drawer below
-(`.all-settings`; open state in `sem.settings.allOpen`). The cards own their keys for the current
+The Settings page has an always-visible toolbar (search + `Show all advanced`) and a Safety summary
+(mode · dry run with a link to the Safety group and to Stop now), then **four dependency-complete
+setup cards** - Price, Meter, Solar, Battery - each carrying every input the current selection needs,
+with the full form in one collapsed **All settings** drawer below (`.all-settings`; open state in
+`sem.settings.allOpen`; rail and form side by side from 720 px via `.settings-columns`). The Battery
+card and the read-only `batteries` provenance line read the canonical `GET /api/v1/batteries`, not the
+settings descriptor. Pending/success/server-rejected feedback lives in the always-visible save bar
+(`.settings-feedback`), and a rejected key is attached to its field with `aria-describedby`. The cards own their keys for the current
 selection (`SEM_APP.setupCardKeys({priceProvider, priceContract, solarSource})`, the pure table the
 render check asserts) and the groups skip exactly those keys, so every setting the API sends is
 rendered **exactly once**. While a search query is active the cards are hidden and the drawer lists
@@ -82,8 +93,14 @@ solarSource})` and `SEM_APP.setupCardKeys({priceProvider, priceContract, solarSo
 - Every number is rendered with its unit (`kW`, `kWh`, `EUR/kWh`, `%`, `cycles`, …).
 - Stale data is marked with a `stale` badge, dashed borders and desaturated chart bars, plus a text
   note — never by colour alone.
+- Navigation and data refresh are separate. A route change re-renders, scrolls to the top and
+  focuses the route `h1`; a background poll calls the view's `state.refresh()` hook, updates values
+  in place and restores focus. `refreshBlocked()` stops every background refresh while a dialog is
+  open, a write is pending, the settings form is dirty or a stop result is on screen, so a poll cannot
+  discard an edit or a failed-stop banner.
 - Writes are never optimistic: the button shows `pending`, then the server response is shown and
-  the affected data is re-fetched. Dangerous actions (auto mode, dry-run off, stop-now, test
+  the affected data is re-fetched. `performWrite` counts in-flight writes so the refresh guard
+  respects them. Dangerous actions (auto mode, dry-run off, stop-now, test
   discharge, battery enable/delete, hardware-moving settings) require an explicit confirm dialog;
   the most dangerous ones also require a checkbox acknowledgement. `Stop now` uses the atomic
   `POST /api/v1/stop` and writes to the hardware even when `dry_run` is on (dry run only suppresses

@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.8.0
+
+- **Every screen now answers first, then explains.** Today opens with the control authority, what the
+  battery is actually doing and what the plan intends, instead of nine equal cards. Plan says whether
+  the horizon saves or loses money before showing the timeline. Forecasts start with the measured
+  error and how fresh the source is. Savings starts with the comparable saving or loss and how many
+  periods actually had a baseline. Log starts with the message. Worked examples, raw capabilities,
+  mappings and long provider notes moved behind named disclosures ("Why this plan?", "Efficiency and
+  wear", "Source details", "Entity mapping", "All slots").
+- **A short navigation instead of seven equal tabs.** Today, Plan, Savings and Manage fit one row on a
+  phone; the second row is contextual (Plan → Forecasts, Manage → Batteries, Settings, Log). All seven
+  pages keep their own link, and each view has one heading that gets focus when you navigate.
+- **Setup cards that can actually finish their job.** The fixed day/night window hours, the day-ahead
+  VAT/energy-tax/import-fee adders, the array's watt peak and the Forecast.Solar plane list are on the
+  card that selects the option, instead of hidden in the advanced drawer. Settings also shows the
+  current authority (mode and dry run) permanently, keeps search and "show all advanced" always
+  visible, and reports saving success or a rejected value in the always-visible save bar — with the
+  server's message attached to the field it rejected. The Battery card reads the battery list Home
+  Assistant actually stores, so an empty or stale descriptor can no longer claim you have no batteries.
+- **Nothing you are reading is thrown away by a refresh.** Polling updates values in place and keeps
+  your scroll position, focus and expanded detail. It pauses while a dialog is open, a change is being
+  saved, you have unsaved settings or a Stop result is on screen. The Log tells you a new entry
+  arrived instead of rebuilding the list you are reading, and Retry now always makes a new request.
+- **One authority, one explanation, one confirmation.** Turning on Auto or turning dry run off asks the
+  same question and gives the same answer wherever you do it; the mode buttons respond on the first
+  click; and a cancelled dry-run change puts the confirmed switch state back. A test discharge now
+  says in plain text what it is waiting for ("Requires Auto and dry run off — currently mode is …").
+- **Numbers you can trust at a glance.** Forecast solar and load are labelled kW (they used to be
+  labelled as energy), forecast error is shown with the unit it is measured in, a day with no forecast
+  data is left blank instead of plotted as zero, partial baselines state their coverage, and "Loss",
+  "Unknown" and "Stale" are separate visible labels. Readability and touch: darker/lighter metadata
+  text that meets contrast in both themes, ~44 px controls, and one type scale instead of many close
+  sizes.
+- **Charts are identifiable without colour.** Each series has a fixed line signature (solid, long
+  dashed or dotted) named in words in the legend, the break-even threshold is dotted and the sell price
+  long-dashed, axis gutters narrow on a phone without dropping their unit, and switching the theme by
+  hand redraws the charts immediately.
+
 ## 0.7.0
 
 - **Wear is derived from your battery, not typed in.** Each battery now takes an optional purchase

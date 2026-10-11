@@ -133,6 +133,25 @@ function classTokens(text) {
     }
   }
 
+  /* ---------- 1b. quiet refresh ---------- */
+  // A background refresh must update in place, never duplicate the answer and never re-render the
+  // route (UI_REVIEW §3.5). This runs before the settings checks so no dirty-form guard is active.
+  console.log("\n1b. quiet refresh (no duplicate answer)");
+  await goto("/dashboard");
+  const answersBefore = byClass(view(), "answer-authority").length;
+  const authorityBefore = answersBefore
+    ? byClass(view(), "answer-authority")[0].textContent
+    : "";
+  // The visibility path is what a returning tab triggers: the one that used to re-render the route.
+  fire("visibilitychange", { type: "visibilitychange" });
+  await sleep(60);
+  const answersAfter = byClass(view(), "answer-authority").length;
+  check("the dashboard answer renders exactly once", answersBefore === 1 && answersAfter === 1,
+    `before=${answersBefore} after=${answersAfter}`);
+  check("a quiet refresh keeps the same answer", answersBefore === 1
+    && (byClass(view(), "answer-authority")[0] || {}).textContent === authorityBefore,
+    "the authority line changed or vanished");
+
   /* ---------- 2. settings structure ---------- */
   console.log("\n2. settings IA (every key present, groups, folding)");
   await goto("/settings");
@@ -218,7 +237,7 @@ function classTokens(text) {
       use.dispatchEvent({ type: "click" });
       await sleep(40);
       const note = view().querySelector(".save-bar .muted");
-      check("using a candidate marks the setting dirty", !!note && /changed, not saved yet/.test(note.textContent), note ? note.textContent : "no save note");
+      check("using a candidate marks the setting dirty", !!note && /unsaved change/.test(note.textContent), note ? note.textContent : "no save note");
     }
   }
   check("advanced rows sit in a disclosure container", byClass(view(), "disclosure").length > 0 || view().querySelectorAll("details").length > 0);
@@ -341,8 +360,8 @@ function classTokens(text) {
     check("theme choice is persisted", [...storage.keys()].some((k) => /theme/i.test(k)), [...storage.keys()].join(","));
   }
 
-  /* ---------- 4. shell ---------- */
-  console.log("\n4. shell (index.html)");
+  /* ---------- 5. shell ---------- */
+  console.log("\n5. shell (index.html)");
   const index = fs.readFileSync(path.join(WEB, "index.html"), "utf8");
   const refs = [...index.matchAll(/(?:href|src)="([^"]+)"/g)].map((m) => m[1]);
   check("no external URLs in index.html", refs.every((r) => !r.includes("://")), refs.filter((r) => r.includes("://")).join(", "));

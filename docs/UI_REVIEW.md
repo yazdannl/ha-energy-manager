@@ -1,8 +1,9 @@
 # UI/UX review — external minimalist review (0.7.0)
 
-**Status: open.** The findings below are not yet triaged into work items. The deliberate
-simplifications and safety rules in [`UI.md`](UI.md) and `SPEC.md` §13 remain in force until a
-change supersedes them; nothing here is a decision to implement.
+**Status: addressed (see §0).** The findings below are kept verbatim as the original critique; §0
+records where each one was implemented and what still needs a live browser. The deliberate
+simplifications and safety rules in [`UI.md`](UI.md) and `SPEC.md` §13 remain in force and were not
+relaxed by any change.
 
 **Scope and method.** An independent external review of the 0.7.0 web UI at commit `d2f475f`, asked
 to judge it as a modern minimalist product UI. The reviewer read the full source under
@@ -40,6 +41,34 @@ naming the temporary artifact directory.
 The full ranked critique, the target-state sketch (navigation, reading hierarchy, tokens, charts,
 copy policy), the quick-win/structural split with effort estimates, the do-not-touch safety and
 accessibility list, and the open questions follow.
+
+## 0. Resolution status
+
+Every actionable finding below has been implemented in the web assets (`app.js`, `charts.js`,
+`index.html`, `style.css`, `mock.js`); the review text itself is unchanged, so §3.x still reads as
+the original critique. Verification at this revision: `node tools/ui_render_check.js` (44/44) and the
+full pytest suite (631 passing, including `test_wp3_ui_render.py`, `test_wp3_assets.py` and
+`test_wp3_mock_contract.py`).
+
+| # | Status | Where the fix lives |
+| --- | --- | --- |
+| 1 | Done | `renderAutopilot()`/`paintAnswer()` lead with authority → measured → planned; warnings/errors first, info demoted to `Recent activity`; one `routeTitle()` per view |
+| 2 | Done | `setupCardKeys()` + cards carry every input of the selected option (fixed day/night hours, day-ahead adders, `solar.capacity_wp`, `solar.planes`); Battery card reads the canonical `GET /batteries`; `batteries` is a read-only provenance line |
+| 3 | Done | one `modeChangeConfirm()`/`dryRunOffConfirm()` policy shared by Today and Settings, confirmation strings unchanged; mode buttons bound once; dry-run restores the server state on cancel/refusal |
+| 4 | Done | four primary nav destinations + contextual sub-row; Plan next-actions vertical window list; message-first Log rows; Savings period+baseline coverage first; ≥44 px targets; test-discharge prerequisite as real text |
+| 5 | Done | `state.refresh()` quiet in-place updates with focus restore; `refreshBlocked()` covers dialogs, pending writes, dirty form and stop results; Log shows "New entries available" instead of rebuilding; scroll-to-top only on deliberate navigation |
+| 6 | Done | `fmtKw` for PV/load power; per-kind MAE units; no zero-filled daily totals (coverage labelled); distinct Loss/Unknown/Stale flags; flattened availability badges; comparable same-period baseline |
+| 7 | Done | answer → qualification → evidence; named disclosures ("Why this plan?", "Efficiency and wear", "Source details", "Entity mapping", "All slots"); `CHOICE_LABELS` display labels without changing API values |
+| 8 | Done | one route title, one surface per panel, borderless metric cards, untinted panel heads, token type/spacing scale |
+| 9 | Done | `--text-muted` for meaningful metadata with both themes verified ≥4.5:1; rail counts read "N customised" with a legend; confidence is neutral text; warning colour reserved for real limitations |
+| 10 | Done | stable line signatures (solid/long-dash/dotted) with semantic legend names; narrow-width axis gutters that keep units; `SEMCharts.refresh()` on explicit theme change |
+| 11 | Done | skip link focuses `#view` without routing; route `h1` focused on navigation; save feedback outside the drawer with `aria-describedby` field errors; `once()` clears rejected caches; explicit numeric-column metadata; consistent dialog body/actions; two-column rail ≥720 px |
+| 12 | Done | compact topbar ("HA connected", no version), commit behind the footer About disclosure, one-line source metadata, quiet driver/enabled text, functional-only badges |
+
+Still requiring the owner's browser (unchanged from §8): live HA layout and screenshots at 360 px and
+zoom, real uPlot legend/cursor/theme behaviour, and screen-reader announcement. Open question 6's
+dialog fallback is now safe by construction: a browser without `showModal` fails closed for
+checkbox-required actions instead of resolving a bare `window.confirm`.
 
 ## 1. Verdict
 
@@ -278,7 +307,7 @@ Estimates are hands-on time for one developer familiar with this plain-JS app, i
 | Quiet refresh model preserving scroll, focus, form drafts, opened rows and result banners; independent retryable loading | 2–4 days | Shared lifecycle rework, not cosmetic CSS |
 | Savings coverage/comparable-cost presentation and forecast trust-first summaries | 1–3 days | Use existing bucket/report data where sufficient; do not invent unsupported metrics |
 | Touch/keyboard chart inspection plus accessible value alternatives | 1–2 days | Plain DOM controls and vendored uPlot hooks |
-| Browser acceptance in HA at 360/720/desktop, both themes, zoom and keyboard | 1–2 days | Owner/browser access required; not replaced by 42 shim checks |
+| Browser acceptance in HA at 360/720/desktop, both themes, zoom and keyboard | 1–2 days | Owner/browser access required; not replaced by 44 shim checks |
 
 A **1–2 day CSS-only pass** can improve tone, target size and contrast, but cannot solve authority ambiguity, setup dependencies or refresh data loss. A focused first redesign slice—safety/units first, then Today hierarchy, complete setup and phone navigation—is roughly **5–8 working days**; the broader structural work and browser acceptance are roughly **10–15 working days**, with overlapping work not counted twice. Stay within the existing stack throughout.
 

@@ -513,9 +513,14 @@
       .sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; })
       .map(function (row) {
         var key = row[0];
+        var value = Object.prototype.hasOwnProperty.call(db.settings, key) ? db.settings[key] : row[2];
+        // The `batteries` setting is server-managed and GET /api/v1/batteries is the canonical
+        // inventory, so the descriptor mirrors the fleet instead of the shipped empty default
+        // (UI_REVIEW §8.3). Nothing writes this value through the settings form.
+        if (key === "batteries") value = batteryList().map(function (record) { return record.config; });
         return {
           key: key,
-          value: Object.prototype.hasOwnProperty.call(db.settings, key) ? db.settings[key] : row[2],
+          value: value,
           type: row[1],
           default: row[2],
           label: row[3],

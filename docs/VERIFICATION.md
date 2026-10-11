@@ -16,14 +16,15 @@ loopback addresses and placeholder coordinates.
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
 | Test suite | `python3 -m pytest tests -q` | **631 passed** (two consecutive runs) |
-| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 90 files scanned`, exit 0 |
+| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 91 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
+| Headless UI render check | `node tools/ui_render_check.js` | **44 passed, 0 failed**, exit 0 |
 
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (77 files, documentation excluded)**:
-  `be90facad864490c51fb83827786e4d37516bbd125a9ce4a2e3f7f5539c2c2f7`
+  `8ad4bb653b5b7589415e1453f7ba3b8e8ca498ec3e1a36b0f16aad42952b8fcd`
 * **path list of the same 77 files** (detects an added, removed or renamed file):
   `63e3910878cca4ec6ac8802e98b49448c7d6655eab98076ddfcf1d0140adf88b`
 
@@ -358,8 +359,8 @@ independently re-downloaded and compared, not just recorded).
 **What the redesign guarantees, and the gate that holds it.** `tools/ui_render_check.js` (run by
 `tests/test_wp3_ui_render.py`, skipped when node is absent) renders the real `app.js` and `mock.js`
 through a dependency-free DOM shim (`tools/ui_dom_shim.js`, ~300 lines: elements, attributes,
-`classList`, `dataset`, `isConnected`, closed-`<details>` semantics) and asserts **42** properties of
-the result. The load-bearing ones:
+`classList`, `dataset`, `isConnected`, closed-`<details>` semantics) and asserts **44** properties of
+the result (42 at 0.7.0; §8.3 added the quiet-refresh pair). The load-bearing ones:
 
 * all seven views render from mock data with no `undefined` or `NaN` in the output;
 * every setting the API sends is reachable: selecting each group through the rail and scanning the
@@ -458,7 +459,8 @@ Two behaviours were added to make the cards real rather than decorative:
   bound and the forecast says so. An explicit `solar.capacity_wp` wins; no export history, fewer than
   24 usable daylight samples or an unmappable battery flow is a status, never a crash.
 
-What the gates prove here: the render check (42 properties) asserts the cards, their key ownership and
+What the gates prove here: the render check (44 properties at 0.8.0) asserts the cards, their key
+ownership and
 a real picker round-trip against the mock; `test_setup_card_keys_are_the_primary_surface` pins the pure
 key table per provider/contract/solar source; `test_wp2a_price.py` covers the derived sell price, the
 tax-refund switch and the per-slot tax extraction; `test_wp2a_solar.py` covers the envelope fit, the
@@ -519,6 +521,58 @@ separate session) was run on this wave. It found the missing `eta_discharge` in 
 forecast covered every hour of a non-UTC horizon (fixed), and NASA cache I/O outside the exception
 handler (fixed). Its remaining findings are either pre-existing or accepted approximations, and are
 listed in the bullet above and SPEC §7.1.1a/§7.1.2 rather than silently dropped.
+
+### 8.3 Review-driven interface rework (0.8.0)
+
+An external UI/UX review of the shipped 0.7.0 interface (`docs/UI_REVIEW.md`, 12 findings: 6 High,
+5 Medium, 1 Low) was implemented in full; §0 of that document maps each finding to the code that
+answers it. The load-bearing changes:
+
+* **Answer-first views.** Today leads with the control authority, the measured battery behaviour and
+  the planned action; Plan leads with the saving/loss against the baseline; Forecasts lead with the
+  measured error and freshness; Savings leads with the comparable saving and its baseline coverage
+  ("Baseline available for N of M periods"); Settings leads with a persistent Safety summary; Log
+  leads with the dispatch outcome. Worked examples, raw capabilities, mappings and full notes moved
+  behind named `<details>` disclosures.
+* **One authority policy.** Auto and dry-run-off share one confirmation implementation and one
+  explanation of the dispatcher/Stop distinction across Today and Settings; the Today mode buttons
+  are built once outside the re-rendered region, so a poll can no longer swallow the first click, and
+  a refused or cancelled dry-run change restores the server's confirmed state.
+* **Dependency-complete setup cards.** The fixed day/night window hours, the day-ahead VAT/energy-tax/
+  import-fee adders, `solar.capacity_wp` and `solar.planes` now sit on the card that selects the
+  option. The Battery card and the `batteries` settings row read the canonical
+  `GET /api/v1/batteries` inventory instead of the settings descriptor (open question 3 of the
+  review); the descriptor is shown as read-only provenance.
+* **Quiet refresh.** Navigation and data refresh are separated: a route change focuses the route
+  `h1`, while polls call a view's `state.refresh()` hook and update in place, restoring focus.
+  `refreshBlocked()` blocks every background refresh while a dialog is open, a write is in flight,
+  the settings form is dirty or a stop result is on screen; `once()` clears a rejected cache so
+  `Retry` re-requests. `renderInto()` now clears its host before drawing — without that fix each poll
+  appended a second copy of the answer, which the render check now pins.
+* **Truthfulness of numbers and state.** Forecast PV/load power is labelled kW (`fmtKw`), MAPE/MAE
+  use the metric's own unit, daily totals are never zero-filled, Loss/Unknown/Stale are separate
+  visible flags, the availability badges are flattened (they had stringified to `[object Object]`),
+  and prose table columns are declared as such so only numeric columns right-align.
+* **Visual and accessibility pass.** One route title and one surface per panel, borderless metric
+  cards, untinted panel heads, a token type scale and 4/8/16/24/32 spacing scale; `--text-muted`
+  carries meaningful metadata with contrast measured ≥4.5:1 in both themes; ≥44 px targets;
+  `Skip to content` focuses `#view` without changing the route hash. A browser without
+  `showModal` fails closed for checkbox-required confirms instead of resolving a bare
+  `window.confirm`.
+* **Charts.** Stable non-colour series signatures (solid / long dash / dotted) named in words in the
+  legend, narrower axis gutters below ~480 px that keep their units, and `SEMCharts.refresh()` on an
+  explicit theme change (previously only `prefers-color-scheme` changes refreshed a mounted chart).
+
+What the gates prove: `node tools/ui_render_check.js` asserts 44 properties, including that the
+dashboard answer renders exactly once and survives a visibility-triggered quiet refresh; the pytest
+suite (631) holds the frozen contracts, the settings-IA pure tables and the copy rules.
+`docs/UI.md` and `docs/REFERENCE.md` §2 were updated in the same change, and
+`energy_manager/CHANGELOG.md` carries the user-facing entry.
+
+Not verified (the same limit as every wave: the ingress panel needs the owner's browser session, and
+this machine has none): the live HA layout above the fold at 360 px and 200 % zoom, real uPlot legend,
+cursor and touch behaviour, and what assistive technology announces for route focus, repeated live
+regions and sticky-bar occlusion. Those remain the review's §8 open questions 1, 2 and 7.
 
 ---
 
@@ -626,10 +680,10 @@ node tools/ui_render_check.js
 
 Frozen digests — manifest digests over the file sets the two recipes select. Both stages are sorted
 under `LC_ALL=C`, which makes the value independent of `find` order and of the locale (a single `sort`
-produces a different value). The `wc -l` count is the cross-check (91 and 77).
+produces a different value). The `wc -l` count is the cross-check (92 and 77).
 
 ```sh
-# all files (91)
+# all files (92)
 find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache \
         -o -name node_modules -o -name .mypy_cache \) -prune -o -type f -print \
   | LC_ALL=C sort | xargs sha256sum | LC_ALL=C sort | sha256sum
@@ -648,4 +702,4 @@ find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name 
 ```
 
 To check the selected file count on its own, run the same `find … -print | LC_ALL=C sort | wc -l`
-part of either recipe: it must print 91 (all files) or 77 (code + tests only).
+part of either recipe: it must print 92 (all files) or 77 (code + tests only).

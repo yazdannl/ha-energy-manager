@@ -16,7 +16,7 @@
   --border: #2e3a49;
   --text: #e7edf4;
   --text-muted: #9fb0c3;
-  --text-dim: #7688a0;
+  --text-dim: #8ba0b8;
 
   --accent: #58a6ff;
   --accent-ink: #0b1b2e;
@@ -78,7 +78,7 @@
   --border: #ccd7e4;
   --text: #16202b;
   --text-muted: #4c5c70;
-  --text-dim: #6b7c92;
+  --text-dim: #59697d;
 
   --accent: #1c62c4;
   --accent-ink: #ffffff;
@@ -128,7 +128,7 @@
     --border: #ccd7e4;
     --text: #16202b;
     --text-muted: #4c5c70;
-    --text-dim: #6b7c92;
+    --text-dim: #59697d;
 
     --accent: #1c62c4;
     --accent-ink: #ffffff;
@@ -276,7 +276,7 @@ a { color: var(--accent); }
 }
 .brand { margin: 0; display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: baseline; }
 .brand-title { font-weight: 700; letter-spacing: 0.01em; }
-.brand-sub { color: var(--text-dim); font-size: 0.8rem; font-family: var(--mono); }
+.brand-sub { color: var(--text-muted); font-size: 0.8rem; font-family: var(--mono); }
 .topbar-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; margin-left: auto; }
 
 .conn {
@@ -335,7 +335,7 @@ main:focus { outline: none; }
 .footer {
   border-top: 1px solid var(--border);
   padding: var(--sp-3) var(--sp-3) var(--sp-5);
-  color: var(--text-dim);
+  color: var(--text-muted);
   font-size: 0.8rem;
   max-width: 1200px;
   width: 100%;
@@ -371,7 +371,6 @@ main:focus { outline: none; }
   align-items: center;
   justify-content: space-between;
   padding: var(--sp-2) var(--sp-3);
-  background: var(--panel-2);
   border-bottom: 1px solid var(--border);
 }
 .panel-head h2 { margin: 0; }
@@ -401,6 +400,15 @@ main:focus { outline: none; }
   min-width: 0;
   height: auto;
   word-wrap: break-word;
+}
+/* Metric cards are separators and type, not containers: the panel around them is already the one
+   surface (UI_REVIEW §3.8). Cards outside a panel keep their border. */
+.panel-body .card {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding-left: 0;
+  padding-right: 0;
 }
 .card-label { color: var(--text-muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }
 .card-value { font-size: 1.35rem; font-weight: 650; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
@@ -578,7 +586,7 @@ input[type="checkbox"], input[type="radio"] { width: auto; }
 .fields { display: grid; gap: var(--sp-3); grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
 .field { display: grid; gap: var(--sp-1); min-width: 0; }
 .field > label, .field-label { font-weight: 600; font-size: 0.85rem; }
-.field-key { color: var(--text-dim); font-size: 0.75rem; font-family: var(--mono); overflow-wrap: anywhere; }
+.field-key { color: var(--text-muted); font-size: 0.75rem; font-family: var(--mono); overflow-wrap: anywhere; }
 .field-help { color: var(--text-muted); font-size: 0.78rem; }
 .field-error { color: var(--danger); font-size: 0.8rem; font-weight: 600; }
 .field-dirty { border-left: 3px solid var(--accent); padding-left: var(--sp-2); }
@@ -894,7 +902,8 @@ tbody tr:hover { background: var(--panel-2); }
 }
 
 @media (max-width: 480px) {
-  main { padding: var(--sp-2) var(--sp-2) var(--sp-5); }
+  /* 16 px side gutters stay on a phone: text touches chrome otherwise (UI_REVIEW §3.12). */
+  main { padding: var(--sp-3) var(--sp-3) var(--sp-5); }
   .topbar { padding: var(--sp-2); }
   .cards { grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); }
   .card-value { font-size: 1.15rem; }
@@ -958,8 +967,309 @@ tbody tr:hover { background: var(--panel-2); }
 .picker-text { min-width: 0; }
 .picker-name { font-size: 0.85rem; }
 .picker-meta {
-  color: var(--text-dim);
+  color: var(--text-muted);
   font-size: 0.72rem;
   font-family: var(--mono);
   overflow-wrap: anywhere;
+}
+
+/* =====================================================================
+   Visual system pass (UI_REVIEW findings F1, F2, F8, F9, F12)
+   ---------------------------------------------------------------------
+   Two densities of card, one type scale, one surface per panel: headings
+   at --type-18, primary values at --type-22, body at --type-15, metadata
+   at --type-13. Spacing reuses the existing 4/8/16/24/32 scale above; no
+   ad-hoc pixel values. Nothing sets a border and a background at the same
+   time, so there are no nested shells (UI_REVIEW §3.8). */
+
+/* ---------- type scale ---------- */
+
+:root {
+  --type-11: 0.6875rem; /* fine print, axis labels                       */
+  --type-12: 0.75rem;   /* metadata, badges, key chips                   */
+  --type-13: 0.8125rem; /* notes, secondary lines, table body            */
+  --type-15: 0.9375rem; /* body default                                 */
+  --type-16: 1rem;      /* emphasised body text                          */
+  --type-18: 1.125rem;  /* panel headings and the answer line            */
+  --type-22: 1.375rem;  /* primary values                                */
+  --type-28: 1.75rem;   /* route titles only                             */
+}
+
+/* ---------- route titles: one per view, the only h1 ---------- */
+
+h1.route-title {
+  margin: 0;
+  font-size: var(--type-28);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+h1.route-title:focus { outline: none; }
+.route-sub {
+  color: var(--text-muted);
+  font-size: var(--type-13);
+  margin: calc(-1 * var(--sp-1)) 0 0;
+  max-width: 70ch;
+}
+
+/* ---------- answer strip (Today): answer first, detail after ---------- */
+
+.answer-authority {
+  margin: 0;
+  font-size: var(--type-18);
+  font-weight: 650;
+}
+.answer-measured,
+.answer-planned {
+  margin: 0;
+  font-size: var(--type-15);
+}
+.answer-measured { color: var(--text); }
+.answer-planned { color: var(--text-muted); font-size: var(--type-13); }
+
+/* The quiet controls row: mode state and confirmations live here, not in a second card. */
+.answer-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--sp-2) var(--sp-3);
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--border);
+}
+.answer-controls .btn { margin: 0; }
+
+.answer-notes {
+  color: var(--text-muted);
+  font-size: var(--type-13);
+  display: grid;
+  gap: var(--sp-1);
+}
+.answer-notes > :last-child { margin-bottom: 0; }
+.answer-notes[hidden] { display: none; }
+
+/* "Confirmed by the server" / "Pending…" / a rejected control: prose, never a colour alone. */
+.control-state { margin: 0; font-size: var(--type-13); color: var(--text-muted); }
+.control-state:empty { display: none; }
+
+/* A server-confirmed Stop result is an outcome, so it keeps a bordered surface. */
+.answer-results { display: grid; gap: var(--sp-2); }
+.answer-results:empty { display: none; }
+
+/* ---------- card flags: a word for the card state, not only a colour ---------- */
+
+.card-flag {
+  display: block;
+  font-size: var(--type-12);
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+  margin-top: var(--sp-1);
+}
+.card-stale { border-left: 3px dashed var(--text-dim); }
+.card-loss { border-left: 3px solid var(--danger); }
+.card-loss .card-flag { color: var(--danger); }
+.card-unknown { border-left: 3px solid var(--text-dim); }
+.card-unknown .card-value,
+.card-stale .card-value { color: var(--text-muted); }
+
+/* ---------- primary values ---------- */
+
+.card-value { font-size: var(--type-22); font-weight: 650; }
+.card-label { font-size: var(--type-12); }
+.card-sub { font-size: var(--type-13); }
+.stat-label { font-size: var(--type-12); }
+.stat-value { font-size: var(--type-15); }
+
+/* ---------- answering statements (savings / plan) ---------- */
+
+.answer-gain { color: var(--ok); }
+.answer-loss { color: var(--danger); }
+.plan-answer { font-size: var(--type-16); margin: 0; }
+.answer-gain .unit,
+.answer-loss .unit { color: inherit; }
+
+/* A one-line trust statement beside its value (measured error, coverage, baseline). */
+.trust-line {
+  color: var(--text-muted);
+  font-size: var(--type-13);
+  margin: 0;
+}
+
+/* ---------- quiet supporting metrics ---------- */
+
+.panel-quiet {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  border-top: 1px solid var(--border);
+  padding-top: var(--sp-2);
+}
+.panel-quiet .panel-head { border-bottom: 0; padding-bottom: var(--sp-1); }
+.panel-quiet .panel-body { padding: var(--sp-1) 0 0; }
+
+/* ---------- next actions (vertical window list) ---------- */
+
+.window-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-2); }
+.window-list li {
+  display: grid;
+  gap: var(--sp-1);
+  padding-left: var(--sp-3);
+  border-left: 3px solid var(--accent);
+}
+.window-time { font-weight: 650; font-variant-numeric: tabular-nums; font-size: var(--type-13); }
+.window-action { margin: 0; font-size: var(--type-15); }
+.window-reason { margin: 0; color: var(--text-muted); font-size: var(--type-13); }
+
+/* ---------- log: message first ---------- */
+
+.log-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-2); }
+.log-list > li {
+  display: grid;
+  gap: var(--sp-1);
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--border);
+}
+.log-list > li:last-child { border-bottom: 0; padding-bottom: 0; }
+.log-message { margin: 0; font-size: var(--type-15); overflow-wrap: anywhere; }
+.log-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-1) var(--sp-2);
+  font-size: var(--type-12);
+  color: var(--text-muted);
+}
+.log-meta .badge { font-size: var(--type-11); }
+
+/* ---------- settings: header toolbar, safety summary, feedback, two columns ---------- */
+
+.settings-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--sp-2) var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.settings-toolbar .field { flex: 1 1 14rem; }
+
+/* The next review note: settings are a form, so the next note belongs next to the form, not in
+   the header region. */
+.settings-feedback:empty { display: none; }
+
+/* The rail and the form side by side from 720 px; one column only on a phone. */
+.settings-columns {
+  display: grid;
+  gap: var(--sp-3);
+  grid-template-columns: 1fr;
+  align-items: start;
+}
+@media (min-width: 720px) {
+  .settings-columns { grid-template-columns: minmax(11rem, 15rem) minmax(0, 1fr); }
+}
+
+/* Safety summary: an always-visible banner, because the authority is never metadata. */
+.banner-safety {
+  border-left-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 6%, transparent);
+}
+.banner-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin: var(--sp-1) 0 0; }
+
+.settings-group > .settings-group-head { background: transparent; }
+
+.legend-note { margin: 0; font-size: var(--type-12); }
+
+/* ---------- nav: primary group + contextual sub-row ---------- */
+
+#nav { display: grid; gap: 0; }
+#nav ul { flex-wrap: wrap; }
+.nav-primary li { flex: 1 1 0; }
+#nav .nav-primary a {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 0.4rem var(--sp-2);
+  font-size: var(--type-15);
+  border-radius: var(--radius-sm);
+}
+#nav .nav-sub a {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0.2rem var(--sp-2);
+  font-size: var(--type-13);
+}
+#nav .nav-sub[hidden] { display: none; }
+
+/* ---------- dialogs: header/body/actions instead of one padded box ---------- */
+
+.dialog-body { padding: var(--sp-2) var(--sp-3); }
+.dialog-actions {
+  justify-content: flex-end;
+  padding: var(--sp-2) var(--sp-3) var(--sp-3);
+  margin: 0;
+  border-top: 1px solid var(--border);
+}
+
+/* ---------- battery cards: one surface, separators, no nested boxes ---------- */
+
+.battery-card { display: grid; gap: var(--sp-2); padding: var(--sp-3) 0; }
+.battery-card:first-child { padding-top: 0; }
+.battery-card + .battery-card { border-top: 1px solid var(--border); }
+.battery-head h3 { margin: 0; font-size: var(--type-16); }
+.battery-note:empty { display: none; }
+
+/* ---------- footer disclosure ---------- */
+
+.footer-help p { max-width: 70ch; margin: var(--sp-1) 0 0; font-size: var(--type-12); }
+.footer-help[hidden] { display: none; }
+
+/* ---------- compact topbar ---------- */
+
+.topbar { padding: var(--sp-1) var(--sp-3); }
+.brand-title { font-size: var(--type-15); }
+.conn { font-size: var(--type-13); }
+
+/* ---------- tables: ≥44 px row height on touch devices too ---------- */
+
+td, th { padding: var(--sp-2); }
+
+/* ---------- Today's dynamic area and the quiet supporting row ---------- */
+
+/* The re-rendered region: authority, measured, planned, notes. It owns no shell of its own so the
+   panel around it stays the one surface. */
+.answer-dynamic { display: grid; gap: var(--sp-1); }
+.answer-dynamic:empty { display: none; }
+
+/* Secondary Today metrics: present, unemphasised, never competing with the controls. */
+.cards.supporting { margin-top: var(--sp-1); }
+.cards.supporting .card-label { font-weight: 500; }
+.cards.supporting .card-value { font-size: var(--type-16); font-weight: 600; }
+
+/* The dry-run toggle's label is prose, not a control caption. */
+.switch-label { display: inline-flex; align-items: center; gap: var(--sp-2); font-size: var(--type-13); }
+.switch-label .switch { margin: 0; }
+
+/* ---------- touch targets: ≥44 px on every interactive control (UI_REVIEW §3.4) ---------- */
+
+.btn { min-height: 2.75rem; }
+.disclosure > summary { min-height: 2.75rem; }
+.segmented > button,
+.segmented > a,
+.segmented > label { min-height: 2.75rem; display: inline-flex; align-items: center; }
+.settings-rail button,
+.settings-rail a { min-height: 2.5rem; }
+.picker-row { min-height: 2.75rem; }
+/* 8 px around a destructive control, so a thumb cannot hit Delete while aiming at Test. */
+.battery-actions { gap: var(--sp-2); }
+.card-actions, .panel-actions { gap: var(--sp-2); }
+
+/* The driver name is an identifier, so it reads as monospace text, not a badge. */
+.battery-driver { font-family: var(--mono); font-size: var(--type-12); color: var(--text-muted); }
+
+@media (max-width: 480px) {
+  .btn { min-height: 2.75rem; }
+  #nav .nav-primary a { min-height: 2.75rem; }
 }
