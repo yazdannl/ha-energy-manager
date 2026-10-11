@@ -24,8 +24,9 @@ The full documentation lives in the [repository README](https://github.com/yazda
 4. Open *Settings*: pick your price provider on the **Price** card and (optionally) choose how the
    add-on should know your PV on the **Solar** card. The **Meter** card can stay empty: the add-on
    reads the meter from your Home Assistant **Energy dashboard** (its power sensor, or its
-   import/export energy counters) — search and pick one there only to override that. Leave the mode
-   at `advisory` for a few days.
+   import/export energy counters) — search and pick one there only to override that. The card shows
+   the resolved roles, and **Use the Energy dashboard** clears an override again. Leave the mode at
+   `advisory` for a few days.
 5. Watch *Plan* and *Log* to see what the add-on would have done, then enable `auto` (with
    `dry_run` still on) when you trust it.
 

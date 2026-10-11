@@ -16,7 +16,7 @@ next to it.
 | `app/config.py` | Option defaults, option/settings parsing and merging, location resolution. |
 | `app/harest.py` | Home Assistant REST client (states, history, statistics, service calls), with retries and timeouts. |
 | `app/haws.py` | Minimal home-grown WebSocket client (handshake, framing) for liveness/session probes and APIs that only exist over the socket. |
-| `app/grid.py` | Effective grid roles: explicit `grid.*` settings first, else the Home Assistant Energy dashboard (`energy/get_prefs`), with a small cache and energy counters as the history fallback. |
+| `app/grid.py` | Effective grid roles: explicit `grid.*` settings first, else the Home Assistant Energy dashboard (`energy/get_prefs`), with a small cache and energy counters as the history fallback; `dashboard_roles()` exposes the dashboard's own roles even under an override, which `engine.grid_resolution()` serves to the settings panel. |
 | `app/store.py` | SQLite persistence: schema migrations, plans, measurements, actuals, dispatch log, events, settings, learned profiles. |
 | `app/sources/price.py` | Price forecast providers (`zonneplan_entity`, `energy_charts`, `entity_forecast`, `static`), unit normalisation and the fallback chain. |
 | `app/sources/solar.py` | PV forecast provider (Forecast.Solar, keyless or with a personal key; capacity/derived model with NASA POWER observed clearness), plane summation, cache and bias correction. |

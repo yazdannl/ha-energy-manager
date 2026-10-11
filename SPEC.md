@@ -792,7 +792,8 @@ GET  /api/v1/discover?kind=battery|price|solar|load|grid
 GET  /api/v1/config            -> {options:{...}, settings:[{key, value, type, default,
                                                           label, help, group, choices,
                                                           advanced}],
-                                   price_warnings:[{key, message}]}
+                                   price_warnings:[{key, message}],
+                                   grid:{source, note, explicit:{grid.*}, dashboard:{role}}}
 PATCH /api/v1/config           -> {settings:{key:value}}  -> 200 {applied:[...], errors:[...]}
                                    Unknown or invalid keys are reported per key in errors (never as a whole
                                    request failure), because the settings form renders them field by field.
@@ -1000,6 +1001,11 @@ drawer**:
 - Entity pickers ask `GET /api/v1/discover`, list the candidates with a `Use` action and write the
   row's `setting_key` (falling back to the card's own key); a typed entity id can always be used
   directly, so a sensor discovery ranks poorly is still reachable.
+- The Meter card names the grid meter's provenance (§3): while every `grid.*` key is empty it shows
+  the roles the Home Assistant Energy dashboard resolves (`config.grid.dashboard`); a saved or
+  edited `grid.*` value is labelled as an override of that fallback, the dashboard's roles stay
+  visible, and a `Use the Energy dashboard` action clears every explicit `grid.*` key through the
+  normal dirty/Save flow.
 - A `save-bar` (sticky, outside the drawer) shows how many keys are changed with Save and Revert;
   navigating away with unsaved changes asks first.
 
@@ -1320,6 +1326,17 @@ round, with the reason:
   meter-derived estimate instead of failing, and reports `no_pv_source` only when no meter
   resolves, attaching the derived failure (`status.detail.derived_fallback`) and a note to the
   hint. The user chose the automatic fallback over leaving the hint.
+
+- **§13.2 (Meter-card grid provenance; requested 2026-10-11, "the meter info is still not coming
+  from ha energy section")** — the runtime fallback above landed in 0.9.0 but was invisible: the
+  card showed only the (empty) setting, and a saved `grid.*` value silently disabled the fallback
+  with no way to clear it from the panel. `GET /api/v1/config` now carries
+  `grid:{source, note, explicit, dashboard}` (`engine.grid_resolution()`; `dashboard` is every role
+  the Energy dashboard offers, explicit overrides included), and the Meter card renders it: the
+  resolved roles while the settings are empty, an explicit "Set here; this overrides …" label plus
+  the dashboard's roles, and a `Use the Energy dashboard` button that clears `grid.power_entity`,
+  `grid.import_entity` and `grid.export_entity` through the normal dirty/Save flow. Additive
+  payload key; the settings themselves stay blank ("runtime default everywhere").
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

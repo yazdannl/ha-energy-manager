@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.1
+
+- **The Meter card now shows where the grid meter comes from.** With every `grid.*` key empty it
+  names the roles the add-on resolved from the Home Assistant Energy dashboard ("From the Home
+  Assistant Energy dashboard: signed power …, import counter …"); a saved value is labelled as an
+  override of that fallback, with the dashboard's own roles beside it, and a **Use the Energy
+  dashboard** button clears `grid.power_entity` / `grid.import_entity` / `grid.export_entity` back to
+  the automatic path. The settings themselves stay empty - this only makes the 0.9.0 runtime default
+  visible (and escapable), since a saved value previously disabled it with no way back from the UI.
+
 ## 0.9.0
 
 - **The meter now comes from your Energy dashboard by default.** The add-on reads `energy/get_prefs`

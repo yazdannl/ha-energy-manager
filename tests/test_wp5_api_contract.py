@@ -449,7 +449,10 @@ def test_discover_candidates_shape_and_cap(wired):
 def test_config_contract_types_choices_and_safety_group(wired):
     status, _headers, body = wired.json("GET", "/api/v1/config")
     assert status == 200
-    assert set(body) == {"options", "settings", "conflicts", "price_warnings"}
+    assert set(body) == {"options", "settings", "conflicts", "price_warnings", "grid"}
+    # SPEC 3/10: the Meter card's grid provenance is always present, even when nothing resolved
+    assert set(body["grid"]) == {"source", "note", "explicit", "dashboard"}
+    assert isinstance(body["grid"]["explicit"], dict) and isinstance(body["grid"]["dashboard"], dict)
     # SPEC 5/10: additive option-conflict list, empty when no stored setting overrides an option
     assert body["conflicts"] == [] or (
         isinstance(body["conflicts"], list)

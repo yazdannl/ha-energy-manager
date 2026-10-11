@@ -113,7 +113,9 @@ disclosure per group).
 If the **Meter** card is left empty, the add-on resolves the meter from your Home Assistant **Energy
 dashboard** (the same grid source the Energy panel already uses): the dashboard's signed power sensor
 for live sampling and control, or its import/export energy counters as a long-term-statistics history
-source when no power sensor is configured. An explicit `grid.*` value always wins.
+source when no power sensor is configured. An explicit `grid.*` value always wins. The Meter card
+shows which roles were resolved; a saved value is labelled as an override of the dashboard, and
+**Use the Energy dashboard** clears it back to the automatic path.
 
 **The sell price is derived from the buy price by default**: `sell = buy − feed-in cost`, minus the
 energy-tax component when `price.feed_in_energy_tax_refund` is off. That is what a saldering contract

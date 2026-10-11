@@ -173,6 +173,14 @@ class GridMapping:
                 roles[role] = entity
         return roles
 
+    def dashboard_roles(self) -> dict[str, str]:
+        """Every role the Energy dashboard offers, explicit overrides included or not.
+
+        The settings panel shows this so a saved override can be told apart from the fallback it
+        replaces; the effective mapping itself stays :meth:`power_roles`/:meth:`history_roles`.
+        """
+        return dict(self._prefs_roles())
+
     def power_roles(self) -> dict[str, str]:
         """Live power roles for the sampler, control and the derived tiers."""
         explicit = self.explicit_roles()

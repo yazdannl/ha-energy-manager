@@ -1312,6 +1312,35 @@ class Engine:
                     roles[role] = entity
         return roles
 
+    def grid_resolution(self) -> dict[str, Any]:
+        """Grid provenance for the settings panel (SPEC 3).
+
+        ``explicit`` names the ``grid.*`` keys the user has set, ``dashboard`` every role the
+        Energy dashboard offers (its power roles plus the energy counters, which have no setting
+        key of their own), and ``source`` which of the two the effective mapping comes from.
+        """
+        explicit = {
+            key: entity
+            for key, entity in (
+                (key, str(self._settings.get(key, "") or ""))
+                for key in GRID_ROLE_SETTINGS.values()
+            )
+            if entity
+        }
+        dashboard: dict[str, str] = {}
+        if self._grid_mapping is not None:
+            dashboard = self._grid_mapping.dashboard_roles()
+        if explicit:
+            source = "settings"
+        elif any(dashboard.get(role) for role in GRID_ROLE_SETTINGS):
+            source = "energy_dashboard_power"
+        elif dashboard:
+            source = "energy_dashboard_energy"
+        else:
+            source = ""
+        note = self._grid_mapping.note() if self._grid_mapping is not None else ""
+        return {"source": source, "note": note, "explicit": explicit, "dashboard": dashboard}
+
     def _registry_entries(self, now: datetime) -> list[dict[str, Any]]:
         if self._registry_source is None:
             return []

@@ -177,6 +177,19 @@ def test_explicit_settings_win_and_the_dashboard_is_never_read():
     assert ws.reads == 0
 
 
+def test_dashboard_roles_stay_visible_under_an_explicit_override():
+    mapping = GridMapping(
+        settings(**{"grid.power_entity": "sensor.example_my_meter"}),
+        ws_factory=lambda: FakeWS(POWER_PREFS),
+    )
+    # The panel needs the dashboard's own roles even when the effective mapping is explicit, so
+    # the override can be told apart from the fallback it replaces.
+    assert mapping.dashboard_roles()["grid_power"] == "sensor.example_net_power"
+    assert mapping.dashboard_roles()["grid_energy_import"] == "sensor.zonneplan_electricity_consumption_today"
+    assert mapping.power_roles() == {"grid_power": "sensor.example_my_meter"}
+    assert mapping.source() == "settings"
+
+
 def test_power_roles_come_from_the_dashboard_and_energy_stays_for_history():
     ws = FakeWS(POWER_PREFS)
     mapping = GridMapping(settings(), ws_factory=lambda: ws)

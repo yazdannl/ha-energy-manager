@@ -223,6 +223,20 @@ function classTokens(text) {
   const cardFields = [...byClass(view(), "setup-cards")[0]?.querySelectorAll("[data-key]") || []].map((f) => f.dataset.key);
   check("every card key is rendered on a card", [...cardKeys].every((key) => cardFields.includes(key)), `cards render ${cardFields.join(", ")}`);
 
+  // SPEC 3: the Meter card names the Energy-dashboard fallback and lets a saved override go back
+  // to it. The mock serves the dashboard roles and mirrors the engine's grid_resolution().
+  function meterCardNode() {
+    const host = byClass(view(), "setup-cards")[0];
+    if (!host) return null;
+    return [...host.querySelectorAll(".setup-card")].find((card) => /The live power the add-on follows/.test(card.textContent)) || null;
+  }
+  const meterText = () => (meterCardNode() ? meterCardNode().textContent : "");
+  check(
+    "the Meter card shows the Energy-dashboard fallback",
+    /From the Home Assistant Energy dashboard: signed power sensor\.example_net_power/.test(meterText()),
+    meterText().slice(0, 180),
+  );
+
   // The pickers must really work against /discover: Find lists candidates, Use marks the key dirty.
   const picker = byClass(view(), "picker")[0];
   check("the meter/solar cards render searchable pickers", byClass(view(), "picker").length >= 2, `${byClass(view(), "picker").length} pickers`);
@@ -238,6 +252,22 @@ function classTokens(text) {
       await sleep(40);
       const note = view().querySelector(".save-bar .muted");
       check("using a candidate marks the setting dirty", !!note && /unsaved change/.test(note.textContent), note ? note.textContent : "no save note");
+      // The candidate made a grid.* key dirty: the card must switch to the override branch, name
+      // the fallback it replaces, and offer to go back to it (SPEC 3).
+      check(
+        "a dirty grid value is labelled as an override",
+        /overrides the Home Assistant Energy dashboard/.test(meterText()) && /The Energy dashboard has signed power sensor\.example_net_power/.test(meterText()),
+        meterText().slice(0, 220),
+      );
+      const useDashboard = meterCardNode() ? [...meterCardNode().querySelectorAll("button")].find((b) => /Use the Energy dashboard/.test(b.textContent)) : null;
+      check("the override offers a way back to the Energy dashboard", !!useDashboard);
+      if (useDashboard) {
+        useDashboard.dispatchEvent({ type: "click" });
+        await sleep(40);
+        check("clearing the override restores the fallback text", /From the Home Assistant Energy dashboard/.test(meterText()), meterText().slice(0, 180));
+        const cleared = view().querySelector(".save-bar .muted");
+        check("clearing the override is an unsaved change", !!cleared && /unsaved change/.test(cleared.textContent), cleared ? cleared.textContent : "no save note");
+      }
     }
   }
   check("advanced rows sit in a disclosure container", byClass(view(), "disclosure").length > 0 || view().querySelectorAll("details").length > 0);

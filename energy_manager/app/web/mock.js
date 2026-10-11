@@ -477,6 +477,32 @@
     return db.batteries;
   }
 
+  // Mirrors engine.grid_resolution() (SPEC 3): the roles the add-on resolves from the Energy
+  // dashboard's energy/get_prefs, plus the grid.* settings that override them. Fake namespaces
+  // only (tools/audit.sh). The Meter card renders both, so an override can be told apart from the
+  // fallback it replaces.
+  var MOCK_ENERGY_DASHBOARD = {
+    grid_power: "sensor.example_net_power",
+    grid_energy_import: "sensor.example_grid_import_energy",
+    grid_energy_export: "sensor.example_grid_export_energy"
+  };
+  function gridResolution() {
+    var explicit = {};
+    ["grid.power_entity", "grid.import_entity", "grid.export_entity"].forEach(function (key) {
+      var value = Object.prototype.hasOwnProperty.call(db.settings, key) ? db.settings[key] : "";
+      if (value) explicit[key] = value;
+    });
+    var source = Object.keys(explicit).length ? "settings" : "energy_dashboard_power";
+    return {
+      source: source,
+      note: source === "settings"
+        ? ""
+        : "grid roles from the Home Assistant Energy dashboard (power): grid_power=sensor.example_net_power",
+      explicit: explicit,
+      dashboard: MOCK_ENERGY_DASHBOARD
+    };
+  }
+
   // Mirrors api.py `_descriptor_row`: keys flagged by the backend's own safety regex land in a
   // dedicated "Safety" group; the rest are Title-cased topic names.
   var MOCK_BACKEND_SAFETY_RE = /^(optimizer\.(reserve_soc_pct|max_grid_import_w|max_grid_export_w|allow_export)|control\.failsafe_on_error)$/;
@@ -876,7 +902,8 @@
           currency: null, timezone: null, latitude_override: null, longitude_override: null
         },
         settings: settingDescriptors(),
-        price_warnings: priceWarnings()
+        price_warnings: priceWarnings(),
+        grid: gridResolution()
       };
     },
     "PATCH /api/v1/config": function (ctx) {

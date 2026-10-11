@@ -308,7 +308,7 @@ on the card):
 | Card | Keys it renders |
 | --- | --- |
 | Price | `price.provider`, `price.export_fee_eur_per_kwh`, `price.feed_in_energy_tax_refund`; plus `price.entity` (`provider=entity`), `price.bzn` + `price.vat_pct` + `price.energy_tax_eur_per_kwh` + `price.import_fee_eur_per_kwh` (`day_ahead`), `price.contract` + `price.fixed_price_eur_per_kwh` (`fixed`, single) or the two day/night rates **and** the two window hours (`fixed_day_night`) |
-| Meter | `grid.power_entity` (searchable picker); left empty, it resolves at runtime from the Energy dashboard |
+| Meter | `grid.power_entity` (searchable picker); left empty, it resolves at runtime from the Energy dashboard. The card shows the resolved roles, labels a saved value as an override, and offers `Use the Energy dashboard` to clear every explicit `grid.*` key |
 | Solar | `solar.enabled`, `solar.source`, `solar.measured_entity` unless the source is `derived`, `solar.capacity_wp` (`capacity`), `solar.planes` (`forecast_solar`) |
 | Battery | the fleet from `GET /api/v1/batteries` (the canonical inventory) plus a link into the wizard |
 
@@ -536,6 +536,12 @@ generated signed `stat_rate` (positive = import) → `grid.power_entity`, else t
 `grid_energy_import`/`grid_energy_export` (history only: a kWh counter cannot be sampled as live
 power). Any explicit `grid.*` value replaces the fallback as a whole, and an `stat_rate_inverted`
 without Home Assistant's generated net sensor is ignored rather than guessed.
+
+The Meter card renders this provenance from `GET /api/v1/config`'s additive `grid` object
+(`engine.grid_resolution()`): with no `grid.*` set it names the resolved roles ("From the Home
+Assistant Energy dashboard: …"), a saved value is labelled "Set here; this overrides …" with the
+dashboard's own roles beside it, and a `Use the Energy dashboard` button clears `grid.power_entity`,
+`grid.import_entity` and `grid.export_entity` through the normal dirty/Save flow.
 
 #### Optimizer
 

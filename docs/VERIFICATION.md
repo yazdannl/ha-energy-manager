@@ -15,16 +15,16 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **663 passed** (two consecutive runs) |
+| Test suite | `python3 -m pytest tests -q` | **668 passed** (two consecutive runs) |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 93 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
-| Headless UI render check | `node tools/ui_render_check.js` | **49 passed, 0 failed**, exit 0 |
+| Headless UI render check | `node tools/ui_render_check.js` | **54 passed, 0 failed**, exit 0 |
 
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (79 files, documentation excluded)**:
-  `581baf1fd3fd0465f639d90ccdce29e6a9d530e5015f81f86b6ff1145c5ff2f7`
+  `fc5f9d440dfa55655aeea5a9f0e6e66b61dffdbad82f6380ff16852344fc24b8`
 * **path list of the same 79 files** (detects an added, removed or renamed file):
   `999c72a0ad237efad84631e1c196871fbab19aaf4e46b1e3e55f351c7c988ad5`
 
@@ -703,14 +703,37 @@ energy-counter fallback, the TTL cache and failed-read caching), the statistics/
 in `tests/test_wp2a_load.py` (7), the statistics-fit and no-planes-fallback tests in
 `tests/test_wp2a_solar.py` (4), the engine fallback/hint tests in `tests/test_wp2b_engine.py` (2),
 the wiring test in `tests/test_wp2b_integration.py` (1) and the two WebSocket wrappers in
-`tests/test_wp2a_haws.py` (2). The suite went from 634 to 663 passing tests; the counts in §1 are the
-frozen-tree rerun.
+`tests/test_wp2a_haws.py` (2). The suite went from 634 to 663 passing tests at that point (668 after
+§8.7); the counts in §1 are the frozen-tree rerun.
 
 Not verified here: the add-on's own read through the container's `SUPERVISOR_TOKEN` (the live checks
 used the CLI's token; neither command is admin-gated per the Core source, so the supervisor token is
 more than sufficient), and the rendered UI after the change (ingress-only, owner's browser). The
 prefs cache, the precedence order and the conversion are asserted with fakes; the live payload shapes
 are the CLI observations above.
+
+### 8.7 Meter-card grid provenance (0.9.1)
+
+0.9.0 resolved the meter at runtime, but the settings panel showed only the (empty)
+`grid.power_entity` field: a saved value silently disabled the fallback and could not be cleared from
+the UI. Requested after the 0.9.0 deploy: "the meter info is still not coming from ha energy section".
+
+* `GridMapping.dashboard_roles()` exposes the Energy dashboard's own roles even when an explicit
+  `grid.*` setting overrides them; `Engine.grid_resolution()` combines them with the explicit keys
+  and the effective source, and `GET /api/v1/config` carries the result as the additive `grid` object
+  (`source`, `note`, `explicit`, `dashboard`).
+* The Meter card renders it: with no `grid.*` set it names the resolved roles ("From the Home
+  Assistant Energy dashboard: signed power …; import counter …; export counter …"), a saved or
+  edited value is labelled as an override with the dashboard's roles beside it, and `Use the Energy
+  dashboard` clears `grid.power_entity`, `grid.import_entity` and `grid.export_entity` through the
+  normal dirty/Save flow (the read itself never writes a setting).
+* The headless render check exercises both branches against the mock's dashboard roles and asserts
+  the clear button restores the fallback text (54 checks now, was 49).
+
+New tests: `tests/test_wp2a_grid.py` (+1, `dashboard_roles` under an override), `tests/test_wp2b_engine.py`
+(+2, `grid_resolution` with and without a mapping), `tests/test_wp2b_api.py` (+2, the `grid` payload and
+the older-engine `{}` fallback) and the updated route-contract assertion in
+`tests/test_wp5_api_contract.py`. The suite went from 663 to 668 passing tests.
 
 ---
 
@@ -805,7 +828,7 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 663 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 668 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 

@@ -1590,6 +1590,57 @@ def test_engine_grid_mapping_falls_back_to_the_energy_dashboard():
     assert engine.grid_mapping()["grid_power"] == "sensor.example_my_meter"
 
 
+def test_engine_grid_resolution_reports_the_dashboard_and_the_override():
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings["grid.power_entity"] = ""
+    settings["grid.import_entity"] = ""
+    settings["grid.export_entity"] = ""
+
+    class PrefsWS:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def energy_prefs(self):
+            return {
+                "energy_sources": [
+                    {
+                        "type": "grid",
+                        "stat_rate": "sensor.example_net_power",
+                        "stat_energy_from": "sensor.example_grid_in_energy",
+                        "stat_energy_to": "sensor.example_grid_out_energy",
+                    }
+                ]
+            }
+
+    engine._grid_mapping = GridMapping(settings, ws_factory=lambda: PrefsWS())
+    resolution = engine.grid_resolution()
+    assert resolution["source"] == "energy_dashboard_power"
+    assert resolution["explicit"] == {}
+    assert resolution["dashboard"]["grid_power"] == "sensor.example_net_power"
+    assert resolution["dashboard"]["grid_energy_import"] == "sensor.example_grid_in_energy"
+    assert "Energy dashboard" in resolution["note"]
+
+    settings["grid.power_entity"] = "sensor.example_my_meter"
+    resolution = engine.grid_resolution()
+    assert resolution["source"] == "settings"
+    assert resolution["explicit"] == {"grid.power_entity": "sensor.example_my_meter"}
+    # the dashboard view survives the override, so the panel can offer to fall back to it
+    assert resolution["dashboard"]["grid_power"] == "sensor.example_net_power"
+    assert resolution["note"] == ""
+
+
+def test_engine_grid_resolution_without_a_mapping_reports_settings_only():
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings["grid.power_entity"] = "sensor.example_my_meter"
+    resolution = engine.grid_resolution()
+    assert resolution["source"] == "settings"
+    assert resolution["dashboard"] == {}
+    assert resolution["explicit"] == {"grid.power_entity": "sensor.example_my_meter"}
+
+
 def test_explain_load_no_history():
     engine, _store, _ha, _clock, settings = build_engine()
     settings["load.entity"] = ""

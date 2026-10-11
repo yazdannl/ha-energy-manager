@@ -3667,6 +3667,9 @@
     var dirtyCount = 0;
     // Keys the four setup cards render this draw; their groups skip them so a key appears once.
     var cardKeys = {};
+    // SPEC 3: the Meter card's provenance — what the Energy dashboard resolves, whether an
+    // explicit grid.* setting overrides it, and the fallback the panel can offer to restore.
+    var grid = (config.grid && typeof config.grid === "object") ? config.grid : {};
 
     // Remembered UI state (SPEC 13.2): active rail group, each group's disclosure, "show all
     // advanced". localStorage is the only store — the server payload is untouched by folding.
@@ -3682,9 +3685,12 @@
 
     function dirty(key, value, wrap, invalid) {
       dirtyValues[key] = { value: value, invalid: !!invalid };
-      wrap.classList.add("field-dirty");
-      if (invalid) wrap.setAttribute("data-invalid", "1");
-      else wrap.removeAttribute("data-invalid");
+      // A card may clear several keys at once; the fields themselves re-render from settingValue.
+      if (wrap) {
+        wrap.classList.add("field-dirty");
+        if (invalid) wrap.setAttribute("data-invalid", "1");
+        else wrap.removeAttribute("data-invalid");
+      }
       dirtyCount = Object.keys(dirtyValues).length;
       updateCounts();
       // Changing the price provider/contract or the solar source changes which fields make sense,
@@ -3903,11 +3909,59 @@
       );
     }
 
+    // SPEC 3: the grid role -> settings key map the Meter card clears, and the Energy-dashboard
+    // description it shows. The dashboard's own roles stay visible under an override so the user
+    // can tell the fallback from the value replacing it (and go back to it).
+    var GRID_ROLE_KEYS = {
+      grid_power: "grid.power_entity",
+      grid_import: "grid.import_entity",
+      grid_export: "grid.export_entity"
+    };
+
+    function gridExplicitKeys() {
+      return Object.keys(GRID_ROLE_KEYS).map(function (role) { return GRID_ROLE_KEYS[role]; })
+        .filter(function (key) { return String(settingValue(key) || "").length > 0; });
+    }
+
+    function gridDashboardText() {
+      var dash = grid.dashboard || {};
+      var parts = [];
+      if (dash.grid_power) parts.push("signed power " + dash.grid_power);
+      if (dash.grid_import) parts.push("import power " + dash.grid_import);
+      if (dash.grid_export) parts.push("export power " + dash.grid_export);
+      if (dash.grid_energy_import) parts.push("import counter " + dash.grid_energy_import);
+      if (dash.grid_energy_export) parts.push("export counter " + dash.grid_energy_export);
+      return parts.join("; ");
+    }
+
+    function clearGridRoles() {
+      gridExplicitKeys().forEach(function (key) { dirty(key, ""); });
+      draw();
+    }
+
     function meterCard() {
+      var children = [cardPicker("grid.power_entity", "grid", "grid power sensor name or entity id")];
+      var dashboardText = gridDashboardText();
+      if (gridExplicitKeys().length) {
+        children.push(el("p", {
+          class: "field-help",
+          text: dashboardText
+            ? "Set here; this overrides the Home Assistant Energy dashboard."
+            : "Set here; the Home Assistant Energy dashboard has no grid meter."
+        }));
+        if (dashboardText) {
+          children.push(el("p", { class: "field-help muted", text: "The Energy dashboard has " + dashboardText + "." }));
+          children.push(button("Use the Energy dashboard", "", clearGridRoles));
+        }
+      } else if (dashboardText) {
+        children.push(el("p", { class: "field-help", text: "From the Home Assistant Energy dashboard: " + dashboardText + "." }));
+      } else {
+        children.push(el("p", { class: "field-help muted", text: "Not set, and the Home Assistant Energy dashboard has no grid meter either." }));
+      }
       return setupCard(
         "Meter",
         "The live power the add-on follows. The load forecast, and the meter-derived solar estimate, read this meter.",
-        [cardPicker("grid.power_entity", "grid", "grid power sensor name or entity id")]
+        children
       );
     }
 

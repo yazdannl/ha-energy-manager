@@ -922,7 +922,21 @@ class ApiServer:
             "conflicts": self._option_conflicts(settings),
             # SPEC 4.1 (0.3.0): price provider/contract problems, reported but never fatal.
             "price_warnings": self._price_warnings(settings),
+            # SPEC 3: what the Meter card resolves from the Energy dashboard, so the panel can
+            # show the fallback and label a saved override instead of leaving both invisible.
+            "grid": self._grid_resolution(),
         }
+
+    def _grid_resolution(self) -> dict[str, Any]:
+        """``engine.grid_resolution()`` when present, else ``{}`` (older engines)."""
+        probe = getattr(self.engine, "grid_resolution", None)
+        if not callable(probe):
+            return {}
+        try:
+            return dict(probe() or {})
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("engine.grid_resolution() failed: %s", exc)
+            return {}
 
     @staticmethod
     def _price_warnings(settings: Any) -> list[dict[str, Any]]:

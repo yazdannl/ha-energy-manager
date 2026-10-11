@@ -1122,3 +1122,34 @@ def test_config_payload_carries_price_warnings():
     assert status == 200
     assert {"options", "settings", "conflicts", "price_warnings"} <= set(body)
     assert body["price_warnings"] == [{"key": "price.contract", "message": "provider/contract mismatch example"}]
+
+
+class GridFakeEngine(FakeEngine):
+    """FakeEngine that answers the Meter card's provenance accessor (SPEC 3)."""
+
+    def grid_resolution(self):
+        return {
+            "source": "energy_dashboard_power",
+            "note": "grid roles from the Home Assistant Energy dashboard (power): grid_power=sensor.example_net_power",
+            "explicit": {},
+            "dashboard": {
+                "grid_power": "sensor.example_net_power",
+                "grid_energy_import": "sensor.example_grid_in_energy",
+            },
+        }
+
+
+def test_config_payload_carries_the_grid_resolution():
+    app = server(GridFakeEngine())
+    status, _headers, _content, body = call(app, "GET", "/api/v1/config")
+    assert status == 200
+    assert body["grid"]["source"] == "energy_dashboard_power"
+    assert body["grid"]["dashboard"]["grid_power"] == "sensor.example_net_power"
+    assert body["grid"]["explicit"] == {}
+
+
+def test_config_payload_without_a_grid_accessor_still_answers():
+    app = server(FakeEngine())
+    status, _headers, _content, body = call(app, "GET", "/api/v1/config")
+    assert status == 200
+    assert body["grid"] == {}
