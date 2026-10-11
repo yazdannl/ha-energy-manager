@@ -445,3 +445,16 @@ def test_off_mode_serves_the_api_without_a_current_plan(wired):
     assert engine.active_plan() is None
     status, _headers, _content, body = _call(api, "GET", "/api/v1/batteries")
     assert status == 200 and body["batteries"]
+
+
+def test_build_sources_exposes_the_energy_dashboard_grid_mapping(tmp_path):
+    """SPEC 3: the Energy-dashboard fallback is built with the sources and handed to the engine."""
+    from app.grid import GridMapping
+
+    store = build_store(str(tmp_path))
+    settings = build_settings(store, {}, str(tmp_path / "options.json"))
+    sources = build_sources(settings, store, _FakeHA(), location=(52.0, 5.0, "UTC"))
+    assert isinstance(sources.get("grid_mapping"), GridMapping)
+    engine = Engine(settings, store=store, ha=_FakeHA(), **sources)
+    assert engine._grid_mapping is sources["grid_mapping"]  # noqa: SLF001 - wiring assertion
+    store.close()

@@ -208,6 +208,7 @@ load.mode                auto|entity|derived   # auto uses load entity if mapped
 load.entity              ""   # runtime-picked load power sensor
 load.temperature_entity  ""   # optional outdoor temperature for the regression term
 load.base_kwh_per_day    0.0  # fallback flat profile when nothing is learned yet
+# grid.* empty -> resolved at runtime from the HA Energy dashboard (energy/get_prefs, section 3); explicit wins
 grid.power_entity        ""   # signed grid power sensor, positive = import (enables the derived load tier)
 grid.import_entity       ""   # separate import power sensor, optional
 grid.export_entity       ""   # separate export power sensor, optional
@@ -461,6 +462,13 @@ Measured bias learning: when `solar.bias_correction` and a measured PV entity ar
 "slot-of-day bucket" (24 hourly buckets) multiplicative factor as an EWMA with `alpha=0.2`, clamped
 to `[0.3, 1.8]`, stored in `learning_profiles`. Factors older than 14 days decay toward 1.0.
 
+**No source to size the array (0.9.0).** `solar.source=forecast_solar` with an empty `solar.planes`
+has nothing to forecast with. Instead of failing straight away, the provider runs the meter-derived
+estimate (§7.1.2) when a meter resolves: an explicit `grid.*` mapping, or the Home Assistant Energy
+dashboard (§3). An explicit `solar.capacity_wp` still wins inside the derived tier. Only when that
+is impossible as well is the forecast empty and the status `no_pv_source`, with the derived failure
+attached in the forecast notes and `status.detail.derived_fallback`.
+
 #### 7.1.1 Capacity-based estimate (`solar.source = capacity`, 0.4.0)
 
 An AC-coupled array whose geometry is not worth modelling needs no API and no planes: the user states
@@ -519,9 +527,15 @@ means production exceeds the house load. With the project's sign convention `gri
 (§8.1, `p > 0` = charging), the array is producing at least `pv = −grid + p` at that moment.
 
 `load.collect_pv_export_samples` assembles those samples from the same roles the derived load tier
-uses: `grid.power_entity` (or the import/export pair) and, when a battery is configured, its AC flow
+uses: `grid.power_entity` (or the import/export pair, or the Energy-dashboard fallback: its power
+sensor, else the import/export energy counters as `grid_energy_import`/`grid_energy_export`) and,
+when a battery is configured, its AC flow
 (`charge_power_entity`/`discharge_power_entity`, else the signed `power_setpoint_entity`; a battery
-whose flow cannot be read refuses the tier rather than letting its discharge read as PV). Stamps
+whose flow cannot be read refuses the tier rather than letting its discharge read as PV). Each series
+is read from long-term statistics (`recorder/statistics_during_period`: the hourly `mean` of a power
+statistic, the hourly `change` of an energy counter converted to average kW) whenever a WebSocket
+client is available, with recorder history as the fallback — so the window is the never-purged
+statistics table, not the recorder's purge window. Stamps
 without export carry no information and are skipped; the house load at export moments is *not*
 subtracted (that load is what the PV forecast is needed to learn), so every sample is a lower bound.
 
@@ -536,8 +550,9 @@ in the notes and in the status detail (`capacity_source`, `derived_samples`); it
 to the settings, and an explicit `solar.capacity_wp > 0` wins over it (the same "explicit beats
 derived" rule the load tier follows). The fit itself is cached in `learning_profiles`
 (`solar_derived`/`capacity`) with the entity mapping it was fitted from and whether the NASA
-clearness was part of the fit, and is refit at most once a day, because it reads weeks of recorder
-history and the array size does not change between refreshes.
+clearness was part of the fit, and is refit at most once a day, because it reads weeks of history
+(long-term statistics when the WebSocket client answers, recorder history otherwise) and the array
+size does not change between refreshes.
 The forecast itself is then the §7.1.1 capacity model, so
 `solar.tilt_deg`, `solar.azimuth_deg`, `solar.performance_ratio` and `solar.weather_entity` apply
 unchanged, and the forecast carries a note that the learned size is a conservative lower bound.
@@ -549,7 +564,9 @@ Sources in priority order, all producing 15-minute `LoadForecast` slots with `p1
    `hour` period) — preferred, survives recorder purging.
 2. **Recorder history** (`GET /api/history/period`) if statistics are unavailable.
 3. **Derived** when no load entity is mapped: `load = grid_import − grid_export + pv + discharge −
-   charge`, assembled from mapped power sensors.
+   charge`, assembled from mapped power sensors (the Energy-dashboard roles when `grid.*` is empty;
+   each series is read through long-term statistics when a WebSocket client is available, energy
+   counters included).
 4. **Fallback** flat profile from `load.base_kwh_per_day` spread by a default residential shape.
 
 Model: median per (weekend|weekday, hour) profile over the last 8 weeks, scaled by
@@ -1095,7 +1112,13 @@ rate limit.
 client **must PONG** or the connection is dropped. Zendure entity-registry `unique_id`s are **not**
 prefixed with the integration domain, so discovery must key on `platform` + `translation_key`, never on a
 `unique_id` prefix (this is what §5 requires). `statistics_during_period` rows carry ms-epoch `start/end`
-plus only the requested statistic types, and need no admin rights.
+plus only the requested statistic types, and need no admin rights — likewise
+`recorder/get_statistics_metadata`, whose rows carry `unit_class` (`power`/`energy`), `has_mean`/`has_sum`
+and the unit, so an external statistic (no entity to read) is still classifiable. `energy/get_prefs` is
+read-only and **not** admin-gated (the sibling `energy/save_prefs` is): it returns the Energy
+dashboard's `energy_sources`, where the grid source carries the signed power sensor (`stat_rate`,
+generated by Home Assistant for every `power_config` shape, positive = import) and the import/export
+energy counters.
 
 **Zendure driver (highest-risk item in the build)** — `manual_power` uses the **opposite sign convention to
 this application's `models.py`: negative = charge, positive = discharge**, so the driver must negate when
@@ -1275,6 +1298,28 @@ round, with the reason:
   are knowingly accepted rather than fixed: the fleet wears a single delivered-energy-weighted mean
   although `allocate_power` favours particular packs, and the derived fit scales historical export
   samples by the *recent* 21-day clearness median rather than the weather of each sample's own date.
+
+- **§3/§7.1/§7.1.2/§7.2 (Energy-dashboard grid mapping and statistics history; requested
+  2026-10-11, "can we get the grid power export/import from home assistants energy section by
+  default … which would let us do a good estimate of solar production")** — the live install's
+  Energy dashboard already named the house meter, but the add-on asked for the mapping again and,
+  with `solar.planes` empty, showed `no_pv_source`. Three coupled changes. (a) `app/grid.py` reads
+  `energy/get_prefs` (WebSocket, not admin-gated) and resolves `grid_power`/`grid_import`/
+  `grid_export` from the grid source's `stat_rate` (Home Assistant generates it for every power
+  configuration, and its sign already matches `grid.power_entity`), falling back to the two-sensor
+  `power_config` and then to the import/export energy counters as `grid_energy_import`/
+  `grid_energy_export` (history only; an `stat_rate_inverted` without the generated sensor is
+  ignored rather than guessed). An explicit `grid.*` setting replaces the fallback as a whole; the
+  read is cached 5 minutes and a failed read is cached too. The user chose "runtime default
+  everywhere" over persisting the resolved values into the settings or limiting the fallback to the
+  estimation tiers. (b) The derived load and PV tiers read every series from long-term statistics
+  when a WebSocket client is available (hourly `mean` for a power statistic, hourly `change` for an
+  energy counter, converted to average kW using the row's own duration), so the learning window is
+  the never-purged statistics table rather than the recorder's default 10-day purge; recorder
+  history remains the fallback. (c) `solar.source=forecast_solar` with no planes now runs the
+  meter-derived estimate instead of failing, and reports `no_pv_source` only when no meter
+  resolves, attaching the derived failure (`status.detail.derived_fallback`) and a note to the
+  hint. The user chose the automatic fallback over leaving the hint.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

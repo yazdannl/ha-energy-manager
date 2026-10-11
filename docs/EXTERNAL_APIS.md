@@ -410,6 +410,34 @@ parent_device_id, primary_config_entry, serial_number, sw_version, via_device_id
   statistics_unit_of_measurement, display_unit_of_measurement, has_mean, has_sum, mean_type}`.
   **[V]** (live)
 
+### `recorder/get_statistics_metadata`
+
+* Request: `statistic_ids` (list). Response `result` = list of rows with `statistic_id`,
+  `unit_class` (`power`/`energy`), `statistics_unit_of_measurement`, `display_unit_of_measurement`,
+  `has_mean`, `has_sum`, `mean_type`, `source`, `name`. **[V]** (live 2026-10-11: a W power sensor
+  returned `has_mean: true`/`has_sum: false`/`unit_class: power`; a kWh counter returned
+  `has_mean: false`/`has_sum: true`/`unit_class: energy`)
+* This classifies a statistic id without reading a state, which is how an external statistic (no
+  entity) is still usable. The derived tiers read a power statistic as an hourly `mean` and an
+  energy counter as an hourly `change`, converting the latter to average kW over the row's own
+  `start`/`end` duration.
+
+### `energy/get_prefs`
+
+* No parameters; **not** admin-gated (the sibling `energy/save_prefs` is). Returns the Energy
+  dashboard `EnergyPreferences`: `energy_sources`, `device_consumption`, `device_consumption_water`.
+  `ws_get_prefs` has no admin decorator and errors `not_found` when the store is empty. **[V]**
+  (source + live)
+* A grid source carries `stat_energy_from`/`stat_energy_to` (mandatory when configured) and an
+  optional `power_config` — exactly one of `stat_rate` (single signed sensor), `stat_rate_inverted`
+  (single sensor, opposite sign) or `stat_rate_from`/`stat_rate_to` (two positive sensors: from =
+  consumption, to = return). Home Assistant fills the source's own `stat_rate` for every power
+  configuration: the configured sensor for the standard form, its generated net-power sensor
+  otherwise (`_process_grid_power`), and that generated sensor's sign already matches this
+  application's `grid.power_entity` (positive = import). The legacy `flow_from`/`flow_to`/`power`
+  arrays are migrated to the unified shape on load (storage minor version 3), so a modern payload is
+  flat. **[V]** (source + live)
+
 ### Frames, pings, limits
 
 * Server heartbeat: Core sends WebSocket **PING** control frames every 55 s (`heartbeat=55`), the

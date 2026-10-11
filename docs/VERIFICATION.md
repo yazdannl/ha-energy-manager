@@ -15,18 +15,18 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **634 passed** (two consecutive runs) |
-| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 91 files scanned`, exit 0 |
+| Test suite | `python3 -m pytest tests -q` | **663 passed** (two consecutive runs) |
+| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 93 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **31/31 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
 | Headless UI render check | `node tools/ui_render_check.js` | **49 passed, 0 failed**, exit 0 |
 
 Frozen digest of the verified artifact (recipe in §11, normative):
 
-* **code + tests (77 files, documentation excluded)**:
-  `0c8eea4500fac38c881f148462de38a4aeb1dc306d9f639607f620619d67b978`
-* **path list of the same 77 files** (detects an added, removed or renamed file):
-  `63e3910878cca4ec6ac8802e98b49448c7d6655eab98076ddfcf1d0140adf88b`
+* **code + tests (79 files, documentation excluded)**:
+  `581baf1fd3fd0465f639d90ccdce29e6a9d530e5015f81f86b6ff1145c5ff2f7`
+* **path list of the same 79 files** (detects an added, removed or renamed file):
+  `999c72a0ad237efad84631e1c196871fbab19aaf4e46b1e3e55f351c7c988ad5`
 
 The recipe sorts the file list **and** the per-file manifest under `LC_ALL=C`, so the digest is
 independent of `find` order and of the locale; a single `sort` is not enough. An earlier revision of
@@ -35,10 +35,10 @@ defect in the record, not in the tree: the file lists were verified byte-identic
 so no source file had changed. Those values (`8f83a0a6…` all files, `c58e912c…` code + tests) are
 superseded by the digest above.
 
-The all-files digest (91 files) is deliberately **not** recorded here: this document is one of the 91,
+The all-files digest (94 files) is deliberately **not** recorded here: this document is one of the 94,
 so every documentation edit would change it while the verified code stayed identical. Compute it with
-the same recipe over the full file list if you want it; the file count printed by the pipeline (91) is
-the quick cross-check. (`tools/audit.sh` prints 90 because it removes the sha-verified vendored
+the same recipe over the full file list if you want it; the file count printed by the pipeline (94) is
+the quick cross-check. (`tools/audit.sh` prints 93 because it removes the sha-verified vendored
 stylesheet from its scan list before scanning.)
 
 ---
@@ -660,6 +660,58 @@ Not verified here: the live instance's plan payload after the change (the add-on
 only the owner's browser sees it; `sensor.sem_*` does not publish slot counts). The engine's slot
 lifecycle, the dispatcher's per-slot refusal and the provider resampling are covered by the suite.
 
+### 8.6 The Energy-dashboard grid mapping and long-term statistics history (0.9.0)
+
+The live instance's Energy dashboard already named the house grid meter (the Connect Energy meter's
+consumption and production sensors, plus Home Assistant's generated signed net-power sensor and the
+Zonneplan import/export counters), but the add-on's `grid.*` settings were empty, so the derived
+load and solar tiers had no meter - and with `solar.planes` empty the solar panel showed
+`no_pv_source`. The request: read the grid import/export from Home Assistant's energy section by
+default, which also brings history for a better solar estimate.
+
+The payload facts were verified against the live instance (2026-10-11) with the `hassio` CLI
+(`energy/get_prefs`, `recorder/get_statistics_metadata`, `recorder/statistics_during_period`):
+
+* `energy/get_prefs` returned one grid source with `stat_energy_from`/`stat_energy_to` (the
+  Zonneplan today counters), a `power_config` with `stat_rate_from`/`stat_rate_to` (the meter's
+  consumption/production sensors) and Home Assistant's generated `stat_rate` net-power sensor, whose
+  sign already matched `grid.power_entity` (positive = import; live state -147 W while production was
+  147 W).
+* `recorder/get_statistics_metadata` classified a live power statistic as `unit_class: power`,
+  `has_mean: true`, unit W, and a kWh counter as `unit_class: energy`, `has_sum: true` - the two
+  shapes the history reader branches on.
+* Hourly long-term statistics existed back to 2026-08-01 while `GET /api/history/period` from
+  2026-09-25 was already empty (the recorder's default purge), which is what makes statistics the
+  history source rather than the recorder.
+
+Three implementation changes, all covered by new tests:
+
+1. `app/grid.py` (new) parses the prefs into role slugs - the generated signed power sensor or the
+   two-sensor `power_config` for live power, the import/export energy counters for history - with an
+   explicit `grid.*` setting winning as a whole and a 300 s cache that caches failures too.
+   `HAWebSocket.energy_prefs` and `HAWebSocket.statistics_metadata` wrap the two commands.
+2. `sources/load.py` reads each derived series from long-term statistics first (hourly `mean` for a
+   power statistic, hourly `change` for an energy counter, converted to average kW over the row's own
+   `start`/`end`), with recorder history as the fallback; the derived load tier and
+   `collect_pv_export_samples` share that path.
+3. `sources/solar.py` runs the meter-derived estimate when `solar.source=forecast_solar` has no
+   planes, and the engine's `no_pv_source` hint names the derived failure
+   (`status.detail.derived_fallback`) when no meter resolves either.
+
+New tests: `tests/test_wp2a_grid.py` (13 tests: the prefs shapes, explicit-settings precedence, the
+energy-counter fallback, the TTL cache and failed-read caching), the statistics/energy-counter tests
+in `tests/test_wp2a_load.py` (7), the statistics-fit and no-planes-fallback tests in
+`tests/test_wp2a_solar.py` (4), the engine fallback/hint tests in `tests/test_wp2b_engine.py` (2),
+the wiring test in `tests/test_wp2b_integration.py` (1) and the two WebSocket wrappers in
+`tests/test_wp2a_haws.py` (2). The suite went from 634 to 663 passing tests; the counts in §1 are the
+frozen-tree rerun.
+
+Not verified here: the add-on's own read through the container's `SUPERVISOR_TOKEN` (the live checks
+used the CLI's token; neither command is admin-gated per the Core source, so the supervisor token is
+more than sufficient), and the rendered UI after the change (ingress-only, owner's browser). The
+prefs cache, the precedence order and the conversion are asserted with fakes; the live payload shapes
+are the CLI observations above.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
@@ -697,6 +749,10 @@ value that may be sensitive.
   integration semantics and a fake over loopback, not observed on a device.
 * **No live price, PV or load provider calls.** The fallback chain and rate-limit handling were
   exercised with injected fakes; real payloads, headers and timezone edge cases remain unverified.
+* **The add-on's own Energy-dashboard read.** The `energy/get_prefs` and
+  `recorder/get_statistics_metadata` payload shapes were verified live with the `hassio` CLI, but the
+  in-container path over the Supervisor token and the 300 s cache are asserted with fakes; the UI is
+  ingress-only and was not clicked through remotely.
 * **No behaviour on real hardware.** The add-on *is* installed and running on the owner's Home
   Assistant in advisory mode with `dry_run: true`, but no battery, price or solar entity is mapped
   yet, so nothing here proves it plans correctly on that instance. The packaged image's entrypoint was
@@ -749,11 +805,11 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 634 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 663 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 
-# 3. R1 tripwire (expect: "audit: clean — 91 files scanned", exit 0)
+# 3. R1 tripwire (expect: "audit: clean — 93 files scanned", exit 0)
 sh tools/audit.sh
 
 # 4. End-to-end selfcheck (expect: 31/31 checks passed, exit 0)
@@ -766,15 +822,15 @@ node tools/ui_render_check.js
 
 Frozen digests — manifest digests over the file sets the two recipes select. Both stages are sorted
 under `LC_ALL=C`, which makes the value independent of `find` order and of the locale (a single `sort`
-produces a different value). The `wc -l` count is the cross-check (92 and 77).
+produces a different value). The `wc -l` count is the cross-check (94 and 79).
 
 ```sh
-# all files (92)
+# all files (94)
 find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache \
         -o -name node_modules -o -name .mypy_cache \) -prune -o -type f -print \
   | LC_ALL=C sort | xargs sha256sum | LC_ALL=C sort | sha256sum
 
-# code + tests only (77), documentation excluded
+# code + tests only (79), documentation excluded
 find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache \
         -o -name node_modules -o -name .mypy_cache -o -name '*.md' -o -name 'LICENSE*' \) -prune \
      -o -type f -print \
@@ -788,4 +844,4 @@ find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name 
 ```
 
 To check the selected file count on its own, run the same `find … -print | LC_ALL=C sort | wc -l`
-part of either recipe: it must print 92 (all files) or 77 (code + tests only).
+part of either recipe: it must print 94 (all files) or 79 (code + tests only).

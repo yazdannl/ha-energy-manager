@@ -308,7 +308,7 @@ on the card):
 | Card | Keys it renders |
 | --- | --- |
 | Price | `price.provider`, `price.export_fee_eur_per_kwh`, `price.feed_in_energy_tax_refund`; plus `price.entity` (`provider=entity`), `price.bzn` + `price.vat_pct` + `price.energy_tax_eur_per_kwh` + `price.import_fee_eur_per_kwh` (`day_ahead`), `price.contract` + `price.fixed_price_eur_per_kwh` (`fixed`, single) or the two day/night rates **and** the two window hours (`fixed_day_night`) |
-| Meter | `grid.power_entity` (searchable picker) |
+| Meter | `grid.power_entity` (searchable picker); left empty, it resolves at runtime from the Energy dashboard |
 | Solar | `solar.enabled`, `solar.source`, `solar.measured_entity` unless the source is `derived`, `solar.capacity_wp` (`capacity`), `solar.planes` (`forecast_solar`) |
 | Battery | the fleet from `GET /api/v1/batteries` (the canonical inventory) plus a link into the wizard |
 
@@ -528,6 +528,14 @@ is the authority for the `advanced` classification (the test suite asserts the e
 | `grid.power_entity` | str | `""` | — | **Grid power entity** — signed, positive = import; enables the derived load tier |
 | `grid.import_entity` | str | `""` | — | **Grid import entity** *(advanced)* |
 | `grid.export_entity` | str | `""` | — | **Grid export entity** *(advanced)* |
+
+All three default to empty. Left empty, the runtime fallback (`app/grid.py`) resolves them from the
+Home Assistant **Energy dashboard** (`energy/get_prefs`, no admin, cached 300 s): the grid source's
+generated signed `stat_rate` (positive = import) → `grid.power_entity`, else the two-sensor
+`power_config` → `grid.import_entity`/`grid.export_entity`, else the import/export energy counters →
+`grid_energy_import`/`grid_energy_export` (history only: a kWh counter cannot be sampled as live
+power). Any explicit `grid.*` value replaces the fallback as a whole, and an `stat_rate_inverted`
+without Home Assistant's generated net sensor is ignored rather than guessed.
 
 #### Optimizer
 
@@ -863,8 +871,13 @@ a failure with a hint naming `solar.capacity_wp` — never a guess.
 
 Because `grid = load − pv + p`, whenever the signed grid power is negative the array is producing at
 least `pv = −grid + p` (`p > 0` = charging). Samples come from the same roles the derived load tier
-uses (`grid.power_entity` or the import/export pair, plus the battery's AC flow); a battery whose flow
-cannot be read refuses the tier rather than letting its discharge read as PV. Stamps without export
+uses (`grid.power_entity` or the import/export pair, else the Energy-dashboard roles — its power
+sensor, or the import/export energy counters as `grid_energy_import`/`grid_energy_export` — plus the
+battery's AC flow); a battery whose flow
+cannot be read refuses the tier rather than letting its discharge read as PV. With a WebSocket client
+each series comes from long-term statistics (hourly `mean` for a power statistic, hourly `change` for
+an energy counter, converted to average kW), so the window is the never-purged statistics table and
+not the recorder's purge window; recorder history is the fallback. Stamps without export
 carry no information and are skipped; the house load at those moments is **not** subtracted, so every
 sample is a lower bound.
 
@@ -881,10 +894,20 @@ cached in `learning_profiles` (`solar_derived`/`capacity`) keyed by the entity-m
 refit at most once per `DERIVED_REFIT_HOURS = 24 h`. The forecast itself is then the capacity model,
 so tilt/azimuth/performance ratio/weather apply unchanged.
 
+`solar.source=forecast_solar` with an empty `solar.planes` runs this estimate as a fallback (source
+selection, §4.3.1): the returned forecast's source becomes `derived` and a note says the planes are
+empty. When no meter resolves either, the status stays `no_pv_source` and
+`status.detail.derived_fallback` carries the derived reason for the hint.
+
 ### 4.4 Load formulas
 
 Priority order: **long-term statistics** (60 days, `hour`, `haws.statistics_during_period`) →
 **recorder history** (`GET /api/history/period`) → **derived** → **fallback flat profile**.
+
+The derived tier reads each series through long-term statistics when a WebSocket client is available
+(an energy counter's hourly `change` is converted to average kW), so a recorder with the default
+10-day purge still yields weeks of samples — and an Energy dashboard with only kWh counters still
+learns.
 
 **Derived tier** (no load entity mapped):
 

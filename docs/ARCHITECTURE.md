@@ -16,10 +16,11 @@ next to it.
 | `app/config.py` | Option defaults, option/settings parsing and merging, location resolution. |
 | `app/harest.py` | Home Assistant REST client (states, history, statistics, service calls), with retries and timeouts. |
 | `app/haws.py` | Minimal home-grown WebSocket client (handshake, framing) for liveness/session probes and APIs that only exist over the socket. |
+| `app/grid.py` | Effective grid roles: explicit `grid.*` settings first, else the Home Assistant Energy dashboard (`energy/get_prefs`), with a small cache and energy counters as the history fallback. |
 | `app/store.py` | SQLite persistence: schema migrations, plans, measurements, actuals, dispatch log, events, settings, learned profiles. |
 | `app/sources/price.py` | Price forecast providers (`zonneplan_entity`, `energy_charts`, `entity_forecast`, `static`), unit normalisation and the fallback chain. |
 | `app/sources/solar.py` | PV forecast provider (Forecast.Solar, keyless or with a personal key; capacity/derived model with NASA POWER observed clearness), plane summation, cache and bias correction. |
-| `app/sources/load.py` | Load forecast: long-term statistics profile, level scaling, EWMA bias, optional temperature regression, flat fallback. |
+| `app/sources/load.py` | Load forecast: long-term statistics profile, level scaling, EWMA bias, optional temperature regression, flat fallback; the derived tier reads every series through statistics first (energy counters included). |
 | `app/sources/measure.py` | Sampling of grid/PV/load/battery measurements into 5-minute `actuals` rows. |
 | `app/optimize/dp.py` | SoC dynamic program over `optimizer.slot_minutes` slots (60 by default); deterministic, with a bounded state/action grid. |
 | `app/optimize/allocate.py` | Split of the aggregate slot power across batteries, respecting per-battery limits and efficiency. |

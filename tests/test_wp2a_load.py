@@ -18,9 +18,11 @@ from app.models import BatteryConfig  # noqa: E402
 from app.sources.load import (  # noqa: E402
     build_profile,
     collect_history,
+    collect_pv_export_samples,
     collect_temperatures,
     load_forecast,
     power_to_kw,
+    pv_export_roles,
     temperature_to_c,
     update_load_profile,
 )
@@ -536,3 +538,176 @@ def test_prediction_interpolates_hourly_values():
     assert first.load_kw == pytest.approx(1.0)
     assert forecast.slots[4].load_kw == pytest.approx(2.0)  # 13:00
     assert second.load_kw == pytest.approx(1.25)
+
+
+# --------------------------------------------------------------- Energy-dashboard history (SPEC 7.1.2)
+# Long-term statistics are never purged, so the derived tiers read the meter through them whenever
+# a WebSocket client is available; energy counters (kWh) are converted to hourly average power, so
+# an Energy dashboard with no power sensor still gives the meter-derived PV tier a history window.
+
+GRID_STAT = "sensor.example_grid_power"
+IMPORT_STAT = "sensor.example_grid_energy_import"
+EXPORT_STAT = "sensor.example_grid_energy_export"
+PV_STAT = "sensor.example_pv_power"
+POWER_META = {"unit_class": "power", "statistics_unit_of_measurement": "W"}
+ENERGY_META = {"unit_class": "energy", "statistics_unit_of_measurement": "kWh"}
+
+
+class FakeStatisticsWS:
+    """``recorder/get_statistics_metadata`` + ``statistics_during_period`` without a socket."""
+
+    def __init__(self, metadata=None, rows=None):
+        self.metadata = metadata or {}
+        self.rows = rows or {}
+        self.metadata_calls = []
+        self.period_calls = []
+
+    def statistics_metadata(self, ids):
+        self.metadata_calls.append(list(ids))
+        return {stat_id: self.metadata[stat_id] for stat_id in ids if stat_id in self.metadata}
+
+    def statistics_during_period(self, ids, start, end=None, period="hour", types=None):
+        self.period_calls.append((list(ids), period, tuple(types or ())))
+        return {stat_id: self.rows.get(stat_id, []) for stat_id in ids}
+
+
+def hourly_stat_rows(series):
+    return [
+        {
+            "start": stamp.isoformat(),
+            "end": (stamp + timedelta(hours=1)).isoformat(),
+            "mean": value,
+        }
+        for stamp, value in series
+    ]
+
+
+def hourly_change_rows(series):
+    return [
+        {
+            "start": stamp.isoformat(),
+            "end": (stamp + timedelta(hours=1)).isoformat(),
+            "change": value,
+        }
+        for stamp, value in series
+    ]
+
+
+def test_pv_export_samples_prefer_long_term_statistics_over_the_recorder():
+    start = NOW - timedelta(hours=3)
+    ws = FakeStatisticsWS(
+        metadata={GRID_STAT: POWER_META},
+        rows={
+            GRID_STAT: hourly_stat_rows(
+                [(start, 1200.0), (start + timedelta(hours=1), -800.0), (start + timedelta(hours=2), -400.0)]
+            )
+        },
+    )
+    client = FakeClient()  # no recorder history at all
+    settings = Settings(None, options={"grid.power_entity": GRID_STAT})
+    samples, reason = collect_pv_export_samples(settings, client, ws=ws, now=NOW, days=2)
+    assert reason == ""
+    assert [round(value, 3) for _stamp, value in samples] == [0.8, 0.4]
+    assert client.calls == [], "statistics answered; the recorder must not be touched"
+    assert ws.period_calls[0][1] == "hour" and ws.period_calls[0][2] == ("mean",)
+
+
+def test_statistics_without_rows_fall_back_to_recorder_history():
+    ws = FakeStatisticsWS(metadata={GRID_STAT: POWER_META})
+    client = FakeClient(history={GRID_STAT: hourly_rows(GRID_STAT, NOW - timedelta(hours=2), 2, -600.0, "W")})
+    settings = Settings(None, options={"grid.power_entity": GRID_STAT})
+    samples, reason = collect_pv_export_samples(settings, client, ws=ws, now=NOW, days=2)
+    assert reason == ""
+    assert [round(value, 3) for _stamp, value in samples] == [0.6, 0.6]
+
+
+def test_energy_counter_statistics_become_a_power_series():
+    start = NOW - timedelta(hours=2)
+    ws = FakeStatisticsWS(
+        metadata={IMPORT_STAT: ENERGY_META, EXPORT_STAT: ENERGY_META},
+        rows={
+            IMPORT_STAT: hourly_change_rows([(start, 0.7)]),
+            EXPORT_STAT: hourly_change_rows([(start, 1.5), (start + timedelta(hours=1), 0.25)]),
+        },
+    )
+    # An import hour at the same stamp reduces the net export, and 1.5 kWh over one hour is 1.5 kW.
+    samples, reason = collect_pv_export_samples(
+        Settings(None, options={}),
+        FakeClient(),
+        ws=ws,
+        now=NOW,
+        days=2,
+        roles={"grid_energy_import": IMPORT_STAT, "grid_energy_export": EXPORT_STAT},
+    )
+    assert reason == ""
+    assert [round(value, 3) for _stamp, value in samples] == [0.8, 0.25]
+    assert ws.period_calls[0][2] == ("change",)
+
+
+def test_a_counter_reset_never_becomes_negative_pv():
+    start = NOW - timedelta(hours=1)
+    ws = FakeStatisticsWS(
+        metadata={
+            EXPORT_STAT: ENERGY_META,
+            IMPORT_STAT: {"unit_class": "energy", "statistics_unit_of_measurement": "Wh"},
+        },
+        rows={
+            EXPORT_STAT: hourly_change_rows([(start, -0.4)]),  # a reset delta, not a sale
+            IMPORT_STAT: hourly_change_rows([(start, 1000.0)]),  # 1 kWh imported over the hour
+        },
+    )
+    samples, reason = collect_pv_export_samples(
+        Settings(None, options={}),
+        FakeClient(),
+        ws=ws,
+        now=NOW,
+        days=2,
+        roles={"grid_energy_import": IMPORT_STAT, "grid_energy_export": EXPORT_STAT},
+    )
+    assert samples == [], "a floored reset leaves the hour importing"
+    assert "never went negative" in reason
+
+
+def test_derived_load_reads_long_term_statistics():
+    settings = Settings(
+        None,
+        options={
+            "load.mode": "derived",
+            "grid.import_entity": IMPORT_STAT,
+            "solar.measured_entity": PV_STAT,
+        },
+    )
+    start = NOW - timedelta(hours=2)
+    ws = FakeStatisticsWS(
+        metadata={IMPORT_STAT: POWER_META, PV_STAT: POWER_META},
+        rows={
+            IMPORT_STAT: hourly_stat_rows([(start, 1000.0), (start + timedelta(hours=1), 1000.0)]),
+            PV_STAT: hourly_stat_rows([(start, 900.0), (start + timedelta(hours=1), 900.0)]),
+        },
+    )
+    client = FakeClient()  # the recorder has nothing; only statistics answer
+    result = collect_history(settings, client, ws=ws, now=NOW)
+    assert result.source == "derived"
+    assert result.samples[-1][1] == pytest.approx(1.0 + 0.9)
+
+
+def test_pv_export_roles_accept_dashboard_defaults_and_explicit_settings_win():
+    roles, refusal = pv_export_roles(
+        Settings(None, options={}),
+        defaults={"grid_energy_import": "sensor.example_in", "grid_energy_export": "sensor.example_out"},
+    )
+    assert refusal == ""
+    assert roles == {"grid_energy_import": "sensor.example_in", "grid_energy_export": "sensor.example_out"}
+
+    roles, refusal = pv_export_roles(
+        Settings(None, options={"grid.power_entity": GRID_STAT}),
+        defaults={"grid_energy_export": "sensor.example_out"},
+    )
+    assert refusal == ""
+    assert roles == {"grid_power": GRID_STAT}, "an explicit grid.* setting replaces the fallback wholesale"
+
+
+def test_pv_export_roles_without_any_grid_still_refuses_with_a_hint():
+    roles, refusal = pv_export_roles(Settings(None, options={}), defaults={"pv": PV_STAT})
+    assert roles == {}
+    assert "Energy dashboard" in refusal

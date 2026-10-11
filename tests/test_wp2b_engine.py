@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from app import engine as engine_module  # noqa: E402
 from app.engine import Engine  # noqa: E402
+from app.grid import GridMapping  # noqa: E402
 from app.main import _FakeHA, _FakeStore, _selfcheck_settings, _selfcheck_sources  # noqa: E402
 from app.models import BatteryConfig, Mode, ProviderStatus, Reason, from_iso  # noqa: E402
 
@@ -1541,6 +1542,52 @@ def test_explain_solar_no_pv_source():
     explanation = engine.explain_forecast("solar")
     assert explanation["reason"] == "no_pv_source"
     assert "solar.planes" in explanation["hint"]
+
+
+def test_explain_solar_names_the_derived_fallback_failure():
+    """SPEC 7.1.1: with no planes the meter-derived fallback is tried, so its failure is the hint."""
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings["solar.enabled"] = True
+    settings["solar.planes"] = []
+    engine._solar = None
+    engine._provider_status[("solar", "forecast_solar")] = ProviderStatus(
+        kind="solar",
+        name="forecast_solar",
+        active=True,
+        ok=True,
+        detail={"derived_fallback": "the derived solar source needs grid.power_entity"},
+    )
+    explanation = engine.explain_forecast("solar")
+    assert explanation["reason"] == "no_pv_source"
+    assert "meter-derived" in explanation["hint"]
+    assert "grid.power_entity" in explanation["hint"]
+
+
+def test_engine_grid_mapping_falls_back_to_the_energy_dashboard():
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings["grid.power_entity"] = ""
+    settings["grid.import_entity"] = ""
+    settings["grid.export_entity"] = ""
+
+    class PrefsWS:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def energy_prefs(self):
+            return {"energy_sources": [{"type": "grid", "stat_rate": "sensor.example_net_power"}]}
+
+    engine._grid_mapping = GridMapping(settings, ws_factory=lambda: PrefsWS())
+    assert engine.grid_mapping() == {
+        "grid_power": "sensor.example_net_power",
+        "grid_import": "",
+        "grid_export": "",
+    }
+    # an explicit confirmation always wins over the dashboard
+    settings["grid.power_entity"] = "sensor.example_my_meter"
+    assert engine.grid_mapping()["grid_power"] == "sensor.example_my_meter"
 
 
 def test_explain_load_no_history():

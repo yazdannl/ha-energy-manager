@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from ..grid import GRID_ENERGY_ROLES
 from ..models import (
     LoadForecast,
     LoadSlot,
@@ -75,6 +76,15 @@ DEFAULT_SHAPE = (
 )
 
 _POWER_TO_KW = {"w": 1e-3, "kw": 1.0, "mw": 1e3}
+#: Energy counter units -> kWh. An hourly statistics ``change`` in kWh is also the average
+#: power over that hour in kW, which is how an energy meter becomes a power series.
+_ENERGY_TO_KWH = {"wh": 1e-3, "kwh": 1.0, "mwh": 1e3}
+#: Roles whose readings are instantaneous power; the energy-counter roles are deliberately absent.
+_POWER_ROLES = frozenset(
+    ("grid_power", "grid_import", "grid_export", "pv", "battery", "charge", "discharge")
+)
+#: The derived PV tier accepts energy counters too, so the role set is not just the power one.
+_PV_EXPORT_ROLES = ("grid_power", "grid_import", "grid_export", "grid_energy_import", "grid_energy_export")
 
 
 def _zone(name: str | ZoneInfo | None) -> ZoneInfo | timezone:
@@ -224,6 +234,132 @@ def _recorder_samples(client: Any, entity_id: str, now: datetime, days: int) -> 
     return _hourly_means(raw), "" if raw else "recorder returned no usable rows"
 
 
+def _statistic_meta(ws: Any, entity_id: str) -> dict[str, Any]:
+    """Statistics metadata for one id; ``{}`` when the recorder has none (or cannot be asked).
+
+    ``recorder/get_statistics_metadata`` is how an external statistic (no state to read) is
+    classified. An older Home Assistant without the command degrades to the state unit.
+    """
+    reader = getattr(ws, "statistics_metadata", None)
+    if not callable(reader):
+        return {}
+    try:
+        found = reader([entity_id])
+    except Exception:  # noqa: BLE001 - unsupported command / transport: use the state unit
+        return {}
+    row = found.get(entity_id) if isinstance(found, Mapping) else None
+    return dict(row) if isinstance(row, Mapping) else {}
+
+
+def _statistics_history_samples(
+    ws: Any, client: Any, entity_id: str, role: str, now: datetime, days: int
+) -> tuple[list[tuple[datetime, float]], str]:
+    """Hourly kW samples for one mapped id from long-term statistics (never purged).
+
+    A power statistic contributes its hourly ``mean``; an energy counter contributes its hourly
+    ``change`` (kWh), which over that hour is an average power in kW. The statistic id comes from
+    the mapping, so an external statistic works without an entity state. A unit that cannot be
+    established yields a reason, never a guess: reading an energy counter's ``mean`` as power would
+    silently warp every learned profile.
+    """
+    if ws is None or not entity_id:
+        return [], "no WebSocket client for statistics"
+    meta = _statistic_meta(ws, entity_id)
+    unit_class = str(meta.get("unit_class") or "").strip().lower()
+    unit = str(
+        meta.get("statistics_unit_of_measurement")
+        or meta.get("unit_of_measurement")
+        or _entity_unit(client, entity_id)
+        or ""
+    )
+    if unit_class in ("power", "energy"):
+        kind = unit_class
+    elif role in GRID_ENERGY_ROLES:
+        kind = "energy"
+    elif role in _POWER_ROLES:
+        kind = "power"
+    elif meta.get("has_mean") and not meta.get("has_sum"):
+        kind = "power"
+    elif meta.get("has_sum") and not meta.get("has_mean"):
+        kind = "energy"
+    else:
+        return [], f"statistics metadata for {entity_id!r} is missing or not power/energy"
+    if kind == "energy":
+        factor = _ENERGY_TO_KWH.get(unit.strip().lower())
+        if factor is None:
+            return [], f"statistic {entity_id!r} is an energy counter with unusable unit {unit!r}"
+        data = ws.statistics_during_period(
+            [entity_id], now - timedelta(days=days), now, period="hour", types=["change"]
+        )
+        samples: list[tuple[datetime, float]] = []
+        for entry in (data or {}).get(entity_id, []) or []:
+            change = entry.get("change")
+            if change is None:
+                continue
+            start = from_iso(entry.get("start"))
+            if start is None:
+                continue
+            end = from_iso(entry.get("end"))
+            hours = (end - start).total_seconds() / 3600.0 if end is not None else 1.0
+            if hours <= 0.0:
+                hours = 1.0
+            try:
+                # A reset can surface a negative change; a meter cannot send energy back through
+                # its import register, so the row is floor-ed rather than trusted as negative PV.
+                samples.append((start, max(0.0, float(change) * factor / hours)))
+            except (TypeError, ValueError):
+                continue
+        return samples, "" if samples else f"statistics returned no rows for {entity_id}"
+    factor = _POWER_TO_KW.get(unit.strip().lower())
+    if factor is None:
+        return [], f"statistic {entity_id!r} is a power sensor with unusable unit {unit!r}"
+    data = ws.statistics_during_period(
+        [entity_id], now - timedelta(days=days), now, period="hour", types=["mean"]
+    )
+    samples = []
+    for entry in (data or {}).get(entity_id, []) or []:
+        mean = entry.get("mean")
+        if mean is None:
+            continue
+        start = from_iso(entry.get("start"))
+        try:
+            value = float(mean) * factor
+        except (TypeError, ValueError):
+            continue
+        if start is not None:
+            samples.append((start, value))
+    return samples, "" if samples else f"statistics returned no rows for {entity_id}"
+
+
+def _history_samples(
+    client: Any, ws: Any, entity_id: str, role: str, now: datetime, days: int
+) -> tuple[list[tuple[datetime, float]], str]:
+    """Hourly kW for one role: long-term statistics when possible, else recorder history."""
+    if ws is not None:
+        samples, _ = _statistics_history_samples(ws, client, entity_id, role, now, days)
+        if samples:
+            return samples, ""
+    return _recorder_samples(client, entity_id, now, days)
+
+
+def _grid_from_series(
+    series: Mapping[str, Mapping[datetime, float]],
+) -> dict[datetime, float]:
+    """Signed grid power (kW, positive = import) from whichever grid roles have samples."""
+    if series.get("grid_power"):
+        return dict(series["grid_power"])
+    imports = [values for role in ("grid_import", "grid_energy_import") if (values := series.get(role))]
+    exports = [values for role in ("grid_export", "grid_energy_export") if (values := series.get(role))]
+    stamps: set[datetime] = set()
+    for values in imports + exports:
+        stamps.update(values)
+    return {
+        stamp: sum(values.get(stamp, 0.0) for values in imports)
+        - sum(values.get(stamp, 0.0) for values in exports)
+        for stamp in stamps
+    }
+
+
 def collect_temperatures(
     client: Any, entity_id: str, *, now: datetime | None = None, days: int = 14
 ) -> list[tuple[datetime, float]]:
@@ -299,6 +435,7 @@ def _derived_samples(
     derived_entities: Mapping[str, str] | None,
     now: datetime,
     days: int,
+    ws: Any = None,
 ) -> tuple[list[tuple[datetime, float]], str]:
     """Gross household load from power sensors (SPEC.md section 7.2, tier 3).
 
@@ -307,13 +444,15 @@ def _derived_samples(
     series has a sample for that stamp: a missing pv or battery-flow stamp is skipped, never read as
     zero. The tier is refused when ``pv`` is unmapped (net grid import is not household load);
     whether a configured battery's flow had to be mapped is enforced by :func:`collect_history` via
-    :func:`_map_battery_flows`.
+    :func:`_map_battery_flows`. With a WebSocket client, every series is read from long-term
+    statistics first (energy counters included), so the learning window is not the recorder's
+    purge window.
     """
     if not derived_entities:
         return [], "no derived entity mapping supplied"
     series: dict[str, dict[datetime, float]] = {}
     for role, entity_id in derived_entities.items():
-        samples, _ = _recorder_samples(client, entity_id, now, days)
+        samples, _ = _history_samples(client, ws, entity_id, role, now, days)
         if samples:
             series[role] = dict(samples)
     if "pv" not in series:
@@ -329,18 +468,9 @@ def _derived_samples(
             f"battery flow data ({', '.join(missing_flow)}) is unavailable for the learning window; "
             "refusing to learn its cycling as household load"
         )
-    grid: dict[datetime, float] = {}
-    if "grid_power" in series:
-        grid = dict(series["grid_power"])
-    elif "grid_import" in series or "grid_export" in series:
-        stamps = set(series.get("grid_import", {})) | set(series.get("grid_export", {}))
-        grid = {
-            stamp: series.get("grid_import", {}).get(stamp, 0.0)
-            - series.get("grid_export", {}).get(stamp, 0.0)
-            for stamp in stamps
-        }
+    grid = _grid_from_series(series)
     if not grid:
-        return [], "derived load needs grid_power or grid_import/grid_export"
+        return [], "derived load needs grid_power, grid_import/grid_export or the energy counters"
     pv = series["pv"]
     battery = series.get("battery")
     charge, discharge = series.get("charge"), series.get("discharge")
@@ -364,15 +494,22 @@ def _derived_samples(
     return out, "" if out else "derived series is empty"
 
 
-def pv_export_roles(settings: Any) -> tuple[dict[str, str], str]:
+def pv_export_roles(
+    settings: Any, defaults: Mapping[str, str] | None = None
+) -> tuple[dict[str, str], str]:
     """Resolve the entities the meter-derived PV tier reads: ``(role -> entity, refusal reason)``.
 
-    The grid role comes from ``grid.power_entity`` (or the import/export pair) and the battery's AC
-    flow from its own mapping (``charge_power_entity``/``discharge_power_entity``, else the signed
-    ``power_setpoint_entity``). A configured battery whose flow cannot be read is a refusal, never a
-    silent omission: its discharge would be read as PV.
+    The grid role comes from ``grid.power_entity`` (or the import/export pair, or the Energy
+    dashboard's energy counters via ``defaults``) and the battery's AC flow from its own mapping
+    (``charge_power_entity``/``discharge_power_entity``, else the signed ``power_setpoint_entity``).
+    A configured battery whose flow cannot be read is a refusal, never a silent omission: its
+    discharge would be read as PV. An explicit ``grid.*`` setting replaces ``defaults`` as a whole.
     """
     roles: dict[str, str] = {}
+    for role, entity in (defaults or {}).items():
+        if role in _PV_EXPORT_ROLES and entity:
+            roles[role] = str(entity)
+    explicit: dict[str, str] = {}
     for role, key in (
         ("grid_power", "grid.power_entity"),
         ("grid_import", "grid.import_entity"),
@@ -380,11 +517,16 @@ def pv_export_roles(settings: Any) -> tuple[dict[str, str], str]:
     ):
         mapped = str(settings.get(key, "") or "")
         if mapped:
-            roles[role] = mapped
-    if not any(role in roles for role in ("grid_power", "grid_import", "grid_export")):
+            explicit[role] = mapped
+    if explicit:
+        for role in _PV_EXPORT_ROLES:
+            roles.pop(role, None)
+        roles.update(explicit)
+    if not any(role in roles for role in _PV_EXPORT_ROLES):
         return {}, (
-            "the derived solar source needs grid.power_entity (or the import/export pair): "
-            "the meter's export is the only place the array is visible"
+            "the derived solar source needs grid.power_entity (or the import/export pair, or a grid"
+            " meter in your Energy dashboard): the meter's export is the only place the array is"
+            " visible"
         )
     refusal = _map_battery_flows(settings, roles)
     if refusal:
@@ -396,6 +538,7 @@ def collect_pv_export_samples(
     settings: Any,
     client: Any,
     *,
+    ws: Any = None,
     now: datetime | None = None,
     days: int = WINDOW_DAYS,
     roles: Mapping[str, str] | None = None,
@@ -407,8 +550,10 @@ def collect_pv_export_samples(
     ``-grid + p``. The house load at that moment is *not* subtracted (a PV forecast is exactly what
     is missing to know it), which makes every sample a lower bound and the learned array size
     conservative. Stamps without export carry no information and are skipped, as are stamps where
-    the battery flow is unknown. Returns ``(samples, reason)``; an empty list always carries a
-    reason a status can show.
+    the battery flow is unknown. With a WebSocket client, every series is read from long-term
+    statistics first (energy counters included), which is why the fit is not limited to the
+    recorder's purge window. Returns ``(samples, reason)``; an empty list always carries a reason a
+    status can show.
     """
     moment = now or utcnow()
     if roles is None:
@@ -417,19 +562,10 @@ def collect_pv_export_samples(
             return [], refusal
     series: dict[str, dict[datetime, float]] = {}
     for role, entity_id in roles.items():
-        samples, _ = _recorder_samples(client, entity_id, moment, days)
+        samples, _ = _history_samples(client, ws, entity_id, role, moment, days)
         if samples:
             series[role] = dict(samples)
-    grid: dict[datetime, float] = {}
-    if "grid_power" in series:
-        grid = dict(series["grid_power"])
-    elif "grid_import" in series or "grid_export" in series:
-        stamps = set(series.get("grid_import", {})) | set(series.get("grid_export", {}))
-        grid = {
-            stamp: series.get("grid_import", {}).get(stamp, 0.0)
-            - series.get("grid_export", {}).get(stamp, 0.0)
-            for stamp in stamps
-        }
+    grid = _grid_from_series(series)
     if not grid:
         return [], "no grid power history for the learning window"
     battery = series.get("battery")
@@ -544,7 +680,7 @@ def collect_history(
         if battery_note:
             notes.append(f"derived: {battery_note}")
         else:
-            samples, note = _derived_samples(client, derived_roles, moment, days)
+            samples, note = _derived_samples(client, derived_roles, moment, days, ws=ws)
             if samples:
                 return result(samples, "derived", ProviderStatus(kind="load", name="derived", ok=True, last_success=moment, detail={"samples": len(samples)}))
             if note:

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.0
+
+- **The meter now comes from your Energy dashboard by default.** The add-on reads `energy/get_prefs`
+  (read-only, no admin needed) and uses the grid source Home Assistant already has: its signed power
+  sensor (positive = import) for live sampling and control, or - when no power sensor is configured -
+  the import/export energy counters as a long-term-statistics history source. The **Meter** card can
+  stay empty; an explicit `grid.*` value still wins, and the read is cached (5 minutes) so an
+  unreachable Home Assistant costs one attempt, not one per tick.
+- **The derived load and solar estimates now read history from long-term statistics**, which are
+  never purged: hourly means for power sensors and hourly `change` for energy counters, converted to
+  average kW. A recorder with the default 10-day purge (or an Energy dashboard with only kWh
+  counters) still gives the meter-derived solar fit weeks of data, so the learned array size is not
+  limited to whatever the recorder still holds. Recorder history stays the fallback.
+- **A solar source with no planes now estimates from the meter instead of failing.** With
+  `solar.source=forecast_solar` and an empty `solar.planes`, the meter-derived estimate runs when a
+  meter resolves (an explicit mapping or the Energy dashboard) and the forecast says so; only when
+  that is impossible too does the panel report `no_pv_source`, now naming the derived failure in its
+  hint.
+
 ## 0.8.2
 
 - **The plan grid now defaults to 60 minutes**, matching the hourly dynamic tariffs most suppliers

@@ -1134,3 +1134,140 @@ def test_derived_source_uses_nasa_clearness_for_fit_and_forecast(store):
     assert forecast.planes[0]["capacity_wp"] == pytest.approx(SYNTHETIC_WP, rel=0.05)
     assert any("NASA POWER clearness refined the meter-derived array fit" in note for note in forecast.notes)
     assert len(nasa.urls) == 1, "the fit and the forecast share one daily profile fetch"
+
+
+# ----------------------------------------------- Energy dashboard + long-term statistics (SPEC 3/7.1.2)
+# The Energy-dashboard fallback gives the derived tier a meter without a manual mapping, and the
+# fit reads it through long-term statistics: the recorder's purge window is not the history window.
+
+POWER_STAT_META = {"unit_class": "power", "statistics_unit_of_measurement": "kW"}
+ENERGY_STAT_META = {"unit_class": "energy", "statistics_unit_of_measurement": "kWh"}
+ENERGY_EXPORT_STAT = "sensor.example_energy_export"
+
+
+class StatisticsWS:
+    """Context-managed ``recorder/statistics_*`` reader for the fit (no socket, no recorder)."""
+
+    def __init__(self, metadata, rows):
+        self.metadata = metadata
+        self.rows = rows
+        self.types = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def statistics_metadata(self, ids):
+        return {stat_id: self.metadata[stat_id] for stat_id in ids if stat_id in self.metadata}
+
+    def statistics_during_period(self, ids, start, end=None, period="hour", types=None):
+        self.types.append(tuple(types or ()))
+        return {stat_id: self.rows.get(stat_id, []) for stat_id in ids}
+
+
+def stat_rows(series, key="mean"):
+    return [
+        {
+            "start": stamp.isoformat(),
+            "end": (stamp + timedelta(hours=1)).isoformat(),
+            key: value,
+        }
+        for stamp, value in series
+    ]
+
+
+def test_derived_solar_reads_long_term_statistics_when_the_recorder_is_empty(store):
+    stamps = daylight_stamps()
+    settings = derived_settings(
+        store,
+        batteries=battery_mapping_entry(
+            charge_power_entity=CHARGE_ENTITY, discharge_power_entity=DISCHARGE_ENTITY
+        ),
+    )
+    ws = StatisticsWS(
+        metadata={GRID_ENTITY: POWER_STAT_META, CHARGE_ENTITY: POWER_STAT_META, DISCHARGE_ENTITY: POWER_STAT_META},
+        rows={
+            GRID_ENTITY: stat_rows([(stamp, 0.5 - model_kw(stamp)) for stamp in stamps]),
+            CHARGE_ENTITY: stat_rows([(stamp, 0.5) for stamp in stamps]),
+            DISCHARGE_ENTITY: stat_rows([(stamp, 0.0) for stamp in stamps]),
+        },
+    )
+    stub = HistoryStub({})  # the purge-limited recorder has nothing; statistics must answer
+    forecast, status = load_solar_forecast(
+        settings, store, stub, location=TEST_LOCATION, now=NOW, ws_factory=lambda: ws
+    )
+    assert status.ok, status.last_error
+    assert forecast.planes[0]["capacity_wp"] == pytest.approx(SYNTHETIC_WP, rel=0.03)
+    assert stub.calls == [], "the fit must come from long-term statistics"
+    assert ("mean",) in ws.types
+
+
+def test_forecast_solar_without_planes_falls_back_to_the_meter(store):
+    """SPEC 7.1.1: no planes means Forecast.Solar has nothing to size, so the meter answers."""
+    stamps = daylight_stamps()
+    settings = derived_settings(
+        store,
+        **{"solar.source": "forecast_solar", "grid.power_entity": ""},
+        batteries=battery_mapping_entry(
+            charge_power_entity=CHARGE_ENTITY, discharge_power_entity=DISCHARGE_ENTITY
+        ),
+    )
+    stub = HistoryStub(
+        {
+            GRID_ENTITY: [(stamp, 0.5 - model_kw(stamp)) for stamp in stamps],
+            CHARGE_ENTITY: [(stamp, 0.5) for stamp in stamps],
+        }
+    )
+    forecast, status = load_solar_forecast(
+        settings,
+        store,
+        stub,
+        location=TEST_LOCATION,
+        now=NOW,
+        grid_roles={"grid_power": GRID_ENTITY},  # what the Energy dashboard would resolve to
+    )
+    assert status.ok, status.last_error
+    assert forecast.source == "derived" and forecast.slots
+    assert any("solar.planes is empty" in note for note in forecast.notes)
+
+
+def test_forecast_solar_without_planes_reports_why_the_fallback_failed(store):
+    settings = derived_settings(
+        store, **{"solar.source": "forecast_solar", "grid.power_entity": ""}
+    )
+    forecast, status = load_solar_forecast(
+        settings, store, HistoryStub({}), location=TEST_LOCATION, now=NOW
+    )
+    assert forecast.slots == []
+    assert "grid.power_entity" in str(status.detail.get("derived_fallback"))
+    assert any("meter-derived estimate" in note for note in forecast.notes)
+
+
+def test_derived_solar_accepts_energy_counters_from_the_energy_dashboard(store):
+    """An Energy dashboard with no power sensor still sizes the array from its export counter."""
+    stamps = daylight_stamps()
+    settings = derived_settings(store, **{"grid.power_entity": ""})
+    ws = StatisticsWS(
+        metadata={ENERGY_EXPORT_STAT: ENERGY_STAT_META},
+        rows={
+            # Every produced kWh reached the meter: the fit's lower-bound formula adds battery
+            # charge back separately, so the counter itself carries the full model output.
+            ENERGY_EXPORT_STAT: stat_rows(
+                [(stamp, model_kw(stamp)) for stamp in stamps], key="change"
+            )
+        },
+    )
+    forecast, status = load_solar_forecast(
+        settings,
+        store,
+        HistoryStub({}),
+        location=TEST_LOCATION,
+        now=NOW,
+        grid_roles={"grid_energy_export": ENERGY_EXPORT_STAT},
+        ws_factory=lambda: ws,
+    )
+    assert status.ok, status.last_error
+    assert forecast.planes[0]["capacity_wp"] == pytest.approx(SYNTHETIC_WP, rel=0.03)
+    assert ("change",) in ws.types, "an energy counter must be read as an hourly change, not a mean"

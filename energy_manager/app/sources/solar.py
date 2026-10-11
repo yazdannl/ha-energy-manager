@@ -1283,6 +1283,35 @@ def _store_derived_capacity(
     )
 
 
+def _collect_export_samples(
+    settings: Any,
+    client: Any,
+    *,
+    moment: datetime,
+    roles: Mapping[str, str],
+    ws_factory: Callable[[], Any] | None,
+) -> tuple[list[tuple[datetime, float]], str]:
+    """Export samples with long-term statistics when a WebSocket client is available.
+
+    The statistics table is never purged, so the fit sees weeks where recorder history
+    (``get_history``) is already empty. A socket failure falls back to recorder history: the fit
+    must never fail because one transport is down (SPEC.md 7.1.2).
+    """
+    from .load import collect_pv_export_samples
+
+    if ws_factory is not None:
+        try:
+            with ws_factory() as websocket:
+                return collect_pv_export_samples(
+                    settings, client, ws=websocket, now=moment, roles=roles
+                )
+        except Exception as exc:  # noqa: BLE001 - recorder history is the fallback
+            log.debug(
+                "meter-derived solar: statistics unavailable (%s); using recorder history", exc
+            )
+    return collect_pv_export_samples(settings, client, now=moment, roles=roles)
+
+
 def _derived_forecast(
     settings: Any,
     store: Any,
@@ -1293,16 +1322,20 @@ def _derived_forecast(
     moment: datetime,
     location: tuple[float, float, str] | None,
     http: Callable[..., Any] | None = None,
+    grid_roles: Mapping[str, str] | None = None,
+    ws_factory: Callable[[], Any] | None = None,
 ) -> tuple[SolarForecast, ProviderStatus]:
     """Learn the array from the meter, then forecast with the capacity model (SPEC.md 7.1.2).
 
     Nothing is written back to the settings: the learned watt peak is stated in the notes and the
     status detail (``capacity_source``, ``derived_samples``), and ``solar.capacity_wp`` overrides
     it. The fit itself is cached per entity mapping and refit at most daily, because it reads weeks
-    of recorder history. A meter that never exports, or a battery whose flow cannot be read, is a
-    status, not a crash.
+    of history. ``grid_roles`` carries the Energy-dashboard fallback from :mod:`app.grid` (explicit
+    ``grid.*`` settings still win); ``ws_factory`` reads that history from long-term statistics so
+    the window is not the recorder's purge window. A meter that never exports, or a battery whose
+    flow cannot be read, is a status, not a crash.
     """
-    from .load import collect_pv_export_samples, pv_export_roles
+    from .load import pv_export_roles
 
     if client is None:
         status.ok = False
@@ -1330,7 +1363,7 @@ def _derived_forecast(
             location=location,
             http=http,
         )
-    roles, refusal = pv_export_roles(settings)
+    roles, refusal = pv_export_roles(settings, defaults=grid_roles)
     if refusal:
         status.ok = False
         status.detail["reason"] = "no usable meter/battery mapping"
@@ -1349,7 +1382,9 @@ def _derived_forecast(
             "cached daily fit",
         )
     else:
-        samples, reason = collect_pv_export_samples(settings, client, now=moment, roles=roles)
+        samples, reason = _collect_export_samples(
+            settings, client, moment=moment, roles=roles, ws_factory=ws_factory
+        )
         if not samples:
             status.ok = False
             status.detail["reason"] = "no export samples"
@@ -1426,6 +1461,8 @@ def load_solar_forecast(
     location: tuple[float, float, str] | None = None,
     now: datetime | None = None,
     http: Callable[..., Any] | None = None,
+    grid_roles: Mapping[str, str] | None = None,
+    ws_factory: Callable[[], Any] | None = None,
 ) -> tuple[SolarForecast, ProviderStatus]:
     """Build the PV forecast, or an empty forecast plus a status explaining why not."""
     moment = now or utcnow()
@@ -1449,6 +1486,8 @@ def load_solar_forecast(
                 moment=moment,
                 location=location,
                 http=http,
+                grid_roles=grid_roles,
+                ws_factory=ws_factory,
             )
         return _capacity_forecast(
             settings,
@@ -1472,8 +1511,38 @@ def load_solar_forecast(
         return forecast, status
     planes = [dict(plane) for plane in (settings.get("solar.planes") or []) if isinstance(plane, Mapping)]
     if not planes:
+        # Forecast.Solar has nothing to size the array with, but the meter may: try the
+        # meter-derived estimate before reporting no_pv_source, because a user who configured the
+        # meter in the Energy dashboard should get a production estimate without repeating the
+        # mapping here. An explicit solar.capacity_wp still wins inside the derived tier.
+        fallback_forecast = SolarForecast(generated_at=moment, source="derived")
+        fallback_status = ProviderStatus(kind="solar", name="derived", active=True)
+        fallback_forecast, fallback_status = _derived_forecast(
+            settings,
+            store,
+            client,
+            status=fallback_status,
+            forecast=fallback_forecast,
+            moment=moment,
+            location=location,
+            http=http,
+            grid_roles=grid_roles,
+            ws_factory=ws_factory,
+        )
+        if fallback_forecast.slots and fallback_status.ok:
+            fallback_forecast.notes.insert(
+                0,
+                "solar.planes is empty; estimating from the meter's export history instead"
+                " (meter-derived array)",
+            )
+            return fallback_forecast, fallback_status
         status.ok = True
         status.detail["reason"] = "no planes configured"
+        if fallback_status.last_error:
+            status.detail["derived_fallback"] = fallback_status.last_error
+            forecast.notes.append(
+                f"the meter-derived estimate is unavailable too: {fallback_status.last_error}"
+            )
         forecast.notes.append("no solar planes configured")
         return forecast, status
     api_key = str(settings.get("solar.api_key", "") or "")

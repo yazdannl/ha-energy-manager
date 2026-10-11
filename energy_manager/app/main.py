@@ -38,7 +38,7 @@ from .notify import Notifier
 
 log = logging.getLogger("app.main")
 
-APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.8.2"
+APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.9.0"
 COMMIT = os.environ.get("SEM_COMMIT") or os.environ.get("GITHUB_SHA") or ""
 DEFAULT_PORT = 8099
 DEFAULT_OPTIONS = "/data/options.json"
@@ -162,11 +162,17 @@ def build_sources(
     load_module = _import("sources.load")
     measure_module = _import("sources.measure")
     haws_module = _import("haws")
+    grid_module = _import("grid")
 
     price_load = _callable(price_module, "load_price_forecast")
     solar_load = _callable(solar_module, "load_solar_forecast")
     load_load = _callable(load_module, "load_forecast")
     measure_collect = _callable(measure_module, "collect")
+
+    ws_class = _callable(haws_module, "HAWebSocket")
+    grid_class = _callable(grid_module, "GridMapping")
+    # The Energy-dashboard fallback (SPEC 3): explicit grid.* settings still win inside it.
+    grid_mapping = grid_class(settings, ws_factory=ws_class) if grid_class is not None else None
 
     price_source = None
     if price_load is not None:
@@ -174,7 +180,13 @@ def build_sources(
     solar_source = None
     if solar_load is not None:
         solar_source = lambda now: solar_load(  # noqa: E731
-            settings, store, ha, location=location, now=now
+            settings,
+            store,
+            ha,
+            location=location,
+            now=now,
+            grid_roles=grid_mapping.history_roles() if grid_mapping is not None else None,
+            ws_factory=ws_class,
         )
     load_source = None
     if load_load is not None:
@@ -194,8 +206,9 @@ def build_sources(
     sampler = None
     if measure_collect is not None and ha is not None:
         def sampler(now: datetime) -> dict[str, Any]:
+            entities = grid_mapping.power_roles() if grid_mapping is not None else grid_roles
             measurements, actuals = measure_collect(
-                ha, settings, settings.battery_list(), entities=grid_roles, now=now
+                ha, settings, settings.battery_list(), entities=entities, now=now
             )
             if store is not None and measurements:
                 # 5-minute measurement rows; the actuals row is written by the engine, which is
@@ -212,7 +225,6 @@ def build_sources(
             }
 
     registry_source = None
-    ws_class = _callable(haws_module, "HAWebSocket")
     if ws_class is not None:
         def registry_source() -> list[dict[str, Any]]:
             with ws_class() as websocket:
@@ -234,10 +246,18 @@ def build_sources(
         "sampler": sampler,
         "registry_source": registry_source,
         "states_source": states_source,
+        "grid_mapping": grid_mapping,
     }
 
 
-def build_maintenance(settings: Any, store: Any, ha: Any, *, timezone_name: str | None = None):
+def build_maintenance(
+    settings: Any,
+    store: Any,
+    ha: Any,
+    *,
+    timezone_name: str | None = None,
+    grid_mapping: Any = None,
+):
     """Daily hook: learn the load profile from history, then apply store retention (SPEC 7.2/11)."""
     load_module = _import("sources.load")
     haws_module = _import("haws")
@@ -259,6 +279,9 @@ def build_maintenance(settings: Any, store: Any, ha: Any, *, timezone_name: str 
     def maintenance(now: datetime) -> None:
         # Each part is guarded: a history failure must not stop retention (SPEC 7.2/11).
         if collect_history is not None and update_profile is not None and ha is not None:
+            history_roles = (
+                grid_mapping.history_roles() if grid_mapping is not None else derived
+            )
             try:
                 history = None
                 if ws_class is not None:
@@ -266,13 +289,13 @@ def build_maintenance(settings: Any, store: Any, ha: Any, *, timezone_name: str 
                         with ws_class() as websocket:
                             history = collect_history(
                                 settings, ha, ws=websocket, now=now, days=60,
-                                derived_entities=derived,
+                                derived_entities=history_roles,
                             )
                     except Exception as exc:
                         log.warning("load history over websocket failed: %s", exc)
                 if history is None:
                     history = collect_history(
-                        settings, ha, now=now, days=60, derived_entities=derived
+                        settings, ha, now=now, days=60, derived_entities=history_roles
                     )
                 if history is not None and getattr(history, "ok", False) and history.samples:
                     update_profile(store, history.samples, now=now, tz=timezone_name)
@@ -324,7 +347,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     location, label = resolve_location(settings, ha)
     sources = build_sources(settings, store, ha, location=location)
     maintenance = build_maintenance(
-        settings, store, ha, timezone_name=location[2] if location else None
+        settings,
+        store,
+        ha,
+        timezone_name=location[2] if location else None,
+        grid_mapping=sources.get("grid_mapping"),
     )
     engine = Engine(
         settings,

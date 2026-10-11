@@ -438,6 +438,33 @@ class HAWebSocket:
             fields["types"] = list(types)
         return self.call("recorder/statistics_during_period", **fields) or {}
 
+    def statistics_metadata(
+        self, statistic_ids: str | Iterable[str]
+    ) -> dict[str, dict[str, Any]]:
+        """``recorder/get_statistics_metadata`` keyed by statistic id.
+
+        The metadata carries ``unit_class`` (``power``/``energy``) and ``unit_of_measurement``,
+        which is how a history reader decides between a power ``mean`` and an energy ``change``
+        without a state read (external statistics have no entity to read).
+        """
+        ids = [statistic_ids] if isinstance(statistic_ids, str) else list(statistic_ids)
+        rows = self.call("recorder/get_statistics_metadata", statistic_ids=ids) or []
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if isinstance(row, Mapping) and row.get("statistic_id"):
+                out[str(row["statistic_id"])] = dict(row)
+        return out
+
+    def energy_prefs(self) -> dict[str, Any]:
+        """``energy/get_prefs``: the Home Assistant Energy dashboard configuration.
+
+        Read-only and not admin-gated (the sibling ``energy/save_prefs`` is), so the add-on can
+        find the meter the user already described to Home Assistant. An unset dashboard is an
+        empty mapping, never an error: the caller falls back to the explicit ``grid.*`` settings.
+        """
+        result = self.call("energy/get_prefs")
+        return dict(result) if isinstance(result, Mapping) else {}
+
 
 def _ws_url_from_ha_url(ha_url: str) -> str:
     parsed = urllib.parse.urlsplit(ha_url.strip())

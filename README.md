@@ -106,9 +106,14 @@ disclosure per group).
 | `price.export_fee_eur_per_kwh` | `0.0` | Feed-in cost, deducted per kWh from the sell price. |
 | `price.feed_in_energy_tax_refund` | `true` | On: the sell price is the buy price minus the feed-in cost. Off: the energy-tax component is not paid back and is subtracted too. |
 | `price.feed_in_eur_per_kwh` / `price.feed_in_entity` | unset | Optional explicit feed-in tariff or live sensor; either one overrides the derived price. |
-| `grid.power_entity` | unset | Signed grid power sensor (positive = import). Enables the load forecast and the meter-derived solar estimate. |
-| `solar.source` | `forecast_solar` | `forecast_solar` (per-plane API), `capacity` (enter the array's Wp) or `derived` (learn the array from the meter's export moments). |
+| `grid.power_entity` | unset | Signed grid power sensor (positive = import). Enables the load forecast and the meter-derived solar estimate. Left empty, it is read from your Home Assistant Energy dashboard. |
+| `solar.source` | `forecast_solar` | `forecast_solar` (per-plane API), `capacity` (enter the array's Wp) or `derived` (learn the array from the meter's export moments; also used automatically when `forecast_solar` has no planes and a meter resolves). |
 | `optimizer.allow_export` | `false` | Export scheduling stays off until you enable it. |
+
+If the **Meter** card is left empty, the add-on resolves the meter from your Home Assistant **Energy
+dashboard** (the same grid source the Energy panel already uses): the dashboard's signed power sensor
+for live sampling and control, or its import/export energy counters as a long-term-statistics history
+source when no power sensor is configured. An explicit `grid.*` value always wins.
 
 **The sell price is derived from the buy price by default**: `sell = buy − feed-in cost`, minus the
 energy-tax component when `price.feed_in_energy_tax_refund` is off. That is what a saldering contract

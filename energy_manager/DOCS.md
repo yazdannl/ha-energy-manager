@@ -21,9 +21,11 @@ The full documentation lives in the [repository README](https://github.com/yazda
    are discovered through the `zendure_ha` integration; you confirm the mapping before it is stored.
    Enter the battery's **round trip** efficiency as one number (the default is a 90 % round trip); the
    card then shows what a stored kWh costs and the sale price at which a cycle breaks even.
-4. Open *Settings*: pick your price provider on the **Price** card, search and pick your meter on
-   the **Meter** card, and (optionally) choose how the add-on should know your PV on the **Solar**
-   card. Leave the mode at `advisory` for a few days.
+4. Open *Settings*: pick your price provider on the **Price** card and (optionally) choose how the
+   add-on should know your PV on the **Solar** card. The **Meter** card can stay empty: the add-on
+   reads the meter from your Home Assistant **Energy dashboard** (its power sensor, or its
+   import/export energy counters) — search and pick one there only to override that. Leave the mode
+   at `advisory` for a few days.
 5. Watch *Plan* and *Log* to see what the add-on would have done, then enable `auto` (with
    `dry_run` still on) when you trust it.
 

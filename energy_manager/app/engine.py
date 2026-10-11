@@ -254,6 +254,7 @@ class Engine:
         solar_source: Callable[[datetime], SolarForecast] | None = None,
         load_source: Callable[[datetime], Any] | None = None,
         sampler: Callable[[datetime], Mapping[str, Any]] | None = None,
+        grid_mapping: Any = None,
         registry_source: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
         states_source: Callable[[], Mapping[str, Mapping[str, Any]]] | None = None,
         device_client_factory: Callable[[], Any] | None = None,
@@ -271,6 +272,7 @@ class Engine:
         self._solar_source = solar_source
         self._load_source = load_source
         self._sampler = sampler
+        self._grid_mapping = grid_mapping
         self._registry_source = registry_source
         self._states_source = states_source
         self._device_client_factory = device_client_factory
@@ -545,7 +547,13 @@ class Engine:
                     "hint": "set solar.capacity_wp (the array's total watt peak) for the capacity solar source",
                 }
         elif not (self._settings.get("solar.planes") or []):
-            return {"reason": "no_pv_source", "hint": "add a PV plane under solar.planes"}
+            hint = "add a PV plane under solar.planes"
+            status = self._provider_status.get(("solar", "forecast_solar"))
+            detail = getattr(status, "detail", None) or {}
+            fallback = detail.get("derived_fallback") if isinstance(detail, Mapping) else None
+            if fallback:
+                hint += f" (the meter-derived estimate also failed: {fallback})"
+            return {"reason": "no_pv_source", "hint": hint}
         statuses = {
             status.name: status
             for (status_kind, _), status in self._provider_status.items()
@@ -1288,11 +1296,21 @@ class Engine:
         return {str(item.get("entity_id")): item for item in states if item.get("entity_id")}
 
     def grid_mapping(self) -> dict[str, str]:
-        """Confirmed grid roles from settings, for the sampler and the derived-load tier."""
-        return {
+        """Effective grid roles from settings, else the Energy-dashboard fallback (SPEC 3).
+
+        The keys are always present (an unmapped role is ``""``) because the sampler's role map
+        and the API read it as a complete picture. The fallback only fills roles the user left
+        empty, so an explicit confirmation always wins.
+        """
+        roles = {
             role: str(self._settings.get(key, "") or "")
             for role, key in GRID_ROLE_SETTINGS.items()
         }
+        if self._grid_mapping is not None:
+            for role, entity in self._grid_mapping.power_roles().items():
+                if not roles.get(role):
+                    roles[role] = entity
+        return roles
 
     def _registry_entries(self, now: datetime) -> list[dict[str, Any]]:
         if self._registry_source is None:

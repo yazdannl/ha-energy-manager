@@ -434,3 +434,39 @@ def test_usable_energy_is_not_offered_as_capacity():
     assert ("sensor.example_available_kwh", "available_energy") in roles
     assert ("sensor.example_total_kwh", "capacity") in roles
     assert not any(entity.endswith("available_kwh") and role == "capacity" for entity, role in roles)
+
+
+# ---------------------------------------------------------------------------------------------
+# Energy dashboard + statistics metadata wrappers (0.9.0)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_energy_prefs_and_statistics_metadata_wrap_their_results(monkeypatch):
+    client = HAWebSocket("ws://127.0.0.1:1/api/websocket", "test-token")
+    seen = {}
+
+    def fake_call(message_type, **fields):
+        seen[message_type] = fields
+        if message_type == "energy/get_prefs":
+            return {"energy_sources": [{"type": "grid", "stat_rate": "sensor.example_net_power"}]}
+        return [{"statistic_id": "sensor.example_power", "unit_class": "power", "has_mean": True, "has_sum": False}]
+
+    monkeypatch.setattr(client, "call", fake_call)
+    assert client.energy_prefs()["energy_sources"][0]["stat_rate"] == "sensor.example_net_power"
+    metadata = client.statistics_metadata("sensor.example_power")
+    assert metadata == {
+        "sensor.example_power": {
+            "statistic_id": "sensor.example_power",
+            "unit_class": "power",
+            "has_mean": True,
+            "has_sum": False,
+        }
+    }
+    assert seen["recorder/get_statistics_metadata"] == {"statistic_ids": ["sensor.example_power"]}
+
+
+def test_energy_prefs_and_metadata_tolerate_a_missing_result(monkeypatch):
+    client = HAWebSocket("ws://127.0.0.1:1/api/websocket", "test-token")
+    monkeypatch.setattr(client, "call", lambda *args, **kwargs: None)
+    assert client.energy_prefs() == {}
+    assert client.statistics_metadata(["sensor.example_power"]) == {}
