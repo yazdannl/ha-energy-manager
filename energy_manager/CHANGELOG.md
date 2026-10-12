@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.14.0
+
+- **Each pack's real usable capacity can now be learned from its own cycles.** A battery gains a
+  `capacity_source` of `manual` (the shipped default) or `learned`. In `learned` mode the capacity
+  you typed becomes the seed/fallback, and the planner uses an estimate measured from the battery's
+  own 5-minute power and SoC rows. Each charge window computes
+  `AC_charge_kWh * eta_charge / dSoC` and each discharge window
+  `AC_discharge_kWh / eta_discharge / |dSoC|`; a window counts only with a SoC move of at least 10
+  points, a mean power of at least 20 % of the battery's own limit, finite values and no gap longer
+  than one sample. Accepted windows are combined with a median after a MAD outlier filter, at least
+  three are required, the result is clamped to a plausible 1..200 kWh, and an estimate older than 30
+  days is ignored. The effective capacity is resolved once and used everywhere capacity is consumed
+  — drivers, the DP optimiser, allocation, the savings baseline and the published summaries — with a
+  stable reason slug logged as the learned value is applied or rejected. The estimate is stored as
+  runtime data (`learning_profiles`), never over your typed capacity. **Manual always wins**: with
+  the default source, or when the estimate is stale or not yet confident, the configured value is
+  used unchanged.
+- **`GET /api/v1/batteries` and the Batteries card show where the capacity comes from.** Each record
+  exposes `capacity_source`, the configured `capacity_kwh`, `capacity_learned_kwh`,
+  `capacity_samples`, `capacity_updated_at` and the `effective_capacity_kwh`, plus a nested
+  `capacity` detail. The card states the effective value, the estimate, its window count and last
+  update, and the Edit dialog switches between manual and learned through the normal save flow. All
+  additions are additive; `capacity_source` defaults to `manual`, so an existing configuration plans
+  exactly as before.
+
 ## 0.13.0
 
 - **Savings are now earned only by energy the battery actually moved.** The savings accounting used

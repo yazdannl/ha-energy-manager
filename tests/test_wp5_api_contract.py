@@ -435,7 +435,44 @@ def test_batteries_view_carries_flat_capabilities_and_cycles(wired):
     assert "driver" in capabilities and "max_charge_w" in capabilities
     assert isinstance(record["cycles"], float)
     assert record["state"]["extra"]["cycles"] == record["cycles"]
+    # SPEC 5: the record states the configured seed, the learned estimate and the effective value.
+    assert {
+        "capacity_source",
+        "capacity_kwh",
+        "capacity_learned_kwh",
+        "capacity_samples",
+        "capacity_updated_at",
+        "effective_capacity_kwh",
+        "capacity_reason",
+    } <= set(record)
+    assert record["capacity_source"] in ("manual", "learned")
+    assert record["config"]["capacity_source"] == record["capacity_source"]
+    assert record["effective_capacity_kwh"] == record["config"]["capacity_kwh"] or record["capacity"]["applied"]
     note(f"batteries: capabilities keys={sorted(capabilities)} cycles={record['cycles']}")
+
+
+def test_capacity_source_round_trips_and_has_no_fabricated_estimate(wired):
+    status, _headers, body = wired.json(
+        "PATCH", "/api/v1/batteries/example_battery_1", {"patch": {"capacity_source": "learned"}}
+    )
+    assert status == 200 and body["config"]["capacity_source"] == "learned"
+    status, _headers, body = wired.json("GET", "/api/v1/batteries")
+    assert status == 200
+    record = next(item for item in body["batteries"] if item["config"]["id"] == "example_battery_1")
+    assert record["capacity_source"] == "learned"
+    # No measurement history in this fixture: the seed is used, never an invented estimate.
+    assert record["capacity_learned_kwh"] is None
+    assert record["capacity_samples"] == 0
+    assert record["effective_capacity_kwh"] == 5.0
+    assert record["capacity_reason"] == "capacity_learned_unavailable"
+    status, _headers, body = wired.json(
+        "PATCH", "/api/v1/batteries/example_battery_1", {"patch": {"capacity_source": "manual"}}
+    )
+    assert status == 200 and body["config"]["capacity_source"] == "manual"
+    status, _headers, body = wired.json(
+        "PATCH", "/api/v1/batteries/example_battery_1", {"patch": {"capacity_source": "nonsense"}}
+    )
+    assert status == 400
 
 
 def test_battery_crud_and_test_discharge_refusal(wired):

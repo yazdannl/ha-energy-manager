@@ -295,6 +295,15 @@ def test_real_engine_battery_view_and_stop_route(wired):
         "mapping_resolved",
         "cycles",
         "discovery",
+        # SPEC 5 learned capacity (additive): flat fields plus the nested detail.
+        "capacity",
+        "capacity_source",
+        "capacity_kwh",
+        "capacity_learned_kwh",
+        "capacity_samples",
+        "capacity_updated_at",
+        "effective_capacity_kwh",
+        "capacity_reason",
     }
     assert isinstance(record["cycles"], float)
     assert record["state"]["extra"]["cycles"] == record["cycles"]

@@ -185,6 +185,28 @@ efficient battery first, and reports the aggregate round trip and wear it assume
 battery from its own values, so a cheap old pack and an efficient new one are not averaged into one
 misleading number.
 
+### Learn each pack's real usable capacity
+
+The capacity you type is the label, and a label is a promise rather than a measurement: a new pack
+may hold less, and an aged one certainly does. Set a battery's **capacity source** to **learned** and
+the add-on measures the pack's real usable capacity from its own cycles, using the capacity you typed
+only as the seed and fallback.
+
+Each measured charge or discharge window pairs the AC energy it moved with the SoC it moved, with
+that direction's efficiency on the right side of the division
+(`capacity = AC × η_charge / dSoC` while charging, `capacity = AC / η_discharge / dSoC` while
+discharging). A window only counts if the SoC moved at least 10 points, the average power was at
+least 20 % of the battery's own limit, every value is finite and no measurement is missing beyond a
+single 5-minute sample. Accepted windows are combined with a median after an outlier filter, and at
+least three are needed before the estimate is used. Estimates older than 30 days are ignored until
+they are refreshed. **Manual always wins**: leave the source on manual, or let a learned estimate go
+stale, and the capacity you typed is used unchanged. Nothing is ever guessed — when there is no
+usable estimate the seed is used and the battery card says why.
+
+The battery card shows the effective capacity, the estimate, how many windows it was built from and
+when it was last learned; the Edit dialog switches between manual and learned through the normal
+save flow. The estimate is stored as runtime data, never written back over your typed capacity.
+
 ### Data footprint
 
 The add-on reads **only the entities you mapped** (targeted state reads, never a full Home Assistant

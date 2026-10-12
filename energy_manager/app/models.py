@@ -140,6 +140,11 @@ PRICE_UNITS = ("auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh")
 #: driver pick, which keeps the shipped behaviour for every existing configuration.
 CONTROL_PATHS = ("auto", "manager", "device")
 
+#: Where a battery's capacity comes from (SPEC.md section 5): ``manual`` uses ``capacity_kwh`` as
+#: typed; ``learned`` keeps it as the seed/fallback and uses the self-measured estimate once it is
+#: confident and fresh, otherwise falling back to the seed.
+CAPACITY_SOURCES = ("manual", "learned")
+
 
 # --------------------------------------------------------------------------------------
 # Batteries
@@ -187,6 +192,10 @@ class BatteryConfig:
     #: talks to the inverter directly, so it does not wait for the manager's next P1 event; the
     #: manager path is the only one that can split power across a fuse group.
     control_path: str = "auto"
+    #: ``manual`` (default) or ``learned`` (SPEC.md section 5). In ``learned`` mode
+    #: ``capacity_kwh`` stays the seed/fallback and the self-measured estimate is used for
+    #: planning, allocation, UI and the published summaries once it is confident and fresh.
+    capacity_source: str = "manual"
 
     def usable_kwh(self) -> float:
         """Energy between the configured SoC floor and ceiling."""
@@ -260,6 +269,8 @@ class BatteryConfig:
             problems.append("mapping is empty: confirm the entity mapping in the UI")
         if self.control_path not in CONTROL_PATHS:
             problems.append(f"control_path must be one of {', '.join(CONTROL_PATHS)}")
+        if self.capacity_source not in CAPACITY_SOURCES:
+            problems.append(f"capacity_source must be one of {', '.join(CAPACITY_SOURCES)}")
         return problems
 
 

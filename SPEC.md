@@ -373,9 +373,27 @@ class BatteryConfig:
     eta_discharge: float    # 0<eta<=1, cell->AC
     price_eur: float = 0.0  # purchase price (EUR); 0 = unknown, no derived wear
     cycle_life: float = 0.0 # rated full cycles; 0 = unknown, no derived wear
+    capacity_source: str = "manual"  # manual | learned (SPEC 5)
     mapping: dict[str, str] # driver-specific entity mapping, resolved at runtime
     enabled: bool = True
 ```
+
+**Learned capacity (``capacity_source``, additive 0.14.0).** A pack rarely holds its label's figure.
+``capacity_source="manual"`` (the shipped default) keeps ``capacity_kwh`` as the effective capacity.
+``capacity_source="learned"`` keeps ``capacity_kwh`` as a seed/fallback and uses an estimate learned
+from the pack's own measured cycles for planning, allocation, UI and the published summaries. The
+estimate pairs AC energy with SoC change over 5-minute rows (SPEC 7.3): for a charge window
+``capacity = AC_charge_kWh * eta_charge / dSoC`` and for a discharge window
+``capacity = AC_discharge_kWh / eta_discharge / |dSoC|`` (each efficiency sits on its own leg). A
+window is accepted only with ``|dSoC| >= 10`` points, ``mean |power| >= 20 %`` of that battery's own
+limit for the direction, finite values and no gap longer than one sample; accepted windows are
+combined with a median after a median-absolute-deviation outlier filter, kept to the last 20, clamped
+to a plausible 1..200 kWh and published only with at least 3 accepted windows. An estimate older than
+30 days is stale. ``manual`` always wins; in ``learned`` mode a missing, stale or low-confidence
+estimate falls back to the seed, and the transition is logged with a stable reason slug
+(``capacity_learned`` / ``capacity_learned_stale`` / ``capacity_learned_low_confidence`` /
+``capacity_learned_unavailable``). The estimate is runtime data (a ``learning_profiles`` payload per
+battery), never written back into user settings.
 
 Efficiency is entered per battery as a **round trip**: the UI/API field `round_trip_efficiency_pct` is
 split evenly into `eta_charge = eta_discharge = sqrt(pct/100)`, and explicit per-direction values (when
@@ -1424,6 +1442,24 @@ round, with the reason:
   forward-only migration 2, and exposes them on `/api/v1/savings` and the Savings view with a
   `measured_buckets` coverage count; a missing or unconfirmed measurement is `null`/unknown, never
   the planned value.
+
+- **§5/§10/§13 (self-learning usable capacity; requested 2026-10-12, "learn each pack's real usable
+  capacity from measured cycles")** — the configured ``capacity_kwh`` is a label, not a measurement,
+  and an aged pack holds less. ``BatteryConfig`` gains the additive ``capacity_source`` (``manual``
+  default, ``learned``) and a pure estimator (``app/capacity.py``) derives capacity from the
+  persisted 5-minute AC power and SoC rows: charge windows divide ``AC * eta_charge`` and discharge
+  windows divide ``AC / eta_discharge`` by the SoC fraction, each direction's efficiency on its own
+  leg; windows need a 10-point SoC move, 20 % of the battery's own power limit, no gap beyond one
+  sample and finite values, and are combined with a median after a MAD outlier filter, kept to 20
+  windows, clamped to 1..200 kWh and published from 3 windows. The engine resolves the effective
+  capacity wherever capacity is consumed (drivers, DP, allocation, savings baseline, published
+  summaries) and falls back to the manual seed for a missing, stale or low-confidence estimate,
+  journaling a stable reason slug. The estimate is stored per battery in ``learning_profiles``, never
+  in user settings; ``GET /api/v1/batteries`` and the Batteries card expose the configured seed, the
+  estimate, its sample count and last update, and the effective value, and the card's Edit dialog
+  switches source through the normal dirty/Save flow. Alternatives rejected: writing the learned
+  value back to ``capacity_kwh`` (destroys the seed and the manual fallback) and trusting a single
+  cycle (one bad meter sample would redefine the pack).
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

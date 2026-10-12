@@ -25,6 +25,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Callable, Mapping, Sequence
 
 from . import analytics
+from . import capacity as capacity_learning
 from .control import drivers as driver_registry
 from .control.dispatcher import Dispatcher, TickOutcome
 from .control.drivers.base import IDEMPOTENT_TOLERANCE_W, HAFacade
@@ -61,6 +62,10 @@ log = logging.getLogger(__name__)
 #: as ``sources.measure.MEASUREMENT_MINUTES``); the optimiser's own grid stays at
 #: ``optimizer.slot_minutes``.  A regression test pins the two together.
 ACTUALS_MINUTES = 5
+
+#: How long a learned-capacity profile read is cached in the engine (SPEC 5); maintenance rewrites
+#: it at most once a day, so a few minutes of staleness changes nothing and keeps the tick cheap.
+CAPACITY_CACHE_S = 300.0
 
 #: Published HA entities (SPEC section 12).  ``sensor.sem_*`` is the documented contract.
 SEM_AUTOPILOT_STATE = "sensor.sem_autopilot_state"
@@ -295,6 +300,11 @@ class Engine:
         self._control_lock = threading.RLock()
         self._drivers: dict[str, Any] = {}
         self._driver_signature: tuple[Any, ...] | None = None
+        # Learned capacity (SPEC 5): the stored profile read is cached briefly because
+        # ``effective_config`` runs inside the tick, and a note is journaled only when the
+        # applied value or its reason slug changes, so the tick cannot spam the log.
+        self._capacity_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
+        self._capacity_notes: dict[str, str] = {}
 
         self._plan: Plan | None = None
         self._plan_inputs: tuple[Any, ...] | None = None
@@ -1080,13 +1090,21 @@ class Engine:
             return []
 
     def resolved_config(self, config: BatteryConfig) -> BatteryConfig:
-        """The config a driver is built from: the stored mapping plus registry-resolved roles.
+        """The config every runtime consumer uses: registry-resolved mapping plus the effective
+        capacity (SPEC 5).
 
-        Only the Zendure drivers resolve at runtime (SPEC 5: their roles are derived from the entity
-        registry -- by platform + translation key on ``zendure_ha``, by property name on an MQTT
-        bridge device).  The stored mapping always wins, and a config is never mutated --
-        ``batteries_view`` still shows what the user confirmed.
+        Mapping resolution is driver-specific: only the Zendure drivers resolve at runtime (their
+        roles are derived from the entity registry -- by platform + translation key on
+        ``zendure_ha``, by property name on an MQTT bridge device).  The stored mapping always wins,
+        and a config is never mutated -- ``batteries_view`` still shows what the user confirmed.
+        On top of that the learned capacity replaces ``capacity_kwh`` when the battery is set to
+        ``capacity_source="learned"`` and the estimate is confident and fresh; otherwise the
+        manual value survives untouched (SPEC 5).
         """
+        return self.effective_config(self._resolved_mapping(config))
+
+    def _resolved_mapping(self, config: BatteryConfig) -> BatteryConfig:
+        """Stored mapping plus registry-resolved roles, before the learned capacity is applied."""
         resolver = driver_registry.resolve_mapping_for(config.driver)
         if resolver is None:
             return config
@@ -1106,6 +1124,123 @@ class Engine:
             return config
         return replace(config, mapping={**mapping, **merged})
 
+    # ------------------------------------------------------------------ learned capacity
+
+    def capacity_status(self, battery_id: str) -> dict[str, Any]:
+        """The stored learned estimate for one battery, classified (SPEC 5).
+
+        Cached for a short time: the profile is written once a day by maintenance, so reading it
+        on every tick would be pure overhead.  A missing store/profile is ``no estimate``.
+        """
+        now = self._clock()
+        cached = self._capacity_cache.get(battery_id)
+        if cached is not None and (now - cached[0]).total_seconds() < CAPACITY_CACHE_S:
+            return cached[1]
+        payload = capacity_learning.load_estimate(self._store, battery_id)
+        status = capacity_learning.capacity_status(payload, now)
+        self._capacity_cache[battery_id] = (now, status)
+        return status
+
+    def invalidate_capacity_cache(self) -> None:
+        """Drop the cached estimates (after maintenance has re-learned them)."""
+        self._capacity_cache = {}
+
+    def learn_capacities(self, now: datetime | None = None) -> dict[str, Any]:
+        """Re-estimate every enabled battery from its stored measurements (SPEC 5).
+
+        Called from daily maintenance.  Each battery is guarded independently: one bad series is a
+        note, never a crash, and the manual capacity remains usable throughout.  Returns a small
+        summary (batteries, published) for logging/tests.
+        """
+        moment = now or self._clock()
+        configs = [config for config in self.battery_configs() if config.enabled]
+        learned: list[str] = []
+        estimated: list[str] = []
+        for config in configs:
+            try:
+                payload = capacity_learning.learn_capacity(self._store, config, moment)
+            except Exception as exc:  # noqa: BLE001 - learning must never break maintenance
+                log.warning("capacity learning failed for %s: %s", config.id, exc)
+                continue
+            if payload is None:
+                continue
+            estimated.append(config.id)
+            if capacity_learning.capacity_status(payload, moment).get("applied"):
+                learned.append(config.id)
+        self._capacity_notes = {}
+        self.invalidate_capacity_cache()
+        return {
+            "batteries": [config.id for config in configs],
+            "estimated": estimated,
+            "learned": learned,
+        }
+
+    def effective_capacity_kwh(self, config: BatteryConfig) -> float:
+        """The capacity planning/UI must use: the learned value when confident+fresh, else manual."""
+        return self.effective_capacity(config)[0]
+
+    def effective_capacity(self, config: BatteryConfig) -> tuple[float, dict[str, Any]]:
+        """``(kwh, status)``: the value to use and why (a stable reason slug in ``status``).
+
+        ``manual`` always returns the configured value.  ``learned`` returns the estimate only when
+        the classifier marked it applied (confident, from at least three windows, not stale); a
+        stale or low-confidence estimate falls back to the seed, which is never a fabricated
+        number.
+        """
+        manual = float(config.capacity_kwh)
+        if config.capacity_source != "learned":
+            status = self.capacity_status(config.id)
+            return manual, {**status, "applied": False, "reason": capacity_learning.REASON_MANUAL,
+                            "capacity_kwh": None}
+        status = self.capacity_status(config.id)
+        learned = status.get("capacity_kwh")
+        if learned is None:
+            return manual, status
+        return float(learned), status
+
+    def effective_config(self, config: BatteryConfig) -> BatteryConfig:
+        """A copy of ``config`` whose ``capacity_kwh`` is the effective capacity (SPEC 5)."""
+        learned, status = self.effective_capacity(config)
+        self._note_capacity_use(config, learned, status)
+        if abs(learned - float(config.capacity_kwh)) < 1e-9:
+            return config
+        return replace(config, capacity_kwh=learned)
+
+    def effective_battery_configs(self) -> list[BatteryConfig]:
+        """The stored batteries with each effective capacity applied (planning, savings, publish)."""
+        return [self.effective_config(config) for config in self.battery_configs()]
+
+    def _note_capacity_use(
+        self, config: BatteryConfig, learned: float, status: Mapping[str, Any]
+    ) -> None:
+        """Journal applied/rejected learned capacity once per change, with the stable reason slug."""
+        signature = f"{status.get('reason')}:{learned:.3f}"
+        if self._capacity_notes.get(config.id) == signature:
+            return
+        self._capacity_notes[config.id] = signature
+        if config.capacity_source != "learned":
+            return
+        detail = {
+            "reason": status.get("reason"),
+            "samples": status.get("samples"),
+            "seed_kwh": round(float(config.capacity_kwh), 4),
+            "effective_kwh": round(learned, 4),
+        }
+        if status.get("applied"):
+            self._journal.event(
+                "info",
+                "capacity_learned_applied",
+                f"battery {config.id}: using learned capacity {learned:.3f} kWh",
+                detail,
+            )
+        else:
+            self._journal.event(
+                "info",
+                "capacity_learned_rejected",
+                f"battery {config.id}: keeping the seed capacity {learned:.3f} kWh",
+                detail,
+            )
+
     def _sync_drivers(self) -> None:
         configs = self.battery_configs()
         effective: dict[str, BatteryConfig] = {}
@@ -1117,7 +1252,10 @@ class Engine:
                 config.driver,
                 tuple(sorted(effective[config.id].mapping.items())),
                 config.enabled,
-                config.capacity_kwh,
+                # The effective capacity, so a change in the learned estimate rebuilds the driver
+                # (it derives energy from SoC with this value) rather than waiting for an
+                # unrelated config change.
+                effective[config.id].capacity_kwh,
                 config.max_charge_w,
                 config.max_discharge_w,
             )
@@ -1194,6 +1332,11 @@ class Engine:
             extra = dict(battery_state.get("extra") or {})
             extra["cycles"] = cycles
             battery_state["extra"] = extra
+            # SPEC 5: the card shows the effective capacity next to the configured seed and the
+            # learned estimate's evidence (samples, last update), so a user can decide which one
+            # to trust; the same numbers are exposed flat on the record for tests/clients.
+            capacity_info = self.capacity_status(config.id)
+            effective_kwh, effective_status = self.effective_capacity(config)
             views.append(
                 {
                     "config": _battery_view(config),
@@ -1202,6 +1345,25 @@ class Engine:
                     "mapping_resolved": bool(capabilities.get("mapping_resolved")),
                     "cycles": cycles,
                     "discovery": discovery,
+                    "capacity_source": config.capacity_source,
+                    "capacity_kwh": float(config.capacity_kwh),
+                    "capacity_learned_kwh": capacity_info.get("learned_kwh"),
+                    "capacity_samples": int(capacity_info.get("samples") or 0),
+                    "capacity_updated_at": capacity_info.get("updated_at"),
+                    "effective_capacity_kwh": effective_kwh,
+                    "capacity_reason": effective_status.get("reason"),
+                    "capacity": {
+                        "source": config.capacity_source,
+                        "configured_kwh": float(config.capacity_kwh),
+                        "learned_kwh": capacity_info.get("learned_kwh"),
+                        "samples": int(capacity_info.get("samples") or 0),
+                        "updated_at": capacity_info.get("updated_at"),
+                        "effective_kwh": effective_kwh,
+                        "reason": effective_status.get("reason"),
+                        "stale": bool(capacity_info.get("stale")),
+                        "confident": bool(capacity_info.get("confident")),
+                        "applied": bool(effective_status.get("applied")),
+                    },
                 }
             )
         return views
@@ -1505,7 +1667,7 @@ class Engine:
         self._sync_drivers()
         self._sync_mode()
         measurements = self._sample(moment)
-        batteries = self.battery_configs()
+        batteries = self.effective_battery_configs()
         live: list[BatteryState] | None = None
         if not self._battery_read_ok:
             # SPEC 9.1: read first, plan second.  A fresh install must act on the measured SoC in
@@ -1812,7 +1974,7 @@ class Engine:
             return
         plan = self.active_plan()
         slot = plan.slot_at(now) if plan is not None else None
-        configs = [config for config in self.battery_configs() if config.enabled]
+        configs = [config for config in self.effective_battery_configs() if config.enabled]
         capacity = sum(config.capacity_kwh for config in configs)
         if not configs:
             # Nothing configured can move: a zero flow is measured-truthful here, not unknown.
@@ -1958,7 +2120,7 @@ class Engine:
         plan (a schedule anchored on an assumed floor SoC is meaningless).  An install with no
         enabled battery has nothing to read, so its documented do-nothing plan is authoritative.
         """
-        configs = self.battery_configs()
+        configs = self.effective_battery_configs()
         if not any(config.enabled for config in configs):
             return True
         if self._battery_read_ok:
@@ -2026,7 +2188,7 @@ class Engine:
             return "plan_age"
         if plan.slot_at(now) is None:
             return "plan_expired"
-        if self._dispatcher.needs_replan(self.snapshot(), plan, self.battery_configs(), now) == "soc_deviation":
+        if self._dispatcher.needs_replan(self.snapshot(), plan, self.effective_battery_configs(), now) == "soc_deviation":
             return "soc_deviation"
         return None
 
@@ -2074,7 +2236,7 @@ class Engine:
             self._note_replan_outcome(None)
             return None
 
-        configs = self.battery_configs()
+        configs = self.effective_battery_configs()
         start_kwh = self._live_energy_kwh(configs)
         mode = str(self.snapshot().mode)
         try:
@@ -2440,7 +2602,7 @@ class Engine:
         if not rows and self._savings_today:
             rows = [dict(self._savings_today)]
         capacity = sum(
-            float(config.capacity_kwh or 0.0) for config in self.battery_configs() if config.enabled
+            float(config.capacity_kwh or 0.0) for config in self.effective_battery_configs() if config.enabled
         )
         return analytics.savings_from_daily(rows, range_key, now, capacity_kwh=capacity)
 
@@ -2475,7 +2637,7 @@ class Engine:
                 "floor_soc_pct": max(float(config.min_soc_pct), floors["reserve_soc_pct"]),
                 "capacity_kwh": float(config.capacity_kwh),
             }
-            for config in sorted(self.battery_configs(), key=lambda item: item.id)
+            for config in sorted(self.effective_battery_configs(), key=lambda item: item.id)
             if config.enabled
         ]
         if plan is None:
@@ -2667,7 +2829,7 @@ class Engine:
     def _check_battery_floor(self, now: datetime) -> None:
         with self._lock:
             state = self.snapshot()
-        configs = {config.id: config for config in self.battery_configs()}
+        configs = {config.id: config for config in self.effective_battery_configs()}
         for battery in state.batteries:
             config = configs.get(battery.id)
             if config is None or battery.soc_pct is None:
@@ -2714,6 +2876,12 @@ class Engine:
         if self._last_maintenance is not None and self._last_maintenance >= today:
             return
         self._last_maintenance = today
+        # Learned capacity first: a plan solved right after maintenance already sees the fresh
+        # estimate, and the manual seed still applies while it is being computed (SPEC 5).
+        try:
+            self.learn_capacities(now)
+        except Exception as exc:  # noqa: BLE001 - capacity learning must not stop retention
+            self._journal.event("warning", "capacity_learning_failed", str(exc)[:200])
         try:
             self._maintenance(now)
         except Exception as exc:
@@ -2806,7 +2974,7 @@ class Engine:
         soc_values = [b.soc_pct for b in state.batteries if b.soc_pct is not None]
         soc_avg = sum(soc_values) / len(soc_values) if soc_values else 0.0
         at_floor = False
-        configs = {config.id: config for config in self.battery_configs()}
+        configs = {config.id: config for config in self.effective_battery_configs()}
         for battery in state.batteries:
             config = configs.get(battery.id)
             if config is not None and battery.soc_pct is not None:

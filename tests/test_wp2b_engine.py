@@ -1625,7 +1625,23 @@ def test_batteries_view_reports_cycles_and_flat_capabilities():
     assert view[0]["state"]["extra"]["cycles"] == 5.25
     capabilities = view[0]["capabilities"]
     assert isinstance(capabilities, dict) and capabilities["driver"] == "generic"
-    assert set(view[0]) == {"config", "state", "capabilities", "mapping_resolved", "cycles", "discovery"}
+    assert set(view[0]) == {
+        "config",
+        "state",
+        "capabilities",
+        "mapping_resolved",
+        "cycles",
+        "discovery",
+        # SPEC 5 learned capacity (additive): the flat record fields and the nested detail.
+        "capacity",
+        "capacity_source",
+        "capacity_kwh",
+        "capacity_learned_kwh",
+        "capacity_samples",
+        "capacity_updated_at",
+        "effective_capacity_kwh",
+        "capacity_reason",
+    }
 
 
 def test_log_exposes_alerts_as_their_own_kind():

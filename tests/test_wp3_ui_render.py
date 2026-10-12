@@ -73,5 +73,10 @@ def test_ui_renders_and_settings_ia_holds():
         "the savings view states measured-series coverage",
         "an unmeasured bucket reports its cycle energy as unknown, not planned",
         "a measured bucket renders its charged and discharged energy",
+        # SPEC 5 learned capacity: the Batteries card must state the effective value and where it
+        # came from, never bury a learned estimate without its evidence.
+        "the batteries card shows the effective capacity, marked learned",
+        "the batteries card states the estimate's sample count and last update",
+        "the batteries card states the configured seed next to the effective value",
     ):
         assert needle in proc.stdout, f"the render check no longer reports {needle!r}:\n{proc.stdout}"

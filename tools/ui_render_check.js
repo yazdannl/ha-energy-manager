@@ -133,6 +133,26 @@ function classTokens(text) {
     }
   }
 
+  /* ---------- 1a. learned battery capacity on the Batteries card (SPEC 5) ---------- */
+  console.log("\n1a. batteries card: effective vs learned capacity");
+  await goto("/batteries");
+  const capacityText = allText(view());
+  check(
+    "the batteries card shows the effective capacity, marked learned",
+    /Capacity/.test(capacityText) && /learned/i.test(capacityText) && /9\.60 kWh/.test(capacityText),
+    capacityText.slice(0, 240),
+  );
+  check(
+    "the batteries card states the estimate's sample count and last update",
+    /accepted measurement window/i.test(capacityText) && /last learned/i.test(capacityText),
+    capacityText.slice(0, 240),
+  );
+  check(
+    "the batteries card states the configured seed next to the effective value",
+    /Configured 12\.00 kWh/.test(capacityText) && /effective 9\.60 kWh/.test(capacityText),
+    capacityText.slice(0, 240),
+  );
+
   /* ---------- 1b. quiet refresh ---------- */
   // A background refresh must update in place, never duplicate the answer and never re-render the
   // route (UI_REVIEW §3.5). This runs before the settings checks so no dirty-form guard is active.

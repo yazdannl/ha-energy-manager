@@ -2830,6 +2830,46 @@
     return null;
   }
 
+  /** SPEC 5 learned capacity: what the card may state, and never a fabricated estimate. */
+  function capacitySummary(record) {
+    var config = (record && record.config) || {};
+    var info = (record && record.capacity) || {};
+    var source = String(config.capacity_source || info.source || "manual");
+    function pick(infoKey, recordKey) {
+      if (isNum(info[infoKey])) return info[infoKey];
+      if (record && isNum(record[recordKey])) return record[recordKey];
+      return null;
+    }
+    var effective = pick("effective_kwh", "effective_capacity_kwh");
+    if (effective == null && isNum(config.capacity_kwh)) effective = config.capacity_kwh;
+    var samples = pick("samples", "capacity_samples");
+    return {
+      source: source,
+      effective: effective,
+      configured: isNum(config.capacity_kwh) ? config.capacity_kwh : null,
+      learned: pick("learned_kwh", "capacity_learned_kwh"),
+      samples: samples == null ? 0 : samples,
+      updated: info.updated_at || (record && record.capacity_updated_at) || null,
+      reason: String((record && record.capacity_reason) || info.reason || ""),
+      stale: !!info.stale,
+      applied: source !== "learned" || !!info.applied
+    };
+  }
+
+  /** One truthful sentence about where a battery's capacity comes from (SPEC 5). */
+  function capacityLearningText(cap) {
+    if (cap.source !== "learned") {
+      return "Capacity source: manual — the configured " + fmtKwh(cap.configured) + " kWh is used everywhere.";
+    }
+    if (cap.learned == null) {
+      return "Learned capacity: no published estimate yet (" + cap.samples + " of 3 accepted windows). The configured " + fmtKwh(cap.configured) + " kWh seed is used meanwhile.";
+    }
+    if (!cap.applied) {
+      return "Learned capacity ignored (" + (cap.reason || "rejected") + "); the configured " + fmtKwh(cap.configured) + " kWh seed is used. Estimate was " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " window(s).";
+    }
+    return "Learned from measured cycles: " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " accepted window(s), last learned " + timeAgo(cap.updated) + ". Effective capacity " + fmtKwh(cap.effective) + " kWh.";
+  }
+
   function mappingList(config, resolved) {
     var mapping = config && config.mapping ? config.mapping : {};
     var keys = Object.keys(mapping);
@@ -2906,6 +2946,7 @@
     var st = record.state || {};
     var capabilities = record.capabilities || {};
     var cycles = batteryCycleCount(st);
+    var cap = capacitySummary(record);
     var eff = batteryEfficiency(config);
     var wearOverride = isNum(cycleCost) ? cycleCost : 0;
     var wear = batteryWear(config, wearOverride);
@@ -2981,6 +3022,14 @@
     ]);
 
     var detailsBlocks = [
+      // SPEC 5: where the effective capacity comes from, with the estimate's own evidence.
+      el("details", { class: "disclosure" }, [
+        el("summary", { text: "Capacity learning" }),
+        el("div", { class: "disclosure-body" }, [
+          el("p", { class: "field-help", text: capacityLearningText(cap) }),
+          el("p", { class: "field-help", text: "Configured " + fmtKwh(cap.configured) + " kWh · effective " + fmtKwh(cap.effective) + " kWh" + (cap.samples ? " · " + cap.samples + " accepted measurement window(s)" : "") + (cap.updated ? " · last learned " + timeAgo(cap.updated) : "") + ". Switch between manual and learned in Edit → Capacity source." })
+        ])
+      ]),
       economics,
       el("details", { class: "disclosure" }, [
         el("summary", { text: "Entity mapping" }),
@@ -3012,6 +3061,7 @@
         el("li", null, [el("span", { class: "stat-label", text: "Power" }), el("span", { class: "stat-value", text: (isNum(st.power_w) ? fmtPower(Math.abs(st.power_w)) : fmtPower(st.power_w)) + (isNum(st.power_w) ? (st.power_w > 0 ? " charging" : st.power_w < 0 ? " discharging" : " idle") : "") })]),
         el("li", null, [el("span", { class: "stat-label", text: "Charge level" }), el("span", { class: "stat-value", text: fmtPct(st.soc_pct) })]),
         el("li", null, [el("span", { class: "stat-label", text: "Energy" }), el("span", { class: "stat-value", text: fmtKwh(st.energy_kwh) + " of " + fmtKwh(st.capacity_kwh || config.capacity_kwh) })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Capacity" }), el("span", { class: "stat-value", text: fmtKwh(cap.effective) + (cap.source === "learned" ? " learned" : "") })]),
         el("li", null, [el("span", { class: "stat-label", text: "Round trip" }), el("span", { class: "stat-value", text: eff ? fmtPct(eff.round_trip_pct) : "--" })]),
         el("li", null, [el("span", { class: "stat-label", text: "Cycles" }), el("span", { class: "stat-value", text: cycles == null ? "not reported" : cycles.toFixed(1) + " cycles" })]),
         el("li", null, [el("span", { class: "stat-label", text: "Limits" }), el("span", { class: "stat-value", text: fmtPower(config.max_charge_w) + " charge / " + fmtPower(config.max_discharge_w) + " discharge" })]),
@@ -3093,7 +3143,10 @@
       enabled: source.enabled !== false,
       // Which write path the driver must use.  "auto" keeps the shipped behaviour (the Zendure
       // manager when its entities are mapped), so an older saved battery is unaffected.
-      control_path: ["auto", "manager", "device"].indexOf(String(source.control_path)) >= 0 ? String(source.control_path) : "auto"
+      control_path: ["auto", "manager", "device"].indexOf(String(source.control_path)) >= 0 ? String(source.control_path) : "auto",
+      // SPEC 5: manual (default) uses the typed capacity; learned uses the measured estimate and
+      // keeps the typed value as the seed/fallback.
+      capacity_source: String(source.capacity_source) === "learned" ? "learned" : "manual"
     };
     var mapping = {};
     Object.keys(source.mapping || {}).forEach(function (key) { mapping[key] = String(source.mapping[key]); });
@@ -3148,6 +3201,18 @@
     }
     driverSelect.addEventListener("change", updateControlPathVisibility);
 
+    var capacitySourceSelect = el("select", { id: "battery-capacity-source" });
+    [
+      ["manual", "Manual — use the capacity I typed"],
+      ["learned", "Learned — measure the pack's real usable capacity"]
+    ].forEach(function (option) {
+      var node = el("option", { value: option[0], text: option[1] });
+      if (option[0] === fields.capacity_source) node.selected = true;
+      capacitySourceSelect.appendChild(node);
+    });
+    inputs.capacity_source = capacitySourceSelect;
+    var capacitySourceNote = el("p", { class: "field-help", text: "Learned keeps the typed capacity as the seed/fallback and uses the estimate measured from this battery's own 5-minute power and SoC history: only windows with at least a 10-point SoC move and at least 20 % of the battery's own power limit count, and at least three accepted windows are needed before it is used. The estimate is ignored once it is older than 30 days or while it is not confident." });
+
     var identity = el("div", { class: "fields" }, [
       textRow("id", "Battery id (slug)", fields.id, editing),
       textRow("name", "Name", fields.name),
@@ -3156,6 +3221,8 @@
       controlPathNote,
       mqttDriverNote,
       fieldRow("capacity_kwh", "Capacity (kWh, usable AC side)", fields.capacity_kwh, "0.1", "0.1"),
+      el("label", { class: "field", for: "battery-capacity-source" }, [el("span", { text: "Capacity source" }), capacitySourceSelect]),
+      capacitySourceNote,
       fieldRow("min_soc_pct", "Minimum SoC (%)", fields.min_soc_pct, "1", "0", "100"),
       fieldRow("max_soc_pct", "Maximum SoC (%)", fields.max_soc_pct, "1", "0", "100"),
       fieldRow("max_charge_w", "Max charge power (W)", fields.max_charge_w, "50", "0"),
@@ -3464,6 +3531,7 @@
         max_discharge_w: Number(inputs.max_discharge_w.value),
         price_eur: Number(inputs.price_eur.value),
         cycle_life: Number(inputs.cycle_life.value),
+        capacity_source: capacitySourceSelect.value === "learned" ? "learned" : "manual",
         mapping: {},
         enabled: !!inputs.enabled.checked
       };
