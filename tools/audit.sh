@@ -273,8 +273,9 @@ rule email '(^|[^A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+([.][A-Za-z0-9-]
 rule device-serial '(^|[^A-Za-z0-9_])(serial|serial_?number|imei)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9][A-Za-z0-9._-]{4,}' serial
 rule device-serial '(^|[^A-Za-z0-9_])(sn|device_?id|unique_?id)[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9][A-Za-z0-9._-]{4,}' serial
 # Public protocol constants that look like serials but are identical on every install: the
-# RFC 6455 WebSocket GUID used by haws.py.
-ALLOW_SERIALS='258EAFA5|C5AB0DC85B11'
+# RFC 6455 WebSocket GUID used by haws.py, and the PVGIS-SARAH2 satellite-irradiance dataset label
+# (a public ECMWF/JRC identifier quoted in docs, never a device or account value).
+ALLOW_SERIALS='258EAFA5|C5AB0DC85B11|PVGIS-SARAH2'
 # A serial-shaped token must carry a letter left of the hyphen: an all-digit stamp such as the
 # 20260101-120000 in an export filename is a timestamp, not a device serial.
 rule device-serial '(^|[^A-Za-z0-9])[A-Z0-9]*[A-Z][A-Z0-9]*-[A-Z0-9]{5,}([^A-Za-z0-9]|$)' "$ALLOW_SERIALS"
