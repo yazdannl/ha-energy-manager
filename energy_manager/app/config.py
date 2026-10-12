@@ -174,6 +174,12 @@ DEFAULTS: dict[str, Any] = {
     "optimizer.max_grid_export_w": 0,
     "optimizer.min_spread_eur_per_kwh": 0.0,
     "optimizer.target_soc_pct_end": None,
+    # -- cost basis and the sell floor (SPEC 5, 0.18.0) ------------------------------------
+    # The ledger is derived from the applied dispatch log and the measured flows, so the floor
+    # refuses a discharge/export below what the energy actually in the pack cost. Default on: with
+    # no ledger yet (basis None) it is inactive and behaviour is exactly as before.
+    "optimizer.sell_floor_enabled": True,
+    "optimizer.sell_floor_margin_eur_per_kwh": 0.0,
     # -- control --------------------------------------------------------------------------
     "control.tick_seconds": 30,
     "control.replan_minutes": 15,
@@ -380,6 +386,8 @@ SETTINGS_META: dict[str, _Meta] = {
     "optimizer.max_grid_import_w": _Meta("float", "optimizer", "Max grid import W", "0 = unlimited.", minimum=0.0),
     "optimizer.max_grid_export_w": _Meta("float", "optimizer", "Max grid export W", "0 = unlimited.", minimum=0.0),
     "optimizer.min_spread_eur_per_kwh": _Meta("float", "optimizer", "Min spread", "Ignore arbitrage thinner than this.", minimum=0.0, maximum=10.0),
+    "optimizer.sell_floor_enabled": _Meta("bool", "optimizer", "Sell floor", "Refuse a discharge or export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at). Off, or before a basis exists, behaves exactly as before."),
+    "optimizer.sell_floor_margin_eur_per_kwh": _Meta("float", "optimizer", "Sell floor margin", "Require this much above the break-even before a sale is allowed.", minimum=0.0, maximum=1.0, advanced=True),
     "optimizer.target_soc_pct_end": _Meta("float", "optimizer", "End SoC target %", "Unset = no hard terminal target.", minimum=0.0, maximum=100.0, nullable=True, advanced=True),
     "control.tick_seconds": _Meta("int", "control", "Tick seconds", "", minimum=5, maximum=3600, advanced=True),
     "control.replan_minutes": _Meta("int", "control", "Replan minutes", "", minimum=1, maximum=1440, advanced=True),

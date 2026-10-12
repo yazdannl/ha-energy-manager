@@ -119,6 +119,11 @@ class OptimizerOptions:
     max_export_kw: float = 0.0
     min_spread_eur_per_kwh: float = 0.0
     target_soc_pct_end: float | None = None
+    #: Cost-basis sell floor (SPEC 5, additive 0.18.0): the fleet's energy-weighted mean
+    #: break-even of the energy actually in the packs, EUR per kWh AC delivered, plus the
+    #: configured margin. ``None`` = no floor (setting off, or no ledger yet) and today's plan.
+    #: The engine derives it from the ledger and passes it in; the DP never reads the store.
+    sell_floor_eur_per_kwh: float | None = None
 
     @classmethod
     def from_settings(cls, settings: Any) -> "OptimizerOptions":
@@ -431,6 +436,21 @@ def power_bounds_kw(
     if not opts.allow_grid_charge:
         grid_hi = min(grid_hi, max(0.0, slot.pv_kw - slot.load_kw))
 
+    # Cost-basis sell floor (SPEC 5, 0.18.0): a discharge/export whose *value leg* sits below the
+    # break-even of what the energy in the pack actually cost is refused. The leg is the slot's
+    # ``sell`` when the flow exports and the slot's ``buy`` when it serves the house, and
+    # ``grid_kw_at`` is exactly the sign test (SPEC 8.1). Charging is never touched. When the
+    # house-serving leg is refused while the export leg would pass (an inverted tariff where
+    # ``sell > buy``), the whole discharge is refused: the feasible set stays one interval.
+    floor = opts.sell_floor_eur_per_kwh
+    if floor is not None:
+        if float(slot.sell or 0.0) < floor:
+            # No flow below the house's own demand: nothing may be exported below the floor.
+            grid_lo = max(grid_lo, -base)
+        if base > 0.0 and float(slot.buy) < floor:
+            # Even displacing import cannot pay for the held energy: hold instead of discharge.
+            grid_lo = max(grid_lo, 0.0)
+
     lo = max(soc_lo, grid_lo)
     hi = min(soc_hi, grid_hi)
     if lo > hi:
@@ -663,6 +683,17 @@ def _cheapest_buy_so_far(slots: Sequence[SlotInput]) -> list[float]:
     return out
 
 
+def _sell_floor_blocks(slot: SlotInput, opts: OptimizerOptions) -> bool:
+    """True when the cost-basis floor (SPEC 5) leaves no discharge possible in this slot."""
+    floor = opts.sell_floor_eur_per_kwh
+    if floor is None:
+        return False
+    base = slot.load_kw - slot.pv_kw
+    if float(slot.sell or 0.0) < floor and base <= 0.0:
+        return True  # every discharge would export below the floor
+    return base > 0.0 and float(slot.buy) < floor  # even serving the house cannot pay for it
+
+
 def _round_trip_blocks_arbitrage(
     slot: SlotInput, cheapest_buy: float, agg: BatteryAggregate, opts: OptimizerOptions
 ) -> bool:
@@ -747,12 +778,20 @@ def _classify(
                 action = Action.EXPORT if exporting else Action.DISCHARGE
                 reason = Reason.SELF_CONSUMPTION
         else:
-            if binding and (abs(lo) <= EPS_KW or abs(hi) <= EPS_KW):
+            floor_blocks = _sell_floor_blocks(slot, opts)
+            if (
+                binding
+                and not floor_blocks
+                and (abs(lo) <= EPS_KW or abs(hi) <= EPS_KW)
+            ):
                 action, reason = Action.HOLD, Reason.GRID_LIMIT_HOLD
             elif e <= agg.e_min_kwh + half_step:
                 action, reason = Action.HOLD, Reason.RESERVE_HOLD
             elif e >= agg.e_max_kwh - half_step:
                 action, reason = Action.HOLD, Reason.FULL
+            elif floor_blocks:
+                # The energy held cannot pay for this sale at this slot's value leg (SPEC 5).
+                action, reason = Action.HOLD, Reason.SELL_FLOOR
             else:
                 if _round_trip_blocks_arbitrage(slot, cheapest_buy[i], agg, opts):
                     # The sale looks profitable against the cheapest charge in the horizon, but
@@ -781,6 +820,7 @@ def _summary(
     objective_eur: float = 0.0,
     wear_eur_per_kwh: float = 0.0,
     maintenance: Mapping[str, Any] | None = None,
+    sell_floor_eur_per_kwh: float | None = None,
 ) -> PlanSummary:
     cost = 0.0
     for s in plan_slots:
@@ -827,6 +867,8 @@ def _summary(
     summary.break_even_sell_eur_per_kwh = aggregate_break_even_sell_eur_per_kwh(
         agg.eta_charge, agg.eta_discharge, median_buy_eur_per_kwh(plan_slots), wear_eur_per_kwh
     )
+    # Cost-basis sell floor (SPEC 5): the floor the DP enforced, so /plan and the UI can state it.
+    summary.sell_floor_eur_per_kwh = sell_floor_eur_per_kwh
     # Scheduled full-charge maintenance (SPEC 8.1): the block the engine computed, carried verbatim
     # so the API/UI can say which batteries the plan charges to balance and against which deadline.
     summary.maintenance = dict(maintenance) if maintenance else None
@@ -857,6 +899,7 @@ def solve(
     mode: str = "advisory",
     dry_run: bool = True,
     maintenance: Mapping[str, Any] | None = None,
+    sell_floor_eur_per_kwh: float | None = None,
 ) -> Plan:
     """Solve the horizon and return a ``Plan`` (SPEC 8.2).  Deterministic.
 
@@ -865,9 +908,15 @@ def solve(
     maintenance target, reusing the existing hard terminal-target machinery so the DP charges in
     the cheapest slots before the deadline.  When it is absent or inactive the terminal target is
     exactly the user's setting: a non-due battery never distorts the schedule.
+
+    ``sell_floor_eur_per_kwh`` is the engine's cost-basis floor (SPEC 5, 0.18.0): when set, no
+    discharge/export transition may carry a value leg below it. ``None`` keeps the schedule
+    bit-for-bit as before.
     """
     now = generated_at or utcnow()
     sources = dict(source_names or {})
+    if sell_floor_eur_per_kwh is not None:
+        options = replace(options, sell_floor_eur_per_kwh=float(sell_floor_eur_per_kwh))
     if options.wear_eur_per_kwh <= 0.0 and aggregate.wear_eur_per_kwh > 0.0:
         # Zero means "derive it": the aggregate already carries the fleet's delivered-energy-weighted mean
         # of the per-battery derived wear (SPEC 5). A non-zero setting is the advanced override
@@ -933,7 +982,15 @@ def solve(
         ]
         return make_plan(
             plan_slots,
-            _summary(plan_slots, aggregate, dt, 0, 0.0, maintenance=active_maintenance),
+            _summary(
+                plan_slots,
+                aggregate,
+                dt,
+                0,
+                0.0,
+                maintenance=active_maintenance,
+                sell_floor_eur_per_kwh=options.sell_floor_eur_per_kwh,
+            ),
         )
 
     dt = options.slot_minutes / 60.0
@@ -976,6 +1033,7 @@ def solve(
             objective_eur=result.objective_eur,
             wear_eur_per_kwh=options.wear_eur_per_kwh,
             maintenance=active_maintenance,
+            sell_floor_eur_per_kwh=options.sell_floor_eur_per_kwh,
         ),
     )
     if infeasible is not None:
@@ -1006,6 +1064,7 @@ def solve_from_forecasts(
     mode: str = "advisory",
     dry_run: bool = True,
     maintenance: Mapping[str, Any] | None = None,
+    sell_floor_eur_per_kwh: float | None = None,
 ) -> Plan:
     """Align the three forecasts, then solve.  Raises ``ValueError`` when inputs are unusable."""
     moment = now or utcnow()
@@ -1031,4 +1090,5 @@ def solve_from_forecasts(
         mode=mode,
         dry_run=dry_run,
         maintenance=maintenance,
+        sell_floor_eur_per_kwh=sell_floor_eur_per_kwh,
     )

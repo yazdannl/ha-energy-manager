@@ -279,6 +279,7 @@ def check(
     now: datetime | None = None,
     *,
     cell_voltage_latch: Mapping[str, Mapping[str, Any]] | None = None,
+    sell_floor_eur_per_kwh: float | None = None,
 ) -> SafetyDecision:
     """Apply SPEC 9.3 and return the write that is allowed (``block`` = nothing)."""
     moment = now or utcnow()
@@ -461,7 +462,32 @@ def check(
     budget = RAMP_LIMIT_W * len(usable)
     ramp_lo, ramp_hi = previous - budget, previous + budget
 
+    # 8b. Cost-basis sell floor (SPEC 5/9.3, 0.18.0). A live *planned* discharge whose value leg is
+    # below the break-even of the energy actually held is clamped to a hold, exactly like the grid
+    # and ramp clamps. Only the plan's own setpoint is judged: charging, SoC-floor holds and an
+    # explicit override are untouched, and with no floor (setting off, or no ledger yet) every
+    # line below is a no-op.
+    floor_lo: float | None = None
+    if (
+        sell_floor_eur_per_kwh is not None
+        and plan_slot is not None
+        and override is None
+        and float(plan_slot.power_w) < 0.0
+    ):
+        base_for_floor = base_kw if base_kw is not None else measured_base_kw
+        if base_for_floor is not None:
+            # The value leg of the *planned* flow: exporting compares with the feed-in price, a
+            # house-serving discharge with the buy price (the DP's own ``grid_kw_at`` sign test).
+            planned_grid = float(base_for_floor) + float(plan_slot.power_w) / 1000.0
+            leg_value = (
+                float(plan_slot.sell or 0.0) if planned_grid < 0.0 else float(plan_slot.buy)
+            )
+            if leg_value < sell_floor_eur_per_kwh:
+                floor_lo = 0.0
+
     lo = max(soc_lo, p_min, grid_lo, ramp_lo)
+    if floor_lo is not None:
+        lo = max(lo, floor_lo)
     hi = min(soc_hi, p_max, grid_hi, ramp_hi)
     if cell_voltage_hold:
         # Nothing usable is allowed to discharge: raise the aggregate floor to neutral.
@@ -479,12 +505,16 @@ def check(
             reasons.append(Reason.SOC_FLOOR)
         if ramp_hi < lo - EPS_W or ramp_lo > hi + EPS_W:
             reasons.append(Reason.RAMP_LIMIT)
+        if floor_lo is not None and floor_lo > hi:
+            reasons.append(Reason.SELL_FLOOR)
         if lo > p_max + EPS_W or hi < p_min - EPS_W:
             reasons.append(Reason.POWER_CLAMP)
         return blocked(reasons or [Reason.POWER_CLAMP], blocked_ids)
 
     allowed = clamp(target, lo, hi)
     clamped = abs(allowed - target) > EPS_W
+    if floor_lo is not None and allowed > target + EPS_W:
+        reasons.append(Reason.SELL_FLOOR)
 
     # Attribute reasons: every bound the result sits on, plus every unusable battery.
     if soc_ceiling_binding and abs(allowed - soc_hi) <= EPS_W and target > 0:

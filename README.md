@@ -28,6 +28,13 @@ no MQTT, no cloud account, and no YAML to install by hand.
   cheapest slots before the deadline instead of force-charging at peak. Reaching the target is
   measured, an overdue cycle alerts and keeps trying, and advisory mode still plans it without
   writing.
+- **Knows what the energy in the pack cost.** A per-battery cost-basis ledger values the energy
+  actually held from the measured charge intervals and the price each was charged at (grid at the
+  buy price, PV at the export price it forgoes), and by default refuses a discharge or export below
+  that break-even (`optimizer.sell_floor_enabled`, with an optional
+  `optimizer.sell_floor_margin_eur_per_kwh`) so the plan cannot sell your pack's energy at a loss.
+  The ledger resets when the pack reaches its floor, survives restarts, and is exposed per battery
+  in `/status` plus `sensor.sem_battery_cost_basis` and `sensor.sem_battery_value`.
 - **Explains itself.** Every planning decision and every blocked dispatch carries a stable reason
   slug, visible in the log, so "why didn't it charge?" always has an answer.
 - **Shows the money.** Savings are accounted against a do-nothing baseline (defined below) and
@@ -125,6 +132,7 @@ disclosure per group).
 | `solar.source` | `forecast_solar` | The single source used when `solar.sources` is empty: `forecast_solar` (per-plane API), `capacity` (enter the array's Wp) or `derived` (learn the array from the meter's export moments; also used automatically when `forecast_solar` has no planes and a meter resolves). |
 | `solar.sources` / `solar.merge_strategy` | unset / `weighted_mean` | Optional merge list `[{source, weight, ...}]` that combines several forecasts into one series: `forecast_solar`, `ha_energy` (every solar-forecast provider already configured in your Home Assistant **Energy dashboard**, e.g. Solcast), `capacity` and `derived`, each with a finite weight `> 0`. The strategy is `weighted_mean`, `median` or `max`; a failed source is skipped, and an empty list keeps `solar.source` alone. The Solar card edits the list with add/remove/reorder. |
 | `optimizer.allow_export` | `false` | Export scheduling stays off until you enable it. |
+| `optimizer.sell_floor_enabled` | `true` | Refuse a discharge/export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at). With no ledger yet, or turned off, the plan behaves exactly as before. `optimizer.sell_floor_margin_eur_per_kwh` (0..1, default 0) demands that much extra. |
 | `protection.cell_voltage_enabled` | `false` | Watch the lowest cell voltage (a mapped `cell_voltage_entity`, or the `zendure_native` driver's own read) and latch an emergency charge below `protection.cell_voltage_cutoff_v`; blocked from discharging until it recovers to `protection.cell_voltage_resume_v`. `protection.emergency_charge_power_w` 0 = the battery's own `max_charge_w`. See the safety model. |
 | `maintenance.full_charge_enabled` | `false` | Reach `maintenance.full_charge_target_soc_pct` (default 100) every `maintenance.full_charge_interval_days` (default 30) days so the BMS can balance its cells. While a battery is due the plan uses the terminal-target mechanism in the cheapest slots before the deadline; the due date and last completion are per-battery runtime data, an overdue cycle alerts and keeps trying, and advisory mode never writes. |
 
@@ -247,6 +255,8 @@ The add-on writes these entities with the Home Assistant state API (no MQTT, no 
 | `sensor.sem_load_forecast_now` | kW | `today_kwh`, `confidence` |
 | `sensor.sem_savings_today` | EUR | `month_eur`, `year_eur`, `baseline_kwh` |
 | `sensor.sem_battery_soc_avg` | % | — |
+| `sensor.sem_battery_cost_basis` | EUR/kWh | `stored_value_eur`, `energy_kwh`, per-battery basis (state `unknown` without a ledger) |
+| `sensor.sem_battery_value` | EUR | `cost_basis_eur_per_kwh`, `sell_floor_eur_per_kwh` |
 | `sensor.sem_forecast_accuracy` | % | `pv_mape`, `load_mape`, `price_mae` |
 | `binary_sensor.sem_autopilot_active` | on/off | — |
 | `binary_sensor.sem_battery_at_floor` | on/off | — |

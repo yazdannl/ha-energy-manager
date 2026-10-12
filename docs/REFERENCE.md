@@ -591,6 +591,8 @@ dashboard's own roles beside it, and a `Use the Energy dashboard` button clears 
 | `optimizer.max_grid_export_w` | float | `0` | ≥ 0 | **Max grid export W** — 0 = unlimited |
 | `optimizer.min_spread_eur_per_kwh` | float | `0.0` | 0…10 | **Min spread** — ignore arbitrage thinner than this |
 | `optimizer.target_soc_pct_end` | float, nullable | `null` | 0…100 | **End SoC target %** *(advanced)* — unset = no hard terminal target |
+| `optimizer.sell_floor_enabled` | bool | `true` | — | **Sell floor** — refuse a discharge or export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at). Off, or before a basis exists, behaves exactly as before |
+| `optimizer.sell_floor_margin_eur_per_kwh` | float | `0.0` | 0…1 | **Sell floor margin** *(advanced)* — require this much above the break-even before a sale is allowed |
 
 #### Control
 
@@ -703,10 +705,10 @@ new value when the user types one.
 `price.fixed_day_price_eur_per_kwh`, `price.fixed_night_price_eur_per_kwh`, `grid.power_entity`,
 `solar.enabled`, `solar.source`, `solar.measured_entity`, `optimizer.horizon_hours`,
 `optimizer.allow_grid_charge`,
-`optimizer.min_spread_eur_per_kwh`, `maintenance.full_charge_enabled`, plus the ten Safety keys.
-Everything else is `advanced: true` (this includes the advanced wear override
-`optimizer.cycle_cost_eur_per_kwh`, `solar.nasa_irradiance` and the two
-`maintenance.full_charge_*` tuning keys).
+`optimizer.min_spread_eur_per_kwh`, `optimizer.sell_floor_enabled`, `maintenance.full_charge_enabled`,
+plus the ten Safety keys. Everything else is `advanced: true` (this includes the advanced wear
+override `optimizer.cycle_cost_eur_per_kwh`, `optimizer.sell_floor_margin_eur_per_kwh`,
+`solar.nasa_irradiance` and the two `maintenance.full_charge_*` tuning keys).
 
 ### 3.4 Battery configuration fields (`models.BatteryConfig`)
 
@@ -1145,6 +1147,40 @@ reason reports `efficiency_loss`; a slot blocked by the user's own floor
 (`optimizer.min_spread_eur_per_kwh`) reports `spread_below_threshold`. The two are deliberately
 distinct: one is physics, the other is a preference.
 
+**Cost-basis sell floor (0.18.0)** — `optimizer.sell_floor_enabled` (default `true`) gives the
+forward rule a memory of what the energy in the pack cost. A per-battery ledger (`app/cost_basis.py`,
+`learning_profiles` kind `battery_cost_basis`) is built from **applied** dispatch changes in `auto`
+(mode `auto`, `dry_run` false, `result` `ok`/`skipped`, `applied_w` changed by more than 25 W): a
+change opens a slice, the next change or the update's `now` closes it, and the slice's end is stored
+as `last_ts` so replaying an update books nothing twice. The slice's energy is the **measured**
+`battery_power:<id>` integral (else `battery_charge - battery_discharge`), piecewise-linear between
+samples, and a data gap beyond 10 minutes is never bridged. Each slice is priced at the persisted
+plan slot it was charged in, split at every price-slot boundary it spans:
+
+```
+grid_part = min(charge_ac, import_ac)   # import_ac from the measured meter import
+grid_part at the slot's buy, pv_part = charge_ac - grid_part at the slot's sell
+basis     = (basis * E + cost_eur) / (E + charge_ac)
+E        += charge_ac
+E        -= discharged_ac / (eta_charge * eta_discharge)   # a discharge leaves basis unchanged
+```
+
+A missing `sell` falls back to `buy`; when neither resolves the sub-slice is skipped and counted,
+never priced by a guess. With no meter reading, the plan slot's own reason is the fallback
+attribution (`pv_surplus_charge` = PV, anything else = grid). At or below the SoC floor
+(`soc <= min_soc_pct + 1`) the ledger resets to `basis = None, E = 0`; `E` is clamped at
+`capacity_kwh / eta_charge` and cleared with the basis when it reaches 0. A first run, or a gap
+longer than the 7-day lookback, starts clean instead of blending old energy in. The last 200 booked
+slices are kept as an audit journal, and `/status` exposes the last five per battery.
+
+The floor per battery is `break_even_sell_eur_per_kwh(basis, wear) + margin` (the frozen helper, the
+battery's own etas, the advanced wear override when set), and the fleet floor the plan enforces is
+the **energy-weighted mean** of those per-battery floors. In the DP a discharge/export transition
+whose *value leg* is below the floor is removed: the leg is the slot's `sell` when the flow exports
+(`grid_kw_at < 0`) and the slot's `buy` when it serves the house. A slot that holds because of the
+floor reports `sell_floor`; charging, SoC-floor holds and everything outside `auto` are untouched,
+and with the floor `None` the schedule is bit-for-bit the pre-0.18.0 one.
+
 **Slot classification** (`_classify`) — stable action + reason slugs:
 
 | Condition | Action | Reason |
@@ -1160,6 +1196,7 @@ distinct: one is physics, the other is a preference.
 | `p = 0`, grid limit binding at a zero bound | hold | `grid_limit_hold` |
 | `p = 0`, at `E_min` (within half a step) | hold | `reserve_hold` |
 | `p = 0`, at `E_max` | hold | `battery_full` |
+| `p = 0`, the cost-basis floor blocks every discharge | hold | `sell_floor` |
 | `p = 0`, round trip blocks the arbitrage | hold | `efficiency_loss` |
 | `p = 0` otherwise | hold | `spread_below_threshold` |
 
@@ -1183,6 +1220,8 @@ objective_eur   = schedule objective (grid + min_spread + wear − terminal salv
 wear_eur_per_kwh
 eta_charge / eta_discharge / round_trip_efficiency / break_even_sell_eur_per_kwh
                 = the aggregate values the plan assumed, break-even at the horizon's median buy
+sell_floor_eur_per_kwh
+                = the fleet cost-basis floor the plan enforced (null when off or no ledger) (0.18.0)
 effective_step_kwh, solver_iterations
 ```
 
@@ -1274,6 +1313,11 @@ result is then clipped by every limit inside `safety.check`.
    floor is raised to 0 W.
 5. **SoC clamp** — ceiling: `(E_max − e) / (dt * eta_chg)`; floor: `−(e − E_min) * eta_dis / dt`,
    where `E_min` uses `max(min_soc_pct, reserve_soc_pct)` per battery.
+8b. **Cost-basis sell floor** (0.18.0, on by default) — a live *planned* discharge whose value leg
+   is below the fleet floor is clamped to a hold (`floor = energy-weighted mean of
+   break_even(basis) + margin`); the leg is `sell` when the planned flow exports and `buy` when it
+   serves the house. Charging, SoC-floor holds and an explicit override are never touched, and with
+   no floor (setting off, or no ledger yet) this clause is a no-op. Reason `sell_floor`.
 6. **Power clamp** — aggregated limits `Σ max_charge_w` / `Σ max_discharge_w`.
 7. **Grid limits** — with the requested power, predicted import/export must stay inside
    `optimizer.max_grid_import_w` / `optimizer.max_grid_export_w`. The live meter is ground truth: the
@@ -1526,6 +1570,8 @@ blocks the control loop. Unchanged state and attributes are not rewritten.
 | `sensor.sem_load_forecast_now` | kW | `today_kwh`, `confidence` |
 | `sensor.sem_savings_today` | EUR | `month_eur`, `year_eur`, `baseline_kwh` |
 | `sensor.sem_battery_soc_avg` | % | — |
+| `sensor.sem_battery_cost_basis` | EUR/kWh | `stored_value_eur`, `energy_kwh`, per-battery basis; state `unknown` without a ledger |
+| `sensor.sem_battery_value` | EUR | `cost_basis_eur_per_kwh`, `sell_floor_eur_per_kwh`; state `unknown` without a ledger |
 | `sensor.sem_forecast_accuracy` | % | `pv_mape`, `load_mape`, `price_mae` |
 | `binary_sensor.sem_autopilot_active` | on/off | — |
 | `binary_sensor.sem_battery_at_floor` | on/off | — |
@@ -1545,8 +1591,8 @@ supplies it (which is why publishing a port would hand battery control to anyone
 | Method & route | Body / query | Returns |
 | --- | --- | --- |
 | `GET /api/v1/health` | — | `{status, version, uptime_s, commit}` |
-| `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]` (each with `cell_voltage_v`), `cell_voltage{enabled,cutoff_v,warning_v,resume_v,emergency_charge_power_w,latched[],batteries[{battery_id,voltage_v,fresh,seen,latched,block_discharge,force_charge_w,reason,note}]}` (additive, 0.16.0), `full_charge{enabled,interval_days,target_soc_pct,overdue_grace_hours,active,due,overdue,batteries[],plan{…}}` (additive, 0.17.0), `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
-| `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, slot_minutes, feasible, infeasible_reason, mode, dry_run, sources{}, maintenance, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh, maintenance{enabled,active,due,overdue,target_soc_pct,effective_target_soc_pct,interval_days,overdue_grace_hours,batteries[],due_batteries[],overdue_batteries[]} (additive, 0.17.0)}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; `slot_minutes` is the plan's own resolution (the UI never assumes one); with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` and `slot_minutes: null` |
+| `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]` (each with `cell_voltage_v`, and additive 0.18.0 `cost_basis_eur_per_kwh`/`stored_value_eur`), `cell_voltage{enabled,cutoff_v,warning_v,resume_v,emergency_charge_power_w,latched[],batteries[{battery_id,voltage_v,fresh,seen,latched,block_discharge,force_charge_w,reason,note}]}` (additive, 0.16.0), `full_charge{enabled,interval_days,target_soc_pct,overdue_grace_hours,active,due,overdue,batteries[],plan{…}}` (additive, 0.17.0), `cost_basis{enabled,margin_eur_per_kwh,sell_floor_eur_per_kwh,fleet_basis_eur_per_kwh,batteries[{id,name,cost_basis_eur_per_kwh,energy_kwh,stored_value_eur,sell_floor_eur_per_kwh,intervals,skipped_*,window_start,updated_at,journal_entries,journal[]}]}` (additive, 0.18.0), `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
+| `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, slot_minutes, feasible, infeasible_reason, mode, dry_run, sources{}, maintenance, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh, maintenance{enabled,active,due,overdue,target_soc_pct,effective_target_soc_pct,interval_days,overdue_grace_hours,batteries[],due_batteries[],overdue_batteries[]} (additive, 0.17.0), sell_floor_eur_per_kwh (additive, 0.18.0)}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; `slot_minutes` is the plan's own resolution (the UI never assumes one); with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` and `slot_minutes: null` |
 | `GET /api/v1/plan/execution` | `hours` | additive (0.10.0): `{generated_at, slot_minutes, now, floors{reserve_soc_pct, min_soc_pct, floor_soc_pct}, batteries[{id, name, min_soc_pct, floor_soc_pct, capacity_kwh}], progress{…}, slots[{t, dispatch, actual}]}` — the same slot grid as `/plan`, joined with the persisted 5-minute actuals and the dispatch log. `dispatch` is the last attempt per battery in that slot (`requested_w`, `applied_w`, `ok`, `dry_run`, `clamped`, `code`, `reason`, `message`, `records`, `batteries[]`) and `actual` the measured aggregate (`samples`, `coverage_pct`, `pv_kw`, `load_kw`, `grid_kw`, `battery_kw`, `planned_kw`, `measured_kw`, `import_kwh`, `export_kwh`, `charged_kwh`, `discharged_kwh`, `soc_kwh_start`, `soc_kwh_end`). Both are `null` for a slot nothing was measured or dispatched in — never a fabricated zero |
 | `POST /api/v1/plan/recompute` | — | `{queued: true}` (async; poll status) |
 | `GET /api/v1/forecast` | `kind=price\|solar\|load`, `hours` | `{kind, generated_at, source, stale, slots, provider, contract, notes[], reason, hint}` |

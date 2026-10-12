@@ -31,6 +31,8 @@ PUBLISHED_ENTITIES = {
     "sensor.sem_savings_today",
     "sensor.sem_battery_soc_avg",
     "sensor.sem_forecast_accuracy",
+    "sensor.sem_battery_cost_basis",
+    "sensor.sem_battery_value",
     "binary_sensor.sem_autopilot_active",
     "binary_sensor.sem_battery_at_floor",
 }
@@ -339,6 +341,10 @@ def test_publisher_publishes_the_documented_entities():
     price = ha.published["sensor.sem_price_now"]
     assert set(price["attributes"]) >= {"rank_pct", "cheap_window_start", "expensive_hour_start"}
     assert ha.published["sensor.sem_autopilot_state"]["state"] == "advisory"
+    # Cost basis (0.18.0): no ledger in a selfcheck store, so both sensors say unknown.
+    basis = ha.published["sensor.sem_battery_cost_basis"]
+    assert basis["state"] == "unknown" and basis["attributes"]["unit_of_measurement"] == "EUR/kWh"
+    assert ha.published["sensor.sem_battery_value"]["state"] == "unknown"
 
 
 def test_publisher_is_throttled_and_idempotent():

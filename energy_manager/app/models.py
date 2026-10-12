@@ -125,6 +125,9 @@ class Reason:
     GRID_EXPORT_LIMIT = "grid_export_limit"
     RAMP_LIMIT = "ramp_limit"
     DRIVER_ERROR = "driver_error"
+    #: Cost-basis sell floor (0.18.0): a discharge/export whose value leg sits below the
+    #: break-even of the energy actually held is refused, in the plan and at dispatch.
+    SELL_FLOOR = "sell_floor"
     IDEMPOTENT_SKIP = "idempotent_skip"
     # cell-voltage protection (0.16.0): a battery latched below its cutoff may not discharge and
     # is charged out of danger; a stale reading keeps the previous latch.
@@ -463,6 +466,11 @@ class PlanSummary:
     eta_discharge: float | None = None
     round_trip_efficiency: float | None = None
     break_even_sell_eur_per_kwh: float | None = None
+    #: Cost-basis sell floor (SPEC 5, additive 0.18.0): the fleet's energy-weighted mean
+    #: break-even of the energy actually in the packs, or ``None`` when the ledger is empty or
+    #: the floor is disabled. The DP blocks a discharge/export leg below it with
+    #: ``Reason.SELL_FLOOR``.
+    sell_floor_eur_per_kwh: float | None = None
     #: Scheduled full-charge maintenance (SPEC 8.1, additive 0.17.0): the plan-level block
     #: (``enabled``/``active``/``due``/``target_soc_pct``/``batteries``) when a battery's deadline
     #: falls inside the horizon, else ``None``. The optimiser attaches it verbatim; the API and UI

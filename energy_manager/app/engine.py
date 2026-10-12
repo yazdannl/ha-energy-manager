@@ -26,6 +26,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from . import analytics
 from . import capacity as capacity_learning
+from . import cost_basis as cost_basis_ledger
 from . import full_charge
 from .control import drivers as driver_registry
 from .control.dispatcher import Dispatcher, TickOutcome
@@ -67,6 +68,9 @@ ACTUALS_MINUTES = 5
 #: How long a learned-capacity profile read is cached in the engine (SPEC 5); maintenance rewrites
 #: it at most once a day, so a few minutes of staleness changes nothing and keeps the tick cheap.
 CAPACITY_CACHE_S = 300.0
+#: The cost-basis ledger is advanced at most this often, so a forced replan storm cannot re-book
+#: the same measured slices over and over (0.18.0).
+COST_BASIS_REFRESH_S = 60.0
 
 #: Published HA entities (SPEC section 12).  ``sensor.sem_*`` is the documented contract.
 SEM_AUTOPILOT_STATE = "sensor.sem_autopilot_state"
@@ -77,6 +81,8 @@ SEM_LOAD_NOW = "sensor.sem_load_forecast_now"
 SEM_SAVINGS = "sensor.sem_savings_today"
 SEM_SOC_AVG = "sensor.sem_battery_soc_avg"
 SEM_ACCURACY = "sensor.sem_forecast_accuracy"
+SEM_COST_BASIS = "sensor.sem_battery_cost_basis"
+SEM_BATTERY_VALUE = "sensor.sem_battery_value"
 SEM_ACTIVE = "binary_sensor.sem_autopilot_active"
 SEM_AT_FLOOR = "binary_sensor.sem_battery_at_floor"
 
@@ -323,6 +329,10 @@ class Engine:
         # applied value or its reason slug changes, so the tick cannot spam the log.
         self._capacity_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
         self._capacity_notes: dict[str, str] = {}
+        # Cost-basis ledger (SPEC 5, 0.18.0): the stored payload per battery, cached like the
+        # learned capacity, and the moment the last update ran (so a replan storm cannot re-book).
+        self._basis_cache: dict[str, tuple[datetime, dict[str, Any] | None]] = {}
+        self._basis_updated_at: datetime | None = None
 
         self._plan: Plan | None = None
         self._plan_inputs: tuple[Any, ...] | None = None
@@ -1215,6 +1225,138 @@ class Engine:
             "learned": learned,
         }
 
+    # ------------------------------------------------------------------ cost basis (0.18.0)
+
+    def _sell_floor_enabled(self) -> bool:
+        return bool(self._settings.get("optimizer.sell_floor_enabled", True))
+
+    def _sell_floor_margin_eur_per_kwh(self) -> float:
+        """The configured margin, clamped to a finite 0..1 (the settings form's own bounds)."""
+        try:
+            value = float(self._settings.get("optimizer.sell_floor_margin_eur_per_kwh", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if value != value:  # NaN
+            return 0.0
+        return max(0.0, min(1.0, value))
+
+    def _cost_basis_wear_eur_per_kwh(self) -> float | None:
+        """The wear the plan charges on a delivered kWh: the advanced override, else ``None``.
+
+        ``None`` lets the frozen helper read the battery's own derived value, exactly like the DP's
+        resolved wear (SPEC 5).
+        """
+        override = self._wear_override_eur_per_kwh()
+        return override if override > 0.0 else None
+
+    def battery_cost_basis(self, battery_id: str) -> dict[str, Any]:
+        """The stored cost-basis ledger for one battery, classified (SPEC 5, 0.18.0).
+
+        Cached like the learned capacity: the ledger is rewritten on a replan, so reading the
+        profile on every tick would be pure overhead.  A missing store/ledger is 'no basis yet'.
+        """
+        now = self._clock()
+        cached = self._basis_cache.get(battery_id)
+        if cached is not None and (now - cached[0]).total_seconds() < CAPACITY_CACHE_S:
+            payload = cached[1]
+        else:
+            payload = cost_basis_ledger.load_basis(self._store, battery_id)
+            self._basis_cache[battery_id] = (now, payload)
+        config = next((c for c in self.battery_configs() if c.id == battery_id), None)
+        return cost_basis_ledger.basis_status(
+            payload,
+            config,
+            enabled=self._sell_floor_enabled(),
+            margin_eur_per_kwh=self._sell_floor_margin_eur_per_kwh(),
+            wear_eur_per_kwh=self._cost_basis_wear_eur_per_kwh(),
+        )
+
+    def fleet_sell_floor(self) -> float | None:
+        """The fleet's energy-weighted cost-basis floor (SPEC 5), or ``None`` when inactive.
+
+        ``None`` means the setting is off, no ledger exists yet, or nothing is accounted: the DP
+        then behaves exactly as it did before 0.18.0.
+        """
+        if not self._sell_floor_enabled():
+            return None
+        entries: list[tuple[BatteryConfig, float | None, float | None, float | None]] = []
+        for config in self.battery_configs():
+            if not config.enabled:
+                continue
+            status = self.battery_cost_basis(config.id)
+            entries.append(
+                (
+                    config,
+                    status.get("cost_basis_eur_per_kwh"),
+                    status.get("energy_kwh"),
+                    self._cost_basis_wear_eur_per_kwh(),
+                )
+            )
+        return cost_basis_ledger.fleet_sell_floor(
+            entries, margin_eur_per_kwh=self._sell_floor_margin_eur_per_kwh()
+        )
+
+    def cost_basis_block(self) -> dict[str, Any]:
+        """Per-battery ledger plus the fleet values for /status (SPEC 10, additive 0.18.0)."""
+        enabled = self._sell_floor_enabled()
+        margin = self._sell_floor_margin_eur_per_kwh()
+        rows: list[dict[str, Any]] = []
+        basis_entries: list[tuple[BatteryConfig, float | None, float | None]] = []
+        floor_entries: list[tuple[BatteryConfig, float | None, float | None, float | None]] = []
+        for config in sorted(self.battery_configs(), key=lambda c: c.id):
+            status = self.battery_cost_basis(config.id)
+            rows.append({"id": config.id, "name": config.name, **status})
+            if not config.enabled:
+                continue
+            basis_entries.append(
+                (config, status.get("cost_basis_eur_per_kwh"), status.get("energy_kwh"))
+            )
+            floor_entries.append(
+                (
+                    config,
+                    status.get("cost_basis_eur_per_kwh"),
+                    status.get("energy_kwh"),
+                    self._cost_basis_wear_eur_per_kwh(),
+                )
+            )
+        return {
+            "enabled": enabled,
+            "margin_eur_per_kwh": margin,
+            "sell_floor_eur_per_kwh": (
+                cost_basis_ledger.fleet_sell_floor(floor_entries, margin_eur_per_kwh=margin)
+                if enabled
+                else None
+            ),
+            "fleet_basis_eur_per_kwh": cost_basis_ledger.fleet_basis_eur_per_kwh(basis_entries),
+            "batteries": rows,
+        }
+
+    def update_cost_bases(self, now: datetime | None = None, *, force: bool = False) -> dict[str, Any]:
+        """Advance every enabled battery's cost-basis ledger from its applied dispatch log (SPEC 5).
+
+        Called before a replan and from daily maintenance.  Each battery is guarded independently:
+        a bad series is a note, never a crash, and a ledger that cannot advance simply leaves the
+        floor inactive.  Returns a small summary (batteries, updated) for logging/tests.
+        """
+        moment = now or self._clock()
+        if not force and self._basis_updated_at is not None and (
+            moment - self._basis_updated_at
+        ).total_seconds() < COST_BASIS_REFRESH_S:
+            return {"skipped": True}
+        self._basis_updated_at = moment
+        configs = [config for config in self.effective_battery_configs() if config.enabled]
+        updated: list[str] = []
+        for config in configs:
+            try:
+                payload = cost_basis_ledger.update_basis(self._store, config, moment)
+            except Exception as exc:  # noqa: BLE001 - the ledger must never break planning
+                log.warning("cost-basis update failed for %s: %s", config.id, exc)
+                continue
+            self._basis_cache.pop(config.id, None)
+            if payload is not None:
+                updated.append(config.id)
+        return {"batteries": [config.id for config in configs], "updated": updated}
+
     def effective_capacity_kwh(self, config: BatteryConfig) -> float:
         """The capacity planning/UI must use: the learned value when confident+fresh, else manual."""
         return self.effective_capacity(config)[0]
@@ -1807,6 +1949,7 @@ class Engine:
             measurements=measurements,
             battery_states=live,
             cell_voltage_latch=self._cell_voltage_latch,
+            sell_floor_eur_per_kwh=self.fleet_sell_floor(),
         )
         self._apply_cell_voltage(outcome.guard, moment)
         with self._lock:
@@ -2673,6 +2816,14 @@ class Engine:
         # While a full charge is due inside this horizon the plan aims for the maintenance target in
         # the cheapest slots; otherwise the user's own terminal target is untouched (SPEC 8.1).
         maintenance = self.full_charge_status(now).get("plan")
+        # Cost basis (SPEC 5, 0.18.0): advance the ledger from the applied dispatch log and the
+        # measured flows, then hand the fleet's energy-weighted floor to the solver. A ledger that
+        # cannot advance leaves the floor ``None`` and the plan exactly as before.
+        try:
+            self.update_cost_bases(now)
+        except Exception as exc:  # noqa: BLE001 - the floor is an optimisation, never a blocker
+            log.warning("cost-basis update failed: %s", exc)
+        sell_floor = self.fleet_sell_floor()
         try:
             plan = dp.solve_from_forecasts(
                 price,
@@ -2685,6 +2836,7 @@ class Engine:
                 mode=mode,
                 dry_run=bool(self.snapshot().dry_run),
                 maintenance=maintenance,
+                sell_floor_eur_per_kwh=sell_floor,
             )
         except ValueError as exc:
             self._journal.event("warning", "plan_infeasible", str(exc)[:200], {"reason": reason})
@@ -3323,6 +3475,10 @@ class Engine:
         except Exception as exc:  # noqa: BLE001 - capacity learning must not stop retention
             self._journal.event("warning", "capacity_learning_failed", str(exc)[:200])
         try:
+            self.update_cost_bases(now, force=True)
+        except Exception as exc:  # noqa: BLE001 - the ledger must not stop retention
+            self._journal.event("warning", "cost_basis_failed", str(exc)[:200])
+        try:
             self._maintenance(now)
         except Exception as exc:
             self._journal.event("warning", "maintenance_failed", str(exc)[:200])
@@ -3423,6 +3579,19 @@ class Engine:
         capacity_kwh = sum(
             float(config.capacity_kwh or 0.0) for config in configs.values() if config.enabled
         )
+        # Cost basis (SPEC 5/12, 0.18.0): the fleet's energy-weighted mean basis and the value of
+        # the AC-equivalent energy held. No ledger means "unknown", never a fabricated 0.
+        basis_block = self.cost_basis_block()
+        basis_rows = [
+            row for row in basis_block.get("batteries", []) if row.get("id") in configs
+        ]
+        fleet_basis = basis_block.get("fleet_basis_eur_per_kwh")
+        stored_values = [row.get("stored_value_eur") for row in basis_rows]
+        fleet_value = (
+            sum(float(value) for value in stored_values if value is not None)
+            if any(value is not None for value in stored_values)
+            else None
+        )
         soc_target_pct = None
         if plan is not None and plan.slots:
             capacity = sum(c.capacity_kwh for c in configs.values() if c.enabled)
@@ -3514,6 +3683,34 @@ class Engine:
             SEM_SOC_AVG: (
                 round(soc_avg, 1),
                 {"friendly_name": "Smart Energy Manager average battery SoC", "unit_of_measurement": "%"},
+            ),
+            SEM_COST_BASIS: (
+                "unknown" if fleet_basis is None else round(float(fleet_basis), 4),
+                {
+                    "friendly_name": "Smart Energy Manager battery cost basis",
+                    "unit_of_measurement": "EUR/kWh",
+                    "stored_value_eur": None if fleet_value is None else round(fleet_value, 2),
+                    "energy_kwh": round(
+                        sum(float(row.get("energy_kwh") or 0.0) for row in basis_rows), 3
+                    ),
+                    "batteries": [
+                        {
+                            "id": row.get("id"),
+                            "cost_basis_eur_per_kwh": row.get("cost_basis_eur_per_kwh"),
+                            "energy_kwh": row.get("energy_kwh"),
+                        }
+                        for row in basis_rows
+                    ],
+                },
+            ),
+            SEM_BATTERY_VALUE: (
+                "unknown" if fleet_value is None else round(fleet_value, 2),
+                {
+                    "friendly_name": "Smart Energy Manager battery stored value",
+                    "unit_of_measurement": "EUR",
+                    "cost_basis_eur_per_kwh": None if fleet_basis is None else round(float(fleet_basis), 4),
+                    "sell_floor_eur_per_kwh": basis_block.get("sell_floor_eur_per_kwh"),
+                },
             ),
             SEM_ACCURACY: (
                 round(accuracy_pct, 1),

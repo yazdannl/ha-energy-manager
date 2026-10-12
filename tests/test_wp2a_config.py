@@ -597,6 +597,8 @@ ADVANCED_KEYS = {
     "optimizer.salvage_multiplier",
     "optimizer.cycle_cost_eur_per_kwh",
     "optimizer.target_soc_pct_end",
+    # SPEC 5 cost basis (0.18.0): the margin folds, the on/off stays essential.
+    "optimizer.sell_floor_margin_eur_per_kwh",
     # SPEC 8.1 scheduled full-charge maintenance: the two tuning knobs fold, the on/off stays essential.
     "maintenance.full_charge_interval_days",
     "maintenance.full_charge_target_soc_pct",

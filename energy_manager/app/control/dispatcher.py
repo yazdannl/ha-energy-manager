@@ -235,6 +235,7 @@ class Dispatcher:
         measurements: Mapping[str, Any] | None = None,
         battery_states: Sequence[BatteryState] | None = None,
         cell_voltage_latch: Mapping[str, Mapping[str, Any]] | None = None,
+        sell_floor_eur_per_kwh: float | None = None,
     ) -> TickOutcome:
         moment = now or self._clock()
         snapshot = dict(measurements or {})
@@ -288,6 +289,7 @@ class Dispatcher:
             self._settings,
             moment,
             cell_voltage_latch=cell_voltage_latch,
+            sell_floor_eur_per_kwh=sell_floor_eur_per_kwh,
         )
         outcome.allowed_w = decision.allowed_w
         outcome.block = decision.block

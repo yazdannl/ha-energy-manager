@@ -1,0 +1,779 @@
+"""Cost basis of the energy in the pack (SPEC.md section 5, additive 0.18.0).
+
+The optimiser only knows a *forward* rule: what a sale has to earn back from here on
+(``dp._round_trip_blocks_arbitrage`` plus ``BatteryConfig.break_even_sell_eur_per_kwh``).  It has no
+memory of what the energy already in the pack cost.  This module keeps that memory: a per-battery
+ledger of the **weighted average price paid for the AC energy currently held**, derived from what
+the add-on really did and what the battery really measured.
+
+Basis unit is EUR per kWh charged *into* the pack (AC).  That makes the sell floor identical to the
+frozen break-even helper with ``buy := basis``:
+``floor = battery.break_even_sell_eur_per_kwh(basis) + margin`` (SPEC 5).
+
+Intervals are **event driven, never timed buckets**.  A slice opens on an applied change the add-on
+made for that battery -- a ``store.dispatch_log`` row for ``mode == auto`` that was really applied
+(``dry_run`` false, ``result`` ``ok`` or ``skipped``) and whose ``applied_w`` differs from the last
+booked command by more than :data:`APPLIED_CHANGE_TOLERANCE_W`.  It closes at the next such change,
+and the still-open tail is closed at each update (``now``).  One row books at most one slice, and
+the slice's end is stored as ``last_ts``, so re-running an update books nothing twice.
+
+The energy booked per slice is **measured**, not the commanded setpoint: the persisted
+``battery_power:<id>`` rows (or the ``battery_charge``/``battery_discharge`` pair) are integrated
+across the slice, piecewise-linearly between samples, so uncommanded device flow, ramps and a
+vendor manager moving the pack are all accounted.  A data gap longer than
+:data:`MAX_GAP_MINUTES` is never bridged: only the covered part is booked.
+
+Pricing follows the plan slot the energy was charged in (the persisted plans, one slot's
+``buy``/``sell``/``reason`` per slot start; the newest plan wins for a slot), splitting the energy
+at price-slot boundaries when a slice spans one:
+``grid_part = min(charge_ac, import_ac)`` at the slot's ``buy`` (``import_ac`` from the measured
+meter import) and ``pv_part = charge_ac - grid_part`` at the slot's ``sell`` (the export forgone --
+the DP's own salvage convention).  When the slot's ``sell`` is missing it falls back to ``buy``;
+when both are missing the sub-slice is skipped and counted.  When the meter reading is missing, the
+plan slot's own reason is the fallback attribution (``pv_surplus_charge`` means PV, anything else
+means grid).  A bounded audit journal keeps the last :data:`MAX_JOURNAL` booked slices.
+
+The ledger is derived data in the ``learning_profiles`` store (``kind = PROFILE_KIND``), never user
+settings.  Nothing here may crash or block: no store, no rows, an unknown battery or a missing price
+degrades to ``basis=None`` (the floor is then inactive) and the control loop carries on.
+"""
+
+from __future__ import annotations
+
+import math
+from bisect import bisect_left, bisect_right
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Iterable, Mapping, Sequence
+
+from .models import BatteryConfig, Mode, Reason, from_iso, to_iso, utcnow
+
+__all__ = [
+    "APPLIED_CHANGE_TOLERANCE_W",
+    "DISPATCH_LIMIT",
+    "JOURNAL_EXPOSED",
+    "LOOKBACK_DAYS",
+    "MAX_GAP_MINUTES",
+    "MAX_JOURNAL",
+    "PLAN_LIMIT",
+    "PROFILE_KIND",
+    "RESET_SOC_MARGIN_PCT",
+    "SAMPLE_MINUTES",
+    "STATE_VERSION",
+    "PriceSlot",
+    "PriceTimeline",
+    "Series",
+    "basis_status",
+    "book_slices",
+    "fleet_basis_eur_per_kwh",
+    "fleet_sell_floor",
+    "load_basis",
+    "measurement_roles",
+    "measurement_series",
+    "update_basis",
+]
+
+#: Store ``learning_profiles`` kind for the per-battery ledger; the key is the battery id.
+PROFILE_KIND = "battery_cost_basis"
+STATE_VERSION = 1
+#: The sampler's bucket; a longer gap means at most one missing sample.
+SAMPLE_MINUTES = 5.0
+#: A whole sample may be missing before a measurement gap is treated as unknown.
+MAX_GAP_SAMPLES = 1.0
+MAX_GAP_MINUTES = SAMPLE_MINUTES * (1.0 + MAX_GAP_SAMPLES)
+#: A command change smaller than this does not open a new slice (grid-follow micro corrections).
+APPLIED_CHANGE_TOLERANCE_W = 25.0
+#: At or below ``min_soc_pct + this`` the pack holds nothing usable: the ledger resets.
+RESET_SOC_MARGIN_PCT = 1.0
+#: A first run (or a gap between updates) never looks further back than this.
+LOOKBACK_DAYS = 7.0
+#: Audit journal: the last N booked slices are kept (and at most ``JOURNAL_EXPOSED`` exposed).
+MAX_JOURNAL = 200
+JOURNAL_EXPOSED = 5
+#: Bounds for the persisted-row reads (the ledger never blocks on an unbounded query).
+DISPATCH_LIMIT = 5000
+PLAN_LIMIT = 800
+PLAN_SCAN_MIN = 12
+
+_APPLIED_RESULTS = ("ok", "skipped")
+_POWER_ROLES = ("battery_power", "battery_charge", "battery_discharge")
+_GRID_ROLES = ("grid_power", "grid_import", "grid_export")
+_SOC_ROLE = "battery_soc"
+
+
+def _finite(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse(value: Any) -> datetime | None:
+    """A parsed timestamp, or ``None`` for anything unparsable (never a crash on stored data)."""
+    try:
+        return from_iso(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def measurement_roles(battery_id: str) -> list[str]:
+    """The persisted roles the ledger reads for one battery (grid is instance-wide, unsuffixed)."""
+    return [f"{base}:{battery_id}" for base in (*_POWER_ROLES, _SOC_ROLE)] + list(_GRID_ROLES)
+
+
+@dataclass(frozen=True)
+class Series:
+    """Measured points for one battery: ``(datetime, value)``, ascending, battery AC W signed."""
+
+    power: tuple[tuple[datetime, float], ...] = ()
+    grid: tuple[tuple[datetime, float], ...] = ()
+    soc: tuple[tuple[datetime, float], ...] = ()
+
+
+def measurement_series(rows: Iterable[Mapping[str, Any]], battery_id: str) -> Series:
+    """Collapse persisted measurement rows into the three series the ledger integrates.
+
+    The signed ``battery_power:<id>`` role wins, else the measured AC pair
+    ``battery_charge:<id> - battery_discharge:<id>`` (a missing side counts as 0), the same
+    convention as :mod:`app.sources.measure` and :mod:`app.capacity`.  Grid is instance-wide
+    ``grid_power`` (positive = import), else ``grid_import - grid_export``; SoC is per battery.
+    A row with an unparsable timestamp or a non-finite value is skipped, never guessed.
+    """
+    buckets: dict[datetime, dict[str, float]] = {}
+    for row in rows:
+        role = str(row.get("entity_role") or row.get("role") or "")
+        value = _finite(row.get("value"))
+        if value is None:
+            continue
+        if role in _GRID_ROLES:
+            base = role
+        elif role.endswith(f":{battery_id}"):
+            base = role.split(":", 1)[0]
+            if base not in _POWER_ROLES and base != _SOC_ROLE:
+                continue
+        else:
+            continue
+        moment = _parse(row.get("ts"))
+        if moment is None:
+            continue
+        buckets.setdefault(moment, {})[base] = value
+    power: list[tuple[datetime, float]] = []
+    grid: list[tuple[datetime, float]] = []
+    soc: list[tuple[datetime, float]] = []
+    for moment in sorted(buckets):
+        values = buckets[moment]
+        if "battery_power" in values:
+            battery_w: float | None = values["battery_power"]
+        elif "battery_charge" in values or "battery_discharge" in values:
+            battery_w = values.get("battery_charge", 0.0) - values.get("battery_discharge", 0.0)
+        else:
+            battery_w = None
+        if battery_w is not None and math.isfinite(battery_w):
+            power.append((moment, battery_w))
+        if "grid_power" in values:
+            grid_w: float | None = values["grid_power"]
+        elif "grid_import" in values or "grid_export" in values:
+            grid_w = values.get("grid_import", 0.0) - values.get("grid_export", 0.0)
+        else:
+            grid_w = None
+        if grid_w is not None and math.isfinite(grid_w):
+            grid.append((moment, grid_w))
+        if _SOC_ROLE in values:
+            soc.append((moment, values[_SOC_ROLE]))
+    return Series(tuple(power), tuple(grid), tuple(soc))
+
+
+def _linear_clamped_area(v0: float, v1: float, length: float) -> float:
+    """Integral of ``max(0, linear(v0 -> v1))`` over ``length`` (same units as ``v * length``)."""
+    if v0 >= 0.0 and v1 >= 0.0:
+        return (v0 + v1) / 2.0 * length
+    if v0 <= 0.0 and v1 <= 0.0:
+        return 0.0
+    if v0 < 0.0 < v1:
+        return (v1 * v1) / (2.0 * (v1 - v0)) * length
+    return (v0 * v0) / (2.0 * (v0 - v1)) * length
+
+
+class _Points:
+    """A sorted measured series with bisect-backed integration, so booking stays O(log n)."""
+
+    __slots__ = ("_points", "_times")
+
+    def __init__(self, points: Sequence[tuple[datetime, float]]) -> None:
+        ordered = tuple(sorted(((t, float(v)) for t, v in points), key=lambda point: point[0]))
+        self._points = ordered
+        self._times = tuple(point[0] for point in ordered)
+
+    def __bool__(self) -> bool:
+        return bool(self._points)
+
+    def __len__(self) -> int:
+        return len(self._points)
+
+    def value_at(self, moment: datetime) -> float:
+        """Piecewise-linear value with flat extrapolation either side of the sampled range."""
+        index = bisect_right(self._times, moment) - 1
+        if index < 0:
+            return self._points[0][1]
+        if index >= len(self._points) - 1:
+            return self._points[-1][1]
+        t0, v0 = self._points[index]
+        t1, v1 = self._points[index + 1]
+        span = (t1 - t0).total_seconds()
+        if span <= 0:
+            return v1
+        return v0 + (v1 - v0) * ((moment - t0).total_seconds() / span)
+
+    def soc_at(self, moment: datetime) -> float | None:
+        """The measured value in force at ``moment`` (last at or before, else the first after)."""
+        if not self._points:
+            return None
+        gap = timedelta(minutes=MAX_GAP_MINUTES)
+        index = bisect_right(self._times, moment) - 1
+        if index >= 0:
+            return self._points[index][1] if moment - self._points[index][0] <= gap else None
+        return self._points[0][1] if self._points[0][0] - moment <= gap else None
+
+    def min_between(self, start: datetime, end: datetime) -> float | None:
+        """Lowest measured value in ``(start, end]``, or ``None`` when nothing was measured."""
+        if not self._points:
+            return None
+        i0 = bisect_right(self._times, start)
+        i1 = bisect_right(self._times, end)
+        window = self._points[i0:i1]
+        return min(value for _t, value in window) if window else None
+
+    def covered_ranges(self, a: datetime, b: datetime) -> list[tuple[datetime, datetime]]:
+        """Sub-ranges of ``[a, b)`` where interpolation is trustworthy (no gap beyond the bound).
+
+        The value is known at every sample, between two samples closer than the bound, and for the
+        bound either side of the outermost sample; everything else is a hole.  A hole is removed,
+        never bridged (SPEC 5).
+        """
+        if not self._points or b <= a:
+            return []
+        gap = timedelta(minutes=MAX_GAP_MINUTES)
+        i0 = bisect_left(self._times, a - gap)
+        i1 = bisect_right(self._times, b + gap)
+        times = self._times[i0:i1]
+        if not times:
+            return []
+        raw: list[tuple[datetime, datetime]] = [(times[0] - gap, times[0])]
+        raw.extend((t0, t1) for t0, t1 in zip(times, times[1:]) if t1 - t0 <= gap)
+        raw.append((times[-1], times[-1] + gap))
+        merged: list[tuple[datetime, datetime]] = []
+        for start, end in raw:
+            start, end = max(start, a), min(end, b)
+            if end <= start:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    def integrate_kwh(self, a: datetime, b: datetime, *, sign: float = 1.0) -> tuple[float, float]:
+        """``(kWh, covered_hours)`` of ``max(0, sign * value)`` over ``[a, b)``.
+
+        The integrand is the piecewise-linear curve *through the measured samples*, so every
+        sample inside the range is a breakpoint: a slice must never be reduced to a straight line
+        between its own endpoints (that would turn a step at the first sample into a full-slice
+        ramp).
+        """
+        total_wh = 0.0
+        covered_hours = 0.0
+        for start, end in self.covered_ranges(a, b):
+            covered_hours += (end - start).total_seconds() / 3600.0
+            inner = self._times[bisect_right(self._times, start) : bisect_left(self._times, end)]
+            stamps = (start, *inner, end)
+            previous = stamps[0]
+            v_previous = self.value_at(previous) * sign
+            for moment in stamps[1:]:
+                v_next = self.value_at(moment) * sign
+                hours = (moment - previous).total_seconds() / 3600.0
+                total_wh += _linear_clamped_area(v_previous, v_next, hours)
+                previous, v_previous = moment, v_next
+        return total_wh / 1000.0, covered_hours
+
+
+@dataclass(frozen=True)
+class PriceSlot:
+    """One plan slot's price and reason, as persisted with the plan that steered that slot."""
+
+    t: datetime
+    minutes: int
+    buy: float | None
+    sell: float | None
+    reason: str = ""
+
+    @property
+    def ends(self) -> datetime:
+        return self.t + timedelta(minutes=max(1, int(self.minutes)))
+
+
+class PriceTimeline:
+    """``moment -> (buy, sell, plan reason)`` from the persisted plans, newest plan winning."""
+
+    def __init__(self, slots: Sequence[PriceSlot] = ()) -> None:
+        ordered = sorted(slots, key=lambda slot: slot.t)
+        self._slots: tuple[PriceSlot, ...] = tuple(ordered)
+        self._starts: tuple[datetime, ...] = tuple(slot.t for slot in ordered)
+
+    def __bool__(self) -> bool:
+        return bool(self._slots)
+
+    @classmethod
+    def from_store(
+        cls, store: Any, start: datetime, end: datetime, *, limit: int | None = None
+    ) -> "PriceTimeline":
+        """Read the persisted plans covering ``[start, end]``; no store is an empty timeline."""
+        lister = getattr(store, "list_plans", None)
+        loader = getattr(store, "load_plan", None)
+        if not callable(lister) or not callable(loader):
+            return cls()
+        window_hours = max(0.0, (end - start).total_seconds() / 3600.0)
+        scan = int(limit) if limit else min(
+            PLAN_LIMIT, max(PLAN_SCAN_MIN, int(window_hours / 0.25) + 2)
+        )
+        try:
+            plan_ids = list(lister(limit=scan) or [])
+        except Exception:  # noqa: BLE001 - no plans is "no price", never a crash
+            return cls()
+        by_start: dict[datetime, PriceSlot] = {}
+        for plan_id in plan_ids:  # newest first: the first plan for a slot wins
+            try:
+                plan = loader(plan_id)
+            except Exception:  # noqa: BLE001
+                continue
+            if plan is None:
+                continue
+            horizon_end = getattr(plan, "horizon_end", None)
+            if horizon_end is not None and horizon_end <= start:
+                # Older plans only ever end earlier, so the rest of the history is out of range.
+                break
+            minutes = int(getattr(plan, "slot_minutes", 15) or 15)
+            for slot in getattr(plan, "slots", ()) or ():
+                moment = getattr(slot, "t", None)
+                if moment is None or moment < start - timedelta(hours=2) or moment > end:
+                    continue
+                if moment in by_start:
+                    continue
+                by_start[moment] = PriceSlot(
+                    t=moment,
+                    minutes=minutes,
+                    buy=_finite(getattr(slot, "buy", None)),
+                    sell=_finite(getattr(slot, "sell", None)),
+                    reason=str(getattr(slot, "reason", "") or ""),
+                )
+        return cls(list(by_start.values()))
+
+    def at(self, moment: datetime) -> PriceSlot | None:
+        """The slot covering ``moment`` exactly, else ``None`` (never a neighbouring price)."""
+        if not self._starts:
+            return None
+        index = bisect_right(self._starts, moment) - 1
+        if index < 0:
+            return None
+        slot = self._slots[index]
+        return slot if moment < slot.ends else None
+
+    def starts_between(self, a: datetime, b: datetime) -> list[datetime]:
+        """Slot starts strictly inside ``(a, b)``: the price boundaries a slice must be split at."""
+        if not self._starts:
+            return []
+        i0 = bisect_right(self._starts, a)
+        i1 = bisect_left(self._starts, b)
+        return list(self._starts[i0:i1])
+
+
+def _effective(pair: tuple[float | None, float | None]) -> tuple[float | None, float | None]:
+    """``(buy, sell)`` with the documented fallbacks; ``(None, None)`` when neither resolved."""
+    buy, sell = pair
+    if buy is None and sell is None:
+        return None, None
+    if buy is None:
+        return sell, sell
+    return buy, buy if sell is None else sell
+
+
+def _battery_floor(
+    battery: BatteryConfig,
+    basis: float,
+    wear_eur_per_kwh: float | None,
+    margin_eur_per_kwh: float,
+) -> float | None:
+    """The frozen break-even helper with ``buy := basis``, plus the configured margin."""
+    break_even = battery.break_even_sell_eur_per_kwh(basis, wear_eur_per_kwh)
+    if break_even is None:
+        return None
+    return break_even + max(0.0, float(margin_eur_per_kwh or 0.0))
+
+
+def book_slices(
+    state: Mapping[str, Any] | None,
+    *,
+    battery: BatteryConfig,
+    series: Series,
+    timeline: PriceTimeline | None = None,
+    dispatch_rows: Sequence[Mapping[str, Any]] = (),
+    now: datetime,
+    reset: bool = False,
+) -> dict[str, Any]:
+    """Advance the ledger over every slice the dispatch log opened since ``state['last_ts']``.
+
+    Pure: no store, no clock.  Returns the new JSON-safe payload.  ``reset`` starts from an empty
+    ledger (a first run with no usable history, or a gap beyond the lookback).
+    """
+    stored = dict(state) if isinstance(state, Mapping) else {}
+    timeline = timeline if timeline is not None else PriceTimeline()
+    power = _Points(series.power)
+    grid = _Points(series.grid)
+    soc = _Points(series.soc)
+    basis = _finite(stored.get("basis_eur_per_kwh"))
+    energy = max(0.0, _finite(stored.get("energy_kwh")) or 0.0)
+    if basis is None:
+        energy = 0.0
+    last_ts = _parse(stored.get("last_ts"))
+    last_applied = _finite(stored.get("last_applied_w"))
+    window_start = _parse(stored.get("window_start"))
+    journal: list[dict[str, Any]] = [
+        dict(entry) for entry in (stored.get("journal") or []) if isinstance(entry, Mapping)
+    ][-MAX_JOURNAL:]
+    intervals = _count(stored.get("intervals"))
+    skipped_no_price = _count(stored.get("skipped_no_price"))
+    skipped_no_power = _count(stored.get("skipped_no_power"))
+    skipped_no_grid = _count(stored.get("skipped_no_grid"))
+    if reset or (last_ts is not None and last_ts > now):
+        basis, energy, last_ts, window_start = None, 0.0, None, None
+
+    round_trip = float(battery.round_trip_efficiency)
+    max_energy = None
+    if battery.capacity_kwh > 0 and battery.eta_charge > 0:
+        max_energy = battery.capacity_kwh / battery.eta_charge
+    reset_soc = float(battery.min_soc_pct) + RESET_SOC_MARGIN_PCT
+
+    # --- one boundary per applied change the add-on really made -------------------------------
+    boundaries: list[tuple[datetime, float, str, str, Any]] = []
+    previous_applied = last_applied
+    for row in dispatch_rows:
+        if int(row.get("dry_run") or 0) != 0:
+            continue
+        if str(row.get("mode") or "") != Mode.AUTO.value:
+            continue
+        if str(row.get("result") or "") not in _APPLIED_RESULTS:
+            continue
+        moment = _parse(row.get("ts"))
+        if moment is None or moment > now:
+            continue
+        if last_ts is not None and moment < last_ts:
+            continue
+        applied = _finite(row.get("applied_w"))
+        applied = 0.0 if applied is None else applied
+        if (
+            previous_applied is not None
+            and abs(applied - previous_applied) <= APPLIED_CHANGE_TOLERANCE_W
+        ):
+            continue
+        boundaries.append(
+            (moment, applied, str(row.get("code") or ""), str(row.get("mode") or ""), row.get("id"))
+        )
+        previous_applied = applied
+    boundaries.sort(key=lambda item: item[0])
+
+    slices: list[tuple[datetime, datetime, float, str, str, Any]] = []
+    cursor = last_ts
+    command: tuple[float, str, str, Any] = (
+        last_applied if last_applied is not None else 0.0,
+        str(stored.get("last_reason") or ""),
+        str(stored.get("last_mode") or ""),
+        stored.get("last_dispatch_id"),
+    )
+    for moment, applied, code, mode, row_id in boundaries:
+        if cursor is None:
+            cursor, command = moment, (applied, code, mode, row_id)
+            continue
+        if moment <= cursor:
+            command = (applied, code, mode, row_id)
+            continue
+        slices.append((cursor, moment, command[0], command[1], command[2], command[3]))
+        cursor, command = moment, (applied, code, mode, row_id)
+    if cursor is not None and now > cursor:
+        slices.append((cursor, now, command[0], command[1], command[2], command[3]))
+
+    booked = 0
+    for start, end, applied, dispatch_reason, mode, dispatch_id in slices:
+        if window_start is None:
+            window_start = start
+        # Nothing usable is held when the pack sits at its floor: start with a clean ledger.
+        start_soc = soc.soc_at(start)
+        if start_soc is not None and start_soc <= reset_soc:
+            basis, energy = None, 0.0
+        charge_kwh = 0.0
+        discharge_kwh = 0.0
+        grid_kwh = 0.0
+        pv_kwh = 0.0
+        cost_eur = 0.0
+        skipped_price = False
+        covered_power_hours = 0.0
+        span_hours = max(0.0, (end - start).total_seconds() / 3600.0)
+        boundaries_t = [start, *timeline.starts_between(start, end), end]
+        for a, b in zip(boundaries_t, boundaries_t[1:]):
+            if b <= a:
+                continue
+            charged, power_hours = power.integrate_kwh(a, b)
+            covered_power_hours += power_hours
+            discharged, _ = power.integrate_kwh(a, b, sign=-1.0)
+            discharge_kwh += discharged
+            if charged <= 0.0 and discharged <= 0.0:
+                continue
+            slot = timeline.at(a)
+            buy, sell = _effective((slot.buy, slot.sell)) if slot is not None else (None, None)
+            if charged > 0.0:
+                if buy is None and sell is None:
+                    # Skip the sub-slice and count it: never invent a price (SPEC 5).
+                    skipped_price = True
+                    skipped_no_price += 1
+                    continue
+                imported, _grid_hours = grid.integrate_kwh(a, b)
+                if not grid:
+                    # No meter reading: the plan slot's own reason is the fallback attribution.
+                    pv_only = slot is not None and slot.reason == Reason.PV_SURPLUS_CHARGE
+                    grid_part = 0.0 if pv_only else charged
+                    skipped_no_grid += 1
+                else:
+                    grid_part = min(charged, max(0.0, imported))
+                pv_part = charged - grid_part
+                cost = grid_part * float(buy) + pv_part * float(sell)
+                grid_kwh += grid_part
+                pv_kwh += pv_part
+                cost_eur += cost
+                total = energy + charged
+                basis = (
+                    (basis * energy + cost) / total
+                    if basis is not None and energy > 0.0
+                    else cost / charged
+                )
+                energy = total
+                charge_kwh += charged
+            if discharged > 0.0 and round_trip > 0.0:
+                energy = max(0.0, energy - discharged / round_trip)
+                if energy <= 0.0:
+                    basis = None
+        if max_energy is not None and energy > max_energy:
+            energy = max_energy
+        end_soc_low = soc.min_between(start, end)
+        if end_soc_low is not None and end_soc_low <= reset_soc:
+            basis, energy = None, 0.0
+        if max_energy is not None and energy > max_energy:
+            energy = max_energy
+        if covered_power_hours <= 0.0 and span_hours > 0.0:
+            skipped_no_power += 1
+        intervals += 1
+        booked += 1
+        if charge_kwh > 0.0 or discharge_kwh > 0.0:
+            journal.append(
+                {
+                    "ts": to_iso(start),
+                    "end": to_iso(end),
+                    "applied_w": None if applied is None else round(float(applied), 1),
+                    "reason": dispatch_reason,
+                    "mode": mode,
+                    "dispatch_id": dispatch_id,
+                    "charge_kwh": round(charge_kwh, 4),
+                    "discharge_kwh": round(discharge_kwh, 4),
+                    "grid_kwh": round(grid_kwh, 4),
+                    "pv_kwh": round(pv_kwh, 4),
+                    "cost_eur": round(cost_eur, 4),
+                    "skipped_no_price": skipped_price,
+                    "basis_eur_per_kwh": None if basis is None else round(basis, 6),
+                    "energy_kwh": round(energy, 4),
+                }
+            )
+    if len(journal) > MAX_JOURNAL:
+        journal = journal[-MAX_JOURNAL:]
+
+    return {
+        "version": STATE_VERSION,
+        "basis_eur_per_kwh": None if basis is None else round(basis, 6),
+        "energy_kwh": round(energy, 4),
+        "last_ts": to_iso(slices[-1][1] if booked else last_ts),
+        "last_dispatch_id": command[3],
+        "last_applied_w": None if command[0] is None else round(float(command[0]), 3),
+        "last_reason": command[1],
+        "last_mode": command[2],
+        "intervals": intervals,
+        "skipped_no_price": skipped_no_price,
+        "skipped_no_power": skipped_no_power,
+        "skipped_no_grid": skipped_no_grid,
+        "window_start": to_iso(window_start),
+        "journal": journal,
+        "updated_at": to_iso(now),
+    }
+
+
+def load_basis(store: Any, battery_id: str) -> dict[str, Any] | None:
+    """Read the stored ledger for one battery; ``None`` without a store or a saved ledger."""
+    getter = getattr(store, "profile_get", None)
+    if not callable(getter):
+        return None
+    try:
+        stored = getter(PROFILE_KIND, battery_id)
+    except Exception:  # noqa: BLE001 - an unreadable profile is "no ledger", never a crash
+        return None
+    if isinstance(stored, tuple) and len(stored) == 2:
+        stored = stored[1]
+    return dict(stored) if isinstance(stored, Mapping) else None
+
+
+def update_basis(
+    store: Any,
+    battery: BatteryConfig,
+    now: datetime | None = None,
+    *,
+    days: float = LOOKBACK_DAYS,
+    timeline: PriceTimeline | None = None,
+) -> dict[str, Any] | None:
+    """Advance one battery's ledger from its dispatch log, measurements and persisted plans.
+
+    Returns the stored payload (or the previous one when nothing new was booked).  A missing store,
+    missing rows or an unreadable profile is not an error, only "no change".
+    """
+    moment = now or utcnow()
+    if not callable(getattr(store, "measurements_range", None)) or not callable(
+        getattr(store, "dispatch_log", None)
+    ):
+        return load_basis(store, battery.id)
+    stored = load_basis(store, battery.id)
+    last_ts = _parse((stored or {}).get("last_ts"))
+    lookback = moment - timedelta(days=max(0.1, float(days)))
+    reset = False
+    start = lookback
+    if last_ts is not None:
+        if lookback <= last_ts <= moment:
+            start = last_ts
+        else:
+            # A gap beyond the lookback: the contents can no longer be attributed, start clean.
+            reset = True
+    read_start = start - timedelta(hours=1)  # one preceding sample, for interpolation at `start`
+    try:
+        rows = store.measurements_range(read_start, moment, roles=measurement_roles(battery.id)) or []
+    except Exception:  # noqa: BLE001 - no history is not an error
+        rows = []
+    try:
+        dispatch_rows = store.dispatch_log(
+            limit=DISPATCH_LIMIT, battery_id=battery.id, since=start
+        ) or []
+    except Exception:  # noqa: BLE001
+        dispatch_rows = []
+    if timeline is None:
+        timeline = PriceTimeline.from_store(store, start, moment)
+    booked = book_slices(
+        stored,
+        battery=battery,
+        series=measurement_series(rows, battery.id),
+        timeline=timeline,
+        dispatch_rows=dispatch_rows,
+        now=moment,
+        reset=reset,
+    )
+    grew = _count(booked.get("intervals")) > _count((stored or {}).get("intervals"))
+    if not grew:
+        return stored
+    writer = getattr(store, "profile_put", None)
+    if callable(writer):
+        try:
+            writer(PROFILE_KIND, battery.id, booked, moment)
+        except Exception:  # noqa: BLE001 - a write failure leaves the previous ledger in place
+            return booked
+    return booked
+
+
+def basis_status(
+    payload: Mapping[str, Any] | None,
+    battery: BatteryConfig | None = None,
+    *,
+    enabled: bool = True,
+    margin_eur_per_kwh: float = 0.0,
+    wear_eur_per_kwh: float | None = None,
+    expose_journal: int = JOURNAL_EXPOSED,
+) -> dict[str, Any]:
+    """Classify a stored payload for the API/UI: basis, held value, sell floor and provenance.
+
+    ``battery=None`` (unknown id) still reports the ledger; only the derived floor needs a battery.
+    The value of the AC-equivalent energy held is defined once: ``basis * energy_kwh``.
+    """
+    basis = _finite((payload or {}).get("basis_eur_per_kwh"))
+    energy = max(0.0, _finite((payload or {}).get("energy_kwh")) or 0.0)
+    if basis is None:
+        energy = 0.0
+    value = basis * energy if basis is not None else None
+    floor = None
+    if enabled and basis is not None and battery is not None:
+        floor = _battery_floor(battery, basis, wear_eur_per_kwh, margin_eur_per_kwh)
+    journal = [
+        dict(entry) for entry in ((payload or {}).get("journal") or []) if isinstance(entry, Mapping)
+    ]
+    exposed = max(0, int(expose_journal))
+    return {
+        "cost_basis_eur_per_kwh": None if basis is None else round(basis, 6),
+        "energy_kwh": round(energy, 4),
+        "stored_value_eur": None if value is None else round(value, 4),
+        "sell_floor_eur_per_kwh": None if floor is None else round(floor, 6),
+        "enabled": bool(enabled),
+        "intervals": _count((payload or {}).get("intervals")),
+        "skipped_no_price": _count((payload or {}).get("skipped_no_price")),
+        "skipped_no_power": _count((payload or {}).get("skipped_no_power")),
+        "skipped_no_grid": _count((payload or {}).get("skipped_no_grid")),
+        "window_start": (payload or {}).get("window_start"),
+        "updated_at": (payload or {}).get("updated_at"),
+        "journal_entries": len(journal),
+        "journal": journal[-exposed:] if exposed else [],
+    }
+
+
+def fleet_sell_floor(
+    entries: Iterable[tuple[BatteryConfig, float | None, float | None, float | None]],
+    *,
+    margin_eur_per_kwh: float = 0.0,
+) -> float | None:
+    """Energy-weighted mean of the per-battery sell floors; ``None`` when nothing is accounted.
+
+    ``entries`` are ``(battery, basis, energy_kwh, wear_eur_per_kwh)``; a battery with no basis or
+    no accounted energy contributes nothing (its money is not at stake) and never a fabricated 0.
+    """
+    total_energy = 0.0
+    weighted = 0.0
+    for battery, basis, energy, wear in entries:
+        basis_value = _finite(basis)
+        energy_value = _finite(energy) or 0.0
+        if basis_value is None or energy_value <= 0.0:
+            continue
+        floor = _battery_floor(battery, basis_value, wear, margin_eur_per_kwh)
+        if floor is None:
+            continue
+        weighted += floor * energy_value
+        total_energy += energy_value
+    return weighted / total_energy if total_energy > 0.0 else None
+
+
+def fleet_basis_eur_per_kwh(
+    entries: Iterable[tuple[BatteryConfig, float | None, float | None]],
+) -> float | None:
+    """Energy-weighted mean cost basis of the fleet, ``None`` when nothing is accounted."""
+    total_energy = 0.0
+    weighted = 0.0
+    for _battery, basis, energy in entries:
+        basis_value = _finite(basis)
+        energy_value = _finite(energy) or 0.0
+        if basis_value is None or energy_value <= 0.0:
+            continue
+        weighted += basis_value * energy_value
+        total_energy += energy_value
+    return weighted / total_energy if total_energy > 0.0 else None

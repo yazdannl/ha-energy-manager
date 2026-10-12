@@ -980,6 +980,67 @@ passed / 0 failed (was 78), `tools/audit.sh` clean over 94 files, `compileall` c
 
 ---
 
+### 8.12 Cost basis of the stored energy and the sell floor (0.18.0)
+
+The owner asked for the energy already in the pack to be valued at what it really cost, and for an
+optional floor that refuses a sale below that value. The chosen semantics are a persisted per-battery
+ledger plus a floor that is **on by default** (`optimizer.sell_floor_enabled`, margin
+`optimizer.sell_floor_margin_eur_per_kwh` 0..1). Nothing here reads or writes a live system: the
+whole change is unit- and engine-tested against fakes.
+
+What 0.18.0 adds:
+
+* `app/cost_basis.py` (new, stdlib only, mirrors `capacity.py`): a per-battery ledger in
+  `learning_profiles` (`kind='battery_cost_basis'`) whose intervals are **event driven, not timed
+  buckets**. A slice opens on an applied dispatch change (`dispatch_log`: `mode auto`, `dry_run`
+  false, `result ok`/`skipped`, `applied_w` differing from the last booked command by more than
+  25 W) and closes at the next change or at the update's `now`; the slice end is stored as `last_ts`,
+  so replaying an update books nothing twice. Slice energy is the *measured* battery power integral
+  (piecewise-linear between persisted samples, `battery_power` or the charge/discharge pair), never
+  the commanded setpoint; a gap longer than 10 minutes is never bridged. Each slice is priced at the
+  plan slot it was charged in (the persisted plans, newest plan winning for a slot start, split at
+  every price-slot boundary it spans): `grid_part = min(charge_ac, import_ac)` at `buy` and
+  `pv_part = charge_ac - grid_part` at `sell` (the export forgone), with a missing `sell` falling
+  back to `buy`, a skipped-and-counted sub-slice when neither resolves, and the plan slot's own
+  reason as the attribution fallback when the meter reading is missing. The basis is
+  `(basis*E + cost)/(E + charge_ac)`, a discharge reduces `E` by `discharged / round_trip`, the SoC
+  floor resets to `basis=None, E=0`, `E` is clamped at `capacity_kwh / eta_charge`, a first run (or
+  a gap beyond the 7-day lookback) starts clean, and the last 200 slices stay as an audit journal.
+* `optimizer.sell_floor_enabled` / `optimizer.sell_floor_margin_eur_per_kwh` in `config.py`
+  (validated, documented; the margin folds as advanced, the on/off stays essential). The floor per
+  battery is the frozen `BatteryConfig.break_even_sell_eur_per_kwh(basis)` plus the margin; the
+  fleet value is the energy-weighted mean.
+* `OptimizerOptions.sell_floor_eur_per_kwh` and an additive `solve`/`solve_from_forecasts` kwarg: the
+  DP removes discharge/export transitions whose value leg is below the floor (the leg is `sell` when
+  exporting, `buy` when serving the house) and a slot that holds for it reports the new additive
+  `Reason.SELL_FLOOR`; charging, SoC-floor holds and everything outside `auto` are untouched, and
+  `None` reproduces the pre-0.18.0 schedule bit for bit. `PlanSummary.sell_floor_eur_per_kwh`
+  carries the enforced floor into `/plan`.
+* A dispatch backstop in `control/safety.check` (additive `sell_floor_eur_per_kwh` kwarg): a live
+  *planned* discharge whose value leg is below the floor is clamped to a hold with the same reason,
+  recorded like the other clamped reasons; an explicit override is never second-guessed. No new
+  alerts, so a clamped tick cannot storm the log.
+* Exposure: `/api/v1/status` gains per-battery `cost_basis_eur_per_kwh` and `stored_value_eur`
+  (`basis * E`, defined once) plus a `cost_basis` block with the fleet values and a five-entry per-
+  battery journal slice; the engine publishes `sensor.sem_battery_cost_basis` (EUR/kWh) and
+  `sensor.sem_battery_value` (EUR) through the existing idempotent publisher, publishing `unknown`
+  rather than a fabricated number when no ledger exists. `mock.js`, SPEC 5/16, README,
+  `docs/REFERENCE.md` and `CHANGELOG.md` were updated with the settings, the formula, the sensors and
+  the payload fields.
+
+Gates: 885 tests (was 860: +25 ledger/floor/dispatch/status/sensor tests), the headless render check
+97 passed / 0 failed (was 97: the settings surface changed but no rendered row did), `tools/audit.sh`
+clean over 103 files, `compileall` clean. New tests: `tests/test_cost_basis.py`.
+
+What is *not* verified live: the ledger has only ever been exercised against synthetic store rows;
+the field behaviour of a real `battery_power` series across a vendor manager's own commands, the
+plan-slot price resolution after a long outage, and the floor's effect on a real sale decision were
+not measured on hardware. The default-on floor therefore only activates once a ledger exists (no
+basis = no floor), so a fresh install behaves exactly as 0.17.1 until it has measured charges.
+Independent review: not run for this change.
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:

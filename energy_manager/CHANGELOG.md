@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.18.0
+
+- **The energy in the pack is valued at what it really cost.** A per-battery cost-basis ledger
+  (`app/cost_basis.py`, runtime data in the store profile, never settings) derives the weighted
+  average price of the AC energy currently held from **applied** dispatch changes and the *measured*
+  battery power between them: a slice opens on an applied `auto` change and closes at the next one
+  (or at the update), one dispatch row books at most one slice, and the slice end is stored so a
+  replay books nothing twice. Each slice is priced at the plan slot it was charged in — grid energy
+  at the slot's buy price, PV energy at the export price it forgoes — splitting only at price-slot
+  boundaries, falling back to buy when sell is missing and skipping (never guessing) when neither
+  resolves. A discharge reduces the accounted energy by the round trip, the SoC floor resets the
+  ledger, and a bounded journal keeps the provenance.
+- **A sale below that value is refused by default.** `optimizer.sell_floor_enabled` (default true)
+  and `optimizer.sell_floor_margin_eur_per_kwh` (0..1, default 0) turn the ledger into a per-battery
+  floor through the existing break-even helper, with the fleet's energy-weighted mean enforced by the
+  plan (`sell_floor` reason) and by a dispatch clamp on a live planned discharge. Charging, SoC
+  holds, overrides and everything outside `auto` are untouched, and with no ledger yet the behaviour
+  is exactly as before. `/status` gains the per-battery basis and stored value plus a fleet block,
+  the plan summary carries the floor, and two new entities (`sensor.sem_battery_cost_basis`,
+  `sensor.sem_battery_value`) mirror it into Home Assistant.
+
 ## 0.17.1
 
 - **A running plan keeps its setpoints.** The recovery guard treated this run's own live command as

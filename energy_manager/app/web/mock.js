@@ -327,6 +327,7 @@
         round_trip_efficiency: roundTrip,
         wear_eur_per_kwh: MOCK_WEAR,
         break_even_sell_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR,
+        sell_floor_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR,
         maintenance: MOCK_MAINTENANCE
       },
       maintenance: MOCK_MAINTENANCE,
@@ -603,6 +604,8 @@
     ["optimizer.max_grid_import_w", "float", 0, "Max grid import W", "0 = unlimited.", "optimizer", null],
     ["optimizer.max_grid_export_w", "float", 0, "Max grid export W", "0 = unlimited.", "optimizer", null],
     ["optimizer.min_spread_eur_per_kwh", "float", 0.0, "Min spread", "Ignore arbitrage thinner than this.", "optimizer", null],
+    ["optimizer.sell_floor_enabled", "bool", true, "Sell floor", "Refuse a discharge or export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at).", "optimizer", null],
+    ["optimizer.sell_floor_margin_eur_per_kwh", "float", 0.0, "Sell floor margin", "Require this much above the break-even before a sale is allowed.", "optimizer", null],
     ["optimizer.target_soc_pct_end", "float", null, "End SoC target %", "Unset = no hard terminal target.", "optimizer", null],
 
     ["control.tick_seconds", "int", 30, "Tick seconds", "", "control", null],
@@ -721,6 +724,7 @@
     "notify.mobile_service", "notify.persistent", "optimizer.cycle_cost_eur_per_kwh",
     "optimizer.power_steps",
     "optimizer.salvage_multiplier", "optimizer.slot_minutes", "optimizer.soc_step_kwh",
+    "optimizer.sell_floor_margin_eur_per_kwh",
     "optimizer.target_soc_pct_end", "price.bzn", "price.contract",
     "price.energy_tax_eur_per_kwh", "price.entity", "price.feed_in_entity",
     "price.feed_in_eur_per_kwh", "price.feed_in_tax_inclusive", "price.fixed_day_price_entity",

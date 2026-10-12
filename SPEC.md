@@ -228,6 +228,8 @@ optimizer.max_grid_import_w  0     # 0 = unlimited
 optimizer.max_grid_export_w  0     # 0 = unlimited
 optimizer.min_spread_eur_per_kwh 0.0  # ignore arbitrage thinner than this
 optimizer.target_soc_pct_end  null   # hard end-of-horizon SoC target if set
+optimizer.sell_floor_enabled  true   # 0.18.0: refuse a discharge/export below what the pack's energy cost
+optimizer.sell_floor_margin_eur_per_kwh 0.0  # 0..1: require this much above the break-even
 control.tick_seconds     30
 control.replan_minutes   15
 control.grid_follow      true
@@ -422,6 +424,63 @@ The cost model uses `round_trip = eta_charge * eta_discharge`, so the break-even
 bought at `buy` EUR/kWh is `buy / round_trip + wear_eur_per_kwh`: only the round trip appears because
 the wear term is already per delivered kWh. Buying at 20 ct with a 75 % round trip breaks even at
 **26.7 ct** before wear, not 25 ct (the 80 % case).
+
+#### Cost basis of the stored energy and the sell floor (0.18.0)
+
+The forward rule above only asks what a sale must earn back *from here on*; it has no memory of what
+the energy already in the pack cost. ``optimizer.sell_floor_enabled`` (default **true**) adds that
+memory: a per-battery **cost basis** and an optional floor that refuses a loss-making sale. The
+basis unit is **EUR per kWh charged into the pack (AC)**, the weighted average price of the energy
+currently held, so the floor is the frozen break-even helper with ``buy := basis``:
+``floor = battery.break_even_sell_eur_per_kwh(basis, wear) + optimizer.sell_floor_margin_eur_per_kwh``.
+
+**The ledger (``app/cost_basis.py``, ``learning_profiles`` kind ``battery_cost_basis``).**
+Intervals are event driven, never timed buckets: a slice opens on an applied change the add-on
+really made for that battery -- a ``dispatch_log`` row with ``mode auto``, ``dry_run`` false,
+``result`` ``ok``/``skipped`` and an ``applied_w`` that differs from the last booked command by more
+than 25 W (grid-follow micro corrections do not fragment the ledger) -- and closes at the next such
+change or at the update's own ``now``. One row books at most one slice and the slice's end is stored
+as ``last_ts``, so replaying an update books nothing twice. The slice's energy is **measured, not
+commanded**: the persisted ``battery_power:<id>`` rows (else the ``battery_charge --
+battery_discharge`` pair) are integrated piecewise-linearly between samples, so uncommanded device
+flow, ramps and a vendor manager moving the pack are all accounted; a data gap longer than one
+sample plus one missing sample (10 minutes) is never bridged, only the covered part is booked. Each
+slice is priced at the plan slot it was charged in (the persisted plan that steered that slot,
+newest plan winning for a slot start, split at every price-slot boundary an interval spans):
+``grid_part = min(charge_ac, import_ac)`` from the measured meter import at the slot's ``buy`` and
+``pv_part = charge_ac - grid_part`` at the slot's ``sell`` (the export forgone, the same convention
+the DP's salvage uses). A missing ``sell`` falls back to ``buy``; when neither resolves the
+sub-slice is skipped and counted, never priced by a guess. When the meter reading is missing the
+plan slot's own reason is the fallback attribution (``pv_surplus_charge`` means PV, anything else
+means grid). The running basis is
+``basis = (basis * E + cost_eur) / (E + charge_ac)`` with ``E += charge_ac``; a discharge reduces
+``E -= discharged_ac / round_trip_efficiency`` and leaves ``basis`` unchanged, clearing it when
+``E`` reaches 0. At or below the SoC floor (``soc <= min_soc_pct + 1``) nothing usable is held, so
+the ledger resets to ``basis=None``, ``E=0`` (before a slice that starts there and after one that
+dips there); ``E`` is clamped at ``capacity_kwh / eta_charge``. A first run starts fresh and may
+back-fill at most the last 7 days from the persisted dispatch log, budgeting only slices whose slot
+price resolves exactly; a gap between updates longer than that lookback also starts clean, because
+the contents can no longer be attributed. The last 200 booked slices are kept as an audit journal
+(``ts``, applied power, reason, source split, price, energy, resulting basis); ``/status`` exposes
+the last five per battery.
+
+**The floor.** Each battery's floor is the frozen helper applied to its own ``basis``, per-direction
+etas and effective wear (the advanced override when set, else the derived value) plus the margin;
+the fleet floor the plan enforces is the **energy-weighted mean** of those per-battery floors, so a
+battery holding nothing usable contributes nothing. In the DP a discharge/export transition whose
+*value leg* sits below the floor is removed from the action set: the leg is the slot's ``sell`` when
+the flow exports and the slot's ``buy`` when it serves the house, which is exactly the
+``grid_kw_at(slot, p) < 0`` sign test. A slot that holds because of the floor reports
+``Reason.SELL_FLOOR``. Charging (including the cell-voltage emergency charge and the scheduled full
+charge), SoC-floor holds and everything outside ``auto`` are untouched, and with the setting off or
+no basis yet the schedule is bit-for-bit the pre-0.18.0 one. A live *planned* discharge whose value
+leg is below the floor is also clamped to a hold at dispatch, reported like the other clamped
+reasons; an explicit override is never second-guessed. Exposure: ``/api/v1/status`` carries per
+battery ``cost_basis_eur_per_kwh`` and ``stored_value_eur`` (defined once as ``basis * E``) plus a
+``cost_basis`` block with the fleet floor, ``PlanSummary.sell_floor_eur_per_kwh`` carries it in
+``/plan``, and the entities ``sensor.sem_battery_cost_basis`` (EUR/kWh) and
+``sensor.sem_battery_value`` (EUR) mirror the fleet basis and the value of the held energy through
+the same idempotent publisher, publishing ``unknown`` rather than inventing a figure.
 
 Runtime discovery is mandatory for `driver: zendure`: find candidate entities by asking HA for the
 entity registry entries whose `platform` is `zendure_ha` (or `unique_id` prefix `zendure_ha.`) and
@@ -1595,6 +1654,8 @@ round, with the reason:
   `optimizer.target_soc_pct_end`; reaching the target records the completion and alerts are
   rate-limited, never a faked completion.
 - **§3/§9.2/§9.3/§9.4/§10 (setpoint ownership; fixed 2026-10-12 after the live-test storm)** — the live run showed the recovery guard fighting its own plan, blocked advisory ticks latching from `requested_w`, and device-path drivers clearing the latch on a momentary 0 W, so the latch is now a per-battery applied-command record: only a real, verified non-zero write sets it, only an explicit verified hold (or a driver-reported zero across a confirmation window) clears it, only a previous run's restored latch is guard-recoverable, and advisory/off/dry-run runs issue zero write calls — guard holds included — except the documented boot/Stop/exit de-escalations.
+
+- **§3/§5/§8.1/§10/§12 (cost basis of the stored energy and the sell floor; requested 2026-10-12, "value the energy in the battery and refuse loss-making sales")** — the optimiser's forward break-even is paired with a persisted per-battery ledger (``app/cost_basis.py``, profile kind ``battery_cost_basis``): applied dispatch changes open event-driven slices, the slice energy is the *measured* ``battery_power:<id>`` integral (never the commanded setpoint), each slice is priced at the plan slot it was charged in (grid at ``buy``, PV at ``sell``, split at price-slot boundaries, skip rather than guess when neither resolves, the plan slot's own reason as the fallback attribution when the meter is missing), and the basis is the weighted average ``(basis*E + cost)/(E + charge_ac)`` with a discharge reducing ``E`` by ``discharged/round_trip`` and a reset to ``basis=None, E=0`` at the SoC floor. ``E`` is clamped at ``capacity_kwh / eta_charge`` and a first run (or a gap beyond the 7-day lookback) starts clean; a bounded 200-slice journal keeps the provenance. ``optimizer.sell_floor_enabled`` (default true) and ``optimizer.sell_floor_margin_eur_per_kwh`` (0..1, default 0) turn that basis into a floor through the frozen ``BatteryConfig.break_even_sell_eur_per_kwh`` helper — per battery, with the fleet value the plan enforces as the energy-weighted mean — and the DP blocks a discharge/export whose value leg (``sell`` when exporting, ``buy`` when serving the house) is below it with the new ``Reason.SELL_FLOOR``; a live planned discharge below the floor is also clamped to a hold at dispatch, without touching charging, SoC-floor holds or overrides. ``/status`` gains the per-battery ``cost_basis_eur_per_kwh``/``stored_value_eur`` and a fleet block, the plan summary gains ``sell_floor_eur_per_kwh``, and ``sensor.sem_battery_cost_basis`` / ``sensor.sem_battery_value`` mirror the fleet basis and held value (or ``unknown``, never a fabricated figure). Off, or with no basis yet, behaviour is exactly the pre-0.18.0 one.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

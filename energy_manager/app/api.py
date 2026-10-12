@@ -292,6 +292,9 @@ def plan_summary_dict(summary: PlanSummary) -> dict[str, Any]:
     payload["eta_discharge"] = getattr(summary, "eta_discharge", None)
     payload["round_trip_efficiency"] = getattr(summary, "round_trip_efficiency", None)
     payload["break_even_sell_eur_per_kwh"] = getattr(summary, "break_even_sell_eur_per_kwh", None)
+    # Additive (0.18.0): the cost-basis sell floor the DP enforced (SPEC 5). ``None`` when the
+    # setting is off or no ledger exists yet; a summary restored from an older store yields null.
+    payload["sell_floor_eur_per_kwh"] = getattr(summary, "sell_floor_eur_per_kwh", None)
     # Additive (0.17.0): scheduled full-charge maintenance.  ``None`` when a summary was restored
     # from a store written before the field existed, or when no battery is due in this horizon.
     payload["maintenance"] = getattr(summary, "maintenance", None)
@@ -573,6 +576,7 @@ def status_dict(
     mode_persisted: bool = True,
     cell_voltage: Mapping[str, Any] | None = None,
     full_charge: Mapping[str, Any] | None = None,
+    cost_basis: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     now = state.now or datetime.now(timezone.utc)
     override = None
@@ -586,6 +590,11 @@ def status_dict(
             except ValueError:
                 override["seconds_left"] = None
     current = plan.slot_at(now) if plan is not None else None
+    basis_by_id = {
+        str(row.get("id")): row
+        for row in (cost_basis or {}).get("batteries", [])
+        if isinstance(row, Mapping)
+    }
     return {
         "version": state.version,
         "commit": state.commit,
@@ -630,6 +639,12 @@ def status_dict(
                 # Additive (0.16.0): the lowest cell voltage this battery reported, when a mapped
                 # entity or the driver hook provides one.  None = never a guessed value.
                 "cell_voltage_v": (battery.extra or {}).get("cell_voltage_v"),
+                # Additive (0.18.0): this battery's cost-basis ledger (SPEC 5). ``None`` = no
+                # ledger yet; the value of the held energy is defined once as ``basis * E``.
+                "cost_basis_eur_per_kwh": (basis_by_id.get(battery.id) or {}).get(
+                    "cost_basis_eur_per_kwh"
+                ),
+                "stored_value_eur": (basis_by_id.get(battery.id) or {}).get("stored_value_eur"),
                 "last_error": battery.last_error,
             }
             for battery in state.batteries
@@ -673,6 +688,9 @@ def status_dict(
         # Additive (0.17.0): scheduled full-charge maintenance (settings, per-battery state and the
         # plan-level block).  ``None`` only when the caller did not provide it.
         "full_charge": dict(full_charge) if full_charge is not None else None,
+        # Additive (0.18.0): the cost-basis ledger and the fleet sell floor (SPEC 5/10). ``None``
+        # only when the caller did not provide it.
+        "cost_basis": dict(cost_basis) if cost_basis is not None else None,
         "alerts": [
             {
                 "ts": to_iso(alert.ts),
@@ -829,6 +847,7 @@ class ApiServer:
             persisted = getattr(engine, "mode_persisted", None)
             cell_voltage = getattr(engine, "cell_voltage_status", None)
             full_charge = getattr(engine, "full_charge_status", None)
+            cost_basis = getattr(engine, "cost_basis_block", None)
             return self._json(
                 status_dict(
                     state,
@@ -837,6 +856,7 @@ class ApiServer:
                     persisted() if callable(persisted) else True,
                     cell_voltage() if callable(cell_voltage) else None,
                     full_charge() if callable(full_charge) else None,
+                    cost_basis() if callable(cost_basis) else None,
                 )
             )
 
