@@ -604,6 +604,7 @@
     ["optimizer.max_grid_import_w", "float", 0, "Max grid import W", "0 = unlimited.", "optimizer", null],
     ["optimizer.max_grid_export_w", "float", 0, "Max grid export W", "0 = unlimited.", "optimizer", null],
     ["optimizer.min_spread_eur_per_kwh", "float", 0.0, "Min spread", "Ignore arbitrage thinner than this.", "optimizer", null],
+    ["optimizer.pv_charge_preference", "str", "auto", "PV charge preference", "How the plan values PV energy it charges into the pack: auto = the export price it forgoes (default), prefer_pv = free (absorb the surplus before buying anything), avoid_pv = the slot's buy price (export the PV and charge from the grid in the cheapest hours). A shadow price for planning only: the reported plan money stays the true grid cost.", "optimizer", ["auto", "prefer_pv", "avoid_pv"]],
     ["optimizer.sell_floor_enabled", "bool", true, "Sell floor", "Refuse a discharge or export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at).", "optimizer", null],
     ["optimizer.sell_floor_margin_eur_per_kwh", "float", 0.0, "Sell floor margin", "Require this much above the break-even before a sale is allowed.", "optimizer", null],
     ["optimizer.target_soc_pct_end", "float", null, "End SoC target %", "Unset = no hard terminal target.", "optimizer", null],

@@ -173,6 +173,11 @@ DEFAULTS: dict[str, Any] = {
     "optimizer.max_grid_import_w": 0,
     "optimizer.max_grid_export_w": 0,
     "optimizer.min_spread_eur_per_kwh": 0.0,
+    # How the plan values PV energy it charges into the pack (SPEC 8.1, 0.19.0): auto = the export
+    # price it forgoes (the economically exact default), prefer_pv = 0 (absorb the surplus first),
+    # avoid_pv = the slot's buy price (export the PV and charge from the grid in the cheapest
+    # hours). An internal shadow price: the reported plan money is the true grid cost either way.
+    "optimizer.pv_charge_preference": "auto",
     "optimizer.target_soc_pct_end": None,
     # -- cost basis and the sell floor (SPEC 5, 0.18.0) ------------------------------------
     # The ledger is derived from the applied dispatch log and the measured flows, so the floor
@@ -272,6 +277,7 @@ _SOLAR_SOURCE_KEYS: dict[str, tuple[str, ...]] = {
     ),
 }
 _LOAD_MODE_CHOICES = ("auto", "entity", "derived")
+_PV_CHARGE_PREFERENCE_CHOICES = ("auto", "prefer_pv", "avoid_pv")
 _NOTIFY_EVENT_CHOICES = (
     "plan_changed",
     "plan_applied",
@@ -386,6 +392,7 @@ SETTINGS_META: dict[str, _Meta] = {
     "optimizer.max_grid_import_w": _Meta("float", "optimizer", "Max grid import W", "0 = unlimited.", minimum=0.0),
     "optimizer.max_grid_export_w": _Meta("float", "optimizer", "Max grid export W", "0 = unlimited.", minimum=0.0),
     "optimizer.min_spread_eur_per_kwh": _Meta("float", "optimizer", "Min spread", "Ignore arbitrage thinner than this.", minimum=0.0, maximum=10.0),
+    "optimizer.pv_charge_preference": _Meta("choice", "optimizer", "PV charge preference", "How the plan values PV energy it charges into the pack: auto = the export price it forgoes (the economically exact default, so PV wins whenever its export price is below the buy price), prefer_pv = free (absorb the surplus before buying anything), avoid_pv = the slot's buy price (export the PV and charge from the grid in the cheapest hours). A shadow price for planning only: the reported plan money stays the true grid cost.", _PV_CHARGE_PREFERENCE_CHOICES),
     "optimizer.sell_floor_enabled": _Meta("bool", "optimizer", "Sell floor", "Refuse a discharge or export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at). Off, or before a basis exists, behaves exactly as before."),
     "optimizer.sell_floor_margin_eur_per_kwh": _Meta("float", "optimizer", "Sell floor margin", "Require this much above the break-even before a sale is allowed.", minimum=0.0, maximum=1.0, advanced=True),
     "optimizer.target_soc_pct_end": _Meta("float", "optimizer", "End SoC target %", "Unset = no hard terminal target.", minimum=0.0, maximum=100.0, nullable=True, advanced=True),

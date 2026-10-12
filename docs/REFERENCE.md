@@ -590,6 +590,7 @@ dashboard's own roles beside it, and a `Use the Energy dashboard` button clears 
 | `optimizer.max_grid_import_w` | float | `0` | ≥ 0 | **Max grid import W** — 0 = unlimited |
 | `optimizer.max_grid_export_w` | float | `0` | ≥ 0 | **Max grid export W** — 0 = unlimited |
 | `optimizer.min_spread_eur_per_kwh` | float | `0.0` | 0…10 | **Min spread** — ignore arbitrage thinner than this |
+| `optimizer.pv_charge_preference` | choice `auto\|prefer_pv\|avoid_pv` | `auto` | — | **PV charge preference** — price PV energy charged into the pack at the slot's `sell` (default: the export forgone), `0` (`prefer_pv`: absorb the surplus first) or the slot's `buy` (`avoid_pv`: export the PV and charge from the grid in the cheapest hours). A planning shadow price: the reported money stays the true grid cost |
 | `optimizer.target_soc_pct_end` | float, nullable | `null` | 0…100 | **End SoC target %** *(advanced)* — unset = no hard terminal target |
 | `optimizer.sell_floor_enabled` | bool | `true` | — | **Sell floor** — refuse a discharge or export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at). Off, or before a basis exists, behaves exactly as before |
 | `optimizer.sell_floor_margin_eur_per_kwh` | float | `0.0` | 0…1 | **Sell floor margin** *(advanced)* — require this much above the break-even before a sale is allowed |
@@ -705,7 +706,8 @@ new value when the user types one.
 `price.fixed_day_price_eur_per_kwh`, `price.fixed_night_price_eur_per_kwh`, `grid.power_entity`,
 `solar.enabled`, `solar.source`, `solar.measured_entity`, `optimizer.horizon_hours`,
 `optimizer.allow_grid_charge`,
-`optimizer.min_spread_eur_per_kwh`, `optimizer.sell_floor_enabled`, `maintenance.full_charge_enabled`,
+`optimizer.min_spread_eur_per_kwh`, `optimizer.sell_floor_enabled`, `optimizer.pv_charge_preference`,
+`maintenance.full_charge_enabled`,
 plus the ten Safety keys. Everything else is `advanced: true` (this includes the advanced wear
 override `optimizer.cycle_cost_eur_per_kwh`, `optimizer.sell_floor_margin_eur_per_kwh`,
 `solar.nasa_irradiance` and the two `maintenance.full_charge_*` tuning keys).
@@ -1192,6 +1194,31 @@ whose *value leg* is below the floor is removed: the leg is the slot's `sell` wh
 (`grid_kw_at < 0`) and the slot's `buy` when it serves the house. A slot that holds because of the
 floor reports `sell_floor`; charging, SoC-floor holds and everything outside `auto` are untouched,
 and with the floor `None` the schedule is bit-for-bit the pre-0.18.0 one.
+
+The floor restricts discharge only (0.19.0): in a slot whose `base = load - pv` is negative (a PV
+surplus) the lower bound is `max(grid_lo, -max(0.0, base)) = 0`, so the surplus keeps exporting and
+the pack is never forced to swallow it; only a deficit caps the discharge at the house's own demand
+(`-base`) or, when `buy < floor`, at a hold. The 0.18.0 branch used `-base`, which in a surplus slot
+is a *positive* bound and forced the charge at any price — the live 0.18.1 plan charged 08:00-10:00
+instead of the cheaper 11:00-13:00 hours. PV that would go straight to the meter has no cost basis,
+so exporting it stays free.
+
+**How PV energy charged into the pack is priced** (0.19.0) is a separate choice:
+`optimizer.pv_charge_preference` is `auto` (default), `prefer_pv` or `avoid_pv`. For a charging slot
+(`p > 0`) with `surplus = max(0, pv - load)` and `pv_kwh = min(p, surplus)`, the objective adds the
+internal shadow price
+
+```
+dt * (pv_price - sell) * pv_kwh
+```
+
+where `pv_price` is the slot's `sell` for `auto` (the export forgone — the addition is zero, so the
+model is exactly the true grid cost and PV is preferred exactly when `sell < buy`), `0` for
+`prefer_pv` (absorb the surplus before buying anything) and the slot's `buy` for `avoid_pv` (export
+the PV and charge from the grid in the cheapest hours). Only the solver's objective carries the
+shadow price: `cost_estimate_eur`, `baseline_cost_eur` and `saved_eur` stay the true grid cost of
+the returned schedule (SPEC 8.1), so no preference can invent a saving. `allow_grid_charge=false`
+keeps its PV-only bound and `min_spread` keeps charging only the grid part.
 
 **Slot classification** (`_classify`) — stable action + reason slugs:
 

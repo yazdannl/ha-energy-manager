@@ -35,9 +35,10 @@ no MQTT, no cloud account, and no YAML to install by hand.
   the pack's own measured SoC content when the samples lag (the basis itself is never touched). By
   default it refuses a discharge or export below that break-even (`optimizer.sell_floor_enabled`,
   with an optional `optimizer.sell_floor_margin_eur_per_kwh`) so the plan cannot sell your pack's
-  energy at a loss. The ledger resets when the pack reaches its floor, survives restarts, and is
-  exposed per battery in `/status` plus `sensor.sem_battery_cost_basis` and
-  `sensor.sem_battery_value`.
+  energy at a loss. The floor only ever restricts a discharge: in a PV-surplus hour the pack holds
+  while the PV exports, so a cheaper later hour still wins. The ledger resets when the pack reaches
+  its floor, survives restarts, and is exposed per battery in `/status` plus
+  `sensor.sem_battery_cost_basis` and `sensor.sem_battery_value`.
 - **Explains itself.** Every planning decision and every blocked dispatch carries a stable reason
   slug, visible in the log, so "why didn't it charge?" always has an answer.
 - **Shows the money.** Savings are accounted against a do-nothing baseline (defined below) and
@@ -135,7 +136,8 @@ disclosure per group).
 | `solar.source` | `forecast_solar` | The single source used when `solar.sources` is empty: `forecast_solar` (per-plane API), `capacity` (enter the array's Wp) or `derived` (learn the array from the meter's export moments; also used automatically when `forecast_solar` has no planes and a meter resolves). |
 | `solar.sources` / `solar.merge_strategy` | unset / `weighted_mean` | Optional merge list `[{source, weight, ...}]` that combines several forecasts into one series: `forecast_solar`, `ha_energy` (every solar-forecast provider already configured in your Home Assistant **Energy dashboard**, e.g. Solcast), `capacity` and `derived`, each with a finite weight `> 0`. The strategy is `weighted_mean`, `median` or `max`; a failed source is skipped, and an empty list keeps `solar.source` alone. The Solar card edits the list with add/remove/reorder. |
 | `optimizer.allow_export` | `false` | Export scheduling stays off until you enable it. |
-| `optimizer.sell_floor_enabled` | `true` | Refuse a discharge/export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at). With no ledger yet, or turned off, the plan behaves exactly as before. `optimizer.sell_floor_margin_eur_per_kwh` (0..1, default 0) demands that much extra. |
+| `optimizer.sell_floor_enabled` | `true` | Refuse a discharge/export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at). With no ledger yet, or turned off, the plan behaves exactly as before. `optimizer.sell_floor_margin_eur_per_kwh` (0..1, default 0) demands that much extra. The floor never forces a charge: in a PV-surplus slot the pack holds while the PV exports. |
+| `optimizer.pv_charge_preference` | `auto` | How the plan prices PV energy it charges into the pack: `auto` (the export price it forgoes — the economically exact default, so PV wins exactly when its export price is below the buy price), `prefer_pv` (free: absorb the surplus before buying anything) or `avoid_pv` (the slot's buy price: export the PV and charge from the grid in the cheapest hours). A shadow price for planning only — the reported plan money stays the true grid cost. |
 | `protection.cell_voltage_enabled` | `false` | Watch the lowest cell voltage (a mapped `cell_voltage_entity`, or the `zendure_native` driver's own read) and latch an emergency charge below `protection.cell_voltage_cutoff_v`; blocked from discharging until it recovers to `protection.cell_voltage_resume_v`. `protection.emergency_charge_power_w` 0 = the battery's own `max_charge_w`. See the safety model. |
 | `maintenance.full_charge_enabled` | `false` | Reach `maintenance.full_charge_target_soc_pct` (default 100) every `maintenance.full_charge_interval_days` (default 30) days so the BMS can balance its cells. While a battery is due the plan uses the terminal-target mechanism in the cheapest slots before the deadline; the due date and last completion are per-battery runtime data, an overdue cycle alerts and keeps trying, and advisory mode never writes. |
 

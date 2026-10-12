@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.19.0
+
+- **The sell floor restricts discharge; it never forces a charge.** The 0.18.0 floor branch used
+  `grid_lo = max(grid_lo, -base)`, so in a PV-surplus slot (`base = load - pv < 0`) the lower bound
+  became *positive* and the pack had to swallow the whole surplus at any price: a live 30 h plan
+  charged 08:00-10:00 (sell 0.34 / 0.30 / 0.28) instead of the cheaper 11:00-13:00 hours
+  (0.27 / 0.26 / 0.27), about 6 ct worse over that window. The bound is now
+  `max(grid_lo, -max(0.0, base))`: a deficit caps the discharge at the house's own demand, a surplus
+  leaves `p >= 0` while the PV exports freely. The floor is about *stored* energy; PV that would go
+  straight to the meter has no cost basis. `_sell_floor_blocks` and the dispatcher clamp already
+  judged discharges only and are unchanged.
+- **You choose how PV is priced: `optimizer.pv_charge_preference`.** `auto` (default) prices PV
+  energy charged into the pack at the slot's sell price (the export forgone — PV then wins exactly
+  when `sell < buy`), `prefer_pv` at 0 (absorb the surplus before buying anything) and `avoid_pv` at
+  the slot's buy price (export the PV and charge from the grid in the cheapest hours). The chosen
+  price is an internal shadow price added to the objective for the PV part of a charge; the plan
+  summary keeps reporting the true grid cost of the returned schedule, so no mode can invent a
+  saving. `allow_grid_charge=false` and `min_spread` keep their existing scopes.
+
 ## 0.18.1
 
 - **The measured energy is booked on the sample grid.** On a live install whose applied setpoint

@@ -1088,6 +1088,74 @@ change.
 
 ---
 
+### 8.14 The sell floor must not force PV charging; the PV charge preference (0.19.0)
+
+The live 0.18.1 plan on the owner's install charged the pack at 08:00-10:00 instead of the cheaper
+11:00-13:00 hours: +303 / +849 / +727 W at sells 0.3361 / 0.2989 / 0.2797 against 11:00-13:00 at
+0.2660 / 0.2620 / 0.2734, about 6 ct worse over that window, because exporting the PV earlier and
+charging later was the profitable schedule. `power_bounds_kw`'s floor branch used
+`grid_lo = max(grid_lo, -base)`: with `base = load - pv < 0` (a PV surplus) that is a *positive*
+lower bound, so the pack was forced to swallow the whole surplus whatever the price. The floor
+exists to stop *stored* energy being sold below its cost basis; PV that would go straight to the
+meter has no basis, so exporting it must stay free.
+
+Reproduced offline with the live-shaped 30 h inputs (`dp.solve_from_forecasts`: 1.92 kWh pack,
+10-100 %, 1000/800 W, eta 0.92, target 100 %, buy = sell + 0.1155; the 08:00-13:00 sells are the
+live ones). The bound, 1 h slot, SoC-safe:
+
+| live-shaped slot | 0.18.1, floor 0.3997 | 0.18.1, no floor | 0.19.0, floor 0.3997 |
+| --- | --- | --- | --- |
+| surplus 0.30 kW, sell 0.3361 | `p in [+0.300, +1.000]` | `p in [-0.460, +1.000]` | `p in [0.000, +1.000]` |
+| surplus 0.85 kW, sell 0.2989 | `p in [+0.850, +1.000]` | `p in [-0.460, +1.000]` | `p in [0.000, +1.000]` |
+| deficit 0.21 kW, sell 0.3361 | `p in [-0.210, +1.000]` | `p in [-0.460, +1.000]` | `p in [-0.210, +1.000]` |
+
+The schedule and the euro arithmetic for 08:00-13:00 (`slot.cost_eur(1.0)` of the returned plan):
+
+| plan | 08:00 | 09:00 | 10:00 | 11:00 | 12:00 | 13:00 | 08-13 cost | 30 h cost |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.18.1 floored | +303.0 W | +849.0 W | +726.3 W | 0 W | 0 W | 0 W | -0.5775 | 3.5436 |
+| 0.18.1 unfloored | 0 W | 0 W | 0 W | +565.2 W | +678.6 W | +634.4 W | -0.6347 | 3.4877 |
+| 0.19.0 floored | 0 W | 0 W | 0 W | +565.2 W | +695.7 W | +617.4 W | -0.6348 | 3.4863 |
+
+All three reach the 1879 Wh the pack needs (1.728 kWh usable / 0.92). The 5.7 ct is the export
+revenue the early charge forgoes: early stored PV
+`0.303*0.3361 + 0.849*0.2989 + 0.7263*0.2797 = 0.5587` against
+`0.5652*0.2660 + 0.6786*0.2620 + 0.6344*0.2734 = 0.5016` in the 11:00-13:00 window, i.e. 0.0571
+(the measured window difference -0.5775 - (-0.6347) = 0.0572; the euro figures are rounded to 4
+decimals). (The 0.19.0 floored plan differs slightly from the
+unfloored one after 13:00 because the floor still clamps a house-serving discharge to the house's
+own demand.)
+
+`optimizer.pv_charge_preference` (0.19.0, `auto` | `prefer_pv` | `avoid_pv`, default `auto`) sets
+the price the objective assigns to PV energy a charge puts into the pack, as an internal shadow
+price: for `p > 0`, `surplus = max(0, pv - load)`, `pv_kwh = min(p, surplus)`, the objective gains
+`dt * (pv_price - sell) * pv_kwh` with `pv_price` the slot's `sell` (`auto`; the term is zero and
+the model is exactly the true grid cost), `0` (`prefer_pv`: absorb the surplus before buying
+anything) or the slot's `buy` (`avoid_pv`: export the PV and charge from the grid in the cheapest
+hours). The summary money is untouched: `cost_estimate_eur`, `baseline_cost_eur` and `saved_eur`
+remain the true grid cost of the returned schedule (SPEC 8.1), so no mode can invent a saving.
+
+Tests (`tests/test_cost_basis.py`, five new; each fails on 0.18.1): the bounds table above; the
+live-shaped schedule holds at 08:00-10:00 and charges 1879 Wh at 11:00-13:00; a below-floor battery
+discharge is refused while the PV export in the same slot is allowed; the three modes pick the slot
+their PV price points at; the summary money equals the plain grid cost of each mode's schedule (the
+`prefer_pv` objective carries a -0.30 shadow credit while the reported cost stays 0.05); and
+`OptimizerOptions.from_settings` normalizes a bad stored value to `auto`. The new key also
+round-trips through `config.coerce_setting` (`tests/test_wp2a_config.py`, bad values rejected) and
+the UI mock carries it (`tests/test_wp3_mock_contract.py` parity).
+
+Gates: 898 tests (was 893: +5 in `tests/test_cost_basis.py`; the config and mock assertions extend
+existing tests), the headless render check 97 passed / 0 failed (the new row renders, no other
+surface changed), `tools/audit.sh` clean over 103 files, `compileall` clean.
+
+What is *not* verified live: the add-on was not deployed and nothing was written to the live
+instance; the live-shaped horizon is a reconstruction from the reported plan (its 08:00-13:00
+prices and the PV surplus the forced powers imply), not a captured forecast, and the three
+preference modes were exercised on synthetic horizons only. Independent review: not run for this
+change.
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:

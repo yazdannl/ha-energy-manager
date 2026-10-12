@@ -30,12 +30,18 @@ from app.models import (  # noqa: E402
     Action,
     BatteryConfig,
     BatteryState,
+    LoadForecast,
+    LoadSlot,
     Measurement,
     Mode,
     Plan,
     PlanSlot,
     PlanSummary,
+    PriceForecast,
+    PriceSlot,
     Reason,
+    SolarForecast,
+    SolarSlot,
     SystemState,
     to_iso,
 )
@@ -659,6 +665,207 @@ def test_lower_bound_matches_the_value_leg():
         export, 2.0, aggregate, dp.OptimizerOptions(slot_minutes=60, sell_floor_eur_per_kwh=0.20), 1.0
     )
     assert lo == pytest.approx(-2.0)
+
+
+# --------------------------------------------------------- the floor restricts discharge (0.19.0)
+
+#: The live-shaped 30 h horizon behind F9 (SPEC 8.14): a 1.92 kWh pack at its 10 % floor must reach
+#: 100 % by the end of the horizon.  The 08:00-13:00 sell prices are the ones the live plan
+#: reported; buy = sell + a fixed fee, so the price order is the live order.
+_LIVE_START = datetime(2026, 10, 13, 0, 0, tzinfo=timezone.utc)
+_LIVE_SELL = {8: 0.3361, 9: 0.2989, 10: 0.2797, 11: 0.2660, 12: 0.2620, 13: 0.2734}
+_LIVE_SHAPE = {
+    0: 0.2900, 1: 0.2800, 2: 0.2700, 3: 0.2650, 4: 0.2680, 5: 0.2790,
+    6: 0.2950, 7: 0.3150, 14: 0.2900, 15: 0.3050, 16: 0.3350, 17: 0.3650,
+    18: 0.3900, 19: 0.3750, 20: 0.3500, 21: 0.3300, 22: 0.3150, 23: 0.3050,
+    24: 0.2950, 25: 0.2850, 26: 0.2750, 27: 0.2700, 28: 0.2800, 29: 0.2950,
+}
+#: The reported forced charges were +303 / +849 / +727 W at 08:00-10:00 over a 0.5 kW house load.
+_LIVE_PV = {7: 0.35, 8: 0.803, 9: 1.349, 10: 1.40, 11: 1.10, 12: 1.20, 13: 1.18, 14: 1.00, 15: 0.60, 16: 0.30}
+_LIVE_FLOOR = 0.3997
+
+
+def _live_slots() -> list[dp.SlotInput]:
+    slots = []
+    for i in range(30):
+        sell = _LIVE_SELL[i] if i in _LIVE_SELL else _LIVE_SHAPE[i]
+        slots.append(
+            dp.SlotInput(
+                t=_LIVE_START + timedelta(hours=i),
+                pv_kw=_LIVE_PV.get(i, 0.0),
+                load_kw=0.5,
+                buy=sell + 0.1155,
+                sell=sell,
+            )
+        )
+    return slots
+
+
+def _live_plan(floor: float | None, preference: str = "auto") -> Plan:
+    config = battery(
+        capacity_kwh=1.92,
+        min_soc_pct=10.0,
+        max_soc_pct=100.0,
+        max_charge_w=1000.0,
+        max_discharge_w=800.0,
+        eta_charge=0.92,
+        eta_discharge=0.92,
+    )
+    price = PriceForecast(source="example_price")
+    solar = SolarForecast(source="example_solar")
+    load = LoadForecast(source="example_load")
+    for slot in _live_slots():
+        price.slots.append(PriceSlot(t=slot.t, buy=slot.buy, sell=slot.sell))
+        solar.slots.append(SolarSlot(t=slot.t, pv_kw=slot.pv_kw))
+        load.slots.append(LoadSlot(t=slot.t, load_kw=slot.load_kw))
+    # Through ``settings``, the live path: on 0.18.1 the unknown preference key is ignored and the
+    # plan is exactly the 0.18.1 one the live finding reported (+303 / +849 / +727 W at 08:00-10:00).
+    settings = {
+        "optimizer.slot_minutes": 60,
+        "optimizer.horizon_hours": 30,
+        "optimizer.power_steps": 24,
+        "optimizer.allow_export": True,
+        "optimizer.target_soc_pct_end": 100.0,
+        "optimizer.pv_charge_preference": preference,
+    }
+    return dp.solve_from_forecasts(
+        price,
+        solar,
+        load,
+        battery_configs=[config],
+        start_kwh=1.92 * 0.10,
+        settings=settings,
+        now=_LIVE_START,
+        sell_floor_eur_per_kwh=floor,
+    )
+
+
+def test_power_bounds_floor_never_forces_a_pv_charge():
+    """0.18.1 used ``max(grid_lo, -base)``, so a PV surplus (``base < 0``) became a positive lower
+    bound and the pack had to swallow the whole surplus at any price.  The floor may only refuse a
+    discharge; PV that would go straight to the meter has no cost basis and exports freely."""
+    config = battery(
+        capacity_kwh=4.0, min_soc_pct=0.0, max_charge_w=1000.0, max_discharge_w=800.0
+    )
+    aggregate = dp.BatteryAggregate.from_configs([config], 0.0)
+    options = dp.OptimizerOptions(slot_minutes=60, allow_export=True, sell_floor_eur_per_kwh=_LIVE_FLOOR)
+
+    surplus_30 = dp.SlotInput(t=T0, pv_kw=0.80, load_kw=0.50, buy=0.4516, sell=0.3361)
+    lo, hi, _binding = dp.power_bounds_kw(surplus_30, 2.0, aggregate, options, 1.0)
+    assert lo == 0.0  # 0.18.1: +0.300 -- the whole surplus was forced into the pack
+    assert lo > -0.30  # a below-floor battery discharge/export is still refused (p >= 0)
+    assert hi == pytest.approx(1.0)
+    assert dp.grid_kw_at(surplus_30, 0.0) < 0.0  # the surplus still exports while the pack holds
+
+    surplus_85 = dp.SlotInput(t=T0, pv_kw=1.35, load_kw=0.50, buy=0.4144, sell=0.2989)
+    lo, _hi, _binding = dp.power_bounds_kw(surplus_85, 2.0, aggregate, options, 1.0)
+    assert lo == 0.0  # 0.18.1: +0.850
+
+    # A deficit keeps the intended scope: discharge up to the house's own demand, no export.
+    deficit = dp.SlotInput(t=T0, pv_kw=0.29, load_kw=0.50, buy=0.4516, sell=0.3361)
+    lo, _hi, _binding = dp.power_bounds_kw(deficit, 2.0, aggregate, options, 1.0)
+    assert lo == pytest.approx(-0.21)
+
+
+def test_live_shaped_plan_keeps_the_pv_surplus_for_the_cheaper_hours():
+    """The live finding (SPEC 8.14): with the fleet floor ~0.3997 the 0.18.1 plan charged
+    +303 / +849 / +727 W at 08:00-10:00 instead of the cheaper 11:00-13:00 hours, because the floor
+    forced the PV surplus into the pack.  The floor must leave this horizon to the price signal."""
+    floored = _live_plan(_LIVE_FLOOR)
+    powers = [slot.power_w for slot in floored.slots]
+    assert floored.summary.sell_floor_eur_per_kwh == pytest.approx(_LIVE_FLOOR)
+    # 08:00-10:00: the pack holds (0.18.1: +303 / +849 / +726 W) and the PV exports below the floor.
+    assert powers[8] == 0.0 and powers[9] == 0.0 and powers[10] == 0.0
+    assert floored.slots[8].action is Action.HOLD
+    assert floored.slots[8].grid_kw() < 0.0
+    # 11:00-13:00 carry the 1879 Wh the pack needs to reach 100 %, exactly as the unfloored plan did.
+    assert powers[11] > 0.0 and powers[12] > 0.0 and powers[13] > 0.0
+    assert sum(powers[8:14]) / 1000.0 == pytest.approx(1.879, abs=0.002)
+    unfloored = _live_plan(None)
+    # The unfloored plan was already price-driven (0.18.1: 0 early, 1879 Wh late), and the floor no
+    # longer touches this window; the two plans may still differ later where the floor clamps a
+    # house-serving discharge, so only the window is compared.
+    assert unfloored.slots[8].power_w == 0.0 and unfloored.slots[11].power_w > 0.0
+    assert sum(powers[8:14]) / 1000.0 == pytest.approx(
+        sum(slot.power_w for slot in unfloored.slots[8:14]) / 1000.0, abs=0.02
+    )
+    # The terminal target is still met exactly (the floor never blocks charging).
+    aggregate = dp.BatteryAggregate.from_configs([battery(capacity_kwh=1.92, min_soc_pct=10.0)], 0.0)
+    last = floored.slots[-1]
+    final = dp.next_energy_kwh(last.soc_kwh, last.power_w / 1000.0, 1.0, aggregate)
+    assert final == pytest.approx(1.92, abs=0.01)
+
+
+def _preference_plan(preference: str, later_buy: float) -> Plan:
+    """One 1.0 kW PV surplus hour (sell 0.30) and one later grid hour at ``later_buy``; the pack must
+    charge exactly 1.0 kWh by the end, so every mode picks the slot its PV price points at and no
+    later spread can be arbitraged."""
+    config = battery(
+        capacity_kwh=4.0, min_soc_pct=0.0, max_charge_w=1000.0, max_discharge_w=1000.0
+    )
+    aggregate = dp.BatteryAggregate.from_configs([config], 0.0)
+    slots = [
+        dp.SlotInput(t=T0, pv_kw=1.5, load_kw=0.5, buy=0.50, sell=0.30),
+        dp.SlotInput(t=T0 + timedelta(hours=1), pv_kw=0.0, load_kw=0.5, buy=later_buy, sell=0.05),
+    ]
+    options = dp.OptimizerOptions(
+        slot_minutes=60,
+        power_steps=24,
+        allow_export=True,
+        target_soc_pct_end=25.0,  # 1.0 kWh of the 4 kWh pack
+        pv_charge_preference=preference,
+    )
+    return dp.solve(slots, aggregate=aggregate, start_kwh=0.0, options=options, generated_at=T0)
+
+
+def test_pv_charge_preference_modes():
+    """``auto`` prices PV at the export it forgoes, ``prefer_pv`` at zero and ``avoid_pv`` at the
+    slot's buy (SPEC 8.1, 0.19.0)."""
+    # auto: PV is cheaper than the 0.35 grid hour, so it charges the surplus at 08:00.
+    auto_pv = _preference_plan("auto", 0.35)
+    assert auto_pv.slots[0].power_w == pytest.approx(1000.0)
+    # auto: a 0.10 grid hour beats the 0.30 export it would forgo -> the PV exports.
+    auto_grid = _preference_plan("auto", 0.10)
+    assert auto_grid.slots[0].power_w == 0.0
+    assert auto_grid.slots[1].power_w == pytest.approx(1000.0)
+    # prefer_pv: the surplus is free, so it is soaked even though 0.10 is cheaper than the 0.30 sell.
+    prefer = _preference_plan("prefer_pv", 0.10)
+    assert prefer.slots[0].power_w == pytest.approx(1000.0)
+    assert prefer.slots[1].power_w == 0.0
+    # avoid_pv: PV is priced at this slot's 0.50 buy, so it exports and buys in the cheaper hour.
+    avoid = _preference_plan("avoid_pv", 0.35)
+    assert avoid.slots[0].power_w == 0.0
+    assert avoid.slots[1].power_w == pytest.approx(1000.0)
+
+
+def test_pv_charge_preference_never_changes_the_reported_money():
+    """The PV price is an internal shadow price: the summary keeps reporting the true grid cost of
+    the returned schedule (SPEC 8.1), so no preference can invent a saving."""
+    for preference in ("auto", "prefer_pv", "avoid_pv"):
+        plan = _preference_plan(preference, 0.10)
+        true_cost = sum(slot.cost_eur(1.0) for slot in plan.slots)
+        assert plan.summary.cost_estimate_eur == pytest.approx(true_cost, abs=1e-9), preference
+        assert plan.summary.saved_eur == pytest.approx(
+            plan.summary.baseline_cost_eur - true_cost, abs=1e-9
+        ), preference
+    prefer = _preference_plan("prefer_pv", 0.10)
+    # The true grid cost of the prefer_pv schedule: the 1.0 kWh PV charge at 08:00 (grid 0), then the
+    # 0.5 kW house hour at 0.10 -- while the objective carries the shadow credit of the forgone
+    # export (-0.30) and the terminal salvage, so it must never be reported as money.
+    assert prefer.summary.cost_estimate_eur == pytest.approx(0.05, abs=1e-9)
+    assert prefer.summary.objective_eur == pytest.approx(-0.55, abs=1e-9)
+
+
+def test_optimizer_options_validate_the_pv_preference():
+    assert dp.OptimizerOptions.from_settings({}).pv_charge_preference == "auto"
+    for value in ("auto", "prefer_pv", "avoid_pv"):
+        assert dp.OptimizerOptions.from_settings(
+            {"optimizer.pv_charge_preference": value}
+        ).pv_charge_preference == value
+    # A stored value that is not one of the three is a typo, never a crash in the solver.
+    assert dp.OptimizerOptions.from_settings(
+        {"optimizer.pv_charge_preference": "always"}
+    ).pv_charge_preference == "auto"
 
 
 # ------------------------------------------------------------------------------- dispatch backstop

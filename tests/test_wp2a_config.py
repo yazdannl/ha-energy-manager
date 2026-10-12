@@ -65,6 +65,7 @@ SPEC_KEYS = {
     "optimizer.max_grid_import_w",
     "optimizer.max_grid_export_w",
     "optimizer.min_spread_eur_per_kwh",
+    "optimizer.pv_charge_preference",
     "optimizer.target_soc_pct_end",
     "control.tick_seconds",
     "control.replan_minutes",
@@ -180,9 +181,15 @@ def test_validation_rejects_bad_values():
         coerce_setting("price.static_schedule", [{"from_hour": 0}])
     with pytest.raises(ConfigError):
         coerce_setting("solar.planes", [{"kwp": 0}])
+    with pytest.raises(ConfigError):
+        coerce_setting("optimizer.pv_charge_preference", "always")
     assert coerce_setting("dry_run", "false") is False
     assert coerce_setting("optimizer.slot_minutes", 15.0) == 15
     assert coerce_setting("price.bzn", "DE-LU") == "DE-LU"
+    # SPEC 8.1 (0.19.0): the PV charge preference round-trips and rejects a typo.
+    for value in ("auto", "prefer_pv", "avoid_pv"):
+        assert coerce_setting("optimizer.pv_charge_preference", value) == value
+    assert DEFAULTS["optimizer.pv_charge_preference"] == "auto"
     assert coerce_setting("currency", None) is None
     with pytest.raises(ConfigError):
         coerce_setting("solar.planes", [{"kwp": 1.0, "azimuth_deg": 400}])

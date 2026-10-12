@@ -99,6 +99,19 @@ def aggregate_break_even_sell_eur_per_kwh(
     return host.break_even_sell_eur_per_kwh(buy_eur_per_kwh, wear_eur_per_kwh)
 
 
+#: ``optimizer.pv_charge_preference`` values (SPEC 8.1, 0.19.0): how the objective prices the PV
+#: energy a charge puts into the pack.  ``auto`` values it at the slot's export price (the revenue
+#: forgone, economically exact), ``prefer_pv`` at zero (absorb the surplus first) and ``avoid_pv``
+#: at the slot's buy price (export the PV and charge from the grid in the cheapest hours).
+PV_CHARGE_PREFERENCES = ("auto", "prefer_pv", "avoid_pv")
+
+
+def normalize_pv_charge_preference(value: Any) -> str:
+    """A valid preference, else ``auto`` (a stored typo must never break a plan; SPEC 3/8.1)."""
+    text = str(value or "").strip().lower()
+    return text if text in PV_CHARGE_PREFERENCES else "auto"
+
+
 @dataclass(frozen=True)
 class OptimizerOptions:
     """Tunables read from ``optimizer.*`` settings (SPEC section 3)."""
@@ -118,6 +131,10 @@ class OptimizerOptions:
     max_import_kw: float = 0.0
     max_export_kw: float = 0.0
     min_spread_eur_per_kwh: float = 0.0
+    #: How the objective prices PV energy charged into the pack (SPEC 8.1, 0.19.0): ``auto`` = the
+    #: slot's sell (the export forgone), ``prefer_pv`` = 0, ``avoid_pv`` = the slot's buy.  An
+    #: internal shadow price: the reported plan money stays the true grid cost of the schedule.
+    pv_charge_preference: str = "auto"
     target_soc_pct_end: float | None = None
     #: Cost-basis sell floor (SPEC 5, additive 0.18.0): the fleet's energy-weighted mean
     #: break-even of the energy actually in the packs, EUR per kWh AC delivered, plus the
@@ -140,6 +157,9 @@ class OptimizerOptions:
             max_import_kw=float(get("optimizer.max_grid_import_w", 0) or 0) / 1000.0,
             max_export_kw=float(get("optimizer.max_grid_export_w", 0) or 0) / 1000.0,
             min_spread_eur_per_kwh=float(get("optimizer.min_spread_eur_per_kwh", 0.0) or 0.0),
+            pv_charge_preference=normalize_pv_charge_preference(
+                get("optimizer.pv_charge_preference", "auto")
+            ),
             target_soc_pct_end=get("optimizer.target_soc_pct_end", None),
         )
 
@@ -362,17 +382,37 @@ def plan_grid_kw(slot: PlanSlot) -> float:
 
 
 def slot_cost_eur(p_kw: float, slot: SlotInput, dt_hours: float, opts: OptimizerOptions) -> float:
-    """Grid cost of one slot at battery power ``p_kw`` (positive = charging)."""
+    """Grid cost of one slot at battery power ``p_kw`` (positive = charging).
+
+    With a non-``auto`` ``opts.pv_charge_preference`` the PV part of a charge carries an internal
+    shadow price (SPEC 8.1, 0.19.0): the objective values that energy at zero (``prefer_pv``) or at
+    the slot's buy (``avoid_pv``) instead of the export it forgoes.  Only the solver's objective is
+    affected -- ``_summary`` still reports the true grid cost of the returned schedule.
+    """
     grid = grid_kw_at(slot, p_kw)
     # An unknown sell price means "no export revenue", never a crash (audit minor).
     sell = float(slot.sell or 0.0)
     cost = dt_hours * (slot.buy * max(grid, 0.0) - sell * max(-grid, 0.0))
-    if opts.min_spread_eur_per_kwh > 0 and p_kw > 0:
-        # A thin-spread guard is charged to energy that has to come from the grid: charging above
-        # the PV surplus has to earn back ``min_spread`` before it is worth doing at all.
+    if p_kw > 0:
         surplus = max(0.0, slot.pv_kw - slot.load_kw)
-        cost += opts.min_spread_eur_per_kwh * max(0.0, p_kw - surplus) * dt_hours
+        pv_kwh = min(p_kw, surplus)
+        pv_price = _pv_price_eur_per_kwh(slot, opts)
+        if pv_kwh > 0.0 and pv_price != sell:
+            cost += dt_hours * (pv_price - sell) * pv_kwh
+        if opts.min_spread_eur_per_kwh > 0:
+            # A thin-spread guard is charged to energy that has to come from the grid: charging
+            # above the PV surplus has to earn back ``min_spread`` before it is worth doing at all.
+            cost += opts.min_spread_eur_per_kwh * max(0.0, p_kw - surplus) * dt_hours
     return cost
+
+
+def _pv_price_eur_per_kwh(slot: SlotInput, opts: OptimizerOptions) -> float:
+    """The price the objective assigns to PV energy charged into the pack in this slot."""
+    if opts.pv_charge_preference == "prefer_pv":
+        return 0.0
+    if opts.pv_charge_preference == "avoid_pv":
+        return float(slot.buy)
+    return float(slot.sell or 0.0)  # auto: the export the charge forgoes
 
 
 def next_energy_kwh(e_kwh: float, p_kw: float, dt_hours: float, agg: BatteryAggregate) -> float:
@@ -445,8 +485,11 @@ def power_bounds_kw(
     floor = opts.sell_floor_eur_per_kwh
     if floor is not None:
         if float(slot.sell or 0.0) < floor:
-            # No flow below the house's own demand: nothing may be exported below the floor.
-            grid_lo = max(grid_lo, -base)
+            # No flow below the house's own demand: nothing may be exported below the floor.  A PV
+            # surplus (``base < 0``) has no cost basis and keeps exporting freely, so the bound is
+            # the house demand alone -- never ``-base``, which turned a surplus into a *positive*
+            # lower bound and forced the pack to swallow it at any price (0.19.0 fix, SPEC 8.14).
+            grid_lo = max(grid_lo, -max(0.0, base))
         if base > 0.0 and float(slot.buy) < floor:
             # Even displacing import cannot pay for the held energy: hold instead of discharge.
             grid_lo = max(grid_lo, 0.0)
@@ -525,8 +568,9 @@ class _DpResult:
     effective_step_kwh: float
     terminal_error_kwh: float
     cycle_cost_eur: float = 0.0
-    #: Objective of the *returned* schedule: grid + min_spread + cycle cost - terminal salvage
-    #: (plus the terminal-target penalty when one was set), i.e. exactly what the DP minimised.
+    #: Objective of the *returned* schedule: grid + min_spread + the PV shadow price + cycle cost
+    #: - terminal salvage (plus the terminal-target penalty when one was set), i.e. exactly what
+    #: the DP minimised.
     objective_eur: float = 0.0
     #: The value function's entry at the start state, before path reconstruction (they agree unless
     #: the reconstructed path leaves the discretised grid; the schedule's own value is reported).

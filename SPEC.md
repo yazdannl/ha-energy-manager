@@ -227,6 +227,7 @@ optimizer.reserve_soc_pct    0.0   # extra floor above battery min_soc
 optimizer.max_grid_import_w  0     # 0 = unlimited
 optimizer.max_grid_export_w  0     # 0 = unlimited
 optimizer.min_spread_eur_per_kwh 0.0  # ignore arbitrage thinner than this
+optimizer.pv_charge_preference auto|prefer_pv|avoid_pv  # 0.19.0: price PV charging at sell (default), 0, or buy
 optimizer.target_soc_pct_end  null   # hard end-of-horizon SoC target if set
 optimizer.sell_floor_enabled  true   # 0.18.0: refuse a discharge/export below what the pack's energy cost
 optimizer.sell_floor_margin_eur_per_kwh 0.0  # 0..1: require this much above the break-even
@@ -502,6 +503,25 @@ remains the tracked average price of the energy we priced); the signed cumulativ
 ``reconciled_kwh``, the last step ``reconciled_last_kwh``, and a single correction beyond half the
 pack capacity is unattributable: the ledger resets (``basis=None``, ``E=0``) and
 ``reconciled_resets`` counts it.
+
+**0.19.0 amendment (the floor restricts discharge, and PV charging gets its own price).** The 0.18.0
+floor branch used ``grid_lo = max(grid_lo, -base)``, so in a PV-surplus slot
+(``base = load - pv < 0``) the lower bound became *positive* and the pack was forced to swallow the
+whole surplus at any price: a live 30 h plan charged 08:00-10:00 instead of the cheaper 11:00-13:00
+hours. The floor now uses ``grid_lo = max(grid_lo, -max(0.0, base))`` -- a deficit caps the
+discharge at the house's own demand and a surplus leaves ``p >= 0`` while the PV exports freely. The
+floor exists to stop *stored* energy being sold below its cost basis, and PV that would go straight
+to the meter has no basis; ``_sell_floor_blocks`` and the dispatcher clamp are unchanged (they
+already judge discharges only). ``optimizer.pv_charge_preference`` (``auto`` | ``prefer_pv`` |
+``avoid_pv``, default ``auto``) sets the price the solver assigns to PV energy it charges into the
+pack: the slot's ``sell`` (the export forgone; ``auto`` is then preferred exactly when
+``sell < buy``), ``0`` (absorb the surplus before buying anything) or the slot's ``buy`` (export the
+PV and charge from the grid in the cheapest hours). In ``slot_cost_eur``, for ``p > 0`` with
+``surplus = max(0, pv - load)`` and ``pv_kwh = min(p, surplus)``, the chosen price adds
+``dt * (pv_price - sell) * pv_kwh``. That is an internal shadow price only: ``cost_estimate_eur``,
+``baseline_cost_eur`` and ``saved_eur`` remain the true grid cost of the returned schedule (SPEC
+8.1), so no preference can invent a saving. ``allow_grid_charge=false`` keeps its PV-only bound and
+``min_spread`` keeps charging only the grid part.
 
 Runtime discovery is mandatory for `driver: zendure`: find candidate entities by asking HA for the
 entity registry entries whose `platform` is `zendure_ha` (or `unique_id` prefix `zendure_ha.`) and
@@ -787,6 +807,13 @@ Arbitrage is only planned when the sale price clears the round-trip break-even
 left idle for that reason reports `Reason.EFFICIENCY_LOSS`, which is distinct from the user's own
 `optimizer.min_spread_eur_per_kwh` floor (`Reason.SPREAD_BELOW_THRESHOLD`). `optimizer.target_soc_pct_end` adds a hard terminal constraint when set
 (infeasible target ⇒ drop to a soft penalty and raise an alert, never crash).
+
+0.19.0: the PV part of a charge may carry an internal shadow price set by
+``optimizer.pv_charge_preference`` (§5) -- ``auto`` prices it at ``sell`` (exactly the formula
+above), ``prefer_pv`` at 0 and ``avoid_pv`` at ``buy`` -- so the objective gains
+``dt * (pv_price - sell) * min(p, max(0, pv - load))``. The reported money
+(``cost_estimate_eur``, ``baseline_cost_eur``, ``saved_eur``) stays the true grid cost of the
+returned schedule, never the shadow-priced objective.
 
 Scheduled full-charge maintenance (0.17.0) reuses that same terminal-target mechanism: while a
 tracked battery is due, the solver aims for ``maintenance.full_charge_target_soc_pct`` (or the
@@ -1678,6 +1705,20 @@ round, with the reason:
 
 - **§3/§5/§8.1/§10/§12 (cost basis of the stored energy and the sell floor; requested 2026-10-12, "value the energy in the battery and refuse loss-making sales")** — the optimiser's forward break-even is paired with a persisted per-battery ledger (``app/cost_basis.py``, profile kind ``battery_cost_basis``): applied dispatch changes open event-driven slices, the slice energy is the *measured* ``battery_power:<id>`` integral (never the commanded setpoint), each slice is priced at the plan slot it was charged in (grid at ``buy``, PV at ``sell``, split at price-slot boundaries, skip rather than guess when neither resolves, the plan slot's own reason as the fallback attribution when the meter is missing), and the basis is the weighted average ``(basis*E + cost)/(E + charge_ac)`` with a discharge reducing ``E`` by ``discharged/round_trip`` and a reset to ``basis=None, E=0`` at the SoC floor. ``E`` is clamped at ``capacity_kwh / eta_charge`` and a first run (or a gap beyond the 7-day lookback) starts clean; a bounded 200-slice journal keeps the provenance. ``optimizer.sell_floor_enabled`` (default true) and ``optimizer.sell_floor_margin_eur_per_kwh`` (0..1, default 0) turn that basis into a floor through the frozen ``BatteryConfig.break_even_sell_eur_per_kwh`` helper — per battery, with the fleet value the plan enforces as the energy-weighted mean — and the DP blocks a discharge/export whose value leg (``sell`` when exporting, ``buy`` when serving the house) is below it with the new ``Reason.SELL_FLOOR``; a live planned discharge below the floor is also clamped to a hold at dispatch, without touching charging, SoC-floor holds or overrides. ``/status`` gains the per-battery ``cost_basis_eur_per_kwh``/``stored_value_eur`` and a fleet block, the plan summary gains ``sell_floor_eur_per_kwh``, and ``sensor.sem_battery_cost_basis`` / ``sensor.sem_battery_value`` mirror the fleet basis and held value (or ``unknown``, never a fabricated figure). Off, or with no basis yet, behaviour is exactly the pre-0.18.0 one.
 - **§3/§5/§8.1/§10 (measured energy on the sample grid and reconciliation with the pack; fixed 2026-10-12 after the live 0.18.0 ledger under-reported the pack by ~12 %)** — the ledger now integrates the *covered sample spans* themselves (split at the applied command changes and price-slot boundaries they cross) and accumulates each command interval's parts into its journal entry, so a command shorter than the sample spacing still books its measured share; ``last_ts`` is the end of the last processed sample span (never a command timestamp) and nothing beyond the newest settled sample is booked, so an update tail can no longer be extrapolated flat and the ramp the next sample reveals is never lost (replaying an update books nothing twice, and a settled command interval with no covered sample span counts in ``skipped_no_power``). After booking, the quantity is reconciled with the pack's own measured SoC content ``E_phys = clamp(capacity_kwh*(soc-min_soc_pct)/100/eta_charge, 0, capacity_kwh/eta_charge)`` from the last SoC sample at or before the booking end (stale/missing skips and counts ``skipped_no_soc``); the difference is applied to ``energy_kwh`` and never to ``basis``, the signed cumulative correction is ``reconciled_kwh`` plus ``reconciled_last_kwh``, and a single correction beyond half the pack capacity resets the ledger (``basis=None``, ``E=0``) and counts ``reconciled_resets``.
+
+- **§3/§5/§8.1 (the sell floor must not force PV charging, and the PV charge preference; reported
+  2026-10-12 after the live plan charged 08:00-10:00 instead of the cheaper 11:00-13:00 hours)** —
+  the 0.18.0 floor branch's ``grid_lo = max(grid_lo, -base)`` is a *positive* lower bound in a
+  PV-surplus slot, so the pack was forced to swallow the whole surplus at any price (live:
+  +303/+849/+727 W at 08:00-10:00 while the same 1879 Wh was cheaper at 11:00-13:00). The branch
+  now uses ``max(grid_lo, -max(0.0, base))``: only a deficit caps the discharge, a surplus leaves
+  ``p >= 0`` and the PV exports freely (a PV kWh headed for the meter has no cost basis).
+  ``optimizer.pv_charge_preference`` (``auto`` | ``prefer_pv`` | ``avoid_pv``, default ``auto``)
+  prices PV energy charged into the pack at the slot's ``sell`` (the export forgone; ``auto`` is
+  economically exact and prefers PV exactly when ``sell < buy``), at ``0`` (absorb the surplus
+  first) or at the slot's ``buy`` (export the PV and charge from the grid in the cheapest hours),
+  as an internal shadow price ``dt * (pv_price - sell) * min(p, max(0, pv - load))`` on the charging
+  leg only; the summary money stays the true grid cost of the schedule (SPEC 8.1).
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded
