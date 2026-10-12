@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.17.1
+
+- **A running plan keeps its setpoints.** The recovery guard treated this run's own live command as
+  "a previous run died with a live setpoint": in `auto` it wrote 0 W over the plan every
+  `RECOVERY_RETRY_S` (about 60 s), alerted `live_setpoint_recovered` on every retry and cut a
+  sustained command to roughly two thirds duty (live test 2026-10-12). The latch is now split into a
+  per-battery applied-command record for what *this* run wrote and a boot latch restored from the
+  store for what a *previous* process left behind. Only the boot latch is guard-recoverable, and a
+  verified hold clears it, so a real recovery holds once, alerts once and then stays silent.
+- **Only a real, verified non-zero write latches.** A blocked `advisory`/`off` tick used to journal
+  `requested_w` and latch from it, which let the guard write `input_limit=0` while the add-on was in
+  advisory. A result now latches only when it is not `dry_run`, is `ok`, really wrote, and applied a
+  non-zero setpoint — so `advisory`/`off`/`dry_run` runs issue zero write calls of any kind, guard
+  holds included. The only writes outside `auto` remain the documented de-escalations (mode or
+  `dry_run` change, Stop now, exit) and neutralising a genuine previous-run latch at boot.
+- **The latch follows what the add-on commanded, not an optional setpoint entity.** On
+  `control_path: device` there is no setpoint entity, so any momentary 0 W flow used to clear the
+  record while `input_limit` still executed — an `auto → advisory` change then logged
+  `hold_skipped — nothing to neutralise` and left the pack charging. The record now clears only on
+  verified neutral: a hold the driver confirmed in its own read-back window, or two consecutive
+  readings where the driver's own setpoint and the measured flow both read ~0. The Zendure driver
+  reports the `input_limit`/`output_limit` read-back as its `commanded_power()` on the device path.
+- **De-escalation touches only what we wrote.** `auto → advisory/off`, `dry_run` on, Stop now and
+  exit neutralise every battery this run really commanded and has not verified neutral, and nothing
+  else: a fresh advisory install, or a run that never wrote, is not touched at all. The `/stop`
+  response shape and per-battery results are unchanged, and `pending_holds` now means "commanded and
+  not yet verified neutral".
+
 ## 0.17.0
 
 - **A scheduled full charge keeps the pack balanced.** New `maintenance.full_charge_enabled`

@@ -611,6 +611,14 @@ def test_mode_partial_update_and_validation(wired):
 
 
 def test_stop_route_is_atomic_and_writes_zero(wired):
+    engine = wired.engine
+    # 0.17.1: Stop only holds batteries this run really wrote to; an override forces that write
+    # (the fixture's plan slot for 12:30 can legitimately be 0 W) and is cleared before the stop.
+    engine.set_mode("auto", False)
+    engine.set_override(500.0, 5.0)
+    engine.tick_now()
+    assert engine.pending_holds() == ["example_battery_1"], "the fixture must command something"
+    engine.clear_override()
     live = wired.server.state
     live.states["number.example_battery_power"] = {"state": "450", "attributes": {}}
     status, _headers, body = wired.json("POST", "/api/v1/stop", {})

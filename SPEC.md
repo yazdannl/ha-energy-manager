@@ -76,7 +76,7 @@ Modes (`mode`):
 | Mode | Behaviour |
 | --- | --- |
 | `off` | No planning, no writes. Data collection, alerts and the UI/API keep working, and a plan computed before the switch is dropped so the UI never shows a stale plan as current. An explicit user-triggered recompute is still served as a preview (it is a read-only what-if), but no scheduled planning happens and nothing is written. |
-| `advisory` | **(default)** Plan is computed, published and shown. **Never writes to the battery**, with the single exception in §9.4: a battery whose last non-zero setpoint is still live is neutralised on Stop, on a mode/`dry_run` change, on exit and on boot. |
+| `advisory` | **(default)** Plan is computed, published and shown. **Never writes to the battery**, with the single exception in §9.4: a battery the add-on really commanded and has not verified neutral is neutralised on Stop, on a mode/`dry_run` change, on exit and on boot. |
 | `auto` | Plan is executed through the configured battery drivers. |
 
 `dry_run` (bool, default `true`): in `auto`, compute and log the exact writes that *would* happen
@@ -488,8 +488,8 @@ Helpers:     BatteryConfig.round_trip_efficiency, BatteryConfig.wear_eur_per_kwh
 now, price_now, price_rank_pct, pv_now_w, load_now_w, grid_now_w, batteries[list[BatteryState]],
 active_plan: Plan|None, last_plan_at, last_tick_at, alerts[list[AlertRecord]], provider_status,
 version, uptime_s`. The API `/status` payload additionally reports `pending_holds[list[str]]` (batteries whose
-last real setpoint is still live) and `mode_persisted: bool`; the engine owns those two values and they are
-not `SystemState` fields.
+last real command is not yet verified neutral) and `mode_persisted: bool`; the engine owns those two
+values and they are not `SystemState` fields.
 
 ---
 
@@ -796,7 +796,10 @@ device with finite write budget).
 `zendure.py` must: put the Zendure manager into manual dispatch before controlling power, express
 charge vs discharge with the driver's own entity semantics (verified in `docs/EXTERNAL_APIS.md`),
 respect device limits when writing, verify read-back after each write inside tolerance, and treat a
-mismatch as a driver error (not a silent success). It must never write to `soc_set`/`min_soc` on
+mismatch as a driver error (not a silent success). Its engine hook `commanded_power()` reports what
+the device was last told to do: on `control_path: "device"` that is the `input_limit`/
+`output_limit` read-back, never the measured flow, because a momentary 0 W flow while the limits
+still execute must not read as "neutral" (0.17.1). It must never write to `soc_set`/`min_soc` on
 every tick — SoC floors are expressed as optimized power, with the device SoC limits configured
 separately and rarely.
 
@@ -824,9 +827,12 @@ saving it probes the device once and refuses a malformed or unreachable config u
 `check(requested_w, plan_slot, batteries, state, settings, now) -> SafetyDecision(allowed_w,
 clamped: bool, reasons: list[str], block: bool)` enforcing, in order:
 
-1. `mode != auto` → block (`advisory`/`off` write nothing). The one exception is the neutralising
-   hold in §9.4, which runs for a battery whose last non-zero setpoint is still live (mode change,
-   `dry_run` change, Stop, exit, boot). A `dry_run` tick never writes.
+1. `mode != auto` → block (`advisory`/`off` write nothing, guard holds included). The one exception
+   is the neutralising hold in §9.4, which runs only for a battery the add-on really wrote to and
+   has not verified neutral (an explicit de-escalation: mode change, `dry_run` change, Stop, exit)
+   or for a previous run's latch restored at boot; the periodic recovery guard may neutralise only
+   that boot latch, never a command this run applied and has not verified neutral. A `dry_run` tick
+   never writes.
 2. Kill switch / override active → block or return the override power.
 3. State older than `control.stale_state_seconds` → block (hold).
 4. HA disconnected or battery unavailable → block for that battery.
@@ -864,11 +870,16 @@ would carry on charging or discharging (see appendix A). Therefore `POST /api/v1
 atomic safety action that:
 
 1. clears any active override,
-2. writes `hold()` (0 W / neutral) **for real** to every battery whose last non-zero setpoint is
-   still live (a persisted per-battery live-write latch), deliberately bypassing the `mode != auto`
-   and `dry_run` blocks — de-escalating to zero power is the safe direction, and a stop button that
-   silently does nothing under `dry_run` would be worse than useless. A battery the add-on has never
-   commanded is not touched, so an advisory install cannot switch the user's own battery mode,
+2. writes `hold()` (0 W / neutral) **for real** to every battery the add-on actually commanded and
+   has not verified neutral (a persisted per-battery applied-command record; only a real, verified
+   non-zero write enters it, never a blocked or dry-run tick), deliberately bypassing the
+   `mode != auto` and `dry_run` blocks — de-escalating to zero power is the safe direction, and a
+   stop button that silently does nothing under `dry_run` would be worse than useless. The record
+   is cleared only on verified neutral: an explicit hold the driver confirmed inside its own
+   read-back window, or `NEUTRAL_CONFIRM_READS` (2) consecutive readings where the driver's own
+   setpoint *and* the measured flow both read ~0; a momentary 0 W measurement never clears it. A
+   battery the add-on has never commanded is not touched, so an advisory install cannot switch the
+   user's own battery mode,
 3. sets `mode: advisory` so no further plan writes happen,
 4. records an `event` plus one `dispatch_log` row per battery, and returns per-battery results.
 
@@ -1583,6 +1594,7 @@ round, with the reason:
   the existing terminal-target mechanism with the higher of the maintenance target and
   `optimizer.target_soc_pct_end`; reaching the target records the completion and alerts are
   rate-limited, never a faked completion.
+- **§3/§9.2/§9.3/§9.4/§10 (setpoint ownership; fixed 2026-10-12 after the live-test storm)** — the live run showed the recovery guard fighting its own plan, blocked advisory ticks latching from `requested_w`, and device-path drivers clearing the latch on a momentary 0 W, so the latch is now a per-battery applied-command record: only a real, verified non-zero write sets it, only an explicit verified hold (or a driver-reported zero across a confirmation window) clears it, only a previous run's restored latch is guard-recoverable, and advisory/off/dry-run runs issue zero write calls — guard holds included — except the documented boot/Stop/exit de-escalations.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

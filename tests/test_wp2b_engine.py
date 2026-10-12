@@ -16,6 +16,7 @@ from typing import Any
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "energy_manager"))
 
 from app import engine as engine_module  # noqa: E402
+from app.control.dispatcher import TickOutcome  # noqa: E402
 from app.engine import Engine  # noqa: E402
 from app.grid import GridMapping  # noqa: E402
 from app.main import _FakeHA, _FakeStore, _selfcheck_settings, _selfcheck_sources  # noqa: E402
@@ -1138,9 +1139,23 @@ def test_live_setpoints_are_recovered_before_control_resumes():
 
 
 def test_stop_now_holds_and_bypasses_dry_run():
-    """SPEC 9.4: the stop button must move the hardware even in advisory/dry_run."""
-    engine, store, ha, _clock, _settings = build_engine()
-    engine.set_mode(Mode.ADVISORY.value, True)  # dry_run on, mode not auto
+    """SPEC 9.4: the stop button must move the hardware even in advisory/dry_run.
+
+    0.17.1: it may only move hardware *we* commanded.  The mode change's own hold is made to fail
+    (a plausible HA hiccup), which leaves the applied command unverified and in advisory/dry_run;
+    Stop must then write for real, deliberately bypassing both blocks.
+    """
+    engine, store, ha, _clock, _settings = live_engine()
+    assert engine.pending_holds() == ["example_battery_1"]
+    original = ha.call_service
+
+    def hiccup(domain, service, data):
+        raise RuntimeError("example HA hiccup")
+
+    ha.call_service = hiccup
+    engine.set_mode(Mode.ADVISORY.value, True)  # dry_run on, mode not auto; its hold fails
+    ha.call_service = original
+    assert engine.pending_holds() == ["example_battery_1"], "a failed hold must not clear it"
     ha.service_calls.clear()
     ha.states["number.example_battery_power"] = {"state": "450", "attributes": {}}
     result = engine.stop_now()
@@ -1152,11 +1167,11 @@ def test_stop_now_holds_and_bypasses_dry_run():
     assert holds[0]["detail"]["dry_run"] is False
     assert store.dispatches[-1]["applied_w"] == 0.0
     assert "stop_now" in [event["code"] for event in engine.log(limit=20, kind="event")]
+    assert engine.pending_holds() == []
 
 
 def test_stop_now_never_raises_when_a_driver_fails():
-    engine, _store, ha, _clock, _settings = build_engine()
-    ha.states["number.example_battery_power"] = {"state": "450", "attributes": {}}
+    engine, _store, ha, _clock, _settings = live_engine()
 
     def boom(domain, service, data):
         raise RuntimeError("example HA failure")
@@ -1294,7 +1309,7 @@ def test_stop_now_drains_an_in_flight_tick_before_holding():
         return original(domain, service, data)
 
     ha.call_service = slow
-    engine._live_writes.clear()  # make the in-flight tick the only writer
+    engine._commands.clear()  # make the in-flight tick the only writer
     clock.advance(minutes=15)
     engine.set_override(500.0, 5.0)  # a target that differs from the device: a real write
     tick = threading.Thread(target=engine.tick_now)
@@ -1452,7 +1467,7 @@ def test_boot_recovery_is_retried_until_it_succeeds():
     """Audit finding 3: a recovery that fails at boot must be retried, with an alert."""
     engine, store, ha, clock, _settings = build_engine()
     store.learning[("control", "live_writes")] = (None, {"batteries": ["example_battery_1"]})
-    engine._live_writes_loaded = False
+    engine._boot_holds_loaded = False
     engine._last_recovery_attempt = None
     original = ha.call_service
 
@@ -1482,7 +1497,7 @@ def test_boot_recovery_is_retried_until_it_succeeds():
     assert len(ha.service_calls) == before, "no further holds once the latch is empty"
     # the guard loop performs the retry itself, not only Engine.start()
     ha.call_service = broken
-    engine._live_writes.add("example_battery_1")  # the latch is outstanding again
+    engine._boot_holds.add("example_battery_1")  # the latch is outstanding again
     clock.advance(seconds=61)
     run_guard_iteration(engine)
     assert engine.pending_holds() == ["example_battery_1"], "the latch survives the outage"
@@ -1513,11 +1528,228 @@ def test_an_external_setpoint_is_left_alone_in_advisory_and_off():
     engine, store, ha, clock, _settings = build_engine()
     engine.set_mode(Mode.ADVISORY.value, True)
     ha.states["number.example_battery_power"] = {"state": "800.0", "attributes": {}}
-    engine._live_writes.add("example_battery_1")
+    engine._note_applied_command("example_battery_1", 800.0)
     held = engine.hold_on_exit("shutdown")
     assert held and held[0]["ok"] is True
     assert ha.service_calls and float(ha.service_calls[-1][2]["value"]) == 0.0
     assert engine.pending_holds() == []
+
+
+# ------------------------------- applied-command record vs a previous run's latch (0.17.1)
+
+#: A ``control_path: device`` battery: the inverter's own AC limits, and **no** setpoint entity.
+#: That is the live-install shape where a momentary 0 W flow cleared the latch (live finding 3).
+DEVICE_PATH_BATTERY = BatteryConfig(
+    id="example_device_path",
+    name="Example Device Path",
+    driver="zendure",
+    control_path="device",
+    capacity_kwh=2.0,
+    min_soc_pct=10.0,
+    max_soc_pct=100.0,
+    max_charge_w=800.0,
+    max_discharge_w=800.0,
+    eta_charge=0.95,
+    eta_discharge=0.95,
+    mapping={
+        "charge_limit_entity": "number.example_device_input_limit",
+        "discharge_limit_entity": "number.example_device_output_limit",
+        "ac_mode_entity": "select.example_device_ac_mode",
+        "soc_entity": "sensor.example_device_soc",
+    },
+    enabled=True,
+)
+
+DEVICE_PATH_STATES = {
+    "number.example_device_input_limit": {"state": "0", "attributes": {}},
+    "number.example_device_output_limit": {"state": "0", "attributes": {}},
+    "select.example_device_ac_mode": {
+        "state": "input",
+        "attributes": {"options": ["input", "output"]},
+    },
+    "sensor.example_device_soc": {
+        "state": "50",
+        "attributes": {"unit_of_measurement": "%"},
+    },
+}
+
+
+def device_path_engine():
+    engine, store, ha, clock, settings = build_engine()
+    settings.add_battery(DEVICE_PATH_BATTERY)
+    ha.states.update({key: dict(value) for key, value in DEVICE_PATH_STATES.items()})
+    engine._sync_drivers()
+    return engine, store, ha, clock, settings
+
+
+def _tick_outcome(*batteries: BatteryState) -> TickOutcome:
+    return TickOutcome(
+        ts=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        mode=Mode.AUTO.value,
+        dry_run=False,
+        battery_states=list(batteries),
+    )
+
+
+def test_a_running_plan_keeps_its_setpoint_through_recovery_retries():
+    """0.17.1 live finding 1: the guard must never neutralise the command this run applied.
+
+    The old guard read its own live setpoint as "a previous run died live" and held the hardware
+    to 0 W every ``RECOVERY_RETRY_S``, cutting a sustained command to about two thirds duty and
+    alerting on every retry.  A control loop that is alive is simulated by ``note_tick``.
+    """
+    engine, store, ha, clock, _settings = build_engine(
+        clock=Clock(datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc))
+    )
+    engine.set_mode(Mode.AUTO.value, False)
+    engine.plan_now("test")
+    engine.set_override(500.0, 5.0)
+    engine.tick_now()
+    assert engine.pending_holds() == ["example_battery_1"]
+    value = float(ha.states["number.example_battery_power"]["state"])
+    assert value == 500.0
+    before = len(ha.service_calls)
+    for _ in range(5):
+        clock.advance(seconds=engine_module.RECOVERY_RETRY_S + 1)
+        engine._dispatcher.note_tick(clock.now)  # the control loop is alive, as in a real run
+        run_guard_iteration(engine)
+    assert ha.service_calls[before:] == [], "the guard wrote over the command it was following"
+    assert float(ha.states["number.example_battery_power"]["state"]) == value
+    assert engine.pending_holds() == ["example_battery_1"], "the command is still in force"
+    assert "live_setpoint_recovered" not in [event["code"] for event in store.events]
+    assert not any(alert.code == "live_setpoint_recovered" for alert in engine.snapshot().alerts)
+
+
+def test_an_advisory_tick_writes_nothing_and_latches_nothing():
+    """0.17.1 live finding 2: a blocked advisory tick used to latch from ``requested_w``."""
+    engine, store, ha, clock, _settings = build_engine()
+    engine.set_mode(Mode.ADVISORY.value, False)  # advisory is write-free even without dry_run
+    engine.plan_now("test")
+    ha.service_calls.clear()
+    outcome = engine.tick_now()
+    assert outcome.target_w != 0.0, "the fixture must propose a non-zero target"
+    assert ha.service_calls == [], "advisory is write-free, guard holds included"
+    assert engine.pending_holds() == []
+    assert engine._commands == {}
+    assert all(row["code"] == Reason.MODE_NOT_AUTO for row in store.dispatches)
+    for _ in range(3):
+        clock.advance(seconds=engine_module.RECOVERY_RETRY_S + 1)
+        engine._dispatcher.note_tick(clock.now)
+        run_guard_iteration(engine)
+    assert ha.service_calls == []
+    assert not any(alert.code == "live_setpoint_recovered" for alert in engine.snapshot().alerts)
+
+
+def test_boot_recovery_holds_once_alerts_once_and_then_stays_silent():
+    """A genuine previous-run latch is neutralised once; a verified hold ends it (0.17.1)."""
+    engine, store, ha, clock, _settings = build_engine()
+    store.learning[("control", "live_writes")] = (
+        None,
+        {"batteries": [{"battery_id": "example_battery_1", "power_w": 500.0}]},
+    )
+    engine._boot_holds_loaded = False
+    ha.states["number.example_battery_power"] = {"state": "500", "attributes": {}}
+    held = engine.recover_live_writes()
+    assert held and held[0]["ok"] is True and held[0]["applied_w"] == 0.0
+    assert float(ha.states["number.example_battery_power"]["state"]) == 0.0
+    assert engine.pending_holds() == []
+    assert [alert.code for alert in engine.snapshot().alerts].count("live_setpoint_recovered") == 1
+    before = len(ha.service_calls)
+    engine._last_recovery_attempt = None
+    engine._retry_live_write_recovery(clock.now)
+    run_guard_iteration(engine)
+    assert len(ha.service_calls) == before, "a verified recovery must not hold again"
+    codes = [alert.code for alert in engine.snapshot().alerts]
+    assert codes.count("live_setpoint_recovered") == 1
+    assert "live_setpoint_recovery_failed" not in codes
+
+
+def test_a_device_path_battery_needs_a_verified_hold_not_a_momentary_zero():
+    """0.17.1 live finding 3: a 0 W reading is not proof with a live limit setpoint.
+
+    ``control_path: device`` commands ``input_limit``/``output_limit``, and the live install had no
+    setpoint entity for the base driver to read, so any momentary 0 W flow used to clear the
+    record while the limits were still executing.
+    """
+    engine, _store, ha, _clock, _settings = device_path_engine()
+    engine._note_applied_command("example_device_path", 500.0)
+    ha.states["number.example_device_input_limit"] = {"state": "500", "attributes": {}}
+    assert engine._commanded_power("example_device_path") == 500.0
+    reading = BatteryState(id="example_device_path", available=True, power_w=0.0)
+    engine._note_live_writes(_tick_outcome(reading))
+    assert engine.pending_holds() == ["example_device_path"], "a momentary 0 W must not clear it"
+    engine._note_live_writes(_tick_outcome(reading))
+    assert engine.pending_holds() == ["example_device_path"], "the limit is still executing"
+    # a verified hold is the explicit proof: the driver writes both limits to 0 and reads it back
+    held = engine._hold_all("test", False, only=["example_device_path"])
+    assert held and held[0]["ok"] is True and held[0]["applied_w"] == 0.0
+    engine._clear_verified_holds(held)
+    assert engine.pending_holds() == []
+    # the driver's own limit read-back at zero, twice in a row, is the other accepted proof
+    engine._note_applied_command("example_device_path", 500.0)
+    for _ in range(engine_module.NEUTRAL_CONFIRM_READS):
+        engine._note_live_writes(_tick_outcome(reading))
+    assert engine.pending_holds() == []
+
+
+def test_leaving_live_control_holds_only_what_this_run_commanded():
+    """0.17.1: auto -> advisory neutralises our setpoint; a never-commanded battery is untouched."""
+    engine, _store, ha, _clock, _settings = live_engine()
+    ha.service_calls.clear()
+    engine.set_mode(Mode.ADVISORY.value, False)
+    writes = [call for call in ha.service_calls if call[0] in ("number", "input_number")]
+    assert writes and float(writes[-1][2]["value"]) == 0.0
+    assert float(ha.states["number.example_battery_power"]["state"]) == 0.0
+    assert engine.pending_holds() == []
+
+    fresh, _store2, fresh_ha, _clock2, _settings2 = build_engine()
+    fresh.set_mode(Mode.AUTO.value, False)  # auto + real, but this run has written nothing
+    fresh_ha.states["number.example_battery_power"] = {"state": "800", "attributes": {}}
+    fresh_ha.service_calls.clear()
+    fresh.set_mode(Mode.ADVISORY.value, False)
+    assert fresh_ha.service_calls == [], "a never-commanded battery must not be touched"
+    assert fresh.pending_holds() == []
+    assert "hold_skipped" in [event["code"] for event in fresh.log(limit=10, kind="event")]
+
+
+def test_a_dry_run_tick_sets_no_latch_and_writes_nothing():
+    """0.17.1 live finding 2: dry_run is a preview; it may never latch or write."""
+    engine, store, ha, _clock, _settings = build_engine()
+    engine.set_mode(Mode.AUTO.value, True)
+    engine.plan_now("test")
+    ha.service_calls.clear()
+    outcome = engine.tick_now()
+    assert outcome.target_w != 0.0, "the fixture must propose a non-zero target"
+    assert ha.service_calls == []
+    assert engine.pending_holds() == []
+    assert engine._commands == {}
+    assert store.dispatches and all(row["dry_run"] for row in store.dispatches)
+
+
+def test_stop_now_neutralises_and_reports_every_commanded_battery():
+    """0.17.1: Stop now still holds each battery this run commanded, per-battery results intact."""
+    clock = Clock(datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc))
+    engine, _store, ha, clock, settings = build_engine(clock=clock)
+    settings.add_battery(SECOND_EXAMPLE_BATTERY)
+    ha.states["number.example_battery_power_2"] = {"state": "0", "attributes": {}}
+    ha.states["sensor.example_battery_soc_2"] = {
+        "state": "55",
+        "attributes": {"unit_of_measurement": "%"},
+    }
+    engine.set_mode(Mode.AUTO.value, False)
+    engine.plan_now("test")
+    engine.tick_now()
+    commanded = engine.pending_holds()
+    assert "example_battery_1" in commanded, commanded
+    ha.service_calls.clear()
+    result = engine.stop_now()
+    assert set(result) == {"mode", "override_cleared", "stopped"}  # SPEC 10 response shape
+    assert result["mode"] == Mode.ADVISORY.value
+    assert [entry["battery_id"] for entry in result["stopped"]] == commanded
+    assert all(entry["ok"] and entry["dry_run"] is False for entry in result["stopped"])
+    assert all(entry["applied_w"] == 0.0 for entry in result["stopped"])
+    assert engine.pending_holds() == []
+    assert ha.service_calls and float(ha.service_calls[-1][2]["value"]) == 0.0
 
 
 def test_publishing_survives_a_missing_load_forecast():

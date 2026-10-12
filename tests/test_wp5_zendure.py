@@ -299,6 +299,26 @@ def test_device_path_reports_commanded_until_the_inverter_echoes():
     assert [call[2].get("entity_id") for call in state.service_calls][2:4] == [INPUT_LIMIT, OUTPUT_LIMIT]
 
 
+def test_device_path_commanded_power_reports_the_limits_not_the_measured_flow():
+    """0.17.1: a momentary 0 W measured flow is not proof that the command is neutral.
+
+    The engine clears its applied-command record from ``commanded_power()``; on this path the
+    command lives in ``input_limit``/``output_limit``, which the inverter echoes back, so those --
+    never the measured pair -- are what it may report.
+    """
+    state = make_state()
+    driver = make_driver(state, control_path="device")
+    assert driver.apply(800.0, dry_run=False).ok is True
+    assert driver.commanded_power() == pytest.approx(800.0)
+    # the AC flow momentarily reads 0 W while the inverter's limits still execute the command
+    state.states[GRID_IN] = {"state": "0", "attributes": {}}
+    state.states[OUTPUT] = {"state": "0", "attributes": {}}
+    assert driver._read_power() == 0.0
+    assert driver.commanded_power() == pytest.approx(800.0)
+    assert driver.hold(dry_run=False).ok is True
+    assert driver.commanded_power() == 0.0
+
+
 def test_device_path_reads_the_direction_option_from_the_entity():
     """The integration localises the select labels, so the option comes from the entity itself."""
     state = make_state()

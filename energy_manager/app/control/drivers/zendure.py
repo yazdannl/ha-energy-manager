@@ -441,6 +441,19 @@ class ZendureDriver(BaseDriver):
         commanded = self._commanded_power()
         return commanded if commanded is not None else self._read_power()
 
+    def commanded_power(self) -> float | None:
+        """What the device was last *told* to do, in models.py sign convention.
+
+        The engine's applied-command record may only be cleared by proof that the command is
+        neutral (0.17.1, live finding 3).  On the device path the command lives in
+        ``input_limit``/``output_limit``, which the inverter echoes back; the base class's
+        fallback to the measured pair can read 0 W while those limits are still executing, so the
+        limit read-back is the honest answer there.  Every other path keeps the base behaviour.
+        """
+        if self._control_path() == "device_limits":
+            return self._read_limit_setpoint()
+        return super().commanded_power()
+
     def _read_power(self) -> float | None:
         """Battery AC power in models.py convention (positive = charging).
 

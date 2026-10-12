@@ -323,10 +323,19 @@ def test_real_engine_battery_view_and_stop_route(wired):
     assert status == 200
     assert {"arbitrage_kwh", "self_consumption_kwh", "cycles"} <= set(body["totals"])
 
+    # 0.17.1: Stop only neutralises hardware this run really wrote to.  An override forces a real
+    # write first (the plan slot for this fixture can legitimately be 0 W), and is cleared before
+    # the stop so the response is still the plain "no override" shape.
+    engine.set_override(500.0, 5.0)
+    engine.tick_now()
+    assert engine.pending_holds() == ["example_battery_1"], "the add-on must really command"
+    engine.clear_override()
+    assert ha.service_calls[-1][2]["value"] == 500.0
     ha.states["number.example_battery_power"] = {"state": "450", "attributes": {}}
     status, _headers, _content, body = _call(api, "POST", "/api/v1/stop")
     assert status == 200
     assert body["mode"] == "advisory"
+    assert body["override_cleared"] is False
     assert body["stopped"][0]["dry_run"] is False and body["stopped"][0]["applied_w"] == 0.0
     assert ha.service_calls[-1][2]["value"] == 0.0
     assert engine.snapshot().mode == Mode.ADVISORY.value

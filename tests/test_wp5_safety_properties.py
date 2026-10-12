@@ -700,8 +700,22 @@ def test_auto_end_to_end_writes_exactly_the_setpoint(tmp_path):
 
 
 def test_stop_writes_zero_even_from_advisory_and_dry_run(tmp_path):
-    engine, settings, store, live, clock = build_engine(tmp_path, mode=Mode.ADVISORY.value, dry_run=True)
+    engine, settings, store, live, clock = build_engine(tmp_path, mode=Mode.AUTO.value, dry_run=False)
     try:
+        engine.plan_now("wp5")
+        engine.tick_now()
+        assert engine.pending_holds() == ["example_battery_1"], "the fixture must command for real"
+        original = engine._ha.call_service
+
+        def hiccup(*args, **kwargs):
+            raise RuntimeError("example HA hiccup")
+
+        # The mode change's own hold fails, so the applied command is still unverified while the
+        # engine is in advisory + dry_run: Stop must still neutralise it for real (0.17.1).
+        engine._ha.call_service = hiccup
+        engine.set_mode(Mode.ADVISORY.value, True)
+        engine._ha.call_service = original
+        assert engine.pending_holds() == ["example_battery_1"], "a failed hold must not clear it"
         live.states["number.example_battery_power"] = {"state": "450", "attributes": {}}
         response = engine.stop_now()
         assert response["mode"] == Mode.ADVISORY.value
@@ -922,9 +936,16 @@ def test_without_the_reserve_the_same_tick_shares_the_discharge(tmp_path):
 
 
 def test_hold_on_exit_writes_zero_when_live(tmp_path):
-    """Appendix A: no device watchdog, so a clean shutdown must neutralise the setpoint."""
+    """Appendix A: no device watchdog, so a clean shutdown must neutralise the setpoint.
+
+    0.17.1: only for a battery this run really commanded -- the tick below is what makes the
+    setpoint ours; an install that never wrote is left untouched.
+    """
     engine, settings, store, live, clock = build_engine(tmp_path, mode=Mode.AUTO.value, dry_run=False)
     try:
+        engine.plan_now("wp5")
+        engine.tick_now()
+        assert engine.pending_holds() == ["example_battery_1"], "the fixture must command for real"
         live.states["number.example_battery_power"] = {"state": "450", "attributes": {}}
         held = engine.hold_on_exit("shutdown")
         assert held and held[0]["dry_run"] is False

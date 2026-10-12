@@ -20,7 +20,7 @@ import copy
 import json
 import logging
 import threading
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Mapping, Sequence
 
@@ -84,6 +84,10 @@ PUBLISH_MIN_INTERVAL_S = 20.0
 MIN_REPLAN_GAP_S = 60.0
 #: Seconds between boot-recovery retries while a live setpoint is still outstanding.
 RECOVERY_RETRY_S = 60.0
+#: Consecutive neutral readings that clear an applied command *when the driver can prove its own
+#: setpoint is at zero* (0.17.1, live finding 3).  A momentary 0 W flow reading on its own must
+#: never clear a command that is still executing.
+NEUTRAL_CONFIRM_READS = 2
 #: Replan attempts back off exponentially while they keep failing (audit finding 6).
 MAX_REPLAN_BACKOFF_S = 900.0
 #: Minimum seconds between two identical alerts (audit finding 6).
@@ -120,6 +124,19 @@ DISCOVER_ROLE_SETTINGS: dict[str, dict[str, str]] = {
         "temperature": "load.temperature_entity",
     },
 }
+
+
+@dataclass
+class _AppliedCommand:
+    """One battery's real, verified non-zero write that is not yet verified neutral (0.17.1).
+
+    Only a verified neutral may clear it: an explicit hold the driver confirmed, or
+    ``NEUTRAL_CONFIRM_READS`` consecutive readings where the measured flow *and* the driver's own
+    setpoint both read ~0.  ``neutral_reads`` counts that confirmation window.
+    """
+
+    power_w: float
+    neutral_reads: int = 0
 
 
 try:  # WP2A supplies the registry scorer; the engine still loads (with discovery disabled) without it
@@ -332,11 +349,13 @@ class Engine:
         # published or dispatched, so planning starts only once a battery has really been read.
         self._battery_read_ok = False
         self._pending_plan_alerted = False
-        # Per-battery "we commanded a non-zero setpoint for real" latch (audit findings 2/3): a
-        # neutralising hold is only allowed to touch hardware when this is set, and it survives a
-        # restart so a run that died unclean is neutralised before control resumes.
-        self._live_writes: set[str] = set()
-        self._live_writes_loaded = False
+        # Per-battery applied-command record (SPEC 9.3/9.4, 0.17.1): only a real, verified
+        # non-zero write this run performed enters ``_commands``, and only a verified neutral
+        # clears it.  ``_boot_holds`` is the *previous* run's record restored from the store:
+        # only that one may be neutralised by the periodic guard (live finding 1).
+        self._commands: dict[str, _AppliedCommand] = {}
+        self._boot_holds: set[str] = set()
+        self._boot_holds_loaded = False
         self._mode_persist_failed = False
         self._last_recovery_attempt: datetime | None = None
         self._replan_backoff_s = MIN_REPLAN_GAP_S
@@ -839,14 +858,15 @@ class Engine:
         """
         if self._held_on_exit:
             return []
-        outstanding = self._live_write_ids() or self._load_live_writes()
-        with self._lock:
-            live_mode = self._state.mode == Mode.AUTO.value and not self._state.dry_run
-        if not outstanding and not live_mode:
-            # Nothing of *ours* is live and the engine was not writing for real: touching the
-            # hardware here would clobber whatever the user set up themselves (audit finding 2).
+        self._load_boot_holds()
+        outstanding = self._neutralisable_ids()
+        if not outstanding:
+            # Nothing of *ours* is live (no unverified command and no previous-run latch):
+            # touching the hardware here would clobber whatever the user set up themselves
+            # (audit finding 2, and the 0.17.1 rule that a never-commanded battery is never
+            # written to).
             return []
-        targets = sorted(outstanding) if outstanding else None
+        targets = sorted(outstanding)
         held: list[dict[str, Any]] = []
         for attempt in (1, 2):  # retry once; the one-shot flag is only set on a verified write
             try:
@@ -873,7 +893,7 @@ class Engine:
         shutdown, fatal error, boot recovery), so a dry-run or advisory install never writes to the
         user's hardware and a real setpoint is never left executing (audit findings 2/3).
         """
-        outstanding = self._live_write_ids()
+        outstanding = self._neutralisable_ids()
         targets = sorted(outstanding if only is None else (set(only) & outstanding))
         if not targets:
             self._journal.event(
@@ -888,13 +908,18 @@ class Engine:
         return held
 
     def _clear_verified_holds(self, held: Sequence[Mapping[str, Any]]) -> None:
-        """A verified hold means nothing of ours is live on that battery any more."""
+        """A verified hold means nothing of ours is live on that battery any more.
+
+        ``driver.hold()`` only reports ``ok`` when its own bounded read-back window proved the
+        setpoint/limit is neutral, so this is the explicit-hold confirmation the 0.17.1 rule
+        requires -- never a bare measured 0 W.
+        """
         for entry in held:
             battery_id = str(entry.get("battery_id") or "")
-            if not battery_id or not entry.get("ok"):
+            if not battery_id or entry.get("dry_run") or not entry.get("ok"):
                 continue
             if abs(float(entry.get("applied_w") or 0.0)) <= self._hold_tolerance(battery_id):
-                self._mark_live_write(battery_id, False)
+                self._mark_verified_neutral(battery_id)
 
     def _hold_all(
         self,
@@ -1807,28 +1832,58 @@ class Engine:
         return outcome
 
     def _note_live_writes(self, outcome: TickOutcome) -> None:
-        """Track whether a real non-zero setpoint is executing (audit findings 2/3).
+        """Record this run's real, verified commands and clear them only on verified neutral.
 
-        Only real, verified commands count: a dry-run tick never touches hardware, and a fresh read
-        that shows the device at rest *and* the commanded value at rest clears the latch.
+        A blocked/preview result must never latch (live finding 2, 2026-10-12): only a non-dry-run
+        result that really wrote a non-zero setpoint enters the record -- ``requested_w`` alone is
+        a would-be value.  Clearing is equally strict: a momentary 0 W measurement never clears a
+        setpoint still executing (live finding 3), only an explicit hold the driver verified, or
+        a driver that reports its own device at zero for a full confirmation window.
         """
         for result in outcome.results:
             if result.dry_run or not result.ok:
                 continue
             tolerance = self._hold_tolerance(result.battery_id)
-            if abs(float(result.requested_w or 0.0)) > tolerance:
-                self._mark_live_write(result.battery_id, True)
-            else:
-                self._mark_live_write(result.battery_id, False)
+            applied = abs(float(result.applied_w or 0.0))
+            if applied > tolerance and result.writes:
+                self._note_applied_command(result.battery_id, float(result.applied_w))
+            elif applied <= tolerance and result.writes:
+                # An explicit neutral write we performed and the driver verified (a hold, or a
+                # 0 W plan target).
+                self._mark_verified_neutral(result.battery_id)
         for battery in outcome.battery_states:
-            if battery.power_w is None or not battery.available:
-                continue
-            tolerance = self._hold_tolerance(battery.id)
-            if abs(float(battery.power_w)) > tolerance:
-                continue
-            commanded = self._commanded_power(battery.id)
-            if commanded is None or abs(float(commanded)) <= tolerance:
-                self._mark_live_write(battery.id, False)
+            self._confirm_neutral_reading(battery)
+
+    def _confirm_neutral_reading(self, battery: BatteryState) -> None:
+        """Count consecutive at-rest readings when the driver can prove its setpoint is zero.
+
+        Only then may a measured flow of ~0 clear the record, and only after
+        ``NEUTRAL_CONFIRM_READS`` consecutive ticks -- the confirmation window that makes a single
+        momentary 0 W reading harmless (live finding 3).  A driver that cannot report its own
+        setpoint at all never clears from measurement alone; only an explicit, verified hold can
+        clear it there.
+        """
+        battery_id = battery.id
+        if battery.power_w is None or not battery.available:
+            return
+        tolerance = self._hold_tolerance(battery_id)
+        commanded = self._commanded_power(battery_id)
+        with self._lock:
+            record = self._commands.get(battery_id)
+            if record is None:
+                return
+            if (
+                commanded is not None
+                and abs(float(commanded)) <= tolerance
+                and abs(float(battery.power_w)) <= tolerance
+            ):
+                record.neutral_reads += 1
+                confirmed = record.neutral_reads >= NEUTRAL_CONFIRM_READS
+            else:
+                record.neutral_reads = 0
+                confirmed = False
+        if confirmed:
+            self._mark_verified_neutral(battery_id)
 
     def _commanded_power(self, battery_id: str) -> float | None:
         """What the device was last *told* to do, when the driver can tell us (else None)."""
@@ -1856,14 +1911,14 @@ class Engine:
                 log.warning("exit hold: cannot build a driver for %s: %s", config.id, exc)
 
     def _batteries_needing_hold(self) -> list[str]:
-        """Latch members plus any battery with a non-zero *commanded* setpoint right now."""
-        self._sync_drivers()
-        needed = self._live_write_ids()
-        for battery_id in sorted(self._drivers):
-            commanded = self._commanded_power(battery_id)
-            if commanded is not None and abs(float(commanded)) > self._hold_tolerance(battery_id):
-                needed.add(battery_id)
-        return sorted(needed)
+        """Batteries this run wrote to and has not verified neutral, plus a previous run's latch.
+
+        A battery whose driver merely reports a non-zero setpoint the add-on never wrote is the
+        user's own control and is deliberately *not* included (live finding 2 / SPEC 9.4): a
+        fresh advisory install, or one that never commanded anything, must not have its hardware
+        moved.
+        """
+        return sorted(self._neutralisable_ids())
 
     def _sync_mode(self) -> None:
         with self._lock:
@@ -1888,9 +1943,13 @@ class Engine:
             return not self._mode_persist_failed
 
     def pending_holds(self) -> list[str]:
-        """Battery ids whose last real command is still non-zero (SPEC 10 /status)."""
+        """Battery ids whose last real command is not yet verified neutral (SPEC 10 /status).
+
+        This run's applied-command record plus a previous run's restored latch; empty for an
+        install that never wrote to hardware.
+        """
         with self._lock:
-            return sorted(self._live_writes)
+            return sorted(set(self._commands) | set(self._boot_holds))
 
     def cell_voltage_status(self) -> dict[str, Any]:
         """The cell-voltage guard as the API/UI sees it (SPEC 10 /status, additive).
@@ -1920,46 +1979,79 @@ class Engine:
         driver = self._drivers.get(battery_id)
         return float(getattr(driver, "tolerance_w", IDEMPOTENT_TOLERANCE_W) or 0.0)
 
-    def _mark_live_write(self, battery_id: str, live: bool) -> None:
+    def _note_applied_command(self, battery_id: str, power_w: float) -> None:
+        """Remember a real, verified non-zero write until something proves it neutral."""
         with self._lock:
-            if live:
-                self._live_writes.add(battery_id)
-            else:
-                self._live_writes.discard(battery_id)
+            self._commands[battery_id] = _AppliedCommand(power_w=float(power_w))
         self._persist_live_writes()
+
+    def _mark_verified_neutral(self, battery_id: str) -> None:
+        """Drop the applied-command record (and any boot hold) for a battery proven neutral."""
+        with self._lock:
+            changed = self._commands.pop(battery_id, None) is not None
+            if battery_id in self._boot_holds:
+                self._boot_holds.discard(battery_id)
+                changed = True
+        if changed:
+            self._persist_live_writes()
+
+    def _neutralisable_ids(self) -> set[str]:
+        """Batteries a de-escalation may hold: our unverified commands plus a previous run's."""
+        with self._lock:
+            return set(self._commands) | set(self._boot_holds)
 
     def _persist_live_writes(self) -> None:
         with self._lock:
-            snapshot = sorted(self._live_writes)
+            entries = [
+                {
+                    "battery_id": battery_id,
+                    "power_w": (
+                        self._commands[battery_id].power_w
+                        if battery_id in self._commands
+                        else None
+                    ),
+                }
+                for battery_id in sorted(set(self._commands) | set(self._boot_holds))
+            ]
         self._store_call(
             "profile_put",
             "control",
             "live_writes",
-            {"batteries": snapshot, "updated_at": to_iso(self._clock())},
+            {"batteries": entries, "updated_at": to_iso(self._clock())},
         )
 
-    def _load_live_writes(self) -> set[str]:
-        """Restore the latch; a run that died unclean neutralises before control resumes."""
-        if self._live_writes_loaded:
-            return self._live_write_ids()
-        self._live_writes_loaded = True
+    def _load_boot_holds(self) -> set[str]:
+        """Restore a *previous* run's live setpoints; only these are guard-recoverable.
+
+        The 0.17.1 record is ``{"batteries": [{"battery_id", "power_w"}]}``; the 0.17.0 shape (a
+        bare list of ids) is still read, so an upgrade can neutralise what the old build left.
+        """
+        if self._boot_holds_loaded:
+            return set(self._boot_holds)
+        self._boot_holds_loaded = True
         stored = self._store_call("profile_get", "control", "live_writes")
         payload = stored[1] if isinstance(stored, tuple) and len(stored) == 2 else stored
         restored: set[str] = set()
         if isinstance(payload, Mapping):
             entries = payload.get("batteries")
             if isinstance(entries, (list, tuple, set)):
-                restored = {str(entry) for entry in entries}
+                for entry in entries:
+                    if isinstance(entry, Mapping):
+                        battery_id = str(entry.get("battery_id") or entry.get("id") or "")
+                    else:
+                        battery_id = str(entry)
+                    if battery_id:
+                        restored.add(battery_id)
         if restored:
             with self._lock:
-                self._live_writes |= restored
+                self._boot_holds |= restored
             self._journal.event(
                 "warning",
                 "live_setpoint_recovered",
                 f"previous run left {len(restored)} live setpoint(s); holding before control resumes",
                 {"batteries": sorted(restored)},
             )
-        return self._live_write_ids()
+        return set(self._boot_holds)
 
     # -- cell-voltage protection (SPEC 9.3 clause 4b) --------------------------------
 
@@ -2183,23 +2275,23 @@ class Engine:
     def recover_live_writes(self) -> list[dict[str, Any]]:
         """Neutralise setpoints a previous run left behind, before taking control (audit 2).
 
-        Safe to call repeatedly: the guard loop retries until the latch is empty (audit 3).
+        Only the *boot* latch is touched: a command this run applied and has not verified neutral
+        is the plan itself, and the periodic guard must never fight it (live finding 1, 0.17.1).
+        Safe to call repeatedly: the guard retries until the latch is empty (audit 3), and a
+        verified hold clears it, so a successful recovery never alerts or writes twice.
         """
-        recovered = self._load_live_writes()
+        recovered = self._load_boot_holds()
         if not recovered:
             return []
         held = self._leave_live_control("boot_recovery", only=sorted(recovered))
-        self._alert(
-            "warning",
-            "live_setpoint_recovered",
-            f"held {len(recovered)} battery(ies) left live by a previous run",
-            {"batteries": sorted(recovered)},
-        )
+        if held and all(bool(entry.get("ok")) for entry in held):
+            self._alert(
+                "warning",
+                "live_setpoint_recovered",
+                f"held {len(recovered)} battery(ies) left live by a previous run",
+                {"batteries": sorted(recovered)},
+            )
         return held
-
-    def _live_write_ids(self) -> set[str]:
-        with self._lock:
-            return set(self._live_writes)
 
     def _drop_plan_for_stale_inputs(self, reason: str) -> None:
         """Withhold the active plan when its inputs went stale (SPEC 9.1, audit finding 2)."""
@@ -3147,7 +3239,11 @@ class Engine:
         and the batteries keep executing whatever the previous run commanded.  Retry from the guard
         loop and make a failure visible.
         """
-        if not self.pending_holds():
+        with self._lock:
+            boot_holds = bool(self._boot_holds)
+        if not boot_holds:
+            # Only a previous run's latch may be neutralised here: a command this run applied and
+            # has not verified neutral is the plan executing, not a leftover (live finding 1).
             return
         last = self._last_recovery_attempt
         if last is not None and (now - last).total_seconds() < RECOVERY_RETRY_S:
@@ -3160,7 +3256,8 @@ class Engine:
                 "error", "live_setpoint_recovery_failed", f"recovery failed: {str(exc)[:160]}"
             )
             return
-        still_live = self.pending_holds()
+        with self._lock:
+            still_live = sorted(self._boot_holds)
         if still_live:
             self._alert(
                 "error",
