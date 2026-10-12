@@ -1147,15 +1147,19 @@ reason reports `efficiency_loss`; a slot blocked by the user's own floor
 (`optimizer.min_spread_eur_per_kwh`) reports `spread_below_threshold`. The two are deliberately
 distinct: one is physics, the other is a preference.
 
-**Cost-basis sell floor (0.18.0)** — `optimizer.sell_floor_enabled` (default `true`) gives the
-forward rule a memory of what the energy in the pack cost. A per-battery ledger (`app/cost_basis.py`,
-`learning_profiles` kind `battery_cost_basis`) is built from **applied** dispatch changes in `auto`
-(mode `auto`, `dry_run` false, `result` `ok`/`skipped`, `applied_w` changed by more than 25 W): a
-change opens a slice, the next change or the update's `now` closes it, and the slice's end is stored
-as `last_ts` so replaying an update books nothing twice. The slice's energy is the **measured**
-`battery_power:<id>` integral (else `battery_charge - battery_discharge`), piecewise-linear between
-samples, and a data gap beyond 10 minutes is never bridged. Each slice is priced at the persisted
-plan slot it was charged in, split at every price-slot boundary it spans:
+**Cost-basis sell floor (0.18.0; sample-grid booking and pack reconciliation 0.18.1)** —
+`optimizer.sell_floor_enabled` (default `true`) gives the forward rule a memory of what the energy
+in the pack cost. A per-battery ledger (`app/cost_basis.py`, `learning_profiles` kind
+`battery_cost_basis`) is built from **applied** dispatch changes in `auto` (mode `auto`, `dry_run`
+false, `result` `ok`/`skipped`, `applied_w` changed by more than 25 W): a change opens a slice and
+the next change ends it. The slice's energy is the **measured** `battery_power:<id>` integral (else
+`battery_charge - battery_discharge`), integrated over the covered *sample spans* and split at the
+command changes and price-slot boundaries they cross (0.18.1), so a command shorter than the sample
+spacing still books its share; a data gap beyond 10 minutes is never bridged, nothing beyond the
+newest settled sample is booked (an unanswered tail waits for its next sample instead of being
+extrapolated flat), and `last_ts` is the end of the last processed sample span — never a command
+timestamp — so replaying an update books nothing twice. Each part is priced at the persisted plan
+slot it was charged in, split at every price-slot boundary it spans:
 
 ```
 grid_part = min(charge_ac, import_ac)   # import_ac from the measured meter import
@@ -1172,6 +1176,14 @@ attribution (`pv_surplus_charge` = PV, anything else = grid). At or below the So
 `capacity_kwh / eta_charge` and cleared with the basis when it reaches 0. A first run, or a gap
 longer than the 7-day lookback, starts clean instead of blending old energy in. The last 200 booked
 slices are kept as an audit journal, and `/status` exposes the last five per battery.
+
+After booking, the **quantity** is reconciled with the pack's own measured content (0.18.1):
+`E_phys = clamp(capacity_kwh * (soc - min_soc_pct) / 100 / eta_charge, 0, capacity_kwh / eta_charge)`
+from the last SoC sample at or before the booking end (a stale or missing sample skips the step and
+counts `skipped_no_soc`). The difference is applied to `E` and never to `basis`; the signed
+cumulative correction is `reconciled_kwh`, the last step `reconciled_last_kwh`, and a single
+correction beyond half the pack capacity resets the ledger (`basis = None, E = 0`) and counts
+`reconciled_resets`. All of these travel with the per-battery ledger into `/status`.
 
 The floor per battery is `break_even_sell_eur_per_kwh(basis, wear) + margin` (the frozen helper, the
 battery's own etas, the advanced wear override when set), and the fleet floor the plan enforces is
@@ -1591,7 +1603,7 @@ supplies it (which is why publishing a port would hand battery control to anyone
 | Method & route | Body / query | Returns |
 | --- | --- | --- |
 | `GET /api/v1/health` | — | `{status, version, uptime_s, commit}` |
-| `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]` (each with `cell_voltage_v`, and additive 0.18.0 `cost_basis_eur_per_kwh`/`stored_value_eur`), `cell_voltage{enabled,cutoff_v,warning_v,resume_v,emergency_charge_power_w,latched[],batteries[{battery_id,voltage_v,fresh,seen,latched,block_discharge,force_charge_w,reason,note}]}` (additive, 0.16.0), `full_charge{enabled,interval_days,target_soc_pct,overdue_grace_hours,active,due,overdue,batteries[],plan{…}}` (additive, 0.17.0), `cost_basis{enabled,margin_eur_per_kwh,sell_floor_eur_per_kwh,fleet_basis_eur_per_kwh,batteries[{id,name,cost_basis_eur_per_kwh,energy_kwh,stored_value_eur,sell_floor_eur_per_kwh,intervals,skipped_*,window_start,updated_at,journal_entries,journal[]}]}` (additive, 0.18.0), `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
+| `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]` (each with `cell_voltage_v`, and additive 0.18.0 `cost_basis_eur_per_kwh`/`stored_value_eur`), `cell_voltage{enabled,cutoff_v,warning_v,resume_v,emergency_charge_power_w,latched[],batteries[{battery_id,voltage_v,fresh,seen,latched,block_discharge,force_charge_w,reason,note}]}` (additive, 0.16.0), `full_charge{enabled,interval_days,target_soc_pct,overdue_grace_hours,active,due,overdue,batteries[],plan{…}}` (additive, 0.17.0), `cost_basis{enabled,margin_eur_per_kwh,sell_floor_eur_per_kwh,fleet_basis_eur_per_kwh,batteries[{id,name,cost_basis_eur_per_kwh,energy_kwh,stored_value_eur,sell_floor_eur_per_kwh,intervals,skipped_no_price,skipped_no_power,skipped_no_grid,skipped_no_soc,reconciled_kwh,reconciled_last_kwh,reconciled_resets,window_start,updated_at,journal_entries,journal[]}]}` (additive, 0.18.0; the `skipped_no_soc`/`reconciled_*` counters additive 0.18.1), `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
 | `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, slot_minutes, feasible, infeasible_reason, mode, dry_run, sources{}, maintenance, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh, maintenance{enabled,active,due,overdue,target_soc_pct,effective_target_soc_pct,interval_days,overdue_grace_hours,batteries[],due_batteries[],overdue_batteries[]} (additive, 0.17.0), sell_floor_eur_per_kwh (additive, 0.18.0)}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; `slot_minutes` is the plan's own resolution (the UI never assumes one); with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` and `slot_minutes: null` |
 | `GET /api/v1/plan/execution` | `hours` | additive (0.10.0): `{generated_at, slot_minutes, now, floors{reserve_soc_pct, min_soc_pct, floor_soc_pct}, batteries[{id, name, min_soc_pct, floor_soc_pct, capacity_kwh}], progress{…}, slots[{t, dispatch, actual}]}` — the same slot grid as `/plan`, joined with the persisted 5-minute actuals and the dispatch log. `dispatch` is the last attempt per battery in that slot (`requested_w`, `applied_w`, `ok`, `dry_run`, `clamped`, `code`, `reason`, `message`, `records`, `batteries[]`) and `actual` the measured aggregate (`samples`, `coverage_pct`, `pv_kw`, `load_kw`, `grid_kw`, `battery_kw`, `planned_kw`, `measured_kw`, `import_kwh`, `export_kwh`, `charged_kwh`, `discharged_kwh`, `soc_kwh_start`, `soc_kwh_end`). Both are `null` for a slot nothing was measured or dispatched in — never a fabricated zero |
 | `POST /api/v1/plan/recompute` | — | `{queued: true}` (async; poll status) |

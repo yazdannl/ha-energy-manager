@@ -13,15 +13,34 @@ frozen break-even helper with ``buy := basis``:
 Intervals are **event driven, never timed buckets**.  A slice opens on an applied change the add-on
 made for that battery -- a ``store.dispatch_log`` row for ``mode == auto`` that was really applied
 (``dry_run`` false, ``result`` ``ok`` or ``skipped``) and whose ``applied_w`` differs from the last
-booked command by more than :data:`APPLIED_CHANGE_TOLERANCE_W`.  It closes at the next such change,
-and the still-open tail is closed at each update (``now``).  One row books at most one slice, and
-the slice's end is stored as ``last_ts``, so re-running an update books nothing twice.
+booked command by more than :data:`APPLIED_CHANGE_TOLERANCE_W`.  It closes at the next such change;
+the still-open tail is booked up to the newest settled measurement sample (0.18.1).  One row books
+at most one slice, and the processed span's end is stored as ``last_ts``, so re-running an update
+books nothing twice.
 
 The energy booked per slice is **measured**, not the commanded setpoint: the persisted
 ``battery_power:<id>`` rows (or the ``battery_charge``/``battery_discharge`` pair) are integrated
-across the slice, piecewise-linearly between samples, so uncommanded device flow, ramps and a
-vendor manager moving the pack are all accounted.  A data gap longer than
-:data:`MAX_GAP_MINUTES` is never bridged: only the covered part is booked.
+over the *settled sample grid* (0.18.1), piecewise-linearly between samples, so uncommanded device
+flow, ramps and a vendor manager moving the pack are all accounted.  A data gap longer than
+:data:`MAX_GAP_MINUTES` is never bridged: only the covered part is booked.  A command interval that
+is settled but has no covered sample span is counted in ``skipped_no_power``, never price-guessed.
+
+Energy follows the samples, price follows the commands (0.18.1).  The covered sample spans are
+split at the applied command changes and the price-slot boundaries they cross, each part is
+attributed to the command in force, and the parts belonging to one command interval accumulate
+into its single journal entry -- so a command whose whole span falls between two samples still
+books its share.  ``last_ts`` is the end of the last processed sample span, never a command
+timestamp, and nothing beyond the newest sample is booked: a ramp the next sample reveals is never
+swallowed by a flat extrapolation at an update boundary.
+
+After booking, the *quantity* is reconciled with the pack's own measured content (0.18.1):
+``E_phys = capacity_kwh * (soc - min_soc_pct) / 100 / eta_charge`` (clamped to ``[0, max_energy]``)
+from the last SoC sample at or before the booking end (a stale/missing one skips the step and is
+counted in ``skipped_no_soc``).  The difference is applied to the energy and never to the basis
+(the basis stays the tracked average price of the energy we priced), the signed cumulative
+correction is kept as ``reconciled_kwh`` plus ``reconciled_last_kwh``, and a single correction
+larger than half the pack capacity is treated as unattributable: the ledger resets and
+``reconciled_resets`` counts it.
 
 Pricing follows the plan slot the energy was charged in (the persisted plans, one slot's
 ``buy``/``sell``/``reason`` per slot start; the newest plan wins for a slot), splitting the energy
@@ -57,6 +76,7 @@ __all__ = [
     "MAX_JOURNAL",
     "PLAN_LIMIT",
     "PROFILE_KIND",
+    "RECONCILE_RESET_FRACTION",
     "RESET_SOC_MARGIN_PCT",
     "SAMPLE_MINUTES",
     "STATE_VERSION",
@@ -85,6 +105,9 @@ MAX_GAP_MINUTES = SAMPLE_MINUTES * (1.0 + MAX_GAP_SAMPLES)
 APPLIED_CHANGE_TOLERANCE_W = 25.0
 #: At or below ``min_soc_pct + this`` the pack holds nothing usable: the ledger resets.
 RESET_SOC_MARGIN_PCT = 1.0
+#: A single SoC reconciliation correction beyond this fraction of the pack capacity means the
+#: ledger can no longer be attributed to the measured grid: it resets instead (0.18.1).
+RECONCILE_RESET_FRACTION = 0.5
 #: A first run (or a gap between updates) never looks further back than this.
 LOOKBACK_DAYS = 7.0
 #: Audit journal: the last N booked slices are kept (and at most ``JOURNAL_EXPOSED`` exposed).
@@ -217,6 +240,11 @@ class _Points:
     def __len__(self) -> int:
         return len(self._points)
 
+    @property
+    def last_time(self) -> datetime | None:
+        """The newest sample's timestamp, or ``None`` when nothing was measured."""
+        return self._times[-1] if self._times else None
+
     def value_at(self, moment: datetime) -> float:
         """Piecewise-linear value with flat extrapolation either side of the sampled range."""
         index = bisect_right(self._times, moment) - 1
@@ -240,6 +268,20 @@ class _Points:
         if index >= 0:
             return self._points[index][1] if moment - self._points[index][0] <= gap else None
         return self._points[0][1] if self._points[0][0] - moment <= gap else None
+
+    def value_at_or_before(self, moment: datetime) -> float | None:
+        """The last measured value at or before ``moment``, or ``None`` when none is fresh enough.
+
+        Unlike :meth:`soc_at` a sample *after* ``moment`` never counts: reconciliation must use
+        what the pack measured up to the booking end, never a later value.
+        """
+        if not self._points:
+            return None
+        index = bisect_right(self._times, moment) - 1
+        if index < 0:
+            return None
+        last = self._points[index]
+        return last[1] if moment - last[0] <= timedelta(minutes=MAX_GAP_MINUTES) else None
 
     def min_between(self, start: datetime, end: datetime) -> float | None:
         """Lowest measured value in ``(start, end]``, or ``None`` when nothing was measured."""
@@ -426,10 +468,18 @@ def book_slices(
     now: datetime,
     reset: bool = False,
 ) -> dict[str, Any]:
-    """Advance the ledger over every slice the dispatch log opened since ``state['last_ts']``.
+    """Advance the ledger over the settled measured sample grid since ``state['last_ts']``.
 
     Pure: no store, no clock.  Returns the new JSON-safe payload.  ``reset`` starts from an empty
     ledger (a first run with no usable history, or a gap beyond the lookback).
+
+    Energy follows the samples and price follows the commands (0.18.1): the covered sample spans
+    are integrated (piecewise-linear through every sample), split at the applied command changes
+    and price-slot boundaries they cross, and attributed to the command in force.  ``last_ts`` is
+    the end of the last processed sample span, never a command timestamp, and nothing beyond the
+    newest sample is booked, so a ramp the next sample reveals is never swallowed by a flat
+    extrapolation at an update boundary.  After booking the quantity is reconciled with the pack's
+    measured SoC content, never touching the basis (SPEC 5, 0.18.1).
     """
     stored = dict(state) if isinstance(state, Mapping) else {}
     timeline = timeline if timeline is not None else PriceTimeline()
@@ -450,8 +500,13 @@ def book_slices(
     skipped_no_price = _count(stored.get("skipped_no_price"))
     skipped_no_power = _count(stored.get("skipped_no_power"))
     skipped_no_grid = _count(stored.get("skipped_no_grid"))
+    reconciled = _finite(stored.get("reconciled_kwh")) or 0.0
+    reconciled_last = _finite(stored.get("reconciled_last_kwh"))
+    reconciled_resets = _count(stored.get("reconciled_resets"))
+    skipped_no_soc = _count(stored.get("skipped_no_soc"))
     if reset or (last_ts is not None and last_ts > now):
         basis, energy, last_ts, window_start = None, 0.0, None, None
+        reconciled, reconciled_last = 0.0, None
 
     round_trip = float(battery.round_trip_efficiency)
     max_energy = None
@@ -508,7 +563,27 @@ def book_slices(
         slices.append((cursor, now, command[0], command[1], command[2], command[3]))
 
     booked = 0
+    coverage_index = 0
+    processed_end = last_ts
+    # The settled sample grid: the covered ranges of the measured series, clipped to the newest
+    # sample.  Booking never runs past it, so a partial command interval waits for its next sample
+    # instead of being extrapolated flat (0.18.1).
+    settled_end = power.last_time
+    if settled_end is not None and settled_end > now:
+        settled_end = now
+    window_from = slices[0][0] if slices else None
+    coverage: list[tuple[datetime, datetime]] = []
+    if window_from is not None and settled_end is not None:
+        coverage = [
+            (a, min(b, settled_end))
+            for a, b in power.covered_ranges(window_from, now)
+            if min(b, settled_end) > a
+        ]
     for start, end, applied, dispatch_reason, mode, dispatch_id in slices:
+        if settled_end is None or start >= settled_end:
+            # Not bounded by samples on both sides yet: leave it for the next update.
+            break
+        processed_end = min(end, settled_end)
         if window_start is None:
             window_start = start
         # Nothing usable is held when the pack sits at its floor: start with a clean ledger.
@@ -522,58 +597,66 @@ def book_slices(
         cost_eur = 0.0
         skipped_price = False
         covered_power_hours = 0.0
-        span_hours = max(0.0, (end - start).total_seconds() / 3600.0)
-        boundaries_t = [start, *timeline.starts_between(start, end), end]
-        for a, b in zip(boundaries_t, boundaries_t[1:]):
-            if b <= a:
+        while coverage_index < len(coverage) and coverage[coverage_index][1] <= start:
+            coverage_index += 1
+        for covered_start, covered_end in coverage[coverage_index:]:
+            if covered_start >= processed_end:
+                break
+            span_start = max(covered_start, start)
+            span_end = min(covered_end, processed_end)
+            if span_end <= span_start:
                 continue
-            charged, power_hours = power.integrate_kwh(a, b)
-            covered_power_hours += power_hours
-            discharged, _ = power.integrate_kwh(a, b, sign=-1.0)
-            discharge_kwh += discharged
-            if charged <= 0.0 and discharged <= 0.0:
-                continue
-            slot = timeline.at(a)
-            buy, sell = _effective((slot.buy, slot.sell)) if slot is not None else (None, None)
-            if charged > 0.0:
-                if buy is None and sell is None:
-                    # Skip the sub-slice and count it: never invent a price (SPEC 5).
-                    skipped_price = True
-                    skipped_no_price += 1
+            boundaries_t = [span_start, *timeline.starts_between(span_start, span_end), span_end]
+            for a, b in zip(boundaries_t, boundaries_t[1:]):
+                if b <= a:
                     continue
-                imported, _grid_hours = grid.integrate_kwh(a, b)
-                if not grid:
-                    # No meter reading: the plan slot's own reason is the fallback attribution.
-                    pv_only = slot is not None and slot.reason == Reason.PV_SURPLUS_CHARGE
-                    grid_part = 0.0 if pv_only else charged
-                    skipped_no_grid += 1
-                else:
-                    grid_part = min(charged, max(0.0, imported))
-                pv_part = charged - grid_part
-                cost = grid_part * float(buy) + pv_part * float(sell)
-                grid_kwh += grid_part
-                pv_kwh += pv_part
-                cost_eur += cost
-                total = energy + charged
-                basis = (
-                    (basis * energy + cost) / total
-                    if basis is not None and energy > 0.0
-                    else cost / charged
-                )
-                energy = total
-                charge_kwh += charged
-            if discharged > 0.0 and round_trip > 0.0:
-                energy = max(0.0, energy - discharged / round_trip)
-                if energy <= 0.0:
-                    basis = None
+                charged, power_hours = power.integrate_kwh(a, b)
+                covered_power_hours += power_hours
+                discharged, _ = power.integrate_kwh(a, b, sign=-1.0)
+                discharge_kwh += discharged
+                if charged <= 0.0 and discharged <= 0.0:
+                    continue
+                slot = timeline.at(a)
+                buy, sell = _effective((slot.buy, slot.sell)) if slot is not None else (None, None)
+                if charged > 0.0:
+                    if buy is None and sell is None:
+                        # Skip the sub-slice and count it: never invent a price (SPEC 5).
+                        skipped_price = True
+                        skipped_no_price += 1
+                        continue
+                    imported, _grid_hours = grid.integrate_kwh(a, b)
+                    if not grid:
+                        # No meter reading: the plan slot's own reason is the fallback attribution.
+                        pv_only = slot is not None and slot.reason == Reason.PV_SURPLUS_CHARGE
+                        grid_part = 0.0 if pv_only else charged
+                        skipped_no_grid += 1
+                    else:
+                        grid_part = min(charged, max(0.0, imported))
+                    pv_part = charged - grid_part
+                    cost = grid_part * float(buy) + pv_part * float(sell)
+                    grid_kwh += grid_part
+                    pv_kwh += pv_part
+                    cost_eur += cost
+                    total = energy + charged
+                    basis = (
+                        (basis * energy + cost) / total
+                        if basis is not None and energy > 0.0
+                        else cost / charged
+                    )
+                    energy = total
+                    charge_kwh += charged
+                if discharged > 0.0 and round_trip > 0.0:
+                    energy = max(0.0, energy - discharged / round_trip)
+                    if energy <= 0.0:
+                        basis = None
         if max_energy is not None and energy > max_energy:
             energy = max_energy
-        end_soc_low = soc.min_between(start, end)
+        end_soc_low = soc.min_between(start, processed_end)
         if end_soc_low is not None and end_soc_low <= reset_soc:
             basis, energy = None, 0.0
         if max_energy is not None and energy > max_energy:
             energy = max_energy
-        if covered_power_hours <= 0.0 and span_hours > 0.0:
+        if covered_power_hours <= 0.0:
             skipped_no_power += 1
         intervals += 1
         booked += 1
@@ -581,7 +664,7 @@ def book_slices(
             journal.append(
                 {
                     "ts": to_iso(start),
-                    "end": to_iso(end),
+                    "end": to_iso(processed_end),
                     "applied_w": None if applied is None else round(float(applied), 1),
                     "reason": dispatch_reason,
                     "mode": mode,
@@ -596,6 +679,28 @@ def book_slices(
                     "energy_kwh": round(energy, 4),
                 }
             )
+    if booked:
+        last_ts = processed_end
+
+    # --- reconcile the quantity with the pack's measured content (0.18.1) ----------------------
+    if booked and basis is not None and max_energy is not None and last_ts is not None:
+        soc_now = soc.value_at_or_before(last_ts)
+        if soc_now is None:
+            skipped_no_soc += 1
+        else:
+            physical = battery.capacity_kwh * (soc_now - float(battery.min_soc_pct)) / 100.0
+            physical = max(0.0, min(physical / float(battery.eta_charge), max_energy))
+            correction = physical - energy
+            if abs(correction) > battery.capacity_kwh * RECONCILE_RESET_FRACTION:
+                # More than half a pack in one step is not a measurement lag: the ledger is
+                # unattributable, so start clean instead of silently adjusting it (0.18.1).
+                basis, energy = None, 0.0
+                reconciled, reconciled_last = 0.0, None
+                reconciled_resets += 1
+            else:
+                energy = physical
+                reconciled += correction
+                reconciled_last = correction
     if len(journal) > MAX_JOURNAL:
         journal = journal[-MAX_JOURNAL:]
 
@@ -603,7 +708,7 @@ def book_slices(
         "version": STATE_VERSION,
         "basis_eur_per_kwh": None if basis is None else round(basis, 6),
         "energy_kwh": round(energy, 4),
-        "last_ts": to_iso(slices[-1][1] if booked else last_ts),
+        "last_ts": to_iso(last_ts),
         "last_dispatch_id": command[3],
         "last_applied_w": None if command[0] is None else round(float(command[0]), 3),
         "last_reason": command[1],
@@ -612,6 +717,10 @@ def book_slices(
         "skipped_no_price": skipped_no_price,
         "skipped_no_power": skipped_no_power,
         "skipped_no_grid": skipped_no_grid,
+        "skipped_no_soc": skipped_no_soc,
+        "reconciled_kwh": round(reconciled, 4),
+        "reconciled_last_kwh": None if reconciled_last is None else round(reconciled_last, 4),
+        "reconciled_resets": reconciled_resets,
         "window_start": to_iso(window_start),
         "journal": journal,
         "updated_at": to_iso(now),
@@ -731,6 +840,16 @@ def basis_status(
         "skipped_no_price": _count((payload or {}).get("skipped_no_price")),
         "skipped_no_power": _count((payload or {}).get("skipped_no_power")),
         "skipped_no_grid": _count((payload or {}).get("skipped_no_grid")),
+        # Additive (0.18.1): how far the quantity was pulled onto the pack's own measured SoC
+        # content, and how often a correction was too large to attribute (a reset).
+        "skipped_no_soc": _count((payload or {}).get("skipped_no_soc")),
+        "reconciled_kwh": round(_finite((payload or {}).get("reconciled_kwh")) or 0.0, 4),
+        "reconciled_last_kwh": (
+            None
+            if _finite((payload or {}).get("reconciled_last_kwh")) is None
+            else round(_finite((payload or {}).get("reconciled_last_kwh")), 4)
+        ),
+        "reconciled_resets": _count((payload or {}).get("reconciled_resets")),
         "window_start": (payload or {}).get("window_start"),
         "updated_at": (payload or {}).get("updated_at"),
         "journal_entries": len(journal),

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.18.1
+
+- **The measured energy is booked on the sample grid.** On a live install whose applied setpoint
+  changes every ~2 minutes while the sampler reports every 5 minutes, the 0.18.0 ledger booked each
+  update's own tail flat at the last visible sample, so the ramp the next sample revealed was never
+  recovered: the reported pack content ran ~12 % behind the meter (250 command intervals, 142 with
+  no power booked). Energy now follows the samples and price follows the commands: the covered
+  sample spans are integrated between consecutive samples and split at the command changes and
+  price-slot boundaries they cross, each part is attributed to the command in force, and a command
+  whose whole span falls between two samples still books its measured share. `last_ts` is the end of
+  the last processed sample span (never a command timestamp) and nothing beyond the newest settled
+  sample is booked, so an unanswered tail waits for its next sample instead of being extrapolated
+  flat and a replay cannot double-book.
+- **The quantity is reconciled with the pack.** After booking, the accounted energy is compared
+  with the pack's own measured SoC content (`capacity_kwh * (soc - min_soc_pct) / 100 / eta_charge`,
+  clamped to the pack) and the difference is applied to the quantity **without touching the basis**,
+  kept as the signed cumulative `reconciled_kwh` plus `reconciled_last_kwh`. A stale or missing SoC
+  sample skips the step (`skipped_no_soc`), and a single correction larger than half the pack
+  capacity resets the ledger (`reconciled_resets`) rather than silently inventing an adjustment.
+  The new counters ride along in every `/status` `cost_basis` battery row.
+
 ## 0.18.0
 
 - **The energy in the pack is valued at what it really cost.** A per-battery cost-basis ledger

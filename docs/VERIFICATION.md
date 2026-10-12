@@ -1041,6 +1041,53 @@ Independent review: not run for this change.
 
 ---
 
+### 8.13 Measured energy on the sample grid and reconciliation with the pack (0.18.1)
+
+The live 0.18.0 ledger on the owner's install under-reported the pack's energy. `/api/v1/status`
+showed `energy_kwh 1.4094` with `intervals 250` and `skipped_no_power 142`, while the pack stood at
+87 % SoC (min 10 %, capacity 1.92 kWh, `eta_charge` 0.92), whose physical AC-charged-in equivalent
+is `1.92 * 0.77 / 0.92 = 1.607 kWh` — about 0.2 kWh (12 %) behind. The measurements are written on a
+~5-minute sample cadence while this installation changes the applied setpoint every ~2 minutes
+(grid-follow trimming), and the ledger booked each update's tail flat at the last visible sample,
+so the ramp the next sample revealed was never recovered (reproduced synthetically: a 7-11 %
+deficit on a rising 5-minute series after a few dozen updates; on the live cadence 142 of 250
+command intervals booked no power at all).
+
+What 0.18.1 adds:
+
+* `app/cost_basis.py` books energy on the settled **sample grid**: the covered sample spans are
+  integrated between consecutive samples, split at the applied command changes and price-slot
+  boundaries they cross, and accumulated into that command interval's single journal entry, so a
+  command whose whole span falls between two samples still books its measured share. `last_ts` is
+  the end of the last processed sample span (never a command timestamp) and nothing beyond the
+  newest settled sample is booked: an unanswered tail waits for its next sample instead of being
+  extrapolated flat, a replay books nothing twice, and a settled command interval with no covered
+  sample span counts in `skipped_no_power` (which drops to ~0 on a healthy series). Pricing, the
+  source split and every fallback are unchanged from 0.18.0.
+* Reconciliation (additive counters): `E_phys = clamp(capacity_kwh * (soc - min_soc_pct) / 100 /
+  eta_charge, 0, capacity_kwh / eta_charge)` from the last SoC sample at or before the booking end;
+  the difference is applied to `energy_kwh` and never to `basis`, the signed cumulative correction
+  is `reconciled_kwh` plus `reconciled_last_kwh`, a stale or missing SoC sample skips the step and
+  counts `skipped_no_soc`, and a single correction beyond half the pack capacity resets the ledger
+  (`basis=None`, `E=0`) and counts `reconciled_resets`. All four counters travel in the `/status`
+  `cost_basis` battery rows.
+* `tools/audit.sh` (its own commit, `audit: allow the public PVGIS-SARAH2 dataset name`) adds one
+  exact public dataset identifier to the documented serial-shape allowlist so an unrelated docs
+  file can mention it; no rule is loosened and no other token is added.
+
+Gates: 893 tests (was 886: +7 sample-grid/reconciliation tests in `tests/test_cost_basis.py`), the
+headless render check 97 passed / 0 failed (no UI surface changed), `tools/audit.sh` clean over 104
+files, `compileall` clean.
+
+What is *not* verified live: booking and reconciliation were exercised against synthetic and
+store-backed series, never against the live add-on; the 1.607 kWh expectation follows from the
+reported SoC and config, not from a re-read of that install, and the reconciliation is trusted
+whenever its correction stays within half a pack, so a badly wrong SoC sensor could move the
+quantity within that band (the basis is never affected). Independent review: not run for this
+change.
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:

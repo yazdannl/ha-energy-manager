@@ -30,11 +30,14 @@ no MQTT, no cloud account, and no YAML to install by hand.
   writing.
 - **Knows what the energy in the pack cost.** A per-battery cost-basis ledger values the energy
   actually held from the measured charge intervals and the price each was charged at (grid at the
-  buy price, PV at the export price it forgoes), and by default refuses a discharge or export below
-  that break-even (`optimizer.sell_floor_enabled`, with an optional
-  `optimizer.sell_floor_margin_eur_per_kwh`) so the plan cannot sell your pack's energy at a loss.
-  The ledger resets when the pack reaches its floor, survives restarts, and is exposed per battery
-  in `/status` plus `sensor.sem_battery_cost_basis` and `sensor.sem_battery_value`.
+  buy price, PV at the export price it forgoes), books that energy on the measurement grid so a
+  command shorter than the sample spacing still gets its share, and pulls the quantity back onto
+  the pack's own measured SoC content when the samples lag (the basis itself is never touched). By
+  default it refuses a discharge or export below that break-even (`optimizer.sell_floor_enabled`,
+  with an optional `optimizer.sell_floor_margin_eur_per_kwh`) so the plan cannot sell your pack's
+  energy at a loss. The ledger resets when the pack reaches its floor, survives restarts, and is
+  exposed per battery in `/status` plus `sensor.sem_battery_cost_basis` and
+  `sensor.sem_battery_value`.
 - **Explains itself.** Every planning decision and every blocked dispatch carries a stable reason
   slug, visible in the log, so "why didn't it charge?" always has an answer.
 - **Shows the money.** Savings are accounted against a do-nothing baseline (defined below) and

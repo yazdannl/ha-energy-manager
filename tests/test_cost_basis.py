@@ -93,6 +93,16 @@ def slot(start: datetime, buy: float, sell: float | None, reason: str = "arbitra
     return ledger.PriceSlot(t=start, minutes=minutes, buy=buy, sell=sell, reason=reason)
 
 
+def soc_for(energy_kwh: float, config: BatteryConfig) -> float:
+    """The measured SoC whose physical content equals ``energy_kwh`` (0.18.1 reconciliation).
+
+    Existing fixtures asserted the measured arithmetic with a flat 50 % SoC; the reconciliation
+    now anchors the quantity to the pack, so a fixture that wants the booked value must measure
+    the SoC that implies it.
+    """
+    return config.min_soc_pct + energy_kwh * config.eta_charge * 100.0 / config.capacity_kwh
+
+
 def book(rows, series, timeline, battery_config, *, now, state=None, reset=False):
     return ledger.book_slices(
         state,
@@ -135,7 +145,7 @@ def test_grid_and_pv_are_attributed_from_the_measured_meter():
     """0.8 kWh in, half the import grid at 0.20 and the rest PV at the 0.05 export forgone."""
     config = battery()
     series = ledger.Series(
-        power=points(T0, 13, 800.0), grid=points(T0, 13, 500.0), soc=points(T0, 13, 50.0)
+        power=points(T0, 13, 800.0), grid=points(T0, 13, 500.0), soc=points(T0, 13, soc_for(0.8, config))
     )
     payload = book(
         [dispatch_row(1, T0, 800.0)],
@@ -157,7 +167,7 @@ def test_grid_and_pv_are_attributed_from_the_measured_meter():
 def test_energy_is_measured_not_commanded():
     config = battery()
     series = ledger.Series(
-        power=points(T0, 13, 200.0), grid=points(T0, 13, 200.0), soc=points(T0, 13, 50.0)
+        power=points(T0, 13, 200.0), grid=points(T0, 13, 200.0), soc=points(T0, 13, soc_for(0.2, config))
     )
     payload = book(
         [dispatch_row(1, T0, 800.0)],  # commanded 800 W, measured 200 W
@@ -201,7 +211,7 @@ def test_weighted_average_across_two_charges():
     series = ledger.Series(
         power=points(T0, 25, 400.0),
         grid=points(T0, 25, 400.0),
-        soc=points(T0, 25, 50.0),
+        soc=points(T0, 25, soc_for(0.8, config)),
     )
     payload = book(rows, series, timeline, config, now=T0 + timedelta(hours=2))
     # 0.4 kWh at 0.20 in the first hour, 0.4 kWh at 0.40 in the second: (0.08 + 0.16) / 0.8 = 0.30.
@@ -214,16 +224,20 @@ def test_discharge_reduces_the_held_energy_by_the_round_trip():
     config = battery(eta_charge=0.95, eta_discharge=0.95)
     timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05, minutes=60)])
     charge = points(T0, 13, 800.0)
-    series = ledger.Series(power=charge, grid=points(T0, 13, 800.0), soc=points(T0, 13, 50.0))
+    series = ledger.Series(
+        power=charge, grid=points(T0, 13, 800.0), soc=points(T0, 13, soc_for(0.8, config))
+    )
     first = book([dispatch_row(1, T0, 800.0)], series, timeline, config, now=T0 + timedelta(hours=1))
     assert first["energy_kwh"] == pytest.approx(0.8)
-    # The discharge slice is integrated from its own measured points (a fresh update window).
+    # The discharge slice is integrated from its own measured points (a fresh update window), and
+    # the pack's own SoC measures the post-discharge content the ledger keeps.
+    after_discharge = 0.8 - 0.5 / (config.eta_charge * config.eta_discharge)
     second = book(
         [dispatch_row(2, T0 + timedelta(hours=1), -500.0, code="peak_discharge")],
         ledger.Series(
             power=points(T0 + timedelta(hours=1), 13, -500.0),
             grid=points(T0 + timedelta(hours=1), 13, 0.0),
-            soc=points(T0 + timedelta(hours=1), 13, 44.0),
+            soc=points(T0 + timedelta(hours=1), 13, soc_for(after_discharge, config)),
         ),
         timeline,
         config,
@@ -231,14 +245,14 @@ def test_discharge_reduces_the_held_energy_by_the_round_trip():
         state=first,
     )
     assert second["basis_eur_per_kwh"] == pytest.approx(0.20)  # basis unchanged by a discharge
-    assert second["energy_kwh"] == pytest.approx(0.8 - 0.5 / 0.9025, abs=1e-4)
+    assert second["energy_kwh"] == pytest.approx(after_discharge, abs=1e-4)
     # A second discharge empties the book: no energy left, so no basis to floor.
     third = book(
         [dispatch_row(3, T0 + timedelta(hours=2), -800.0, code="peak_discharge")],
         ledger.Series(
             power=points(T0 + timedelta(hours=2), 13, -800.0),
             grid=points(T0 + timedelta(hours=2), 13, 0.0),
-            soc=points(T0 + timedelta(hours=2), 13, 30.0),
+            soc=points(T0 + timedelta(hours=2), 13, config.min_soc_pct),
         ),
         timeline,
         config,
@@ -258,7 +272,10 @@ def test_soc_floor_resets_the_ledger():
     start_low = ledger.Series(
         power=points(T0, 13, 400.0),
         grid=points(T0, 13, 400.0),
-        soc=tuple((T0 + timedelta(minutes=5 * index), 10.5 + 3.0 * index) for index in range(13)),
+        soc=tuple(
+            (T0 + timedelta(minutes=5 * index), 10.5 + (soc_for(0.4, config) - 10.5) / 12.0 * index)
+            for index in range(13)
+        ),
     )
     payload = book([], start_low, timeline, config, now=T0 + timedelta(hours=1), state=state)
     assert payload["basis_eur_per_kwh"] == pytest.approx(0.20)
@@ -300,7 +317,7 @@ def test_price_slot_boundary_splits_the_energy():
         ]
     )
     series = ledger.Series(
-        power=points(T0, 13, 400.0), grid=points(T0, 13, 400.0), soc=points(T0, 13, 50.0)
+        power=points(T0, 13, 400.0), grid=points(T0, 13, 400.0), soc=points(T0, 13, soc_for(0.4, config))
     )
     payload = book(
         [dispatch_row(1, T0, 400.0)], series, timeline, config, now=T0 + timedelta(hours=1)
@@ -371,7 +388,7 @@ def test_only_an_applied_auto_change_opens_a_slice_and_idempotent_replay_books_o
         dispatch_row(5, T0 + timedelta(minutes=40), 900.0),
     ]
     series = ledger.Series(
-        power=points(T0, 13, 500.0), grid=points(T0, 13, 500.0), soc=points(T0, 13, 50.0)
+        power=points(T0, 13, 500.0), grid=points(T0, 13, 500.0), soc=points(T0, 13, soc_for(0.5, config))
     )
     timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05)])
     now = T0 + timedelta(hours=1)
@@ -414,7 +431,8 @@ def test_covered_gap_is_not_bridged():
     series = ledger.Series(
         power=points(T0, 3, 800.0) + points(T0 + timedelta(minutes=50), 3, 800.0),
         grid=points(T0, 3, 800.0) + points(T0 + timedelta(minutes=50), 3, 800.0),
-        soc=points(T0, 3, 50.0) + points(T0 + timedelta(minutes=50), 3, 50.0),
+        soc=points(T0, 3, soc_for(800.0 / 1000.0 * (20.0 / 60.0), config))
+        + points(T0 + timedelta(minutes=50), 3, soc_for(800.0 / 1000.0 * (20.0 / 60.0), config)),
     )
     payload = book(
         [dispatch_row(1, T0, 800.0)],
@@ -432,13 +450,16 @@ def test_covered_gap_is_not_bridged():
 
 
 def _seed_store(store: Store, config: BatteryConfig, *, start: datetime, hours: int = 1) -> None:
+    # The measured SoC the seeded charge physically implies, so the 0.18.1 reconciliation agrees
+    # with the measured integral instead of pulling the quantity to a flat 50 % fixture.
+    seeded_soc = soc_for(0.8 * hours, config)
     store.add_measurements(
         [
             Measurement(ts=start + timedelta(minutes=5 * index), role=f"battery_power:{config.id}", value=800.0, unit="W")
             for index in range(hours * 12 + 1)
         ]
         + [
-            Measurement(ts=start + timedelta(minutes=5 * index), role=f"battery_soc:{config.id}", value=50.0, unit="%")
+            Measurement(ts=start + timedelta(minutes=5 * index), role=f"battery_soc:{config.id}", value=seeded_soc, unit="%")
             for index in range(hours * 12 + 1)
         ]
         + [
@@ -850,6 +871,10 @@ def _seed_ledger(store, config: BatteryConfig, *, now: datetime, basis: float = 
             "last_ts": to_iso(now),
             "intervals": 5,
             "window_start": to_iso(now - timedelta(hours=2)),
+            "reconciled_kwh": -0.05,
+            "reconciled_last_kwh": -0.05,
+            "reconciled_resets": 1,
+            "skipped_no_soc": 2,
             "journal": [
                 {
                     "ts": to_iso(now - timedelta(hours=2)),
@@ -876,6 +901,11 @@ def test_engine_exposes_the_basis_the_floor_and_the_sensors():
     assert row["cost_basis_eur_per_kwh"] == pytest.approx(0.20)
     assert row["stored_value_eur"] == pytest.approx(0.20)
     assert row["journal_entries"] == 1
+    # Additive (0.18.1): the reconciliation provenance travels with the block into /status.
+    assert row["reconciled_kwh"] == pytest.approx(-0.05)
+    assert row["reconciled_last_kwh"] == pytest.approx(-0.05)
+    assert row["reconciled_resets"] == 1
+    assert row["skipped_no_soc"] == 2
     assert block["fleet_basis_eur_per_kwh"] == pytest.approx(0.20)
     assert block["sell_floor_eur_per_kwh"] == pytest.approx(expected_floor, abs=1e-6)
     assert engine.fleet_sell_floor() == pytest.approx(expected_floor, abs=1e-6)
@@ -946,3 +976,211 @@ def test_engine_update_cost_bases_advances_the_ledger_from_the_store(tmp_path):
     assert again["updated"] == [config.id]
     assert engine.battery_cost_basis(config.id)["intervals"] == status["intervals"]
     store.close()
+
+
+# ------------------------------------------- the sample grid and the pack reconciliation (0.18.1)
+
+
+def _visible(samples, now: datetime):
+    """The measurement rows a store read at ``now`` returns (``ts < now``), never the future."""
+    return tuple((t, v) for t, v in samples if t < now)
+
+
+def test_energy_follows_the_sample_grid_when_commands_outpace_the_samples():
+    """A ~2-minute command cadence over 5-minute samples must book the whole measured integral.
+
+    Before 0.18.1 every update booked its own tail flat at the last visible sample, so the ramp
+    the next sample revealed was never recovered -- the live 2026-10-12 ledger ran ~12 % behind
+    the pack (250 intervals, 142 skipped_no_power) on exactly this cadence.
+    """
+    config = battery(capacity_kwh=50.0)
+    samples = [(T0 + timedelta(minutes=5 * index), 1000.0 * index) for index in range(9)]
+    rows = [
+        dispatch_row(index + 1, T0 + timedelta(minutes=2 * index), 1000.0 + 50.0 * index)
+        for index in range(20)
+    ]
+    timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05, minutes=120)])
+    state = None
+    for minute in range(1, 42):
+        now = T0 + timedelta(minutes=minute)
+        visible = _visible(samples, now)
+        state = book(
+            rows, ledger.Series(power=visible, grid=visible), timeline, config, now=now, state=state
+        )
+    expected = ledger._Points(samples).integrate_kwh(T0, T0 + timedelta(minutes=40))[0]
+    assert state["energy_kwh"] == pytest.approx(expected, rel=0.01)
+    assert state["skipped_no_power"] == 0
+    # The idempotency key is the end of the settled sample span, never a command timestamp.
+    assert state["last_ts"] == to_iso(T0 + timedelta(minutes=40))
+
+
+def test_a_command_interval_between_two_samples_books_its_measured_share():
+    """A command change faster than the sampler still books the measured integral over its span."""
+    config = battery()
+    samples = ((T0, 0.0), (T0 + timedelta(minutes=5), 1000.0))
+    rows = [
+        dispatch_row(1, T0, 1000.0),
+        dispatch_row(2, T0 + timedelta(minutes=2), 500.0),
+        dispatch_row(3, T0 + timedelta(minutes=4), 1000.0),
+    ]
+    timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05)])
+    payload = book(
+        rows,
+        ledger.Series(power=samples, grid=samples),
+        timeline,
+        config,
+        now=T0 + timedelta(minutes=5),
+    )
+    # The ramp 0 -> 1000 W over 5 minutes: 2500 W*min, split 400/1200/900 over the commands.
+    assert payload["energy_kwh"] == pytest.approx(2500.0 / 60.0 / 1000.0, abs=1e-4)
+    assert payload["skipped_no_power"] == 0
+    middle = payload["journal"][1]
+    assert middle["ts"] == to_iso(T0 + timedelta(minutes=2))
+    assert middle["end"] == to_iso(T0 + timedelta(minutes=4))
+    assert middle["charge_kwh"] == pytest.approx(1200.0 / 60.0 / 1000.0, abs=1e-6)
+
+
+def test_sample_grid_booking_is_idempotent_and_never_double_books():
+    config = battery()
+    samples = [(T0 + timedelta(minutes=5 * index), 1000.0 * index) for index in range(5)]
+    rows = [
+        dispatch_row(index + 1, T0 + timedelta(minutes=2 * index), 1000.0 + 50.0 * index)
+        for index in range(10)
+    ]
+    timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05, minutes=60)])
+    first_now = T0 + timedelta(minutes=11)
+    visible = _visible(samples, first_now)
+    first = book(
+        rows, ledger.Series(power=visible, grid=visible), timeline, config, now=first_now
+    )
+    assert first["last_ts"] == to_iso(T0 + timedelta(minutes=10))
+    assert first["energy_kwh"] == pytest.approx(
+        ledger._Points(samples).integrate_kwh(T0, T0 + timedelta(minutes=10))[0], abs=1e-4
+    )
+    replay = book(
+        rows,
+        ledger.Series(power=visible, grid=visible),
+        timeline,
+        config,
+        now=first_now,
+        state=first,
+    )
+    assert replay["intervals"] == first["intervals"]
+    assert replay["energy_kwh"] == pytest.approx(first["energy_kwh"])
+    later_now = T0 + timedelta(minutes=21)
+    visible_later = _visible(samples, later_now)
+    later = book(
+        rows,
+        ledger.Series(power=visible_later, grid=visible_later),
+        timeline,
+        config,
+        now=later_now,
+        state=replay,
+    )
+    assert later["energy_kwh"] == pytest.approx(
+        ledger._Points(samples).integrate_kwh(T0, T0 + timedelta(minutes=20))[0], abs=1e-4
+    )
+
+
+def test_reconciliation_pulls_the_quantity_to_the_pack_content_never_the_basis():
+    config = battery(capacity_kwh=4.0)
+    timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05, minutes=60)])
+    state = {"basis_eur_per_kwh": 0.20, "energy_kwh": 1.4, "last_ts": to_iso(T0)}
+    now = T0 + timedelta(minutes=20)
+    series = ledger.Series(
+        power=points(T0, 5, 600.0), grid=points(T0, 5, 600.0), soc=points(T0, 5, 60.0)
+    )
+    payload = book([dispatch_row(1, T0, 600.0)], series, timeline, config, now=now, state=state)
+    # E_phys = 4 kWh * (60 - 10) / 100 = 2.0 kWh; the measured booking was 1.4 + 0.2 = 1.6.
+    assert payload["energy_kwh"] == pytest.approx(2.0)
+    assert payload["basis_eur_per_kwh"] == pytest.approx(0.20)  # never touched
+    assert payload["reconciled_kwh"] == pytest.approx(0.4)
+    assert payload["reconciled_last_kwh"] == pytest.approx(0.4)
+    assert payload["reconciled_resets"] == 0
+    # A replay at the same end applies nothing twice; the value follows basis * E.
+    again = book([dispatch_row(1, T0, 600.0)], series, timeline, config, now=now, state=payload)
+    assert again["energy_kwh"] == pytest.approx(2.0)
+    assert again["reconciled_kwh"] == pytest.approx(0.4)
+    status = ledger.basis_status(payload, config)
+    assert status["stored_value_eur"] == pytest.approx(0.40)
+
+
+def test_reconciliation_is_capped_and_resets_beyond_half_a_pack():
+    # The clamp: a glitched SoC above 100 % cannot push more than capacity / eta_charge in.
+    config = battery(capacity_kwh=1.0, min_soc_pct=0.0)
+    timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05, minutes=60)])
+    state = {"basis_eur_per_kwh": 0.20, "energy_kwh": 0.5, "last_ts": to_iso(T0)}
+    capped = book(
+        [dispatch_row(1, T0, 300.0)],
+        ledger.Series(
+            power=points(T0, 13, 300.0), grid=points(T0, 13, 300.0), soc=points(T0, 13, 120.0)
+        ),
+        timeline,
+        config,
+        now=T0 + timedelta(hours=1),
+        state=state,
+    )
+    # E_phys would be 1.2 kWh but max_energy is 1.0: the correction is 1.0 - 0.8 = 0.2, not 0.4.
+    assert capped["energy_kwh"] == pytest.approx(1.0)
+    assert capped["reconciled_last_kwh"] == pytest.approx(0.2)
+    assert capped["basis_eur_per_kwh"] == pytest.approx(0.20)
+    assert capped["reconciled_resets"] == 0
+    # Beyond half a pack in one step the ledger is unattributable: reset and count it.
+    reset = book(
+        [dispatch_row(1, T0, 100.0)],
+        ledger.Series(
+            power=points(T0, 5, 100.0), grid=points(T0, 5, 100.0), soc=points(T0, 5, 90.0)
+        ),
+        timeline,
+        config,
+        now=T0 + timedelta(minutes=20),
+        state={"basis_eur_per_kwh": 0.20, "energy_kwh": 0.1, "last_ts": to_iso(T0)},
+    )
+    assert reset["basis_eur_per_kwh"] is None
+    assert reset["energy_kwh"] == 0.0
+    assert reset["reconciled_resets"] == 1
+    assert reset["reconciled_kwh"] == 0.0
+
+
+def test_stale_or_missing_soc_skips_reconciliation_and_counts_it():
+    config = battery(capacity_kwh=4.0)
+    timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05, minutes=60)])
+    state = {"basis_eur_per_kwh": 0.20, "energy_kwh": 1.0, "last_ts": to_iso(T0)}
+    now = T0 + timedelta(minutes=30)
+    # The last SoC sample is 20 minutes old: past the 10-minute bound, so it is not used.
+    stale = ledger.Series(
+        power=points(T0, 7, 600.0), grid=points(T0, 7, 600.0), soc=points(T0, 3, 60.0)
+    )
+    payload = book([dispatch_row(1, T0, 600.0)], stale, timeline, config, now=now, state=state)
+    assert payload["energy_kwh"] == pytest.approx(1.0 + 600.0 * 30 / 60 / 1000.0)
+    assert payload["skipped_no_soc"] == 1
+    assert payload["reconciled_kwh"] == 0.0
+    assert payload["reconciled_last_kwh"] is None
+    # No SoC series at all: still skipped and counted, never a fabricated correction.
+    without = ledger.Series(power=points(T0, 7, 600.0), grid=points(T0, 7, 600.0))
+    payload2 = book([dispatch_row(1, T0, 600.0)], without, timeline, config, now=now, state=state)
+    assert payload2["energy_kwh"] == pytest.approx(1.3)
+    assert payload2["skipped_no_soc"] == 1
+    assert payload2["reconciled_resets"] == 0
+
+
+def test_basis_status_carries_the_reconciliation_counters():
+    payload = {
+        "basis_eur_per_kwh": 0.2,
+        "energy_kwh": 1.0,
+        "reconciled_kwh": -0.05,
+        "reconciled_last_kwh": 0.02,
+        "reconciled_resets": 2,
+        "skipped_no_soc": 3,
+    }
+    status = ledger.basis_status(payload)
+    assert status["reconciled_kwh"] == pytest.approx(-0.05)
+    assert status["reconciled_last_kwh"] == pytest.approx(0.02)
+    assert status["reconciled_resets"] == 2
+    assert status["skipped_no_soc"] == 3
+    # No ledger yet: the counters are present and null/zero, never invented.
+    empty = ledger.basis_status(None)
+    assert empty["reconciled_kwh"] == 0.0
+    assert empty["reconciled_last_kwh"] is None
+    assert empty["reconciled_resets"] == 0
+    assert empty["skipped_no_soc"] == 0

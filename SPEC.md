@@ -482,6 +482,27 @@ battery ``cost_basis_eur_per_kwh`` and ``stored_value_eur`` (defined once as ``b
 ``sensor.sem_battery_value`` (EUR) mirror the fleet basis and the value of the held energy through
 the same idempotent publisher, publishing ``unknown`` rather than inventing a figure.
 
+**0.18.1 amendment (the quantity follows the settlement grid and the pack).** A live 0.18.0 ledger
+under-reported the pack's energy by ~12 % on a 5-minute sampler cadence: each update booked its own
+tail flat at the last visible sample, so the ramp the next sample revealed was never recovered, and
+142 of 250 command intervals booked nothing at all. Energy now follows the samples and price
+follows the commands: the covered sample spans are integrated between consecutive samples, split at
+the applied command changes and the price-slot boundaries they cross, attributed to the command in
+force, and accumulated into that command interval's single journal entry, so a command shorter than
+the sample spacing still books its measured share. ``last_ts`` is the end of the last processed
+sample span -- never a command timestamp -- and nothing beyond the newest settled sample is booked,
+so a command interval whose next sample has not arrived waits for the next update instead of being
+extrapolated flat, and replaying an update still books nothing twice. A settled command interval
+with no covered sample span is counted in ``skipped_no_power``. After booking, the *quantity* is
+reconciled with the pack's own content:
+``E_phys = clamp(capacity_kwh * (soc - min_soc_pct) / 100 / eta_charge, 0, capacity_kwh / eta_charge)``
+from the last SoC sample at or before the booking end (stale or missing: skip and count
+``skipped_no_soc``). The difference is applied to ``energy_kwh`` and never to ``basis`` (the basis
+remains the tracked average price of the energy we priced); the signed cumulative correction is
+``reconciled_kwh``, the last step ``reconciled_last_kwh``, and a single correction beyond half the
+pack capacity is unattributable: the ledger resets (``basis=None``, ``E=0``) and
+``reconciled_resets`` counts it.
+
 Runtime discovery is mandatory for `driver: zendure`: find candidate entities by asking HA for the
 entity registry entries whose `platform` is `zendure_ha` (or `unique_id` prefix `zendure_ha.`) and
 matching **translation keys** (`input_limit`, `output_limit`, `electric_level`,
@@ -1656,6 +1677,7 @@ round, with the reason:
 - **§3/§9.2/§9.3/§9.4/§10 (setpoint ownership; fixed 2026-10-12 after the live-test storm)** — the live run showed the recovery guard fighting its own plan, blocked advisory ticks latching from `requested_w`, and device-path drivers clearing the latch on a momentary 0 W, so the latch is now a per-battery applied-command record: only a real, verified non-zero write sets it, only an explicit verified hold (or a driver-reported zero across a confirmation window) clears it, only a previous run's restored latch is guard-recoverable, and advisory/off/dry-run runs issue zero write calls — guard holds included — except the documented boot/Stop/exit de-escalations.
 
 - **§3/§5/§8.1/§10/§12 (cost basis of the stored energy and the sell floor; requested 2026-10-12, "value the energy in the battery and refuse loss-making sales")** — the optimiser's forward break-even is paired with a persisted per-battery ledger (``app/cost_basis.py``, profile kind ``battery_cost_basis``): applied dispatch changes open event-driven slices, the slice energy is the *measured* ``battery_power:<id>`` integral (never the commanded setpoint), each slice is priced at the plan slot it was charged in (grid at ``buy``, PV at ``sell``, split at price-slot boundaries, skip rather than guess when neither resolves, the plan slot's own reason as the fallback attribution when the meter is missing), and the basis is the weighted average ``(basis*E + cost)/(E + charge_ac)`` with a discharge reducing ``E`` by ``discharged/round_trip`` and a reset to ``basis=None, E=0`` at the SoC floor. ``E`` is clamped at ``capacity_kwh / eta_charge`` and a first run (or a gap beyond the 7-day lookback) starts clean; a bounded 200-slice journal keeps the provenance. ``optimizer.sell_floor_enabled`` (default true) and ``optimizer.sell_floor_margin_eur_per_kwh`` (0..1, default 0) turn that basis into a floor through the frozen ``BatteryConfig.break_even_sell_eur_per_kwh`` helper — per battery, with the fleet value the plan enforces as the energy-weighted mean — and the DP blocks a discharge/export whose value leg (``sell`` when exporting, ``buy`` when serving the house) is below it with the new ``Reason.SELL_FLOOR``; a live planned discharge below the floor is also clamped to a hold at dispatch, without touching charging, SoC-floor holds or overrides. ``/status`` gains the per-battery ``cost_basis_eur_per_kwh``/``stored_value_eur`` and a fleet block, the plan summary gains ``sell_floor_eur_per_kwh``, and ``sensor.sem_battery_cost_basis`` / ``sensor.sem_battery_value`` mirror the fleet basis and held value (or ``unknown``, never a fabricated figure). Off, or with no basis yet, behaviour is exactly the pre-0.18.0 one.
+- **§3/§5/§8.1/§10 (measured energy on the sample grid and reconciliation with the pack; fixed 2026-10-12 after the live 0.18.0 ledger under-reported the pack by ~12 %)** — the ledger now integrates the *covered sample spans* themselves (split at the applied command changes and price-slot boundaries they cross) and accumulates each command interval's parts into its journal entry, so a command shorter than the sample spacing still books its measured share; ``last_ts`` is the end of the last processed sample span (never a command timestamp) and nothing beyond the newest settled sample is booked, so an update tail can no longer be extrapolated flat and the ramp the next sample reveals is never lost (replaying an update books nothing twice, and a settled command interval with no covered sample span counts in ``skipped_no_power``). After booking, the quantity is reconciled with the pack's own measured SoC content ``E_phys = clamp(capacity_kwh*(soc-min_soc_pct)/100/eta_charge, 0, capacity_kwh/eta_charge)`` from the last SoC sample at or before the booking end (stale/missing skips and counts ``skipped_no_soc``); the difference is applied to ``energy_kwh`` and never to ``basis``, the signed cumulative correction is ``reconciled_kwh`` plus ``reconciled_last_kwh``, and a single correction beyond half the pack capacity resets the ledger (``basis=None``, ``E=0``) and counts ``reconciled_resets``.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded
