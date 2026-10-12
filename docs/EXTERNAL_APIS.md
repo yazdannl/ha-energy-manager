@@ -544,16 +544,39 @@ Idempotence: the integration skips a write when
 
 ### Minimal write sequences (recommended driver behaviour)
 
+Manager path (system-wide setpoint, applied on the manager's next P1 event):
+
 ```
 (a) charge at X W     select operation -> "manual"; number manual_power -> -X
 (b) discharge at Y W  select operation -> "manual"; number manual_power -> +Y
 (c) hold at 0 W       select operation -> "manual"; number manual_power -> 0
 ```
 
-* Write `operation` before the first power write; verify the select state read-back.
-* After the manual_power write, read back `output_home_power`/`grid_input_power` and
-  `electric_level` within a bounded timeout (the next P1 event). No change within timeout -> driver
-  error, retry once, then hold.
+Device path (the inverter's own AC limits, applied by the device itself):
+
+```
+(a) charge at X W     select operation -> "off"; select ac_mode -> "input";
+                      number input_limit -> X; number output_limit -> 0
+(b) discharge at Y W  select operation -> "off"; select ac_mode -> "output";
+                      number input_limit -> 0; number output_limit -> Y
+(c) hold at 0 W       number input_limit -> 0; number output_limit -> 0  (direction kept)
+```
+
+* Manager: write `operation` before the first power write; verify the select state read-back.
+* Manager: after the manual_power write, read back `output_home_power`/`grid_input_power` within a
+  bounded timeout (the next P1 event). A command that landed but has not been followed inside that
+  window is reported as ``commanded`` (pending, with the measured value), **not** as a driver error:
+  a driver error triggers the failsafe hold, which would revoke the command before the manager reads
+  it. Only a setpoint that does not read back at all, or a manager that cannot be held in `manual`,
+  is a driver error. Live 2026-10-12: a 5-minute house P1 feed turned every 1 kW charge into a 4.6 s
+  blip this way.
+* Device: `acMode`/`inputLimit`/`outputLimit` go to the device over MQTT/zenSDK and are echoed back
+  on its own report cadence (observed ~5 s on an SF800 Plus over zenSDK), so the same bounded window
+  applies; a matching `input_limit`/`output_limit` read-back is real device evidence, so it confirms
+  the write even before any AC flow shows. The manager must be `off` on this path: while it is not,
+  it re-writes both properties (and runs its smart modes) on every P1 event. Its `off` mode performs
+  one `power_off()`, which the next tick's limits write replaces.
+* Neither path needs `smartMode`; a device-path hold leaves `acMode` alone (limits 0 is the hold).
 * "Hold" only means **AC = 0**. DC PV keeps charging the battery: `acMode`/`inputLimit`/`outputLimit`
   govern AC only, `solar_input_power` is independent, and at SOCFULL the surplus can bypass to the
   home (`exports_bypass` / `gridReverse`). Never assume SoC follows the AC plan; keep the add-on's own
@@ -563,7 +586,13 @@ Idempotence: the integration skips a write when
   P1 event, so the device holds its last AC power indefinitely if the controller vanishes. Device
   firmware still enforces `soc_set`/`min_soc`.
 * Multi-battery: because manual_power is system-wide, model the Zendure manager as **one** aggregated
-  `BatteryConfig` (capacity = `total_kwh`, limits from the model/entity limits).
+  `BatteryConfig` (capacity = `total_kwh`, limits from the model/entity limits).  The device path is
+  per device, so one battery per inverter -- but it takes the manager out of the loop for *every*
+  device of that manager, so a mixed fleet must either use the manager for all of them or the device
+  path for all of them.
+* `control_path` on the battery (`auto` | `manager` | `device`, default `auto`) picks the path; the
+  driver's capabilities report the effective one (`manager_manual_power`, `device_setpoint`,
+  `device_limits`).
 
 ### Rate limits and polling
 

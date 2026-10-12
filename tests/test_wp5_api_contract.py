@@ -757,3 +757,57 @@ def test_test_discharge_succeeds_in_auto_and_is_bounded(wired):
     assert wired.json("GET", "/api/v1/status")[2]["override"] is not None
     wired.json("DELETE", "/api/v1/override", {})
     wired.json("POST", "/api/v1/mode", {"mode": "advisory", "dry_run": True})
+
+
+def test_battery_control_path_is_validated_and_round_trips(wired):
+    """SPEC 5/9.2: the write path is a first-class battery field, validated at save time.
+
+    ``auto`` is the default so every stored battery keeps the behaviour it shipped with; a battery
+    that asks for the inverter path must carry that device's own AC limits, and one that asks for
+    the manager must carry the manager pair.
+    """
+    status, _headers, body = wired.json("GET", "/api/v1/batteries")
+    assert status == 200
+    assert body["batteries"][0]["config"]["control_path"] == "auto"
+
+    payload = {
+        "config": {
+            "id": "example_zendure",
+            "name": "Example Zendure",
+            "driver": "zendure",
+            "capacity_kwh": 2.4,
+            "control_path": "device",
+            "mapping": {
+                "charge_limit_entity": "number.example_device_input_limit",
+                "discharge_limit_entity": "number.example_device_output_limit",
+                "soc_entity": "sensor.example_device_electric_level",
+            },
+        }
+    }
+    status, _headers, body = wired.json("POST", "/api/v1/batteries", payload)
+    assert status == 201, body
+    assert body["config"]["control_path"] == "device"
+    assert body["config"]["driver"] == "zendure"
+
+    # A device-path battery without both limits is refused at save time, naming the missing key.
+    status, _headers, body = wired.json(
+        "PATCH",
+        "/api/v1/batteries/example_zendure",
+        {"patch": {"mapping": {"charge_limit_entity": "number.example_device_input_limit"}}},
+    )
+    assert status == 400, (status, body)
+    assert "discharge_limit_entity" in body["error"]["message"]
+
+    # Switching back is one ordinary patch, and an unknown path never validates.
+    status, _headers, body = wired.json(
+        "PATCH", "/api/v1/batteries/example_zendure", {"patch": {"control_path": "inverter-ish"}}
+    )
+    assert status == 400, (status, body)
+    assert "control_path" in body["error"]["message"]
+    status, _headers, body = wired.json(
+        "PATCH", "/api/v1/batteries/example_zendure", {"patch": {"control_path": "manager"}}
+    )
+    assert status == 400 and "manual_power_entity" in body["error"]["message"], (status, body)
+    status, _headers, body = wired.json("DELETE", "/api/v1/batteries/example_zendure")
+    assert status == 200
+    note("battery control_path: auto default, device path save-time validation, 400s name the key")

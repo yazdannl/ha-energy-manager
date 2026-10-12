@@ -15,22 +15,22 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **675 passed** (two consecutive runs) |
+| Test suite | `python3 -m pytest tests -q` | **685 passed** (two consecutive runs) |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 93 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
-| Headless UI render check | `node tools/ui_render_check.js` | **75 passed, 0 failed**, exit 0 |
+| Headless UI render check | `node tools/ui_render_check.js` | **77 passed, 0 failed**, exit 0 |
 
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (79 files, documentation excluded)**:
-  `784dbf04149edf58640ed0f3f320f5181a8161c7eceb8021a972befad2c6d9f9`
+  `28fdad8a997460965eee2bfa9b4dac594f9c6589e2ce1cad8606ba2667b5675b`
 * **path list of the same 79 files** (detects an added, removed or renamed file):
   `999c72a0ad237efad84631e1c196871fbab19aaf4e46b1e3e55f351c7c988ad5`
 
-The 0.9.1 tree's code + tests digest was `fc5f9d44…`; 0.10.0 (§8.8) changed file contents only - it
-added no file, so the path-list digest above is the same one, which is exactly what that recipe is
-for.
+The 0.10.0 tree's code + tests digest was `784dbf04…` and 0.9.1's `fc5f9d44…`; 0.10.1 (§8.9) changed
+file contents only - it added no file, so the path-list digest above is the same one, which is exactly
+what that recipe is for.
 
 The recipe sorts the file list **and** the per-file manifest under `LC_ALL=C`, so the digest is
 independent of `find` order and of the locale; a single `sort` is not enough. An earlier revision of
@@ -802,6 +802,79 @@ slot's tariff), and the measured side re-prices the measured import/export at th
 two are comparable but neither is a bill. `clamped` uses a 1 W tolerance (`CLAMP_TOLERANCE_W`), so an
 idempotent re-write is not reported as a clamp.
 
+### 8.9 Direct inverter control and the "commanded" dispatch state (0.10.1)
+
+Reported from the owner's phone: "We have charging planned now but it is not charging" - the Today
+view said `Planned now: charge 1.00 kW` while the pack reported 9 % SoC, 0 W and `idle`. The live
+instance said why, in three layers:
+
+* **The command was revoked before it could land.** The manager's `manual_power` number was written
+  to -1000 W and to 0 W 4.6 s later, every 30 s, for hours: the driver confirmed a non-zero command
+  only from the *measured* AC flow inside a 4-attempt / 1.5 s window (`readback_attempts`,
+  `readback_delay_s`), and a miss was a `driver_error`, which `control.failsafe_on_error` turned into
+  a fail-safe hold of 0 W. The Zendure manager applies `manual_power` **only** on its next P1-meter
+  event (`manager.py _p1_changed`, throttled >=2.2 s), so the window was decided before the manager
+  ever looked; the device's own `input_limit` reached 1000 W exactly once in twenty minutes and went
+  back to 0 five seconds later. `grid_input_power` had not moved since 2026-10-11 12:34 - the pack had
+  not charged at all, and the previous day's charging was the manager's own smart mode, before
+  `operation` was switched to `manual`.
+* **The house P1 feed is minutes away.** The only grid entity Home Assistant sees is the Zonneplan
+  Connect Energy Meter, which `zonneplan_one` reports every five minutes (and whose reading is itself
+  2-5 min old); the manager's `operation_state` flips land exactly on those `:xx:20` marks. A manual
+  setpoint therefore cannot be applied - or revoked - faster than that, which makes the manager path
+  structurally wrong for this house regardless of the read-back window.
+* **The inverter's own entities do not wait for any of it.** The device's `ac_mode` select and its
+  `input_limit` / `output_limit` numbers are written by the integration over the local
+  zenSDK/MQTT link (`doCommand -> httpPost('properties/write')`) and echoed back on the device's own
+  report cadence (measured on the live SF800 Plus: a property report every ~5 s).
+  `input_limit = 1000` with `ac_mode = input` is a charge command the device applies itself.
+
+What 0.10.1 changes:
+
+* `BatteryConfig.control_path` (`auto` | `manager` | `device`, default `auto`) plus
+  `ZendureDriver.validate_control_path`, wired into `driver_registry.validate_config`, so
+  `POST`/`PATCH /api/v1/batteries` refuses a path that lacks its entities at save time (SPEC 5).
+  `auto` keeps every existing configuration on exactly the path it used before.
+* The **device** path: `_manager_quiet_write()` (the manager's `operation` select to its `off` value,
+  written only when it is not already there - while it is not `off` it re-writes both limits on every
+  P1 event), `_ac_mode_write()` (direction select; the option string is read from the entity's own
+  `options`, because the integration localises the labels), then the two magnitude writes. A hold
+  zeroes both limits and leaves the direction alone.
+* `Reason.COMMANDED` + `_flow_pending`: a command whose setpoint landed but whose effect the device
+  has not shown is reported as in force but unconfirmed (`applied_w` = the live setpoint,
+  `readback_w` = what the device reports, message naming both). `driver_error` - and therefore the
+  fail-safe hold - is now reserved for a setpoint that does not read back at all and for a manager
+  that cannot be held in `manual`. `_verify_device_limits()` treats a matching `input_limit`/
+  `output_limit` read-back as device evidence on its own (those entities are device reports, not our
+  own echo) and falls back to the measured flow.
+* Interface: a **Control path** select in the battery dialog with the trade-off spelled out, a
+  `Dispatch` line on the battery card (`capabilities.control_path` plus whether it was chosen or
+  automatic), the `commanded` reason label, and a Plan line that reads "commanded 1.00 kW of 1.00 kW
+  requested; the device has not confirmed it yet" instead of a failure or a silent success.
+
+Gates: 685 tests (was 675: +8 driver/device-path, +1 API contract, +1 battery-config), the headless
+render check 77 passed / 0 failed (was 75), the selfcheck still **33/33**, `tools/audit.sh` clean over
+93 files, `compileall` clean. New tests:
+`tests/test_wp5_zendure.py::test_device_path_writes_direction_and_limits_and_quiets_the_manager`,
+`::test_device_path_discharge_uses_output_mode_and_output_limit`,
+`::test_device_path_hold_zeroes_both_limits_without_touching_the_direction`,
+`::test_device_path_reports_commanded_until_the_inverter_echoes`,
+`::test_device_path_reads_the_direction_option_from_the_entity`,
+`::test_control_path_device_is_refused_without_the_limit_entities`,
+`::test_a_bogus_control_path_is_rejected_by_the_battery_config`,
+`tests/test_wp2b_control.py::test_zendure_reports_a_pending_command_when_the_p1_feed_is_silent`,
+`::test_dispatcher_keeps_a_commanded_charge_alive`,
+`tests/test_wp5_api_contract.py::test_battery_control_path_is_validated_and_round_trips`.
+
+Honest limits: the device path was verified against the fake HA and the integration's source, not
+(or not yet) on the owner's hardware - the owner declined a live write during the fix, so the first
+inverter write will be the add-on's own. `ac_mode` option strings are matched case-insensitively
+against the entity's own options because the integration localises them; a build that advertises
+neither "input" nor "output" falls back to the raw options. The device path is per inverter, but
+putting the manager `off` affects every device of that manager, so a mixed fleet must choose one path
+for all of them. A `commanded` result is deliberately not a failure and not a measurement: the plan
+execution line (measured vs planned) is what turns it into "the device did not follow".
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
@@ -895,7 +968,7 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 675 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 685 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 

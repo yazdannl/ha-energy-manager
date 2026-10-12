@@ -29,6 +29,7 @@ OPERATION = "select.example_manager_operation"
 GRID_IN = "sensor.example_device_grid_input"
 OUTPUT = "sensor.example_device_output_home"
 SOC = "sensor.example_device_electric_level"
+AC_MODE = "select.example_device_ac_mode"
 INPUT_LIMIT = "number.example_device_input_limit"
 OUTPUT_LIMIT = "number.example_device_output_limit"
 
@@ -41,6 +42,7 @@ MAPPING = {
     "output_power_entity": OUTPUT,
     "charge_limit_entity": INPUT_LIMIT,
     "discharge_limit_entity": OUTPUT_LIMIT,
+    "ac_mode_entity": AC_MODE,
 }
 
 
@@ -54,13 +56,14 @@ def make_state() -> FakeHAState:
             SOC: {"state": "50", "attributes": {"unit_of_measurement": "%"}},
             INPUT_LIMIT: {"state": "0", "attributes": {}},
             OUTPUT_LIMIT: {"state": "0", "attributes": {}},
+            AC_MODE: {"state": "output", "attributes": {"options": ["input", "output"]}},
         }
     )
     state.link_manager(MANUAL, GRID_IN, OUTPUT)
     return state
 
 
-def make_driver(state: FakeHAState, **overrides) -> ZendureDriver:
+def make_driver(state: FakeHAState, control_path: str = "auto", **overrides) -> ZendureDriver:
     config = BatteryConfig(
         id="example_zendure",
         name="Example Zendure",
@@ -73,6 +76,7 @@ def make_driver(state: FakeHAState, **overrides) -> ZendureDriver:
         eta_charge=0.95,
         eta_discharge=0.95,
         mapping=dict(MAPPING),
+        control_path=control_path,
     )
     return ZendureDriver(
         config,
@@ -198,3 +202,133 @@ def test_manager_power_is_read_back_with_the_models_sign_convention():
     assert discharge.ok, discharge.message
     assert state.states[MANUAL]["state"] == "600.0"
     assert state.states[OUTPUT]["state"] == "600.0"  # discharging shows on output_home
+
+
+# -- device path: the inverter's own AC limits, no manager, no P1 event ---------------------
+
+
+def test_device_path_writes_direction_and_limits_and_quiets_the_manager():
+    """control_path='device': ac_mode + input_limit/output_limit, and the manager put off.
+
+    The inverter applies those properties itself over zenSDK/MQTT, so the command does not wait
+    for the manager's next P1 event -- which is the whole point of this path.  The manager is
+    taken out of the loop first, because while it is not ``off`` it re-writes the same two
+    properties on every P1 event (live 2026-10-12: a 5-minute P1 feed made the manager path
+    unusable).
+    """
+    state = make_state()
+    driver = make_driver(state, control_path="device")
+    assert driver.capabilities()["control_path"] == "device_limits"
+
+    result = driver.apply(800.0, dry_run=False)
+    assert result.ok is True, result.message
+    assert result.applied_w == pytest.approx(800.0)
+    assert result.code == Reason.OK  # the limits echo back, so this is a real confirmation
+
+    order = [call[2].get("entity_id") for call in state.service_calls]
+    assert order[:4] == [OPERATION, AC_MODE, INPUT_LIMIT, OUTPUT_LIMIT], order
+    assert state.states[OPERATION]["state"] == "off"
+    assert state.states[AC_MODE]["state"] == "input"
+    assert state.states[INPUT_LIMIT]["state"] == "800.0"
+    assert state.states[OUTPUT_LIMIT]["state"] == "0.0"
+    # the device-path battery never touches the manager's manual setpoint
+    assert MANUAL not in order
+
+
+def test_device_path_discharge_uses_output_mode_and_output_limit():
+    state = make_state()
+    state.states[AC_MODE] = {"state": "input", "attributes": {"options": ["input", "output"]}}
+    driver = make_driver(state, control_path="device")
+    result = driver.apply(-500.0, dry_run=False)
+    assert result.ok is True, result.message
+    assert state.states[AC_MODE]["state"] == "output"
+    assert state.states[OUTPUT_LIMIT]["state"] == "500.0"
+    assert state.states[INPUT_LIMIT]["state"] == "0.0"
+
+
+def test_device_path_hold_zeroes_both_limits_without_touching_the_direction():
+    state = make_state()
+    driver = make_driver(state, control_path="device")
+    driver.apply(800.0, dry_run=False)
+    direction_writes = len([call for call in state.service_calls if call[2].get("entity_id") == AC_MODE])
+    result = driver.hold(dry_run=False)
+    assert result.ok is True, result.message
+    assert result.applied_w == 0.0
+    assert state.states[INPUT_LIMIT]["state"] == "0.0"
+    assert state.states[OUTPUT_LIMIT]["state"] == "0.0"
+    # a hold is a power write, not a direction change
+    assert len([call for call in state.service_calls if call[2].get("entity_id") == AC_MODE]) == direction_writes
+
+
+def test_device_path_reports_commanded_until_the_inverter_echoes():
+    """A command the inverter has not reported back yet is pending, never a revoked command."""
+    state = make_state()
+    state.never_apply.add(INPUT_LIMIT)  # written, but the device never reports the property
+    driver = make_driver(state, control_path="device")
+    result = driver.apply(800.0, dry_run=False)
+    assert result.ok is True, result.message
+    assert result.code == Reason.COMMANDED
+    assert result.applied_w == pytest.approx(800.0)
+    assert result.readback_w == pytest.approx(0.0)
+    assert "has not confirmed" in result.message
+    # the write is still in force; only the echo is missing
+    assert [call[2].get("entity_id") for call in state.service_calls][2:4] == [INPUT_LIMIT, OUTPUT_LIMIT]
+
+
+def test_device_path_reads_the_direction_option_from_the_entity():
+    """The integration localises the select labels, so the option comes from the entity itself."""
+    state = make_state()
+    state.states[AC_MODE] = {
+        "state": "AC Output Mode",
+        "attributes": {"options": ["AC Input Mode", "AC Output Mode"]},
+    }
+    driver = make_driver(state, control_path="device")
+    result = driver.apply(600.0, dry_run=False)
+    assert result.ok is True, result.message
+    assert state.states[AC_MODE]["state"] == "AC Input Mode"
+
+
+def test_control_path_device_is_refused_without_the_limit_entities():
+    """SPEC 5: an unusable choice is refused at save time, not discovered at dispatch."""
+    complete = BatteryConfig(
+        id="example_zendure",
+        name="Example Zendure",
+        driver="zendure",
+        capacity_kwh=2.4,
+        mapping=dict(MAPPING),
+        control_path="device",
+    )
+    assert ZendureDriver.validate_control_path(complete) == []
+    missing = BatteryConfig(
+        id="example_zendure",
+        name="Example Zendure",
+        driver="zendure",
+        capacity_kwh=2.4,
+        mapping={"manual_power_entity": MANUAL, "operation_entity": OPERATION},
+        control_path="device",
+    )
+    problems = ZendureDriver.validate_control_path(missing)
+    assert any("charge_limit_entity" in problem for problem in problems)
+    assert any("discharge_limit_entity" in problem for problem in problems)
+
+    manager_path = BatteryConfig(
+        id="example_zendure",
+        name="Example Zendure",
+        driver="zendure",
+        capacity_kwh=2.4,
+        mapping={"charge_limit_entity": INPUT_LIMIT, "discharge_limit_entity": OUTPUT_LIMIT},
+        control_path="manager",
+    )
+    assert any("manual_power_entity" in problem for problem in ZendureDriver.validate_control_path(manager_path))
+
+
+def test_a_bogus_control_path_is_rejected_by_the_battery_config():
+    config = BatteryConfig(
+        id="example_zendure",
+        name="Example Zendure",
+        driver="zendure",
+        capacity_kwh=2.4,
+        mapping=dict(MAPPING),
+        control_path="inverter-ish",
+    )
+    assert any("control_path" in problem for problem in config.validate())

@@ -314,6 +314,12 @@ if they are absent:
 - `POST /api/v1/batteries/{id}/test`: the UI sends `{power_w, seconds, intent: "discharge"}` (a
   positive field means discharge) and renders `applied_w`, the exact `seconds`, `ok`, `code` and
   `message` from the response; the server clamps power to `max_discharge_w` and seconds to 1–60.
+- `GET /api/v1/batteries` / `PATCH /batteries/{id}`: `control_path` (`auto` | `manager` |
+  `device`) is the battery's chosen write path and `capabilities.control_path`
+  (`manager_manual_power` | `device_setpoint` | `device_limits` | `unresolved`) the one really in use —
+  the card shows both as `Dispatch`, and the dialog offers the three choices with a save-time refusal
+  when the chosen path lacks its entities. Dispatch codes include `commanded` (in force, not yet
+  confirmed by the device), which the Plan view states in words instead of reporting a failure.
 - `GET /api/v1/batteries`: `capabilities` as a flat object, and `state.extra.cycles` for the cycle
   count. For the efficiency/wear block: `round_trip_efficiency_pct` (the stored input), `eta_charge`
   and `eta_discharge` (the effective values, after the even split or the override), `price_eur`,

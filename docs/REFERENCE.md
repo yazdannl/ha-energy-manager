@@ -669,6 +669,7 @@ new value when the user types one.
 | `eta_discharge` | float | `0.95` | must be in (0, 1] |
 | `price_eur` | float | `0.0` | ≥ 0; 0 = unknown purchase price, no derived wear |
 | `cycle_life` | float | `0.0` | ≥ 0; 0 = unknown rated cycles, no derived wear |
+| `control_path` | str | `auto` | how the driver must write: `auto` (driver preference), `manager` (the Zendure manager's system-wide `manual_power`) or `device` (the inverter's own `ac_mode` + `input_limit`/`output_limit`). Validated at save time: `manager` needs `manual_power_entity` + `operation_entity`, `device` needs `charge_limit_entity` + `discharge_limit_entity`. Ignored by drivers without paths of their own |
 | `mapping` | dict | `{}` | must be non-empty: "confirm the entity mapping in the UI" |
 | `enabled` | bool | `true` | disabled batteries are excluded from aggregate, allocation and safety |
 
@@ -1227,12 +1228,21 @@ Writes go through the HA service API or state-setting where no service exists.
 - **Idempotent within a slot**: no write when the device already reports the target within tolerance
   (the SolarFlow is BLE/cloud with a finite write budget). Result code `idempotent_skip`.
 - **Never assume a write landed**: read back, tolerate the delay until the device reports its next
-  event, retry, and treat a persistent mismatch as `driver_error`.
-- **Zendure driver**: switch the manager into manual dispatch (`operation = manual`) before
-  commanding power, express charge/discharge with the device's own semantics, respect device limits,
-  re-assert manual mode while in control (its smart modes overwrite external writes), and write a
-  hold on shutdown/fatal error because the integration has no watchdog. It never writes `soc_set` or
-  `min_soc` every tick — SoC floors are expressed as optimised power.
+  event, retry, and treat a persistent mismatch as `driver_error`. "Persistent" means the *write*
+  itself never landed: a command that is in force but whose effect the device has not (yet) shown is
+  reported as `commanded` — not an error, because the fail-safe hold a driver error triggers would
+  revoke a command the device is about to apply. The plan execution line compares measured vs planned
+  separately, so "commanded but not following" stays visible.
+- **Zendure driver**: two write paths, chosen by `control_path` (`auto` = manager first). *Manager*:
+  switch the manager into manual dispatch (`operation = manual`) before commanding power, express
+  charge/discharge with the device's own semantics, re-assert manual mode while in control (its smart
+  modes overwrite external writes), and write a hold on shutdown/fatal error because the integration
+  has no watchdog — but note it applies a setpoint only on the manager's next P1 event, so a slow
+  house P1 feed bounds how fast any of this lands. *Device*: the `ac_mode` select (direction) plus
+  the `input_limit` / `output_limit` numbers (magnitudes) straight on the inverter, with the manager
+  put in `off` so it cannot overwrite them; this path needs no P1 event and is confirmed by the
+  device's own property echo. Either way it never writes `soc_set` or `min_soc` every tick — SoC
+  floors are expressed as optimised power.
 - **Generic driver**: `power_setpoint_entity` (signed W, + charge / − discharge) or the pair
   `charge_power_entity` + `discharge_power_entity`, plus optional mode select/manual value, SoC and
   capacity entities. A generic battery with no usable setpoint is rejected at **save** time, not at
@@ -1436,7 +1446,9 @@ supplies it (which is why publishing a port would hand battery control to anyone
 `spread_below_threshold`, `efficiency_loss`, `terminal_target`, `battery_full`, `battery_empty`,
 `no_forecast_slots`, `stale_input`; dispatch blocks `mode_not_auto`, `dry_run`, `override_active`,
 `stale_state`, `ha_disconnected`, `battery_unavailable`, `soc_floor`, `soc_ceiling`, `power_clamp`,
-`grid_import_limit`, `grid_export_limit`, `ramp_limit`, `driver_error`, `idempotent_skip`, `ok`;
+`grid_import_limit`, `grid_export_limit`, `ramp_limit`, `driver_error`, `idempotent_skip`,
+`commanded` (the command is in force, the device has not confirmed it yet — `applied_w` is the
+setpoint that is live, `readback_w` what the device reports), `ok`;
 empty-forecast slugs `not_configured`, `provider_failed`, `fixed_price_missing`, `no_pv_source`,
 `no_history`, `empty_horizon`, `unknown`.
 

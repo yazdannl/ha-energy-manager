@@ -603,16 +603,67 @@ def test_zendure_readback_retries_instead_of_failing_on_a_slow_p1_event():
     assert sleeps  # the driver waited instead of reporting a false failure
 
 
-def test_zendure_reports_a_driver_error_when_the_device_never_follows():
-    """Never a false success: a silent P1 sensor ends in a driver error, not in 'ok'."""
+def test_zendure_reports_a_pending_command_when_the_p1_feed_is_silent():
+    """A landed setpoint whose flow has not followed is *commanded*, never a driver error.
+
+    The manager applies manual power on its next P1 event, and a house P1 feed can be minutes
+    away.  Calling that a driver error made the failsafe hold revoke the command before the
+    manager read it (live 2026-10-12), so the command must survive and stay visible as pending.
+    """
     ha = offline_manager_ha()
     driver = registry.create(
         config(driver="zendure", mapping=manager_mapping()), ha, sleep=lambda _s: None
     )
     result = driver.apply(500.0, dry_run=False)
+    assert result.ok is True, result.message
+    assert result.code == Reason.COMMANDED
+    assert result.applied_w == 500.0  # the setpoint that is in force
+    assert result.readback_w == 0.0  # what the device still measures
+    assert "P1" in result.message
+    # the command was not revoked: the raw (negated) setpoint is still in the manager entity
+    assert ha.states["number.example_manager_manual_power"]["state"] == "-500.0"
+
+
+def test_zendure_reports_a_driver_error_when_the_setpoint_does_not_land():
+    """Never a false success: a write that does not land keeps the failsafe hold reachable."""
+    ha = offline_manager_ha()
+    driver = registry.create(
+        config(driver="zendure", mapping=manager_mapping()), ha, sleep=lambda _s: None
+    )
+    original = ha.call_service
+
+    def swallow_numbers(domain, service, data):
+        if domain in ("number", "input_number"):
+            ha.calls.append((domain, service, dict(data)))  # recorded, but never applied
+            return None
+        return original(domain, service, data)
+
+    ha.call_service = swallow_numbers
+    result = driver.apply(500.0, dry_run=False)
     assert result.ok is False
     assert result.code == Reason.DRIVER_ERROR
-    assert "read-back" in result.message
+    assert "did not land" in result.message
+
+
+def test_dispatcher_keeps_a_commanded_charge_alive():
+    """The failsafe holds on a real driver error -- and must not touch a *commanded* battery.
+
+    Regression for the live 2026-10-12 charge that never started: every tick wrote -1000 W, saw
+    the (P1-driven) measured flow still at 0 W, called it a driver error and wrote 0 W back.
+    """
+    cfg = config(driver="zendure", mapping=manager_mapping())
+    ha = offline_manager_ha()
+    driver = registry.create(cfg, ha, sleep=lambda _s: None)
+    journal = FakeJournal()
+    dispatcher = Dispatcher(SETTINGS, journal, {cfg.id: driver})
+    outcome = dispatcher.tick(NOW, state=system_state(), plan=make_plan(), batteries=[cfg])
+    assert outcome.results and outcome.results[0].ok is True
+    assert outcome.results[0].code == Reason.COMMANDED
+    assert [entry["code"] for entry in journal.dispatches] == [Reason.COMMANDED]
+    writes = [call for call in ha.calls if call[2].get("entity_id") == "number.example_manager_manual_power"]
+    assert writes, ha.calls
+    assert all(call[2]["value"] != 0 for call in writes), "a pending command must not be zeroed"
+    assert not any(code == "driver_error" for _, code, _, _ in journal.events)
 
 
 def test_zendure_reasserts_manual_operation_when_a_smart_mode_takes_over():

@@ -222,6 +222,10 @@
     ramp_limit: "Blocked: ramp limit",
     driver_error: "Driver error",
     idempotent_skip: "Skipped: already at target",
+    // The command is in force but the device (or the Zendure manager, which only applies a
+    // setpoint on its next P1 event) has not confirmed it yet.  Not an error, and not a claim
+    // that the flow was measured: the plan execution line reports measured vs planned.
+    commanded: "Commanded: the device has not confirmed it yet",
     ok: "OK"
   };
 
@@ -889,6 +893,22 @@
 
   function batteryName(battery) {
     return (battery.extra && battery.extra.name) || battery.id || "battery";
+  }
+
+  // Which write path a Zendure battery really dispatches through (driver capabilities) and how it
+  // was chosen (config.control_path), so a switch to the inverter path is visible on the card.
+  var DISPATCH_PATHS = {
+    manager_manual_power: "Zendure manager: manual power",
+    device_limits: "Inverter: AC mode + limits",
+    device_setpoint: "Device setpoint",
+    unresolved: "unmapped"
+  };
+
+  function dispatchPathText(config, capabilities) {
+    var path = capabilities && capabilities.control_path ? String(capabilities.control_path) : "";
+    var label = DISPATCH_PATHS[path] || (path || "unknown");
+    var chosen = String(config && config.control_path || "auto");
+    return label + (["manager", "device"].indexOf(chosen) >= 0 ? " (chosen)" : " (auto)");
   }
 
   // Measured behaviour, stated separately from the plan, so a proposal can never be read as what
@@ -1601,6 +1621,7 @@
       if (dispatch.code === "mode_not_auto") parts.push("not written: the mode is not auto (mode_not_auto)");
       else if (dispatch.dry_run) parts.push("dry run: simulated " + applied + " of " + requested);
       else if (!dispatch.ok) parts.push("dispatch failed (" + reasonText(dispatch.code) + ")");
+      else if (dispatch.code === "commanded") parts.push("commanded " + applied + " of " + requested + " requested; the device has not confirmed it yet");
       else if (dispatch.clamped) parts.push("applied " + applied + " of " + requested + " requested (clamped: " + reasonText(dispatch.code) + ")");
       else parts.push("applied " + applied + " of " + requested + " requested");
       if (who && dispatch.code !== "mode_not_auto") parts.push(who);
@@ -2852,6 +2873,7 @@
         el("li", null, [el("span", { class: "stat-label", text: "Round trip" }), el("span", { class: "stat-value", text: eff ? fmtPct(eff.round_trip_pct) : "--" })]),
         el("li", null, [el("span", { class: "stat-label", text: "Cycles" }), el("span", { class: "stat-value", text: cycles == null ? "not reported" : cycles.toFixed(1) + " cycles" })]),
         el("li", null, [el("span", { class: "stat-label", text: "Limits" }), el("span", { class: "stat-value", text: fmtPower(config.max_charge_w) + " charge / " + fmtPower(config.max_discharge_w) + " discharge" })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Dispatch" }), el("span", { class: "stat-value", text: dispatchPathText(config, capabilities) })]),
         el("li", null, [el("span", { class: "stat-label", text: "SoC window" }), el("span", { class: "stat-value", text: fmtPct(config.min_soc_pct, 0) + " to " + fmtPct(config.max_soc_pct, 0) })]),
         el("li", null, [el("span", { class: "stat-label", text: "Wear" }), el("span", { class: "stat-value", text: fmtEur(wear) + "/kWh delivered" + (wearOverride > 0 ? " (override)" : "") })])
       ]),
@@ -2926,7 +2948,10 @@
       round_trip_efficiency_pct: sourceEfficiency ? Math.round(sourceEfficiency.round_trip_pct * 10) / 10 : 90.0,
       price_eur: isNum(source.price_eur) ? source.price_eur : 0.0,
       cycle_life: isNum(source.cycle_life) ? source.cycle_life : 0.0,
-      enabled: source.enabled !== false
+      enabled: source.enabled !== false,
+      // Which write path the driver must use.  "auto" keeps the shipped behaviour (the Zendure
+      // manager when its entities are mapped), so an older saved battery is unaffected.
+      control_path: ["auto", "manager", "device"].indexOf(String(source.control_path)) >= 0 ? String(source.control_path) : "auto"
     };
     var mapping = {};
     Object.keys(source.mapping || {}).forEach(function (key) { mapping[key] = String(source.mapping[key]); });
@@ -2955,10 +2980,25 @@
     });
     inputs.driver = driverSelect;
 
+    var controlPathSelect = el("select", { id: "battery-control-path", "aria-label": "Control path" });
+    [
+      ["auto", "Automatic (Zendure manager when its entities are mapped)"],
+      ["manager", "Zendure manager: manual power (needs a fast P1 meter)"],
+      ["device", "Inverter itself: AC mode + input/output limits"]
+    ].forEach(function (option) {
+      controlPathSelect.appendChild(el("option", { value: option[0], text: option[1] }));
+    });
+    controlPathSelect.value = fields.control_path;
+    // The manager only applies its setpoint on the next P1 event and re-writes the inverter's own
+    // limits on every one of those events, so the device path takes the manager out of the loop.
+    var controlPathNote = el("p", { class: "field-help", text: "Manager: one system-wide setpoint, applied on the manager's next meter (P1) update — needs a fast grid feed. Inverter: the device's own AC direction and input/output limits, applied immediately, with the Zendure manager kept switched off. Both are bounded by this battery's SoC window and power limits." });
+
     var identity = el("div", { class: "fields" }, [
       textRow("id", "Battery id (slug)", fields.id, editing),
       textRow("name", "Name", fields.name),
       el("label", { class: "field", for: "battery-driver" }, [el("span", { text: "Driver" }), driverSelect]),
+      el("label", { class: "field", for: "battery-control-path" }, [el("span", { text: "Control path" }), controlPathSelect]),
+      controlPathNote,
       fieldRow("capacity_kwh", "Capacity (kWh, usable AC side)", fields.capacity_kwh, "0.1", "0.1"),
       fieldRow("min_soc_pct", "Minimum SoC (%)", fields.min_soc_pct, "1", "0", "100"),
       fieldRow("max_soc_pct", "Maximum SoC (%)", fields.max_soc_pct, "1", "0", "100"),
@@ -3269,6 +3309,8 @@
         mapping: {},
         enabled: !!inputs.enabled.checked
       };
+      // Only the Zendure driver has two write paths to choose between.
+      if (driverSelect.value === "zendure") out.control_path = controlPathSelect.value;
       var efficiency = batteryEfficiencyPayload(inputs.round_trip_efficiency_pct.value, inputs.eta_charge.value, inputs.eta_discharge.value);
       out.__efficiency = efficiency;
       if (efficiency.payload) {
@@ -3293,6 +3335,13 @@
       if (!Object.keys(config.mapping).length) problems.push("Map at least one entity (or the manual mode value) before saving.");
       if (config.driver === "generic" && !config.mapping.power_setpoint_entity && !(config.mapping.charge_power_entity && config.mapping.discharge_power_entity)) {
         problems.push("A generic battery needs either a signed setpoint entity or a charge + discharge entity pair; a setpoint-less battery is rejected at save time.");
+      }
+      // The server refuses these too; catching them here explains the choice instead of echoing it.
+      if (config.driver === "zendure" && config.control_path === "device" && !(config.mapping.charge_limit_entity && config.mapping.discharge_limit_entity)) {
+        problems.push("Control path 'inverter itself' needs both the charge limit (input_limit) and the discharge limit (output_limit) entity mapped.");
+      }
+      if (config.driver === "zendure" && config.control_path === "manager" && !(config.mapping.manual_power_entity && config.mapping.operation_entity)) {
+        problems.push("Control path 'Zendure manager' needs both the manager manual_power entity and its operation select.");
       }
       return problems;
     }
@@ -4746,6 +4795,7 @@
     batteryEfficiency: batteryEfficiency,
     batteryEfficiencyPayload: batteryEfficiencyPayload,
     batteryWear: batteryWear,
+    dispatchPathText: dispatchPathText,
     derivedWearEur: derivedWearEur,
     roundTripPct: roundTripPct,
     storedKwhCostEur: storedKwhCostEur,

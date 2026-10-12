@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.10.1
+
+- **A battery can now be told which write path to use, and a Zendure inverter can be driven
+directly.** `BatteryConfig.control_path` (`auto` | `manager` | `device`, default `auto`) is picked in
+the battery dialog and validated at save time: `manager` needs the Zendure manager's `manual_power`
+and `operation` entities, `device` needs that inverter's own `charge_limit_entity`
+(`input_limit`) and `discharge_limit_entity` (`output_limit`). The **device** path writes the
+direction select (`ac_mode` → *input* while charging, *output* while discharging) plus both limits,
+and puts the manager into `off` so its next P1 event cannot overwrite them. That matters because the
+manager applies a setpoint **only** when its P1 meter changes: on a house whose grid feed reaches
+Home Assistant once every five minutes, a 1 kW charge planned for hours was applied as a five-second
+blip about once every twenty minutes (the inverter path needs no P1 event at all). The battery card
+now states which path is really in use (`Dispatch`), and the dialog explains the trade-off.
+- **A command the device has not confirmed yet is no longer revoked.** The driver used to require the
+*measured* AC flow to match within the read-back window and otherwise report `driver_error`, which
+with `control.failsafe_on_error` wrote 0 W back — cancelling the very command the device was about to
+apply (live 2026-10-12: −1000 W written every 30 s and zeroed 4.6 s later, forever). Such a command is
+now reported as the new dispatch code `commanded`: `applied_w` is the setpoint that is in force,
+`readback_w` what the device reports, and the message names both. `driver_error` (and the fail-safe
+hold) is kept for a write that really did not land, or a manager that cannot be held in `manual`. The
+**Plan** view states it in words ("commanded 1.00 kW of 1.00 kW requested; the device has not
+confirmed it yet") and the measured-vs-planned line remains the honest check.
+- The device path confirms itself honestly: `input_limit`/`output_limit` are device properties, so a
+matching read-back **is** device evidence (the inverter echoes them within a few seconds over zenSDK
+or MQTT), and the AC flow is the second proof.
+
 ## 0.10.0
 
 - **Every planned window now states the data behind it, not just its action.** The **Next actions**

@@ -6,10 +6,18 @@ Verified facts this driver is built on (docs/EXTERNAL_APIS.md section 6):
   ``number.<manager>_manual_power`` carries the setpoint **system-wide**.  ``manual_power`` uses the
   opposite sign convention to ``models.py``: negative = charge, positive = discharge.  Every write
   and every read-back is therefore negated here.
+* ``control_path = "device"`` bypasses the manager instead (same driver, per-device entities):
+  the ``ac_mode`` select picks the direction, the ``input_limit``/``output_limit`` numbers carry
+  the magnitudes, and the manager is put in ``off`` so it cannot overwrite them on its next P1 event.
+  That path does not wait for a P1 event at all -- it is what makes control possible on a house
+  whose only grid feed reaches Home Assistant every few minutes.
 * Nothing is dispatched by the write itself: the manager applies the setpoint when it processes the
   next P1 event (>=2.2 s later), so read-back verification runs inside a bounded retry window
-  (``BaseDriver._verify_writes``) and a mismatch after that window is a driver error, never a
-  silent success.
+  (``BaseDriver._verify_writes``).  A setpoint that landed but whose flow has not followed inside
+  that window is reported as ``Reason.COMMANDED`` (the command is in force, the device has not
+  reached it yet), never as a driver error: a driver error triggers the failsafe hold, which would
+  cancel the very command the manager is about to apply.  Only a write that did not land at all, or
+  a manager that cannot be held in ``manual``, is a driver error.
 * The integration's smart modes overwrite external writes, so ``operation`` is asserted to be
   ``manual`` before every power write and re-asserted (and re-verified) when it has drifted.
 * ``electric_level`` is the authoritative SoC (``soc_status`` is calibration bookkeeping and is
@@ -25,9 +33,12 @@ Verified facts this driver is built on (docs/EXTERNAL_APIS.md section 6):
 
 from __future__ import annotations
 
+import logging
 import time
+from dataclasses import replace
 from typing import Any, Iterable
 
+from ...models import DispatchResult, Reason
 from .base import (
     WRITABLE_NUMBER_DOMAINS,
     WRITABLE_SELECT_DOMAINS,
@@ -40,6 +51,8 @@ from .base import (
 )
 
 ZENDURE_PLATFORM = "zendure_ha"
+
+log = logging.getLogger(__name__)
 
 #: integration translation key -> driver mapping key.  Registry rows are matched on
 #: ``platform == zendure_ha`` plus this translation key (never on a unique-id prefix).
@@ -65,6 +78,14 @@ MAPPING_ROLES = tuple(TRANSLATION_TO_MAPPING.values())
 
 #: value the manager's ``operation`` select must have before we command power.
 DEFAULT_OPERATION_VALUE = "manual"
+
+#: value the manager's ``operation`` select gets on the device path, so it stops overwriting the
+#: inverter's own AC limits on every P1 event (its ``off`` mode also runs one ``power_off()``).
+DEFAULT_OPERATION_OFF_VALUE = "off"
+
+#: direction select options on the device path (``ac_mode``).  The integration localises the
+#: option labels ("input" vs "AC Input Mode"), so the entity's own options win when it has them.
+DEFAULT_AC_MODE_VALUES: dict[str, str] = {"input": "input", "output": "output"}
 
 #: Manager power entities are the *opposite* sign of models.py (negative = charge).
 MANAGER_SIGN = -1.0
@@ -173,6 +194,28 @@ class ZendureDriver(BaseDriver):
                 problems.append(f"mapping: {key} is not an entity id")
         return problems
 
+    @classmethod
+    def validate_control_path(cls, config: BatteryConfig) -> list[str]:
+        """Problems with the *chosen* write path (SPEC 5: refused at save time, never at dispatch).
+
+        ``control_path`` is a preference, not a fallback: a battery that asks for the device path
+        must have the device's own AC limit entities, and one that asks for the manager must have
+        the manager pair -- silently dispatching through the other path would be a surprise.
+        """
+        path = str(getattr(config, "control_path", "auto") or "auto").strip().lower()
+        mapping = {key: value for key, value in (config.mapping or {}).items() if value}
+        problems: list[str] = []
+        if path == "manager":
+            if not mapping.get("manual_power_entity"):
+                problems.append("mapping: control_path 'manager' needs manual_power_entity")
+            if not mapping.get("operation_entity"):
+                problems.append("mapping: control_path 'manager' needs operation_entity")
+        elif path == "device":
+            for key in ("charge_limit_entity", "discharge_limit_entity"):
+                if not mapping.get(key):
+                    problems.append(f"mapping: control_path 'device' needs {key}")
+        return problems
+
     def effective_mapping(self) -> dict[str, str]:
         """The mapping in use.  The engine merges registry-resolved roles in before construction."""
         return {key: value for key, value in self.config.mapping.items() if value}
@@ -198,14 +241,45 @@ class ZendureDriver(BaseDriver):
     # -- mapping helpers ---------------------------------------------------------------
 
     def _control_path(self) -> str:
-        mapping = self.effective_mapping()
-        if mapping.get("manual_power_entity") and self._operation_entity():
+        """The write path in use (SPEC 9.2).
+
+        ``config.control_path`` picks it explicitly: ``manager`` is the Zendure manager's
+        system-wide ``manual_power`` (applied on its next P1 event, and the only path that can
+        split power across a fuse group), ``device`` is the inverter's own direction select plus
+        ``input_limit``/``output_limit`` (applied by the device itself, no P1 event involved).
+        ``auto`` keeps the manager first for compatibility, then a device setpoint, then the
+        limits.
+        """
+        preference = str(getattr(self.config, "control_path", "auto") or "auto").strip().lower()
+        if preference == "device":
+            return "device_limits" if self._device_limits_mapped() else "unresolved"
+        if preference == "manager":
+            return "manager_manual_power" if self._manager_mapped() else "unresolved"
+        if self._manager_mapped():
             return "manager_manual_power"
-        if mapping.get("power_setpoint_entity"):
+        if self.effective_mapping().get("power_setpoint_entity"):
             return "device_setpoint"
-        if mapping.get("charge_limit_entity") and mapping.get("discharge_limit_entity"):
+        if self._device_limits_mapped():
             return "device_limits"
         return "unresolved"
+
+    def _manager_mapped(self) -> bool:
+        return bool(self.effective_mapping().get("manual_power_entity")) and self._operation_entity() is not None
+
+    def _device_limits_mapped(self) -> bool:
+        mapping = self.effective_mapping()
+        return bool(mapping.get("charge_limit_entity") and mapping.get("discharge_limit_entity"))
+
+    def _unresolved_message(self) -> str:
+        preference = str(getattr(self.config, "control_path", "auto") or "auto").strip().lower()
+        if preference == "device":
+            return (
+                "control_path 'device' needs charge_limit_entity (input_limit) and "
+                "discharge_limit_entity (output_limit)"
+            )
+        if preference == "manager":
+            return "control_path 'manager' needs manual_power_entity and operation_entity"
+        return "zendure mapping has no usable power entity"
 
     def _operation_entity(self) -> str | None:
         entity = self.effective_mapping().get("operation_entity")
@@ -359,7 +433,7 @@ class ZendureDriver(BaseDriver):
         mapping = self.effective_mapping()
         write_path = self._control_path()
         if write_path == "unresolved":
-            raise DriverError("zendure mapping has no usable power entity")
+            raise DriverError(self._unresolved_message())
         writes: list[_Write] = []
         if write_path == "manager_manual_power":
             # (a) assert manual dispatch when it is not already there, (b) then the
@@ -373,10 +447,75 @@ class ZendureDriver(BaseDriver):
         if write_path == "device_setpoint":
             writes.append(self.make_write(mapping["power_setpoint_entity"], target_w))
             return writes
-        # Fallback for a SolarFlow without the manager: magnitudes on the device limits.
+        # Device path (SPEC 9.2, appendix A): magnitudes on the inverter's own AC limits -- input
+        # for charging, output for discharging -- with the direction as a separate select.  The
+        # device applies these itself (local zenSDK/MQTT), so this path does not wait for the
+        # manager's next P1 event.  The manager is put into ``off`` whenever its select is mapped:
+        # while it is not off it re-writes the same two properties on every P1 event.
+        quiet = self._manager_quiet_write()
+        if quiet is not None:
+            writes.append(quiet)
+        mode = self._ac_mode_write(target_w)
+        if mode is not None:
+            writes.append(mode)
         writes.append(self.make_write(mapping["charge_limit_entity"], max(0.0, target_w)))
         writes.append(self.make_write(mapping["discharge_limit_entity"], max(0.0, -target_w)))
         return writes
+
+    def _manager_quiet_write(self) -> _Write | None:
+        """Put the Zendure manager into ``off`` on the device path (None when it already is).
+
+        The manager re-issues ``inputLimit``/``outputLimit`` (in manual mode) or its smart-mode
+        setpoints on every P1 event, so a device-path battery has to keep it off -- and ``off``
+        makes the manager run one ``power_off()``, which the next tick's limits write replaces.
+        """
+        entity = self._operation_entity()
+        if entity is None:
+            return None
+        off = self._operation_off_value()
+        if self._select_reads(entity, off):
+            return None
+        return self.make_write(entity, off)
+
+    def _ac_mode_write(self, target_w: float) -> _Write | None:
+        """Direction select for the device path: input while charging, output while discharging.
+
+        A hold (``target ~ 0``) only zeroes the limits: flipping the direction there would add a
+        pointless write (and the device is idle anyway).  The option string is taken from the
+        entity's own ``options`` because the integration localises the labels.
+        """
+        mapping = self.effective_mapping()
+        entity = mapping.get("ac_mode_entity")
+        if not is_entity_id(entity) or abs(target_w) <= self.tolerance_w:
+            return None
+        wanted = "input" if target_w > 0 else "output"
+        option = self._ac_mode_option(str(entity), wanted)
+        if option is None:
+            return None
+        if self._select_reads(str(entity), option):
+            return None
+        return self.make_write(str(entity), option)
+
+    def _ac_mode_option(self, entity_id: str, wanted: str) -> str | None:
+        mapping = self.effective_mapping()
+        override = mapping.get(f"ac_mode_{wanted}_value")
+        if override:
+            return str(override)
+        state = self._state(entity_id)
+        options = (state or {}).get("attributes") or {}
+        for option in options.get("options") or []:
+            if wanted in str(option).strip().lower():
+                return str(option)
+        return DEFAULT_AC_MODE_VALUES.get(wanted)
+
+    def _operation_off_value(self) -> str:
+        value = self.effective_mapping().get("operation_off_value")
+        return str(value) if value else DEFAULT_OPERATION_OFF_VALUE
+
+    def _select_reads(self, entity_id: str, value: str) -> bool:
+        state = self._state(entity_id)
+        current = str((state or {}).get("state") or "").strip().lower()
+        return current == value.strip().lower()
 
     def _manual_write(self) -> _Write:
         """The select write that puts the manager into manual dispatch."""
@@ -388,8 +527,7 @@ class ZendureDriver(BaseDriver):
         entity = self._operation_entity()
         if entity is None:
             return True
-        state = self._state(entity)
-        return str((state or {}).get("state") or "").strip().lower() == self._operation_value().lower()
+        return self._select_reads(entity, self._operation_value())
 
     def _verify_writes(self, target_w: float) -> tuple[float | None, str | None]:
         """Verify the *commanded setpoint* and that manual dispatch survived.
@@ -397,8 +535,11 @@ class ZendureDriver(BaseDriver):
         The measured pair lags by one P1 event, so it can neither confirm nor refute a fresh
         write: it is only consulted as a secondary signal for non-zero targets (audit finding 1).
         """
-        if self._control_path() == "manager_manual_power":
+        path = self._control_path()
+        if path == "manager_manual_power":
             return self._verify_manager_write(target_w)
+        if path == "device_limits":
+            return self._verify_device_limits(target_w)
         readback, problem = super()._verify_writes(target_w)
         if problem is not None:
             return readback, problem
@@ -419,6 +560,42 @@ class ZendureDriver(BaseDriver):
             "refusing to report success"
         )
 
+    def _verify_device_limits(self, target_w: float) -> tuple[float | None, str | None]:
+        """Verify the device path against the inverter's own reported limits, then the flow.
+
+        Unlike the manager's ``manual_power`` (a request the manager applies on its next P1
+        event), ``input_limit``/``output_limit`` are device properties: the integration writes
+        them over the local zenSDK/MQTT link and the device reports them back, so a matching
+        read-back is real evidence, not an echo of our own write.  Both proofs are retried inside
+        the bounded window; a command that has not been echoed *yet* is pending
+        (``Reason.COMMANDED``) instead of a driver error, because the failsafe hold a driver error
+        triggers would cancel a command the device is about to apply.
+        """
+        limits, limit_problem = self._verify_against(
+            target_w, self._read_limit_setpoint, "limit read-back"
+        )
+        if limit_problem is None:
+            return limits, None
+        flow, flow_problem = self._verify_against(target_w, self._read_power, "measured read-back")
+        if flow_problem is None:
+            return flow, None
+        echo = self._read_limit_setpoint()
+        self._flow_pending = (
+            target_w,
+            echo if echo is not None else flow,
+            "the inverter reports its own AC limits within a few seconds",
+        )
+        return target_w, None
+
+    def _read_limit_setpoint(self) -> float | None:
+        """The inverter's AC limits as one signed setpoint (positive = charge, models.py sign)."""
+        mapping = self.effective_mapping()
+        charge = self._number(mapping.get("charge_limit_entity"))
+        discharge = self._number(mapping.get("discharge_limit_entity"))
+        if charge is None and discharge is None:
+            return None
+        return abs(charge or 0.0) - abs(discharge or 0.0)
+
     def _verify_manager_write(self, target_w: float) -> tuple[float | None, str | None]:
         """Verify the command without ever reporting a false success or a false failure.
 
@@ -427,6 +604,13 @@ class ZendureDriver(BaseDriver):
           a silent no-op (audit finding 1).  The measured pair is only a fallback.
         * A **non-zero** command is proven by the *flow*: the setpoint entity matching only shows
           that the write landed in Home Assistant, never that the device followed it.
+        * A non-zero command the device has **not reached yet** is not a failure: when the setpoint
+          itself reads back, the result is marked pending (``_flow_pending`` -> the caller reports
+          ``Reason.COMMANDED``) instead of ``DRIVER_ERROR``.  The manager applies manual power on
+          its next P1 event, and a house P1 feed can be minutes away (live 2026-10-12: a 5-minute
+          meter made every 1 kW charge a 4.6 s blip -- the failsafe hold revoked each command
+          before the manager read it).  The plan execution view is what turns "commanded" into
+          "the device did not follow", without ever fighting the device.
         Manual dispatch must survive either way (a smart mode can grab the manager back).
         """
         if abs(target_w) <= self.tolerance_w:
@@ -439,9 +623,62 @@ class ZendureDriver(BaseDriver):
                 )
         else:
             readback, problem = super()._verify_writes(target_w)
+            if problem is not None:
+                commanded = self._read_commanded()
+                if commanded is None or abs(commanded - target_w) > self.tolerance_w:
+                    # The write never landed: a real driver error, and the failsafe hold is right.
+                    shown = "no reading" if commanded is None else f"{commanded:.0f} W"
+                    return readback, (
+                        f"{problem}; the setpoint read-back is {shown}, so the write did not land"
+                    )
+                self._flow_pending = (
+                    target_w,
+                    readback,
+                    "the manager applies manual power on its next P1 event",
+                )
+                readback, problem = commanded, None
         if problem is not None:
             return readback, problem
         return self._verify_operation(readback)
+
+    def _read_commanded(self) -> float | None:
+        """``_commanded_power`` without raising: verification must not turn a read error into a
+        crash (the pending/error decision falls back to the measured mismatch)."""
+        try:
+            return self._commanded_power()
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("driver %s: setpoint read-back failed: %s", self.id(), exc)
+            return None
+
+    def _apply(
+        self, power_w: float, *, dry_run: bool, allow_idempotent_skip: bool = True
+    ) -> DispatchResult:
+        """Report a command the device has not confirmed yet as ``Reason.COMMANDED``.
+
+        ``applied_w`` stays the setpoint that is in force (that is what "applied" means for an
+        asynchronous surface), while ``readback_w`` carries what the device is measuring/echoing,
+        and the message says which of the two the user is looking at.
+        """
+        self._flow_pending = None
+        result = super()._apply(
+            power_w, dry_run=dry_run, allow_idempotent_skip=allow_idempotent_skip
+        )
+        pending = self._flow_pending
+        if pending is None or not result.ok or result.dry_run:
+            return result
+        target_w, measured, hint = pending
+        direction = "charge" if target_w > 0 else ("discharge" if target_w < 0 else "hold")
+        measured_text = f"{measured:.0f} W" if measured is not None else "no reading"
+        raw = f" (raw manual_power {MANAGER_SIGN * target_w:.0f} W)" if self._control_path() == "manager_manual_power" else ""
+        return replace(
+            result,
+            code=Reason.COMMANDED,
+            message=(
+                f"commanded {direction}{raw} {abs(target_w):.0f} W; the device has not confirmed "
+                f"it yet (it still reports {measured_text}) -- {hint}"
+            ),
+            readback_w=measured,
+        )
 
     def _verify_operation(self, readback: float | None) -> tuple[float | None, str | None]:
         """Manual dispatch must survive the write (a smart mode can grab the manager)."""

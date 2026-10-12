@@ -83,6 +83,9 @@ def validate_config(config: BatteryConfig) -> list[str]:
         problems.append(f"unknown driver: {config.driver!r} (have {', '.join(names())})")
     else:
         problems.extend(cls.validate_mapping(config.mapping))
+        path_validator = getattr(cls, "validate_control_path", None)
+        if callable(path_validator):
+            problems.extend(path_validator(config))
     return problems
 
 

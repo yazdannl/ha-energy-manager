@@ -224,6 +224,21 @@ function classTokens(text) {
   const staleWindow = syntheticWindows[1];
   check("a stale window says the dispatcher refuses it (stale_input)",
     /not dispatchable/.test(A.windowStatusText(staleWindow, ctx)) && /stale_input/.test(A.windowStatusText(staleWindow, ctx)));
+  // A command the device has not confirmed yet is stated as commanded, never as measured or as a
+  // failure: the Zendure manager applies manual power on its next P1 event, which can be minutes.
+  const commandedWindow = Object.assign({}, discharge, {
+    dispatch: Object.assign({}, discharge.dispatch, { code: "commanded", clamped: false })
+  });
+  check("a commanded dispatch says the device has not confirmed it yet",
+    /commanded 400 W of 800 W requested/.test(A.windowStatusText(commandedWindow, ctx))
+    && /not confirmed/.test(A.windowStatusText(commandedWindow, ctx))
+    && !/failed/.test(A.windowStatusText(commandedWindow, ctx)),
+    A.windowStatusText(commandedWindow, ctx));
+  check("the battery card names the write path that is really in use",
+    A.dispatchPathText({ control_path: "device" }, { control_path: "device_limits" }) === "Inverter: AC mode + limits (chosen)"
+    && A.dispatchPathText({ control_path: "auto" }, { control_path: "manager_manual_power" }) === "Zendure manager: manual power (auto)"
+    && A.dispatchPathText({}, {}) === "unknown (auto)",
+    A.dispatchPathText({ control_path: "device" }, { control_path: "device_limits" }));
   check("a stale window's price is not presented as a fresh one",
     /no fresh price/.test(A.windowPriceText(staleWindow, ctx)));
   check("a fresh window names its price source and rank",

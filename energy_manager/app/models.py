@@ -126,10 +126,19 @@ class Reason:
     RAMP_LIMIT = "ramp_limit"
     DRIVER_ERROR = "driver_error"
     IDEMPOTENT_SKIP = "idempotent_skip"
+    #: The command is in force in Home Assistant, but the device has not followed it yet: an
+    #: asynchronous control surface (the Zendure manager applies manual power on its next P1
+    #: event) must not be mistaken for a broken one.  Not an error, and never a claim that the
+    #: measured flow confirms it -- the plan execution view reports measured vs planned.
+    COMMANDED = "commanded"
     OK = "ok"
 
 
 PRICE_UNITS = ("auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh")
+
+#: Write paths a battery may be pinned to (``BatteryConfig.control_path``); ``auto`` lets the
+#: driver pick, which keeps the shipped behaviour for every existing configuration.
+CONTROL_PATHS = ("auto", "manager", "device")
 
 
 # --------------------------------------------------------------------------------------
@@ -172,6 +181,12 @@ class BatteryConfig:
     #: are optional: 0 means "not known", never a guess, and the derived wear is then 0.
     price_eur: float = 0.0
     cycle_life: float = 0.0
+    #: Which write path the driver must use: ``auto`` (driver preference: Zendure manager first),
+    #: ``manager`` (the Zendure manager's system-wide ``manual_power``) or ``device`` (the
+    #: inverter's own direction select plus ``input_limit``/``output_limit``).  The device path
+    #: talks to the inverter directly, so it does not wait for the manager's next P1 event; the
+    #: manager path is the only one that can split power across a fuse group.
+    control_path: str = "auto"
 
     def usable_kwh(self) -> float:
         """Energy between the configured SoC floor and ceiling."""
@@ -243,6 +258,8 @@ class BatteryConfig:
                 problems.append(f"{name} must be >= 0")
         if not self.mapping:
             problems.append("mapping is empty: confirm the entity mapping in the UI")
+        if self.control_path not in CONTROL_PATHS:
+            problems.append(f"control_path must be one of {', '.join(CONTROL_PATHS)}")
         return problems
 
 

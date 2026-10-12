@@ -394,6 +394,7 @@
         round_trip_efficiency_pct: MOCK_ROUND_TRIP_PCT,
         price_eur: MOCK_PRICE_EUR,
         cycle_life: MOCK_CYCLE_LIFE,
+        control_path: "auto",
         mapping: {
           power_setpoint_entity: "number.example_battery_input_limit",
           mode_select_entity: "select.example_battery_mode",
