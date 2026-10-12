@@ -209,6 +209,67 @@ function classTokens(text) {
     && (byClass(view(), "answer-authority")[0] || {}).textContent === authorityBefore,
     "the authority line changed or vanished");
 
+  /* ---------- 1b2. the manual override panel (0.20.0, SPEC 5/9.3/10) ---------- */
+  // The panel is asserted in both documented states: nothing set, then an active override with a
+  // per-battery limit — the mock serves /status manual_limits plus cap_charge_w/cap_discharge_w.
+  console.log("\n1b2. manual override panel (force + per-direction limits)");
+  const manualPanel = () => [...view().querySelectorAll(".panel")].find((p) => {
+    const h2 = p.querySelector("h2");
+    return h2 && h2.textContent === "Manual override";
+  }) || null;
+
+  await goto("/dashboard");
+  let panel = manualPanel();
+  check("the dashboard has one Manual override panel", !!panel
+    && byClass(view(), "panel").filter((p) => (p.querySelector("h2") || {}).textContent === "Manual override").length === 1);
+  let panelText = panel ? panel.textContent : "";
+  check("the panel says no override is active and the plan is in control",
+    /No manual override is active/.test(panelText), panelText.slice(0, 140));
+  check("the panel renders the force controls (battery, direction, power, duration)",
+    !!panel && !!panel.querySelector("#override-battery") && !!panel.querySelector("#override-direction")
+    && !!panel.querySelector("#override-power") && !!panel.querySelector("#override-minutes")
+    && /Charge/.test(panelText) && /Discharge/.test(panelText) && /Hold/.test(panelText)
+    && /30 min/.test(panelText));
+  check("the panel states the force is bounded by the protections and the limits",
+    /A manual override bypasses the plan until it expires or you clear it; it is still bounded by the cell-voltage protection, the SOC floor and the limits above\./.test(panelText),
+    panelText.slice(0, 200));
+  check("the panel states the limits cap both the plan and manual overrides",
+    /Limits cap both the automatic plan and manual overrides\. They can never raise a battery's configured maximum\./.test(panelText),
+    panelText.slice(0, 200));
+  check("the panel renders a limits row per battery plus an All batteries row",
+    /All batteries/.test(panelText) && /Example Battery 1/.test(panelText) && /unlimited/.test(panelText)
+    && /Max charge \(W\)/.test(panelText) && /Max discharge \(W\)/.test(panelText)
+    && !/undefined|NaN/.test(panelText));
+  check("the limits inputs carry the configured hardware maximum as their range",
+    !!panel && [...panel.querySelectorAll("input[type=number]")].some((input) => input.max === "800"),
+    panel ? [...panel.querySelectorAll("input[type=number]")].map((i) => i.id + "=" + i.max).join(", ") : "no panel");
+
+  // State 2: an active override plus a per-battery limit, with dry run on and mode auto.
+  M.routes["POST /api/v1/mode"]({ body: { mode: "auto", dry_run: true }, params: {} });
+  M.routes["POST /api/v1/override"]({ body: { power_w: 600, minutes: 30, battery_id: null }, params: {} });
+  M.routes["POST /api/v1/limits"]({ body: { battery_id: "battery_1", charge_w: 300 }, params: {} });
+  await goto("/dashboard");
+  panel = manualPanel();
+  panelText = panel ? panel.textContent : "";
+  check("an active override is stated with its direction, power, expiry and scope",
+    /Manual override active/.test(panelText) && /Active: charge 600 W until \d{1,2}:\d{2}( [AP]M)? on all batteries/.test(panelText),
+    panelText.slice(0, 200));
+  check("the active override offers a confirming Clear",
+    !!panel && [...panel.querySelectorAll("button")].some((b) => /Clear override/.test(b.textContent)));
+  check("a set per-battery limit shows its value and source",
+    /Charge: 300 W \(this battery\)/.test(panelText) && /Discharge: unlimited/.test(panelText),
+    panelText.slice(0, 260));
+  check("the dry-run state is stated for the override",
+    /Dry run is on: an override is not written to the hardware/.test(panelText), panelText.slice(0, 200));
+  check("the panel still shows no duplicate or undefined text",
+    (panelText.match(/No manual override is active/g) || []).length === 0
+    && !/undefined|NaN/.test(panelText));
+
+  // Restore the shared mock state for the sections that follow.
+  M.routes["DELETE /api/v1/override"]({ params: {} });
+  M.routes["DELETE /api/v1/limits"]({ params: {} });
+  M.routes["POST /api/v1/mode"]({ body: { mode: "advisory", dry_run: true }, params: {} });
+
   /* ---------- 1c. next actions: the data behind each time slot (SPEC 10) ---------- */
   // The window rows are the phone-first reading of the plan, so they are checked as data first
   // (pure helpers, deterministic synthetic slots) and then as rendered structure.

@@ -23,7 +23,7 @@ appended, e.g. `…/?mock=1#/plan?hours=24`:
 
 - every view renders from `mock.js`, with obviously fake values (`sensor.example_*`, round numbers)
   and **no network calls at all**;
-- writes (mode, override, config, batteries, test discharge) are answered by the in-memory mock so
+- writes (mode, override, limits, config, batteries, test discharge) are answered by the in-memory mock so
   pending → confirmed flows are visible;
 - `mock.js` never touches the DOM or `fetch`, so it can be loaded and inspected in Node, which is how
   the pytest suite asserts the SPEC §10 payload fields.
@@ -105,6 +105,18 @@ solarSource})` and `SEM_APP.setupCardKeys({priceProvider, priceContract, solarSo
   the most dangerous ones also require a checkbox acknowledgement. `Stop now` uses the atomic
   `POST /api/v1/stop` and writes to the hardware even when `dry_run` is on (dry run only suppresses
   the normal plan dispatcher; advisory mode alone would leave the last battery setpoint in place).
+- The Dashboard's **Manual override** panel mirrors the safety banner with more detail. Its force
+  section posts the unchanged `POST /override`/`DELETE /override` with a signed power (charge `+`,
+  discharge `-`, hold `0`), a battery or `All batteries` and a 5/15/30/60/120-minute duration; the
+  watt range is the resolved cap, so the form never promises a force the dispatcher will refuse. Its
+  limits section has a `Max charge`/`Max discharge` row per battery plus an `All batteries` row
+  (`POST /limits` with missing/`null` battery id; `DELETE /limits?battery_id=…`), showing the current
+  value and its source (`this battery` vs `all batteries`) or `unlimited`. Limits cap both the
+  automatic plan and manual overrides, never raise a battery's configured maximum, persist like
+  `mode`/`dry_run` and never bypass the cell-voltage/SOC/reserve rails; the panel says so, and states
+  when `mode` is not `auto` (nothing is dispatched) or `dry_run` is on (the override is logged, not
+  written — only Stop now writes in dry run). A background poll skips the panel while focus is inside
+  it, so a typed value is not discarded.
 - Test discharge writes a real, bounded setpoint: the field is discharge power (W) limited by
   `max_discharge_w`, the duration is honoured to the exact second (1–60 s), and the result line shows
   the server-confirmed `applied_w` and `seconds` plus the code/message when the write did not land.

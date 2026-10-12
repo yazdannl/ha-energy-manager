@@ -57,9 +57,9 @@ Single-page app in `energy_manager/app/web/` (`index.html`, `app.js`, `charts.js
 | --- | --- |
 | Skip link | `Skip to content` — focuses `#view` directly (no hash change, so it never changes route) |
 | Top bar — brand | `Smart Energy Manager` (compact; the build/version line now lives in the footer About disclosure as `#build-info`) |
-| Top bar — connection | `#conn-status`, live region: `Connecting…` / `HA connected` / `HA unreachable` (mode and dry run are answered on Today, not repeated here) |
+| Top bar — connection | `#conn-status`, live region: `Connecting…` / `HA connected` / `HA unreachable` (mode and dry run are answered on the Dashboard, not repeated here) |
 | Top bar — theme button | `Theme: dark` / `Theme: light`; sets `data-bs-theme` on `<html>`, persisted in localStorage, and calls `SEMCharts.refresh()` |
-| Nav — primary | Four links: Today (`#/dashboard`), Plan, Savings, Manage (`#/batteries`); ≥44 px tall |
+| Nav — primary | Four links: Dashboard (`#/dashboard`), Plan, Savings, Manage (`#/batteries`); ≥44 px tall |
 | Nav — contextual sub-row | Shown only for the current area: Plan → Plan, Forecasts; Manage → Batteries, Settings, Log; all seven routes stay real links (`aria-current` marks the exact route, the area entry stays marked) |
 | Main | `#view`, `tabindex="-1"`; every view renders one `h1.route-title` + `.route-sub` via `routeTitle()` |
 | Footer | `Times: local` plus an About disclosure (`#help-toggle`/`#help`): units, ISO-8601 timestamps and the build line |
@@ -81,10 +81,10 @@ Single-page app in `energy_manager/app/web/` (`index.html`, `app.js`, `charts.js
 Unknown routes fall back to `#/dashboard`. Unknown paths are normalised by
 `SEM_APP.normalizeRoute()`.
 
-### 2.3 Dashboard (Today)
+### 2.3 Dashboard
 
-Panels: **Now** (the answer strip), **Warnings and activity**, **Right now**, **Supporting
-measurements** (quiet), **Next 24 hours**, **Batteries**.
+Panels: **Now** (the answer strip), **Warnings and activity**, **Manual override**, **Right now**,
+**Supporting measurements** (quiet), **Next 24 hours**, **Batteries**.
 
 **Now panel — the answer first**, in `.answer-dynamic` (re-rendered in place on every refresh):
 
@@ -116,6 +116,21 @@ outstanding holds, plus a per-battery `Battery`, `Result`, `Applied power`, `Cod
 
 **Warnings and activity panel** — warning/error alerts first, each with a level badge and text;
 informational entries are demoted behind a `Recent activity` disclosure.
+
+**Manual override panel** (`renderManualOverride`, additive 0.20.0) — **Force**: a battery select
+(`All batteries` plus each battery), a direction select (`Charge` / `Discharge` / `Hold`), a watt
+field shown for charge/discharge, a duration select (5/15/30/60/120 min, default 30) and
+`Apply override` (confirmation dialog; posts `POST /api/v1/override` with a signed power). The watt
+range is the resolved cap, so the form cannot promise a force the dispatcher will refuse. An active
+override is shown as `Active: charge 600 W until 21:45 on <battery>` with a confirming
+`Clear override` (`DELETE /api/v1/override`). **Limits**: `Max charge` / `Max discharge` inputs per
+battery plus an `All batteries` row, with `Set` (`POST /api/v1/limits`; both fields are sent and an
+empty field clears that direction) and `Clear` (confirmation dialog; explicit `null`s for that row).
+Each row states the resolved value and its source (`this battery` vs `all batteries`) or `unlimited`,
+and the configured maximum bounds the input. The panel always states whether a force writes: `mode`
+not `auto` → nothing is dispatched; `dry_run` on → logged, not written (only Stop now writes in dry
+run). A background poll never repaints the panel while a number field or select inside it has focus,
+so a typed value is not discarded.
 
 **Right now — three primary cards**: `Battery charge` (mean SoC of available batteries),
 `Grid power` (`fmtPower(grid_now_w)` + importing/exporting/balanced/unknown), `Price now`
@@ -324,7 +339,7 @@ Panels: **Settings** (always-visible toolbar + Safety summary, four setup cards,
 
 Always visible above the cards: the `.settings-toolbar` (`settings-search` + `settings-show-advanced`)
 and the **Safety summary** (`Control authority: <mode> · dry run on/off — <authorityNote>`, a
-`Review safety limits` control that opens the Safety group, and `Stop now is on Today`).
+`Review safety limits` control that opens the Safety group, and `Stop now is on the Dashboard`).
 
 **Setup cards** — the default surface; `SEM_APP.setupCardKeys({priceProvider, priceContract, solarSource})`
 is the pure table of keys a card owns for the current selection (every input the selection needs is
@@ -1357,7 +1372,8 @@ result is then clipped by every limit inside `safety.check`.
    break_even(basis) + margin`); the leg is `sell` when the planned flow exports and `buy` when it
    serves the house. Charging, SoC-floor holds and an explicit override are never touched, and with
    no floor (setting off, or no ledger yet) this clause is a no-op. Reason `sell_floor`.
-6. **Power clamp** — aggregated limits `Σ max_charge_w` / `Σ max_discharge_w`.
+6. **Power clamp** — aggregated limits `Σ max_charge_w` / `Σ max_discharge_w` (the effective,
+   manual-capped maxima of 0.20.0; SPEC 5).
 7. **Grid limits** — with the requested power, predicted import/export must stay inside
    `optimizer.max_grid_import_w` / `optimizer.max_grid_export_w`. The live meter is ground truth: the
    measured grid flow is corrected back to the "battery idle" base before clamping, and the more
@@ -1388,7 +1404,23 @@ start, before control resumes; the exit/shutdown hold is serialised behind the s
 
 **Override** (`POST /api/v1/override`) pins a battery (or all) to a fixed power for a bounded time
 (max 240 min, auto-expires, visible countdown). `mode: off` is the global kill switch. A UI test
-discharge is an override, so it is still bounded by the battery's own floor/ceiling/reserve.
+discharge is an override, so it is still bounded by the battery's own floor/ceiling/reserve — and by
+the per-direction manual limits below.
+
+**Manual limits** (`POST /api/v1/limits`, `DELETE /api/v1/limits`) cap one direction of one battery,
+or of the fleet, in watts: `SystemState.manual_limits` is
+`{"*": {"charge_w": …, "discharge_w": …}, "<battery_id>": {…}}`, where a missing/`null` value means
+no limit and `0` blocks that direction. `models.resolve_manual_limit` resolves one battery direction
+as own entry → `"*"` entry → the configured maximum, and never returns more than
+`BatteryConfig.max_charge_w`/`max_discharge_w`; a value above that maximum (or below 0) is refused by
+the API with `400 invalid_body` naming it, never silently clamped. The resolved cap is applied by
+lowering the *effective* config (`max = min(configured, cap)`), which is the number the planner's
+bounds, the aggregate safety clamp, the per-battery allocation/headroom, the dispatcher's clamp and
+`/status` all read — so a cap constrains the automatic plan and a manual force alike, and the stored
+config is never modified. The limits persist in the settings store under `manual_limits` (like
+`mode`/`dry_run`, deliberately not a `DEFAULTS` key) and are journaled (`limits_set`,
+`limits_cleared`). Unknown battery ids return 404; `charge_w`/`discharge_w` are partial (absent =
+unchanged, explicit `null` = cleared).
 
 ### 4.10 Drivers
 
@@ -1630,7 +1662,7 @@ supplies it (which is why publishing a port would hand battery control to anyone
 | Method & route | Body / query | Returns |
 | --- | --- | --- |
 | `GET /api/v1/health` | — | `{status, version, uptime_s, commit}` |
-| `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]` (each with `cell_voltage_v`, and additive 0.18.0 `cost_basis_eur_per_kwh`/`stored_value_eur`), `cell_voltage{enabled,cutoff_v,warning_v,resume_v,emergency_charge_power_w,latched[],batteries[{battery_id,voltage_v,fresh,seen,latched,block_discharge,force_charge_w,reason,note}]}` (additive, 0.16.0), `full_charge{enabled,interval_days,target_soc_pct,overdue_grace_hours,active,due,overdue,batteries[],plan{…}}` (additive, 0.17.0), `cost_basis{enabled,margin_eur_per_kwh,sell_floor_eur_per_kwh,fleet_basis_eur_per_kwh,batteries[{id,name,cost_basis_eur_per_kwh,energy_kwh,stored_value_eur,sell_floor_eur_per_kwh,intervals,skipped_no_price,skipped_no_power,skipped_no_grid,skipped_no_soc,reconciled_kwh,reconciled_last_kwh,reconciled_resets,window_start,updated_at,journal_entries,journal[]}]}` (additive, 0.18.0; the `skipped_no_soc`/`reconciled_*` counters additive 0.18.1), `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
+| `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]` (each with `cell_voltage_v`, additive 0.18.0 `cost_basis_eur_per_kwh`/`stored_value_eur`, and additive 0.20.0 `max_charge_w`/`max_discharge_w` plus `cap_charge_w`/`cap_discharge_w`, `null` = unlimited), `cell_voltage{enabled,cutoff_v,warning_v,resume_v,emergency_charge_power_w,latched[],batteries[{battery_id,voltage_v,fresh,seen,latched,block_discharge,force_charge_w,reason,note}]}` (additive, 0.16.0), `full_charge{enabled,interval_days,target_soc_pct,overdue_grace_hours,active,due,overdue,batteries[],plan{…}}` (additive, 0.17.0), `cost_basis{enabled,margin_eur_per_kwh,sell_floor_eur_per_kwh,fleet_basis_eur_per_kwh,batteries[{id,name,cost_basis_eur_per_kwh,energy_kwh,stored_value_eur,sell_floor_eur_per_kwh,intervals,skipped_no_price,skipped_no_power,skipped_no_grid,skipped_no_soc,reconciled_kwh,reconciled_last_kwh,reconciled_resets,window_start,updated_at,journal_entries,journal[]}]}` (additive, 0.18.0; the `skipped_no_soc`/`reconciled_*` counters additive 0.18.1), `manual_limits{}` (additive, 0.20.0: the raw per-direction mapping), `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
 | `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, slot_minutes, feasible, infeasible_reason, mode, dry_run, sources{}, maintenance, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh, maintenance{enabled,active,due,overdue,target_soc_pct,effective_target_soc_pct,interval_days,overdue_grace_hours,batteries[],due_batteries[],overdue_batteries[]} (additive, 0.17.0), sell_floor_eur_per_kwh (additive, 0.18.0)}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; `slot_minutes` is the plan's own resolution (the UI never assumes one); with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` and `slot_minutes: null` |
 | `GET /api/v1/plan/execution` | `hours` | additive (0.10.0): `{generated_at, slot_minutes, now, floors{reserve_soc_pct, min_soc_pct, floor_soc_pct}, batteries[{id, name, min_soc_pct, floor_soc_pct, capacity_kwh}], progress{…}, slots[{t, dispatch, actual}]}` — the same slot grid as `/plan`, joined with the persisted 5-minute actuals and the dispatch log. `dispatch` is the last attempt per battery in that slot (`requested_w`, `applied_w`, `ok`, `dry_run`, `clamped`, `code`, `reason`, `message`, `records`, `batteries[]`) and `actual` the measured aggregate (`samples`, `coverage_pct`, `pv_kw`, `load_kw`, `grid_kw`, `battery_kw`, `planned_kw`, `measured_kw`, `import_kwh`, `export_kwh`, `charged_kwh`, `discharged_kwh`, `soc_kwh_start`, `soc_kwh_end`). Both are `null` for a slot nothing was measured or dispatched in — never a fabricated zero |
 | `POST /api/v1/plan/recompute` | — | `{queued: true}` (async; poll status) |
@@ -1647,6 +1679,8 @@ supplies it (which is why publishing a port would hand battery control to anyone
 | `POST /api/v1/stop` | — | `{mode, override_cleared, stopped[{battery_id, ok, applied_w, code, message, dry_run}]}` |
 | `POST /api/v1/override` | `{power_w, minutes, battery_id?}` | `{override}` |
 | `DELETE /api/v1/override` | — | `{}` |
+| `POST /api/v1/limits` | `{battery_id?, charge_w?, discharge_w?}` (`null` clears, absent = unchanged) | `{manual_limits}`; 404 unknown battery, 400 `invalid_body` below 0 or above the configured maximum |
+| `DELETE /api/v1/limits` | `battery_id?` (no id clears every entry) | `{manual_limits}`; 404 unknown battery |
 | `GET /api/v1/savings` | `range=day\|week\|month\|year\|all` | `{range, buckets[], totals{}, baseline_note}`; additive 0.13.0: buckets carry `charged_kwh`, `discharged_kwh`, `charge_cost_eur`, `discharge_value_eur` and `grid_measured`/`load_measured`/`pv_measured`/`battery_measured` flags, totals add the same flows plus `measured_buckets` counts (`null` = no confirmed measurement) |
 | `GET /api/v1/accuracy` | `days=14` | `{pv, load, price: AccuracyReport}` |
 | `GET /api/v1/log` | `limit`, `level`, `kind` | `{entries[{ts, kind, level, code, message, detail}]}` |

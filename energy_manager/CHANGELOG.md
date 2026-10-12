@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.20.0
+
+- **The "Today" tab is now "Dashboard".** The primary nav, the HA-connection tooltip and the
+  Settings safety summary say Dashboard; the hash route `#/dashboard` and the internal area key are
+  unchanged, so existing links and deep links keep working. No other tab label changed.
+- **A Manual override panel on the Dashboard: a bounded force plus per-direction limits.** The force
+  section pins one battery or the whole fleet to Charge / Discharge / Hold at a chosen wattage for
+  5–120 minutes through the existing `POST /override` / `DELETE /override` (signed power, unchanged
+  API); an active override is shown with its direction, power, expiry and scope, and Clear confirms
+  first. The limits section sets `Max charge` / `Max discharge` per battery and for an `All
+  batteries` row (`POST /limits`, `DELETE /limits?battery_id=…`), showing the current value, its
+  source (this battery vs all batteries) or `unlimited`, with the configured hardware maximum as the
+  field's range. A limit can only lower a battery's configured maximum: a value above it is refused
+  with 400 `invalid_body` naming the maximum, and the resolver clamps a hand-edited or stale cap as
+  well. Limits are applied to the **effective** config (`max = min(configured, cap)`), so the
+  planner's bounds, the safety aggregate, the per-battery allocation, the dispatcher clamp and
+  `/status` all agree without a second enforcement path — the stored battery config and the battery
+  PATCH path are untouched. A limit therefore constrains the automatic plan *and* a manual force,
+  and never bypasses the cell-voltage protection, the SOC floor/ceiling, the reserve or the
+  full-charge state machine. Limits persist like `mode`/`dry_run` (the settings store's
+  `manual_limits` key, deliberately not a settings-form field) and are journaled (`limits_set`,
+  `limits_cleared`). `/status` gains `manual_limits` and, per battery row, the configured
+  `max_charge_w`/`max_discharge_w` plus the resolved `cap_charge_w`/`cap_discharge_w` (`null` =
+  unlimited); the panel states when dry run or a non-auto mode means nothing is written.
+
 ## 0.19.0
 
 - **The sell floor restricts discharge; it never forces a charge.** The 0.18.0 floor branch used

@@ -77,6 +77,8 @@ DOCUMENTED_ROUTES = [
     "POST /api/v1/stop",
     "POST /api/v1/override",
     "DELETE /api/v1/override",
+    "POST /api/v1/limits",
+    "DELETE /api/v1/limits",
     "GET /api/v1/savings",
     "GET /api/v1/accuracy",
     "GET /api/v1/log",
@@ -225,6 +227,42 @@ def test_test_discharge_payload_matches_section_10(fixtures):
     assert payload["dry_run"] is False and payload["ok"] is True
 
 
+def test_mock_limits_round_trip_matches_the_api(fixtures):
+    """The mock serves /limits like the engine: caps in /status rows, 404/400 on bad input (0.20.0)."""
+    script = """
+    const fs = require("fs");
+    (0, eval)(fs.readFileSync("mock.js", "utf8"));
+    (async function () {
+      const out = {};
+      out.set = await SEM_MOCK.handle("POST", "/api/v1/limits", { battery_id: "battery_1", charge_w: 300 });
+      out.fleet = await SEM_MOCK.handle("POST", "/api/v1/limits", { charge_w: 400, discharge_w: 0 });
+      out.status = await SEM_MOCK.handle("GET", "/api/v1/status");
+      try { await SEM_MOCK.handle("POST", "/api/v1/limits", { battery_id: "example_nope", charge_w: 100 }); }
+      catch (err) { out.unknown = err.code || String(err); }
+      try { await SEM_MOCK.handle("POST", "/api/v1/limits", { battery_id: "battery_1", charge_w: 5000 }); }
+      catch (err) { out.tooHigh = err; }
+      out.cleared = await SEM_MOCK.handle("DELETE", "/api/v1/limits?battery_id=battery_1");
+      out.empty = await SEM_MOCK.handle("DELETE", "/api/v1/limits");
+      console.log(JSON.stringify(out));
+    })().catch(function (err) { console.error(err && err.message ? err.message : err); process.exit(1); });
+    """
+    data = run_node_script(script)
+    assert data["set"]["manual_limits"] == {"battery_1": {"charge_w": 300}}
+    assert data["fleet"]["manual_limits"] == {
+        "battery_1": {"charge_w": 300.0},
+        "*": {"charge_w": 400.0, "discharge_w": 0.0},
+    }
+    status = data["status"]
+    assert status["manual_limits"] == data["fleet"]["manual_limits"]
+    row = status["batteries"][0]
+    assert (row["max_charge_w"], row["max_discharge_w"]) == (800.0, 800.0)
+    assert (row["cap_charge_w"], row["cap_discharge_w"]) == (300.0, 0.0)
+    assert data["unknown"] == "not_found"
+    assert data["tooHigh"]["code"] == "invalid_body" and "800" in data["tooHigh"]["message"]
+    assert data["cleared"]["manual_limits"] == {"*": {"charge_w": 400.0, "discharge_w": 0.0}}
+    assert data["empty"]["manual_limits"] == {}
+
+
 def test_mock_route_table_covers_the_documented_contract(fixtures):
     routes = set(fixtures["routes"])
     missing = [route for route in DOCUMENTED_ROUTES if route not in routes]
@@ -250,16 +288,20 @@ def test_health_and_status_payloads(fixtures):
         "location", "now", "price_now", "price_rank_pct", "pv_now_w", "load_now_w", "grid_now_w",
         "batteries", "active_plan", "last_plan_at", "last_tick_at", "next_cheap_window",
         "next_expensive_window", "override", "pending_holds", "mode_persisted", "alerts",
-        "provider_status", "scheduler_healthy",
+        "provider_status", "scheduler_healthy", "manual_limits",
     ], "GET /status")
     assert status["mode"] in {"off", "advisory", "auto"}
+    assert status["manual_limits"] == {}, "?mock=1 starts with no manual limits"
     for alert in status["alerts"]:
         assert_fields(alert, ["ts", "level", "code", "message", "detail", "acknowledged"], "AlertRecord")
     for battery in status["batteries"]:
         assert_fields(battery, [
             "id", "available", "soc_pct", "power_w", "capacity_kwh", "energy_kwh", "pv_power_w",
             "temperature_c", "read_at", "last_error", "stale", "extra",
+            "max_charge_w", "max_discharge_w", "cap_charge_w", "cap_discharge_w",
         ], "BatteryState")
+        # The resolved caps mirror resolve_manual_limit: unlimited prints as null, never 0.
+        assert battery["cap_charge_w"] is None and battery["cap_discharge_w"] is None
     for provider in status["provider_status"]:
         assert_fields(provider, ["kind", "name", "active", "ok", "last_success", "last_error", "stale", "detail"], "ProviderStatus")
 

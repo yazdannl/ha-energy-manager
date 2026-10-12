@@ -1720,6 +1720,37 @@ round, with the reason:
   as an internal shadow price ``dt * (pv_price - sell) * min(p, max(0, pv - load))`` on the charging
   leg only; the summary money stays the true grid cost of the schedule (SPEC 8.1).
 
+- **§5/§9.3/§10 (per-direction manual limits and a bounded manual force; requested 2026-10-12,
+  "cap charge/discharge per battery and force a direction from the dashboard")** —
+  `SystemState.manual_limits` (additive) is the mapping `{"*": {...}, "<battery_id>": {...}}` with
+  `charge_w`/`discharge_w`: absent/`null` = no limit, `0.0` = that direction is blocked, a number is
+  a cap in watts. The resolution order for one battery direction is the per-battery entry, then the
+  `"*"` fleet entry, then the configured `BatteryConfig.max_charge_w`/`max_discharge_w`; the result
+  never exceeds the configured maximum (`models.resolve_manual_limit` clamps a hand-edited or stale
+  cap, and the resolver is the only reader of the mapping). The cap is applied by lowering the
+  *effective* config
+  (`replace(config, max_charge_w=min(configured, cap), max_discharge_w=min(configured, cap))`), so
+  the plan (the DP's own `p_charge_kw`/`p_discharge_kw` bounds), the aggregate safety clamp
+  (`p_min`/`p_max`), the per-battery allocation and headroom, the dispatcher's per-battery clamp,
+  the HA publish and `/status` all read one number and no second enforcement path can drift. The
+  stored config and the battery PATCH path are untouched: a later maximum update is stored exactly
+  as requested and the cap keeps applying on top. A limit clamps *any* commanded power, including a
+  manual force/hold pin, and never bypasses the cell-voltage protection, the SOC floor/ceiling, the
+  reserve or the full-charge maintenance state machine. Limits persist exactly like `mode`/`dry_run`
+  (the settings store's `manual_limits` key; deliberately **not** a `DEFAULTS` setting, so it never
+  becomes an editable `/config` field) and are journaled (`limits_set`, `limits_cleared`).
+  `POST /limits {battery_id?, charge_w?, discharge_w?}` writes the named battery (unknown id = 404)
+  or the `"*"` fleet entry (missing/`null` id); an explicit `null` clears that direction and an
+  absent field is left unchanged. A value above the configured maximum, or below 0, is refused with
+  400 `invalid_body` naming the maximum -- never silently clamped (the fleet entry is judged against
+  the largest configured maximum, and each battery still caps it at its own). `DELETE /limits`
+  clears every entry, `DELETE /limits?battery_id=<id>` one entry. `/status` gains `manual_limits` (the
+  raw mapping) and every `batteries[]` row gains `max_charge_w`/`max_discharge_w` (the configured
+  hardware maxima the UI needs as ranges) plus `cap_charge_w`/`cap_discharge_w` (`null` = unlimited,
+  `min(configured, limit)` otherwise). The force override API is restated unchanged --
+  `POST /override {power_w, minutes, battery_id}` with a signed power (charge `+`, discharge `-`,
+  hold `0`) and `DELETE /override` -- and the Dashboard panel is its only new client.
+
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded
 in `docs/VERIFICATION.md`.

@@ -23,7 +23,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 __all__ = [
     "Mode",
@@ -58,6 +58,9 @@ __all__ = [
     "eur_per_kwh_from_raw",
     "clamp",
     "safe_div",
+    "MANUAL_LIMIT_DIRECTIONS",
+    "clean_manual_limits",
+    "resolve_manual_limit",
 ]
 
 
@@ -540,6 +543,12 @@ class SystemState:
     next_cheap_window: tuple[datetime, datetime] | None = None
     next_expensive_window: tuple[datetime, datetime] | None = None
     override: dict[str, Any] | None = None
+    #: Additive (0.20.0): per-direction manual caps the operator sets from the Dashboard.  The
+    #: mapping is ``{"*": {...}, "<battery_id>": {...}}`` with ``charge_w``/``discharge_w`` values:
+    #: ``None`` (absent) = no limit, ``0.0`` = that direction is blocked, a number = a cap in watts
+    #: that never raises the battery's configured maximum (SPEC 5/9.3).  A per-battery key wins
+    #: over ``"*"``.  Resolved by :func:`resolve_manual_limit`, never read ad hoc.
+    manual_limits: dict[str, dict[str, float]] = field(default_factory=dict)
     alerts: list[AlertRecord] = field(default_factory=list)
     provider_status: list[ProviderStatus] = field(default_factory=list)
     scheduler_healthy: bool = True
@@ -706,6 +715,80 @@ def slot_minutes_between(a: datetime, b: datetime) -> float:
 
 def clamp(value: float, low: float, high: float) -> float:
     return low if value < low else high if value > high else value
+
+
+#: The two limit directions of a manual cap (SPEC 5/9.3, 0.20.0).
+MANUAL_LIMIT_DIRECTIONS: tuple[str, ...] = ("charge", "discharge")
+
+
+def _manual_limit_key(direction: str) -> str:
+    return "charge_w" if str(direction).strip().lower() == "charge" else "discharge_w"
+
+
+def clean_manual_limits(raw: Any) -> dict[str, dict[str, float]]:
+    """A stored limits mapping reduced to ``{key: {"charge_w"|"discharge_w": float >= 0}}``.
+
+    Used when loading the settings store: junk, negative values, NaN and entries with no usable
+    direction are dropped (never guessed), and an entry that ends up empty is dropped as well, so
+    the in-memory mapping is always the canonical shape the API returns.
+    """
+    out: dict[str, dict[str, float]] = {}
+    if not isinstance(raw, Mapping):
+        return out
+    for key, entry in raw.items():
+        if not isinstance(entry, Mapping):
+            continue
+        clean: dict[str, float] = {}
+        for name in ("charge_w", "discharge_w"):
+            value = entry.get(name)
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number != number or number < 0.0:  # NaN / negative junk from a hand-edited store
+                continue
+            clean[name] = number
+        if clean:
+            out[str(key)] = clean
+    return out
+
+
+def resolve_manual_limit(
+    limits: Mapping[str, Mapping[str, Any]] | None,
+    battery_id: str,
+    direction: str,
+    configured_max_w: float,
+) -> float | None:
+    """The manual cap in force for one battery direction, or ``None`` when unlimited.
+
+    Resolution order (SPEC 5/9.3, 0.20.0): the battery's own entry, then the ``"*"`` fleet entry,
+    then the configured maximum.  The result never exceeds ``configured_max_w``: a cap left above
+    it (a hand-edited store, or a maximum lowered after the cap was set) is clamped here too, so
+    no code path can raise a battery's configured maximum.
+    """
+    if not isinstance(limits, Mapping):
+        return None
+    name = _manual_limit_key(direction)
+    entry = limits.get(str(battery_id))
+    value = entry.get(name) if isinstance(entry, Mapping) else None
+    if value is None:
+        fleet = limits.get("*")
+        value = fleet.get(name) if isinstance(fleet, Mapping) else None
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number < 0.0:
+        return None
+    try:
+        maximum = float(configured_max_w or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return min(number, max(0.0, maximum))
 
 
 def safe_div(numerator: float, denominator: float, default: float = 0.0) -> float:

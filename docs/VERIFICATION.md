@@ -1156,6 +1156,64 @@ change.
 
 ---
 
+### 8.15 Dashboard tab and manual override limits (0.20.0)
+
+The primary nav's first tab is now **Dashboard** (`#/dashboard` unchanged; the internal
+`NAV_AREAS["/dashboard"] = "today"` key is not user-visible and stays), and the Dashboard carries a
+new **Manual override** panel between *Warnings and activity* and *Right now*. The panel forces
+charge/discharge/hold for 5–120 min on one battery or the fleet through the unchanged
+`POST/DELETE /override`, and sets per-direction `Max charge`/`Max discharge` caps per battery and
+for an `All batteries` row through `POST/DELETE /limits`.
+
+The caps are applied by lowering the **effective** config (`max_charge_w = min(configured, cap)`,
+`max_discharge_w = min(configured, cap)`), which is the single number the planner's own bounds, the
+aggregate safety clamp, the per-battery allocation/headroom, the dispatcher's per-battery clamp, the
+HA publisher and `/status` read; the stored battery config and the battery PATCH path are never
+touched. Resolution for one direction is per-battery entry → `"*"` fleet entry → the configured
+maximum, and the resolver clamps a hand-edited or stale cap so no path can raise a maximum. A value
+above the configured maximum (or below 0) is refused by the API with 400 `invalid_body` naming it,
+never silently clamped. Limits persist like `mode`/`dry_run` (settings-store key `manual_limits`,
+deliberately not a `DEFAULTS` field, so it never becomes a `/config` form field) and are journaled
+(`limits_set`, `limits_cleared`); the cell-voltage guard, the SOC floor/ceiling, the reserve and the
+full-charge state machine are untouched, so a limit can only narrow what those rails already allow.
+
+Concrete scheduled-power example — the selfcheck-shaped 30 h horizon (5 kWh / 1000 W battery, eta
+0.95, start 11:00, grid follow off; `dp.solve_from_forecasts`), slot powers in W:
+
+| plan | 11:00 | 12:00 | 13:00 | 14:00 | 15:00 | 16:00 | 17:00 | 18:00 | 19:00 | 20:00 | … | cost / saved (EUR) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| uncapped | +1000 | +1000 | +368 | 0 | 0 | −436 | −333 | −800 | −800 | −800 | … | 1.4665 / 1.0735 |
+| `discharge_w = 200` | +1000 | +1000 | +368 | 0 | 0 | −200 | −200 | −200 | −200 | −200 | … | 1.8679 / 0.6721 |
+| `charge_w = 200` | +200 | +200 | +200 | +200 | +200 | −255 | −73 | −800 | −800 | −800 | … | — |
+
+Every capped slot obeys the cap (never below −200 W / never above +200 W), the horizon is unchanged
+(11:00 → 17:00 next day) and the summary reports the real consequence instead of the uncapped
+schedule's saving: capping the discharge costs 0.40 EUR over the horizon (saved 1.0735 → 0.6721).
+
+Tests (`tests/test_wp8_manual_limits.py`, 13 new; each behavioural one fails on 0.19.0): resolution
+(per-battery beats `"*"`, `0` blocks, `None`/absent is unlimited, a cap above the maximum is clamped
+by the resolver, junk is dropped on load); `effective_config` caps without touching the stored
+config and a battery `PATCH` still reads back the requested maximum while the cap applies; the
+planner never exceeds a discharge or a charge cap and still covers the horizon; a force above the
+limit is applied at the limit; a force-discharge pin at the SOC floor still yields 0 W; a blocked
+direction is never commanded; the limits survive a reload of the real settings store and clearing
+restores the configured maxima; `/status` carries `manual_limits` and the resolved caps; `POST`/
+`DELETE /limits` round-trip including the fleet entry and the 404/400 paths. The mock contract
+(`tests/test_wp3_mock_contract.py`) asserts the mock's `/limits` round-trip and the new `/status`
+keys, and the render check asserts the panel in both states (nothing set; an active override with a
+per-battery limit).
+
+Gates: 912 tests (was 898: +13 in `tests/test_wp8_manual_limits.py`, +1 mock limits round-trip; the
+status/mock assertions extend existing tests), the headless render check 109 passed / 0 failed (12
+new checks), `tools/audit.sh` clean over 111 files, `compileall` clean, the add-on selfcheck 33/33.
+
+What is *not* verified live: the add-on was not deployed and nothing was written to the live
+instance or any battery; the force/limit panel was exercised through the DOM shim and the mock API
+only, not in a browser against the running add-on, and the concrete plan above is a synthetic
+selfcheck horizon, not a captured forecast. Independent review: not run for this change.
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:

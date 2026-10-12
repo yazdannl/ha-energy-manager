@@ -1017,7 +1017,7 @@ h1.route-title:focus { outline: none; }
   max-width: 70ch;
 }
 
-/* ---------- answer strip (Today): answer first, detail after ---------- */
+/* ---------- answer strip (Dashboard): answer first, detail after ---------- */
 
 .answer-authority {
   margin: 0;
@@ -1253,14 +1253,14 @@ h1.route-title:focus { outline: none; }
 
 td, th { padding: var(--sp-2); }
 
-/* ---------- Today's dynamic area and the quiet supporting row ---------- */
+/* ---------- the Dashboard's dynamic area and the quiet supporting row ---------- */
 
 /* The re-rendered region: authority, measured, planned, notes. It owns no shell of its own so the
    panel around it stays the one surface. */
 .answer-dynamic { display: grid; gap: var(--sp-1); }
 .answer-dynamic:empty { display: none; }
 
-/* Secondary Today metrics: present, unemphasised, never competing with the controls. */
+/* Secondary Dashboard metrics: present, unemphasised, never competing with the controls. */
 .cards.supporting { margin-top: var(--sp-1); }
 .cards.supporting .card-label { font-weight: 500; }
 .cards.supporting .card-value { font-size: var(--type-16); font-weight: 600; }

@@ -47,8 +47,10 @@ from .models import (
     SolarForecast,
     SystemState,
     clamp,
+    clean_manual_limits,
     from_iso,
     quarter_floor,
+    resolve_manual_limit,
     slot_hours_from,
     to_iso,
     utcnow,
@@ -71,6 +73,9 @@ CAPACITY_CACHE_S = 300.0
 #: The cost-basis ledger is advanced at most this often, so a forced replan storm cannot re-book
 #: the same measured slices over and over (0.18.0).
 COST_BASIS_REFRESH_S = 60.0
+
+#: Sentinel for "this field was not sent" on a partial manual-limits update (SPEC 10 /limits).
+_UNSET: Any = object()
 
 #: Published HA entities (SPEC section 12).  ``sensor.sem_*`` is the documented contract.
 SEM_AUTOPILOT_STATE = "sensor.sem_autopilot_state"
@@ -409,6 +414,9 @@ class Engine:
             ha_connected=ha is not None,
             location=location,
             now=clock(),
+            # The limits persist like mode/dry_run (the settings store's ``manual_limits`` key)
+            # and are cleaned on load, so junk in the store can never widen a direction (0.20.0).
+            manual_limits=clean_manual_limits(self._settings.get("manual_limits", {})),
         )
         self._journal.event("info", "engine_start", f"Smart Energy Manager {version} started")
 
@@ -1055,6 +1063,173 @@ class Engine:
         self._journal.event("info", "override_cleared", "override cleared")
         return {}
 
+    # ------------------------------------------------------------- manual limits (0.20.0)
+
+    def manual_limits(self) -> dict[str, dict[str, float]]:
+        """A copy of the per-direction limits, keyed by battery id plus ``"*"`` (SPEC 5)."""
+        with self._lock:
+            return {key: dict(value) for key, value in self._state.manual_limits.items()}
+
+    def set_manual_limits(
+        self,
+        battery_id: str | None = None,
+        *,
+        charge_w: Any = _UNSET,
+        discharge_w: Any = _UNSET,
+    ) -> dict[str, dict[str, float]]:
+        """Partial update of one entry (SPEC 10 POST /limits); returns the new mapping.
+
+        ``None`` clears a direction, an omitted direction is left unchanged.  A value above the
+        battery's configured maximum is refused with a :class:`ValueError` naming it -- never
+        silently clamped -- so the UI cannot promise a force the hardware will not take.  A
+        ``None`` battery id writes the ``"*"`` fleet entry, judged against the largest configured
+        maximum; every battery then caps it at its own maximum when resolved.
+        """
+        if charge_w is _UNSET and discharge_w is _UNSET:
+            raise ValueError("charge_w and/or discharge_w is required")
+        target = "*" if battery_id is None else str(battery_id)
+        maxima = self._manual_limit_maxima(target)
+        limits = self.manual_limits()
+        entry = dict(limits.get(target) or {})
+        for name, value in (("charge_w", charge_w), ("discharge_w", discharge_w)):
+            if value is _UNSET:
+                continue
+            if value is None:
+                entry.pop(name, None)
+                continue
+            entry[name] = self._validate_manual_limit(name, value, target, maxima[name])
+        if entry:
+            limits[target] = entry
+        else:
+            limits.pop(target, None)
+        with self._lock:
+            self._state.manual_limits = limits
+        self._persist_manual_limits(limits)
+        self._journal.event(
+            "info",
+            "limits_set",
+            f"manual limits for {target}: {self._manual_limits_text(limits.get(target) or {})}",
+            {"battery_id": target, "limits": dict(limits.get(target) or {})},
+        )
+        # The plan's bounds come from the effective configs, so a new cap must replan to be visible
+        # in the schedule; the dispatch clamp enforces it in the meantime.
+        self.request_replan("limits")
+        return limits
+
+    def clear_manual_limits(self, battery_id: str | None = None) -> dict[str, dict[str, float]]:
+        """Clear one entry, or every entry when no id is given (SPEC 10 DELETE /limits)."""
+        target = "*" if battery_id is None else str(battery_id)
+        if target != "*":
+            known = {config.id for config in self.battery_configs()}
+            if target not in known:
+                raise KeyError(target)
+        with self._lock:
+            previous = {key: dict(value) for key, value in self._state.manual_limits.items()}
+            if target == "*":
+                limits: dict[str, dict[str, float]] = {}
+            else:
+                limits = {key: dict(value) for key, value in previous.items() if key != target}
+            changed = limits != previous
+            if changed:
+                self._state.manual_limits = limits
+        if changed:
+            self._persist_manual_limits(limits)
+            self._journal.event(
+                "info",
+                "limits_cleared",
+                f"manual limits cleared for {target}",
+                {"battery_id": target},
+            )
+            self.request_replan("limits")
+        return limits
+
+    def _manual_limit_maxima(self, target: str) -> dict[str, float]:
+        """The configured maximum each direction may name for ``target`` (SPEC 5/10).
+
+        A per-battery entry is judged against that battery's own hardware maximum; the ``"*"``
+        fleet entry against the largest of every configured battery.  Each battery still caps the
+        fleet value at its own maximum when the limit is resolved, so the fleet entry can never
+        raise one either.
+        """
+        configs = self.battery_configs()
+        if target != "*":
+            configs = [config for config in configs if config.id == target]
+            if not configs:
+                raise KeyError(target)
+        maxima = {
+            "charge_w": [float(config.max_charge_w or 0.0) for config in configs],
+            "discharge_w": [float(config.max_discharge_w or 0.0) for config in configs],
+        }
+        return {name: max(values or [0.0]) for name, values in maxima.items()}
+
+    @staticmethod
+    def _validate_manual_limit(name: str, value: Any, target: str, maximum: float) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be a number") from None
+        if number != number:
+            raise ValueError(f"{name} must be a finite number")
+        if number < 0.0:
+            raise ValueError(f"{name} must be >= 0 W; 0 blocks that direction")
+        if number > maximum + 1e-9:
+            where = f"battery {target}" if target != "*" else "any configured battery"
+            raise ValueError(
+                f"{name} {number:g} W exceeds the configured maximum {maximum:g} W for {where}"
+            )
+        return number
+
+    @staticmethod
+    def _manual_limits_text(entry: Mapping[str, Any]) -> str:
+        parts = [
+            f"{label} {float(entry[name]):g} W"
+            for name, label in (("charge_w", "charge"), ("discharge_w", "discharge"))
+            if name in entry
+        ]
+        return ", ".join(parts) if parts else "unlimited"
+
+    def _persist_manual_limits(self, limits: Mapping[str, Mapping[str, float]] | None = None) -> None:
+        """Persist the limits like mode/dry_run: the settings store's ``manual_limits`` key.
+
+        ``manual_limits`` is deliberately not a ``DEFAULTS`` settings key (it must not become an
+        editable form field), so the real ``Settings`` object -- which validates every write
+        against ``DEFAULTS`` -- is not used; its store is written directly.  A settings object
+        without a store (the selfcheck/tests fake) keeps the value in memory through ``set``.
+        """
+        payload = {
+            str(key): {str(name): float(value) for name, value in (entry or {}).items()}
+            for key, entry in (limits if limits is not None else self.manual_limits()).items()
+        }
+        store = getattr(self._settings, "store", None)
+        try:
+            if callable(getattr(store, "set_setting", None)):
+                store.set_setting("manual_limits", payload)
+            elif callable(getattr(self._settings, "set", None)):
+                self._settings.set("manual_limits", payload)
+        except Exception as exc:  # pragma: no cover - a failing store must not break the write
+            log.warning("manual limits could not be persisted: %s", exc)
+
+    def manual_limits_view(self) -> dict[str, dict[str, Any]]:
+        """Per configured battery: its hardware maxima and the resolved caps (SPEC 10 /status).
+
+        ``cap_*`` is ``None`` when no limit is in force, so the UI can say "unlimited" without
+        confusing it with a cap that happens to equal the configured maximum.
+        """
+        limits = self.manual_limits()
+        out: dict[str, dict[str, Any]] = {}
+        for config in sorted(self.battery_configs(), key=lambda c: c.id):
+            out[config.id] = {
+                "max_charge_w": float(config.max_charge_w),
+                "max_discharge_w": float(config.max_discharge_w),
+                "cap_charge_w": resolve_manual_limit(
+                    limits, config.id, "charge", config.max_charge_w
+                ),
+                "cap_discharge_w": resolve_manual_limit(
+                    limits, config.id, "discharge", config.max_discharge_w
+                ),
+            }
+        return out
+
     def test_discharge(
         self,
         battery_id: str,
@@ -1381,12 +1556,28 @@ class Engine:
         return float(learned), status
 
     def effective_config(self, config: BatteryConfig) -> BatteryConfig:
-        """A copy of ``config`` whose ``capacity_kwh`` is the effective capacity (SPEC 5)."""
+        """A copy of ``config`` with the effective capacity and the manual caps (SPEC 5).
+
+        The manual limits are applied here, by lowering the configured maxima, so the planner, the
+        safety clamps, the dispatcher, the HA publisher and ``/status`` all read one number and no
+        second enforcement path can drift.  A cap never raises a maximum: it is ``min(configured,
+        cap)`` and an unlimited direction leaves the stored value untouched.
+        """
         learned, status = self.effective_capacity(config)
         self._note_capacity_use(config, learned, status)
-        if abs(learned - float(config.capacity_kwh)) < 1e-9:
+        limits = self._state.manual_limits
+        charge_cap = resolve_manual_limit(limits, config.id, "charge", config.max_charge_w)
+        discharge_cap = resolve_manual_limit(limits, config.id, "discharge", config.max_discharge_w)
+        updates: dict[str, Any] = {}
+        if abs(learned - float(config.capacity_kwh)) >= 1e-9:
+            updates["capacity_kwh"] = learned
+        if charge_cap is not None and charge_cap < float(config.max_charge_w):
+            updates["max_charge_w"] = charge_cap
+        if discharge_cap is not None and discharge_cap < float(config.max_discharge_w):
+            updates["max_discharge_w"] = discharge_cap
+        if not updates:
             return config
-        return replace(config, capacity_kwh=learned)
+        return replace(config, **updates)
 
     def effective_battery_configs(self) -> list[BatteryConfig]:
         """The stored batteries with each effective capacity applied (planning, savings, publish)."""

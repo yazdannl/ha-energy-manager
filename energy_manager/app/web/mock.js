@@ -380,8 +380,9 @@
   var MOCK_NOTE = "Synthetic mock data (?mock=1): not a real installation.";
 
   function statePayload(batteryId) {
+    var id = batteryId || "battery_1";
     return {
-      id: batteryId || "battery_1",
+      id: id,
       available: true,
       soc_pct: 62.5,
       power_w: -240,
@@ -393,6 +394,12 @@
       last_error: null,
       stale: false,
       cell_voltage_v: 3.05,
+      // 0.20.0 manual limits: the configured hardware maxima and the resolved caps (null =
+      // unlimited), exactly the keys the real /status row carries.
+      max_charge_w: 800.0,
+      max_discharge_w: 800.0,
+      cap_charge_w: mockManualLimit(id, "charge"),
+      cap_discharge_w: mockManualLimit(id, "discharge"),
       extra: { cycles: 128.5, name: "Example Battery 1", cell_voltage_v: 3.05 }
     };
   }
@@ -668,8 +675,27 @@
     },
     batteries: null,
     pendingHolds: [],
-    modePersisted: true
+    modePersisted: true,
+    // 0.20.0 manual limits: {"*": {...}, "<battery_id>": {...}} with charge_w/discharge_w.
+    // Empty by default so ?mock=1 starts unlimited; a render-check scenario sets one.
+    limits: {}
   };
+
+  function limitsCopy() {
+    var out = {};
+    Object.keys(db.limits).forEach(function (key) { out[key] = Object.assign({}, db.limits[key]); });
+    return out;
+  }
+
+  // Mirrors models.resolve_manual_limit: own entry, then "*", never above the 800 W maximum.
+  function mockManualLimit(batteryId, direction) {
+    var key = direction === "charge" ? "charge_w" : "discharge_w";
+    var own = db.limits[batteryId] || {};
+    var fleet = db.limits["*"] || {};
+    var value = typeof own[key] === "number" ? own[key] : (typeof fleet[key] === "number" ? fleet[key] : null);
+    if (value === null || value < 0) return null;
+    return Math.min(value, 800.0);
+  }
   function batteryList() {
     if (!db.batteries) db.batteries = [batteryRecord()];
     return db.batteries;
@@ -1003,6 +1029,7 @@
       next_cheap_window: [iso(Date.now() + 3 * 3600000), iso(Date.now() + 4 * 3600000)],
       next_expensive_window: [iso(Date.now() + 6 * 3600000), iso(Date.now() + 7 * 3600000)],
       override: db.override,
+      manual_limits: limitsCopy(),
       cell_voltage: {
         enabled: true,
         cutoff_v: 3.0,
@@ -1197,6 +1224,38 @@
       return db.override;
     },
     "DELETE /api/v1/override": function () { db.override = null; return {}; },
+    "POST /api/v1/limits": function (ctx) {
+      var body = ctx.body || {};
+      var target = body.battery_id ? String(body.battery_id) : "*";
+      if (target !== "*" && !batteryList().some(function (record) { return record.config.id === target; })) {
+        return { error: { code: "not_found", message: "unknown battery " + target } };
+      }
+      if (!("charge_w" in body) && !("discharge_w" in body)) {
+        return { error: { code: "invalid_body", message: "charge_w and/or discharge_w is required" } };
+      }
+      var entry = Object.assign({}, db.limits[target] || {});
+      var problem = null;
+      ["charge_w", "discharge_w"].forEach(function (key) {
+        if (problem || !(key in body)) return;
+        var value = body[key];
+        if (value === null) { delete entry[key]; return; }
+        if (typeof value !== "number" || !isFinite(value) || value < 0 || value > 800) {
+          problem = key + " must be 0..800 W";
+          return;
+        }
+        entry[key] = value;
+      });
+      if (problem) return { error: { code: "invalid_body", message: problem } };
+      if (entry.charge_w === undefined && entry.discharge_w === undefined) delete db.limits[target];
+      else db.limits[target] = entry;
+      return { manual_limits: limitsCopy() };
+    },
+    "DELETE /api/v1/limits": function (ctx) {
+      var target = ctx.params && ctx.params.battery_id ? String(ctx.params.battery_id) : null;
+      if (target && target !== "*") delete db.limits[target];
+      else db.limits = {};
+      return { manual_limits: limitsCopy() };
+    },
     "GET /api/v1/savings": function (ctx) { return savingsPayload(ctx.params.range); },
     "GET /api/v1/accuracy": function (ctx) { return accuracyPayload(ctx.params.days); },
     "GET /api/v1/log": function (ctx) { return logEntries(ctx.params.limit); },

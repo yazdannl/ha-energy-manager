@@ -687,7 +687,7 @@
         chip.className = "conn " + (status.ha_connected ? "ok" : "warn");
         chip.textContent = status.ha_connected ? "HA connected" : "HA unreachable";
         chip.title = status.ha_connected
-          ? "Home Assistant connected; control authority is on Today"
+          ? "Home Assistant connected; control authority is on the Dashboard"
           : "Home Assistant is unreachable, so no reading here is live";
       }
       if (build) build.textContent = "v" + (status.version || "?") + (status.commit ? " · " + status.commit : "");
@@ -1092,6 +1092,233 @@
     body.appendChild(grid);
   }
 
+  // One line for an active manual override, shared by the safety banner and the panel.
+  function manualOverrideText(override) {
+    if (!override) return "no override";
+    var power = isNum(override.power_w) ? override.power_w : 0;
+    var what = power > 0 ? "charge " + fmtPower(power) : power < 0 ? "discharge " + fmtPower(-power) : "hold";
+    return what + " until " + fmtTime(override.expires_at) + (override.battery_id ? " on " + override.battery_id : " on all batteries");
+  }
+
+  // Manual override (SPEC 5/9.3/10, 0.20.0): a bounded force plus the per-direction manual limits.
+  // The force goes through POST/DELETE /override, the limits through POST/DELETE /limits; the copy
+  // states what the server really does, so the panel never promises a write the rails will refuse.
+  function renderManualOverride(draw, data, handles) {
+    var status = data.status || {};
+    var batteries = (Array.isArray(status.batteries) ? status.batteries : []).filter(function (b) { return b && b.id; });
+    var limits = status.manual_limits && typeof status.manual_limits === "object" ? status.manual_limits : {};
+    var override = status.override || null;
+
+    // ---- what is active now, with the same confirmed Clear as the safety banner above
+    if (override) {
+      var overrideBox = el("div", { class: "banner banner-warn" }, [
+        el("p", { class: "banner-title", text: "Manual override active" }),
+        el("p", { text: "Active: " + manualOverrideText(override) + "." })
+      ]);
+      var clearOverride = button("Clear override", "btn-danger");
+      writeAction({
+        button: clearOverride, noteContainer: handles.notes,
+        confirm: { title: "Clear override?", body: "Normal plan dispatch resumes.", confirmLabel: "Clear override" },
+        request: function () { return del("/override"); },
+        successText: function () { return "Override cleared (confirmed by the server)."; },
+        onDone: function () { handles.refresh(); }
+      });
+      overrideBox.appendChild(clearOverride);
+      draw(overrideBox);
+    } else {
+      draw(el("p", { class: "muted", text: "No manual override is active; the plan is in control." }));
+    }
+
+    // ---- the watts this selection may really command, never above the limit or the maximum
+    function configuredMax(battery, direction) {
+      var capKey = direction === "charge" ? "cap_charge_w" : "cap_discharge_w";
+      var maxKey = direction === "charge" ? "max_charge_w" : "max_discharge_w";
+      var rows = battery ? [battery] : batteries;
+      return rows.reduce(function (sum, row) {
+        if (isNum(row[capKey])) return sum + row[capKey];
+        return sum + (isNum(row[maxKey]) ? row[maxKey] : 0);
+      }, 0);
+    }
+
+    function resolvedLimitText(batteryId, direction) {
+      var key = direction === "charge" ? "charge_w" : "discharge_w";
+      var own = batteryId ? limits[batteryId] : null;
+      var fleet = limits["*"];
+      if (own && isNum(own[key])) return fmtPower(own[key]) + " (this battery)";
+      if (fleet && isNum(fleet[key])) return fmtPower(fleet[key]) + " (all batteries)";
+      return "unlimited";
+    }
+
+    // A limit is a per-battery cap, so the all-batteries field is bounded by the largest configured
+    // maximum (the API refuses more), never by the sum a fleet-wide *force* may use.
+    function limitRangeMax(direction) {
+      var maxKey = direction === "charge" ? "max_charge_w" : "max_discharge_w";
+      return batteries.reduce(function (highest, row) {
+        return Math.max(highest, isNum(row[maxKey]) ? row[maxKey] : 0);
+      }, 0);
+    }
+
+    // ---- force
+    draw(el("h3", { text: "Force" }));
+    if (!batteries.length) {
+      draw(el("p", { class: "muted", text: "No batteries are configured, so there is nothing to force." }));
+    }
+    var batterySelect = el("select", { id: "override-battery" }, [el("option", { value: "", text: "All batteries" })].concat(
+      batteries.map(function (b) { return el("option", { value: b.id, text: batteryName(b) }); })
+    ));
+    var directionSelect = el("select", { id: "override-direction" }, [
+      el("option", { value: "charge", text: "Charge" }),
+      el("option", { value: "discharge", text: "Discharge" }),
+      el("option", { value: "hold", text: "Hold" })
+    ]);
+    directionSelect.value = "charge";
+    var powerInput = el("input", { type: "number", id: "override-power", min: "1", step: "50", value: "500" });
+    var powerHelp = el("span", { class: "field-help" });
+    var powerField = el("label", { class: "field", for: "override-power" }, [
+      el("span", { text: "Power (W)" }), powerHelp, powerInput
+    ]);
+    var minutesSelect = el("select", { id: "override-minutes" }, [5, 15, 30, 60, 120].map(function (minutes) {
+      return el("option", { value: String(minutes), text: minutes + " min" });
+    }));
+    minutesSelect.value = "30";
+
+    function selectedBattery() {
+      for (var i = 0; i < batteries.length; i += 1) {
+        if (batteries[i].id === batterySelect.value) return batteries[i];
+      }
+      return null;
+    }
+
+    function syncPowerField() {
+      var direction = directionSelect.value;
+      powerField.hidden = direction === "hold";
+      if (direction === "hold") return;
+      var max = configuredMax(selectedBattery(), direction);
+      powerInput.max = String(Math.max(0, Math.round(max)));
+      powerHelp.textContent = max >= 1
+        ? "1 to " + fmtPower(max) + " (the configured maximum, lowered by any limit)"
+        : "No capacity in this direction: a 0 W limit blocks it.";
+    }
+    batterySelect.addEventListener("change", syncPowerField);
+    directionSelect.addEventListener("change", syncPowerField);
+    syncPowerField();
+
+    var apply = button("Apply override", "btn-primary");
+    apply.addEventListener("click", function () {
+      var direction = directionSelect.value;
+      var battery = selectedBattery();
+      var hold = direction === "hold";
+      var max = hold ? 0 : configuredMax(battery, direction);
+      if (!hold && max < 1) {
+        setNote(handles.notes, "Nothing to apply: " + direction + " is blocked by a 0 W limit or has no capacity.", true);
+        return;
+      }
+      var asked = Number(powerInput.value);
+      var watts = hold ? 0 : Math.min(Math.max(1, isFinite(asked) ? Math.round(asked) : 1), Math.round(max));
+      var signed = direction === "charge" ? watts : direction === "discharge" ? -watts : 0;
+      var minutes = Number(minutesSelect.value) || 30;
+      var who = battery ? batteryName(battery) : "all batteries";
+      var what = hold ? "a hold at 0 W" : direction + " " + fmtPower(watts);
+      confirmAction({
+        title: "Apply manual override?",
+        body: "Sets " + what + " on " + who + " for " + minutes + " min. The plan is bypassed until it expires or you clear it; the cell-voltage protection, the SOC floor and the manual limits still apply." + (status.dry_run ? " Dry run is on, so this is logged and not written to the hardware." : ""),
+        confirmLabel: "Apply override"
+      }).then(function (ok) {
+        if (!ok) return;
+        performWrite(apply, handles.notes, function () {
+          return post("/override", { power_w: signed, minutes: minutes, battery_id: battery ? battery.id : null });
+        }, function () { return "Manual override applied (confirmed by the server)."; }, function () { handles.refresh(); });
+      });
+    });
+    draw(el("div", { class: "fields" }, [
+      el("label", { class: "field", for: "override-battery" }, [el("span", { text: "Battery" }), batterySelect]),
+      el("label", { class: "field", for: "override-direction" }, [el("span", { text: "Direction" }), directionSelect]),
+      powerField,
+      el("label", { class: "field", for: "override-minutes" }, [el("span", { text: "Duration" }), minutesSelect])
+    ]));
+    draw(el("div", { class: "toolbar" }, [apply]));
+    draw(el("p", {
+      class: "field-help",
+      text: String(status.mode) === "auto"
+        ? (status.dry_run
+          ? "Dry run is on: an override is not written to the hardware. Only Stop now writes in dry run."
+          : "Mode auto with dry run off: an applied override writes to the hardware.")
+        : "Mode is " + (String(status.mode) || "unknown") + ": nothing is dispatched at all."
+    }));
+
+    // ---- limits
+    draw(el("h3", { text: "Limits" }));
+    var limitRows = el("div", { class: "fields" });
+
+    function limitRow(battery, label) {
+      var batteryId = battery ? battery.id : null;
+      var own = batteryId ? (limits[batteryId] || {}) : (limits["*"] || {});
+      var chargeMax = battery ? (isNum(battery.max_charge_w) ? battery.max_charge_w : 0) : limitRangeMax("charge");
+      var dischargeMax = battery ? (isNum(battery.max_discharge_w) ? battery.max_discharge_w : 0) : limitRangeMax("discharge");
+      var chargeInput = el("input", {
+        type: "number", id: (batteryId || "fleet") + "-limit-charge", min: "0",
+        max: String(Math.max(0, Math.round(chargeMax))), step: "50", placeholder: "unlimited",
+        value: isNum(own.charge_w) ? String(own.charge_w) : ""
+      });
+      var dischargeInput = el("input", {
+        type: "number", id: (batteryId || "fleet") + "-limit-discharge", min: "0",
+        max: String(Math.max(0, Math.round(dischargeMax))), step: "50", placeholder: "unlimited",
+        value: isNum(own.discharge_w) ? String(own.discharge_w) : ""
+      });
+      var set = button("Set", "btn-primary");
+      set.addEventListener("click", function () {
+        var payload = { battery_id: batteryId };
+        ["charge", "discharge"].forEach(function (direction) {
+          var input = direction === "charge" ? chargeInput : dischargeInput;
+          var raw = String(input.value === undefined || input.value === null ? "" : input.value).trim();
+          payload[direction + "_w"] = raw === "" ? null : Number(raw);
+        });
+        if (payload.charge_w !== null && !isFinite(payload.charge_w)) {
+          setNote(handles.notes, "Max charge must be a number or empty.", true);
+          return;
+        }
+        if (payload.discharge_w !== null && !isFinite(payload.discharge_w)) {
+          setNote(handles.notes, "Max discharge must be a number or empty.", true);
+          return;
+        }
+        performWrite(set, handles.notes, function () {
+          return post("/limits", payload);
+        }, function () {
+          return "Limits set for " + label + " (confirmed by the server).";
+        }, function () { handles.refresh(); });
+      });
+      var clearLimits = button("Clear", "");
+      clearLimits.addEventListener("click", function () {
+        confirmAction({
+          title: "Clear limits for " + label + "?",
+          body: "The configured maximum applies again in both directions for " + (battery ? "this battery" : "the all-batteries entry") + ".",
+          confirmLabel: "Clear limits"
+        }).then(function (ok) {
+          if (!ok) return;
+          performWrite(clearLimits, handles.notes, function () {
+            return post("/limits", { battery_id: batteryId, charge_w: null, discharge_w: null });
+          }, function () { return "Limits cleared for " + label + " (confirmed by the server)."; }, function () { handles.refresh(); });
+        });
+      });
+      return el("div", { class: "field" }, [
+        el("span", { class: "field-label", text: label }),
+        el("p", { class: "field-help", text: "Charge: " + resolvedLimitText(batteryId, "charge") + " · Discharge: " + resolvedLimitText(batteryId, "discharge") + ". Configured maximum " + fmtPower(chargeMax) + " charge / " + fmtPower(dischargeMax) + " discharge. An empty field clears that direction; a 0 W value blocks it." }),
+        el("div", { class: "row" }, [
+          el("label", { class: "field", for: chargeInput.id }, [el("span", { text: "Max charge (W)" }), chargeInput]),
+          el("label", { class: "field", for: dischargeInput.id }, [el("span", { text: "Max discharge (W)" }), dischargeInput]),
+          set,
+          clearLimits
+        ])
+      ]);
+    }
+
+    limitRows.appendChild(limitRow(null, "All batteries"));
+    batteries.forEach(function (battery) { limitRows.appendChild(limitRow(battery, batteryName(battery))); });
+    draw(limitRows);
+    draw(el("p", { class: "field-help", text: "Limits cap both the automatic plan and manual overrides. They can never raise a battery's configured maximum." }));
+    draw(el("p", { class: "field-help", text: "A manual override bypasses the plan until it expires or you clear it; it is still bounded by the cell-voltage protection, the SOC floor and the limits above." }));
+  }
+
   function viewDashboard(host) {
     var data = { status: null, plan: null };
     var modeButtons = {};
@@ -1128,6 +1355,13 @@
     function paintAnswer() { if (data.status) { drawAnswer(); setConfirmed(data.status); } }
 
     var alertsBody = dashboardPanel(host, "Warnings and activity");
+    // Manual override (0.20.0): after the Now/alerts area, before the plan chart. Its own note and
+    // dynamic hosts stay outside the redrawn area, so a write result survives a quiet refresh.
+    var overrideBody = dashboardPanel(host, "Manual override");
+    var overrideDynamic = el("div", { class: "answer-dynamic" });
+    var overrideNotes = el("div", { class: "answer-notes" });
+    overrideBody.appendChild(overrideDynamic);
+    overrideBody.appendChild(overrideNotes);
     var nowBody = dashboardPanel(host, "Right now");
     var supportBody = dashboardPanel(host, "Supporting measurements", "panel-quiet");
     var chartBody = dashboardPanel(host, "Next 24 hours");
@@ -1273,6 +1507,22 @@
     function paintBatteries() {
       renderInto(batteryBody, function (target) { renderBatteryCards(target, data.status); });
     }
+    function paintManualOverride() {
+      if (!data.status) {
+        panelStatus(overrideDynamic, "loading", "Loading…");
+        return;
+      }
+      // A poll must never clobber a value being typed: while a number field or select inside the
+      // panel has focus the redraw waits, and the confirmed state is painted as soon as focus
+      // leaves (UI_REVIEW §3.5). A focused button does not hold it back.
+      var active = document.activeElement;
+      var editing = active && within(active, overrideDynamic)
+        && ["INPUT", "SELECT", "TEXTAREA"].indexOf(active.tagName) >= 0;
+      if (editing) return;
+      renderInto(overrideDynamic, function (target) {
+        renderManualOverride(function (node) { target.appendChild(node); }, data, { notes: overrideNotes, refresh: refresh });
+      });
+    }
     function paintChart() {
       renderInto(chartBody, function (target) {
         clear(target);
@@ -1294,6 +1544,7 @@
         state.status = status;
         paintAnswer();
         paintAlerts();
+        paintManualOverride();
         paintNow();
         paintSupporting();
         paintBatteries();
@@ -1314,6 +1565,7 @@
       paintAnswer();
       setConfirmed(status);
       paintAlerts();
+      paintManualOverride();
       paintNow();
       paintSupporting();
       paintBatteries();
@@ -1321,6 +1573,7 @@
       dryBox.checked = !!status.dry_run;
     }, function (err) {
       panelStatus(answerDynamic, "error", "Could not load the live status: " + (err && err.message ? err.message : err), function () { refresh(); });
+      panelStatus(overrideDynamic, "error", "The manual override controls need the live status, which could not be loaded.", function () { refresh(); });
     });
     get("/plan", { hours: 24 }).then(function (plan) {
       data.plan = plan;
@@ -4944,7 +5197,7 @@
     }
 
     // An always-visible safety summary: the authority in force right now, and direct links to the
-    // Safety group and to Stop now (UI_REVIEW §3.2). Stop now lives on Today, not here.
+    // Safety group and to Stop now (UI_REVIEW §3.2). Stop now lives on the Dashboard, not here.
     function authoritySummary() {
       var mode = settingValue("mode");
       var dry = settingValue("dry_run");
@@ -4970,7 +5223,7 @@
             });
             return link;
           })() : null,
-          el("a", { class: "btn", href: "#/dashboard", text: "Stop now is on Today" })
+          el("a", { class: "btn", href: "#/dashboard", text: "Stop now is on the Dashboard" })
         ])
       ]);
     }

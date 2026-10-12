@@ -78,7 +78,12 @@ no MQTT, no cloud account, and no YAML to install by hand.
 - **Dashboard** — now-cards for battery SoC, PV, house load, grid flow, current price and its rank
   against the next 24 h, the current action with its reason, the autopilot state, and the next cheap
   and next expensive window. Below them, a 24 h SoC/price mini-chart, an alert strip, mode switches
-  and a **Stop now** button.
+  and a **Stop now** button. A **Manual override** panel sits under the alerts: it forces charge,
+  discharge or hold for 5–120 minutes on one battery or all of them, and sets a per-direction
+  **Max charge** / **Max discharge** cap for one battery or the whole fleet, showing each cap's
+  value, its source (`this battery` vs `all batteries`) or `unlimited`. The caps bound the
+  automatic plan and a manual force alike and can only lower a battery's configured maximum; the
+  panel states when dry run or a non-auto mode means nothing is written.
 - **Plan** — one aligned timeline with price bars, PV and load areas, the SoC line and
   charge/discharge bars, plus a per-slot table with the reason for every slot and the plan summary.
   The price chart marks the break-even sale price for the round trip the plan assumed, so a sell price
@@ -319,6 +324,14 @@ The shipped defaults cannot move hardware, and the guarantees are enforced in co
 9. A blocked or clamped action is always visible: an alert, a dispatch-log row and a banner in the
    UI, each with a stable reason slug. On an unrecoverable error the failsafe writes 0 W (hold)
    rather than guessing a setpoint.
+10. **Manual actions are bounded, not authoritative.** The Dashboard's **Manual override** panel
+   pins one battery (or the fleet) to a signed power for a bounded time, and sets per-direction
+   `Max charge` / `Max discharge` caps. A cap can only *lower* a battery's configured maximum — a
+   value above it is refused with the maximum named, never silently clamped — and the override
+   still passes the whole ordered check above. The caps are applied to the effective config the
+   plan, the safety clamps and the dispatcher share, so a cap constrains the automatic plan and
+   the manual force alike, and it never bypasses the cell-voltage guard, the SOC floor/ceiling or
+   the reserve. Limits persist like `mode`/`dry_run` and every change is journaled.
 
 ### Zendure SolarFlow: read this before you uninstall
 

@@ -577,6 +577,7 @@ def status_dict(
     cell_voltage: Mapping[str, Any] | None = None,
     full_charge: Mapping[str, Any] | None = None,
     cost_basis: Mapping[str, Any] | None = None,
+    manual_limit_caps: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     now = state.now or datetime.now(timezone.utc)
     override = None
@@ -595,6 +596,7 @@ def status_dict(
         for row in (cost_basis or {}).get("batteries", [])
         if isinstance(row, Mapping)
     }
+    cap_by_id = {str(key): row for key, row in (manual_limit_caps or {}).items()}
     return {
         "version": state.version,
         "commit": state.commit,
@@ -645,6 +647,12 @@ def status_dict(
                     "cost_basis_eur_per_kwh"
                 ),
                 "stored_value_eur": (basis_by_id.get(battery.id) or {}).get("stored_value_eur"),
+                # Additive (0.20.0): the configured hardware maxima and the manual caps in force
+                # (SPEC 5). ``cap_*`` is ``None`` when that direction is unlimited.
+                "max_charge_w": (cap_by_id.get(battery.id) or {}).get("max_charge_w"),
+                "max_discharge_w": (cap_by_id.get(battery.id) or {}).get("max_discharge_w"),
+                "cap_charge_w": (cap_by_id.get(battery.id) or {}).get("cap_charge_w"),
+                "cap_discharge_w": (cap_by_id.get(battery.id) or {}).get("cap_discharge_w"),
                 "last_error": battery.last_error,
             }
             for battery in state.batteries
@@ -683,6 +691,12 @@ def status_dict(
         if state.next_expensive_window
         else None,
         "override": override,
+        # Additive (0.20.0): the raw per-direction manual caps (SPEC 5/10).  The resolved caps and
+        # the configured maxima ride in every ``batteries[]`` row above.
+        "manual_limits": {
+            str(key): dict(entry)
+            for key, entry in (getattr(state, "manual_limits", None) or {}).items()
+        },
         # Additive (0.16.0): the cell-voltage guard's thresholds, latch and per-battery readings.
         "cell_voltage": dict(cell_voltage) if cell_voltage is not None else None,
         # Additive (0.17.0): scheduled full-charge maintenance (settings, per-battery state and the
@@ -848,6 +862,7 @@ class ApiServer:
             cell_voltage = getattr(engine, "cell_voltage_status", None)
             full_charge = getattr(engine, "full_charge_status", None)
             cost_basis = getattr(engine, "cost_basis_block", None)
+            limits = getattr(engine, "manual_limits_view", None)
             return self._json(
                 status_dict(
                     state,
@@ -857,6 +872,7 @@ class ApiServer:
                     cell_voltage() if callable(cell_voltage) else None,
                     full_charge() if callable(full_charge) else None,
                     cost_basis() if callable(cost_basis) else None,
+                    limits() if callable(limits) else None,
                 )
             )
 
@@ -983,6 +999,38 @@ class ApiServer:
 
         if route == "override" and method == "DELETE":
             return self._json(engine.clear_override())
+
+        if route == "limits" and method == "POST":
+            body = self._body(payload)
+            if "charge_w" not in body and "discharge_w" not in body:
+                raise ApiError(400, "invalid_body", "charge_w and/or discharge_w is required")
+            battery_id = body.get("battery_id")
+            if battery_id is not None and not isinstance(battery_id, str):
+                raise ApiError(400, "invalid_body", "battery_id must be a string or null")
+            fields: dict[str, Any] = {}
+            for key in ("charge_w", "discharge_w"):
+                if key not in body:
+                    continue
+                value = body[key]
+                if value is not None and (
+                    isinstance(value, bool) or not isinstance(value, (int, float))
+                ):
+                    raise ApiError(400, "invalid_body", f"{key} must be a number or null")
+                fields[key] = value
+            try:
+                limits = engine.set_manual_limits(battery_id, **fields)
+            except ValueError as exc:
+                # Above the configured maximum (or negative): a client mistake, never a clamp.
+                raise ApiError(400, "invalid_body", str(exc)) from None
+            return self._json({"manual_limits": limits})
+
+        if route == "limits" and method == "DELETE":
+            battery_id = str(query.get("battery_id") or "").strip() or None
+            try:
+                limits = engine.clear_manual_limits(battery_id)
+            except ValueError as exc:  # pragma: no cover - defensive, mirrors POST
+                raise ApiError(400, "invalid_body", str(exc)) from None
+            return self._json({"manual_limits": limits})
 
         if route == "stop" and method == "POST":
             return self._json(engine.stop_now())
