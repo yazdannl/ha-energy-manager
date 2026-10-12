@@ -19,6 +19,9 @@ The full documentation lives in the [repository README](https://github.com/yazda
 2. Install **Smart Energy Manager** and start it.
 3. Open the **Energy** panel, then *Batteries → Add battery*. For a Zendure SolarFlow the entities
    are discovered through the `zendure_ha` integration; you confirm the mapping before it is stored.
+   A device with no integration (or one you want to drive **without it**) uses the `zendure_native`
+   driver instead: enable the device's local API in the Zendure app (add HEMS and exit to apply),
+   then type its address and serial — the add-on reads the device once before it saves the battery.
    Enter the battery's **round trip** efficiency as one number (the default is a 90 % round trip); the
    card then shows what a stored kWh costs and the sale price at which a cycle breaks even.
 4. Open *Settings*: pick your price provider on the **Price** card and (optionally) choose how the

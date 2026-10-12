@@ -339,7 +339,7 @@ class BaseDriver:
                 capacity_kwh=capacity,
                 energy_kwh=energy,
                 pv_power_w=self._read_pv_power(),
-                temperature_c=None,
+                temperature_c=self._read_temperature(),
                 read_at=moment,
                 # Only a confirmed measurement may stand in for delivered battery energy.
                 power_measured=power is not None and self._power_is_measured(),
@@ -396,6 +396,19 @@ class BaseDriver:
         return max(0.0, float(capacity) * soc / 100.0)
 
     def _read_pv_power(self) -> float | None:
+        return None
+
+    def _read_temperature(self) -> float | None:
+        """Battery/enclosure temperature in °C when the driver can report one."""
+        return None
+
+    def read_cell_voltage(self) -> float | None:
+        """Optional driver hook: lowest cell voltage in V, or None when unavailable (SPEC 9.2).
+
+        A driver that can read a real cell voltage (``zendure_native``) overrides this so a
+        low-voltage guard can act on it.  The default is None -- an unreadable cell voltage is
+        never guessed from a pack total voltage.
+        """
         return None
 
     # -- writing ----------------------------------------------------------------------

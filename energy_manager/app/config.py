@@ -34,10 +34,47 @@ __all__ = [
     "battery_payload",
     "coerce_setting",
     "load_options",
+    "merge_mapping_patch",
+    "redact_battery_mapping",
     "resolve_location",
     "setting_descriptors",
     "validate_battery_config",
 ]
+
+#: Mapping values that are credentials, never echoed by the API/UI (the driver still gets them).
+SECRET_MAPPING_KEYS = ("token", "password", "secret", "api_key")
+#: What a masked secret reads as in `battery_payload`; a PATCH sending it back keeps the stored one.
+MASKED_SECRET = "***"
+
+
+def redact_battery_mapping(mapping: Mapping[str, Any] | None) -> dict[str, str]:
+    """The mapping as the API/UI may see it: credential values replaced by :data:`MASKED_SECRET`."""
+    out: dict[str, str] = {}
+    for key, value in (mapping or {}).items():
+        name = str(key)
+        if name.lower() in SECRET_MAPPING_KEYS and str(value or "") != "":
+            out[name] = MASKED_SECRET
+        else:
+            out[name] = str(value)
+    return out
+
+
+def merge_mapping_patch(
+    current: Mapping[str, Any] | None, patch: Mapping[str, Any] | None
+) -> dict[str, str]:
+    """A PATCH mapping that keeps stored credentials the client never saw (masked/absent).
+
+    The UI reads the redacted mapping back, so a save that echoes :data:`MASKED_SECRET` -- or
+    omits the key entirely -- means "keep the stored value"; anything else is a new value.
+    """
+    merged = {str(key): str(value) for key, value in (patch or {}).items()}
+    for key, value in (current or {}).items():
+        name = str(key)
+        if name.lower() not in SECRET_MAPPING_KEYS or str(value or "") == "":
+            continue
+        if name not in merged or merged[name] == MASKED_SECRET:
+            merged[name] = str(value)
+    return merged
 
 #: Every option (SPEC.md section 3 option schema) and every setting, with shipped defaults.
 DEFAULTS: dict[str, Any] = {
@@ -748,6 +785,8 @@ def battery_payload(config: BatteryConfig) -> dict[str, Any]:
     ``round_trip_efficiency_pct`` and ``wear_eur_per_kwh`` (SPEC.md section 5). Both are
     convenience/derived values and are never persisted as settings keys."""
     payload = asdict(config)
+    # Credentials are stored for the driver but never echoed back to a client (SPEC 3.3/3.4).
+    payload["mapping"] = redact_battery_mapping(config.mapping)
     payload["round_trip_efficiency_pct"] = round(config.round_trip_efficiency * 100.0, 6)
     payload["wear_eur_per_kwh"] = round(config.wear_eur_per_kwh, 9)
     return payload

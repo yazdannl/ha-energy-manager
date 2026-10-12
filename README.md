@@ -35,9 +35,13 @@ no MQTT, no cloud account, and no YAML to install by hand.
 - A **price source**, any one of: a Zonneplan price sensor entity, the keyless energy-charts
   day-ahead API, any sensor that publishes a forecast attribute (Nordpool, Tibber, ENTSO-E, ...), or
   a static schedule you enter yourself.
-- A **battery** that Home Assistant can control: a Zendure SolarFlow through the community
-  `zendure_ha` integration (entities are discovered and you confirm the mapping), or any battery
-  with a writable power setpoint entity (generic driver).
+- A **battery** that Home Assistant can control, any one of: a Zendure SolarFlow through the
+  community `zendure_ha` integration (entities are discovered and you confirm the mapping), a Zendure
+  SolarFlow through its **own local zenSDK HTTP API** (`zendure_native`: no integration, no MQTT
+  broker, no cloud — enter the device's address and serial), or any battery with a writable power
+  setpoint entity (generic driver).
+- Zendure hardware needs no third-party Python package: the native driver uses the standard library
+  alone (`urllib`/`ssl`) and `energy_manager/requirements.txt` stays empty.
 - Optional: outside temperature and a measured PV power sensor, for better forecasts.
 
 ## Install
@@ -303,6 +307,23 @@ The shipped defaults cannot move hardware, and the guarantees are enforced in co
   therefore take a short while to show up in the device state. The dashboard and the log show
   *requested* versus *applied* power for exactly this reason: a brief difference is normal, a
   persistent one is a driver error worth investigating.
+- **The native driver (`zendure_native`) talks to the device directly and needs neither the
+  integration nor a broker.** Choose it in the battery wizard and enter the device's IP address (or
+  mDNS name) and serial. Enable the device's own local API first — in the Zendure app, add HEMS and
+  exit to apply — otherwise the device refuses the connection and the add-on says so. The add-on
+  reads the device (SoC, AC power, PV, the device's own limits and pack voltages) and writes the
+  documented property command, clamped to both your limit and the device's own maximum; every write
+  is read back from the device and a mismatch is a driver error, so the failsafe hold still governs
+  failures. The device reports no capacity in kWh, so the capacity you enter is what the planner
+  uses. Saving probes the device once: an unreachable address or a mismatched serial is refused
+  unless the stored mapping sets `allow_unreachable`. This transport is verified against the vendor's
+  documented API and an in-process fake device; **live-hardware validation is still pending** — if
+  you run it on real hardware, the log's per-write messages are the evidence to check (see
+  `docs/EXTERNAL_APIS.md` section 6). The device's local MQTT path is documented as planned work, not
+  shipped.
+- **On the device path there is still no watchdog.** A `zendure_native` hold writes 0 W to the
+  device's AC limits and verifies it, but the device itself may keep inverting for an off-grid port;
+  the add-on's hold is an AC-limit command, not a power switch.
 
 ## Savings baseline
 
@@ -381,7 +402,8 @@ addresses.
 | No plan, or "forecast unavailable" alerts | The configured price source returned no future slots. Check the Log for the failing source; the add-on falls back to energy-charts and then to a static schedule, but it never plans against an empty or silently stale forecast. |
 | Prices look greyed out / "stale" | Your price sensor's forecast attribute is older than the plan window. The add-on still shows them, but treats stale future prices as flat instead of guessing. |
 | Nothing moves the battery | Expected in `advisory` and in `auto` with `dry_run` on. Otherwise read the Log: every rejection has a reason (SoC floor, power clamp, grid limit, ramp limit, stale measurement, override). |
-| A Zendure battery is not discovered | The `zendure_ha` integration must be set up and the device reachable (cloud/BLE). Discovery matches translation keys, so renamed entity ids still resolve; the mapping is shown for confirmation before it is stored. |
+| A Zendure battery is not discovered | The `zendure_ha` integration must be set up and the device reachable (cloud/BLE). Discovery matches translation keys, so renamed entity ids still resolve; the mapping is shown for confirmation before it is stored. A device with **no** integration installed is not discovered at all: add it manually with the `zendure_native` driver and its address + serial. |
+| A `zendure_native` battery is refused at save time | The add-on read the device's local API and did not get a usable report: the local API is disabled (in the Zendure app, add HEMS and exit to apply), the address/port is wrong, the serial does not match, or a configured token is rejected (401). The error names the cause; `allow_unreachable` in the stored mapping is the deliberate opt-out, after which the battery card shows the read error instead. |
 | A generic battery is rejected | A generic battery needs either a signed power setpoint entity or a charge/discharge entity pair. It is refused when you save, not silently at dispatch time. |
 | Times look shifted | Timezone and currency are read from Home Assistant; override them in the options only if Home Assistant itself is misconfigured. |
 | Costs look wrong by a factor | Check `price.unit` and `price.scale_divisor` against your provider. The add-on uses the provider's declared unit and never guesses magnitude, because a wrong guess corrupts every cost number. |

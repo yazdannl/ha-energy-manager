@@ -25,12 +25,14 @@ from .base import (
     parse_soc_pct,
 )
 from .generic import GenericDriver
+from .native import ZendureNativeDriver
 from .zendure import ZendureDriver, ZendureMqttDriver, resolve_mapping, resolve_mqtt_mapping
 
 DRIVERS: dict[str, type[BaseDriver]] = {
     GenericDriver.driver_name: GenericDriver,
     ZendureDriver.driver_name: ZendureDriver,
     ZendureMqttDriver.driver_name: ZendureMqttDriver,
+    ZendureNativeDriver.driver_name: ZendureNativeDriver,
 }
 
 #: Drivers that resolve their roles from the entity registry at runtime, by platform
@@ -119,6 +121,24 @@ def validate_config(config: BatteryConfig) -> list[str]:
     return problems
 
 
+def probe_config(config: BatteryConfig) -> list[str]:
+    """Driver-specific save-time device check (empty when the driver has none).
+
+    ``validate_config`` stays pure and is called on every driver rebuild; this hook is only for
+    the battery create/update path, where one bounded device read may refuse a config that looks
+    valid but does not work (an unreachable host or a serial that does not match).  A probe must
+    return problems, never raise.
+    """
+    cls = DRIVERS.get(config.driver)
+    probe = getattr(cls, "probe_config", None)
+    if cls is None or not callable(probe):
+        return []
+    try:
+        return list(probe(config))
+    except Exception as exc:  # pragma: no cover - defensive: a probe must never crash a save
+        return [f"{config.driver} probe failed: {str(exc)[:160]}"]
+
+
 def create(
     config: BatteryConfig,
     ha: HAFacade,
@@ -156,12 +176,14 @@ __all__ = [
     "ROLE_TO_MAPPING",
     "ZendureDriver",
     "ZendureMqttDriver",
+    "ZendureNativeDriver",
     "create",
     "driver_class",
     "names",
     "parse_energy_kwh",
     "parse_number",
     "parse_soc_pct",
+    "probe_config",
     "resolve_mapping",
     "resolve_mapping_for",
     "resolve_mqtt_mapping",

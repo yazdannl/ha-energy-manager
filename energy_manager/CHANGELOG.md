@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.15.0
+
+- **Zendure hardware can now be driven directly, with no `zendure_ha` integration.** The new
+  `zendure_native` battery driver speaks the device's own local zenSDK HTTP API with the standard
+  library alone (`urllib`/`ssl`; `requirements.txt` stays empty): no integration, no MQTT broker and
+  no cloud account. Add the battery by hand in the wizard — `host` and `serial` are required, with
+  optional `scheme`/`port`/`api_path`/`token`/`timeout_s`/`insecure_tls` — and enable the device's
+  local API first (in the Zendure app, add HEMS and exit to apply).
+- **Reads and writes follow the documented device contract** (`docs/EXTERNAL_APIS.md` section 6,
+  from the vendor zenSDK docs and the reference implementation): `GET /properties/report` supplies
+  SoC, the measured AC power pair, PV, the device's own limits and per-pack voltages; the write is
+  `POST /properties/write` with `{sn, properties: {acMode, inputLimit, outputLimit, smartMode}}`
+  using the property sign convention (magnitudes plus direction). Writes are clamped to the
+  configured limit **and** the device's reported maximum, and every write is read back against the
+  device's own limit echo within 5 W — a mismatch or timeout is a driver error, so the existing
+  failsafe hold path decides what happens next. `read_cell_voltage()` exposes the lowest pack cell
+  voltage (0.01 V) for a low-voltage guard, and the device's pack count/temperature/limits are
+  reported as diagnostics. The device reports no capacity in kWh, so `capacity_kwh` stays the
+  figure you entered — never a number derived from voltages.
+- **Saving a `zendure_native` battery proves the connection.** The add-on reads the device once
+  (bounded to 5 s) before storing: an unreachable host, a report with no properties (local API
+  disabled) or a serial that does not match the device is refused at save time with the reason
+  named. `allow_unreachable` in the mapping is the explicit opt-out; the battery card then shows
+  the read error instead. A configured `token` is sent as `Authorization: Bearer`, stored, masked in
+  every API/UI read-back (`***`, and a PATCH that omits or echoes the mask keeps the stored value)
+  and never logged.
+- **The local MQTT path is documented as planned work, not stubbed.** The device is an MQTT
+  *client* that must be pointed at a broker (`POST /rpc`, `HA.Mqtt.SetConfig`) and publishes on
+  `iot/<productKey>/<deviceId>/properties/{report,read,write}`; a stdlib-only broker/client within
+  this task was not achievable, so the exact remaining work is recorded in the docs and no
+  untested code ships.
+- **Verified against an in-process fake device, not the hardware.** `tests/test_wp5_zendure_native.py`
+  covers read/write round trips, charge-vs-discharge sign mapping, device clamping, read-back
+  mismatch, HTTP errors, malformed JSON, timeouts, holds, cell-voltage reads, connection validation
+  and the save-time probe; live firmware behaviour (per-model maxima, HTTPS certificates, the
+  undocumented 401/token path) still needs validation on a real device and is stated as assumed in
+  `docs/EXTERNAL_APIS.md` section 6.
+
 ## 0.14.0
 
 - **Each pack's real usable capacity can now be learned from its own cycles.** A battery gains a

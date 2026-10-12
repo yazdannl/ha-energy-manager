@@ -894,3 +894,63 @@ def test_battery_mqtt_driver_is_validated_and_round_trips(wired):
     status, _headers, body = wired.json("DELETE", "/api/v1/batteries/example_mqtt")
     assert status == 200
     note("battery zendure_mqtt: 201 with the bridge mapping, 400s name the missing/mistyped key")
+
+
+def test_native_driver_saves_without_an_integration_and_never_echoes_its_token(wired):
+    """SPEC 5/9.2: `zendure_native` is validated at save time and its token stays masked.
+
+    `allow_unreachable` makes the save-time probe a no-op here (no device is reachable from the
+    test machine); the unreachable-refusal path itself is covered in test_wp5_zendure_native.py
+    against a fake device.  What this test pins is the API contract: the driver round-trips
+    through POST/PATCH/GET, and a mapping token is `***` in every read-back while the stored
+    config keeps the real value.
+    """
+    payload = {
+        "config": {
+            "id": "example_native",
+            "name": "Example native inverter",
+            "driver": "zendure_native",
+            "capacity_kwh": 2.4,
+            "mapping": {
+                "host": "127.0.0.1",
+                "serial": "EXAMPLE0000001",
+                "token": "example-token",
+                "allow_unreachable": "true",
+            },
+        }
+    }
+    status, _headers, body = wired.json("POST", "/api/v1/batteries", payload)
+    assert status == 201, body
+    assert body["config"]["driver"] == "zendure_native"
+    assert body["config"]["mapping"]["token"] == "***"
+
+    status, _headers, body = wired.json("GET", "/api/v1/batteries")
+    assert status == 200
+    record = next(row for row in body["batteries"] if row["config"]["id"] == "example_native")
+    assert record["config"]["mapping"]["token"] == "***"
+    assert "example-token" not in json.dumps(record["config"])
+
+    # The advanced settings row carries the same battery list, so it must be masked too.
+    status, _headers, body = wired.json("GET", "/api/v1/config")
+    assert status == 200
+    row = next(row for row in body["settings"] if row["key"] == "batteries")
+    native = next(item for item in row["value"] if item["id"] == "example_native")
+    assert native["mapping"]["token"] == "***"
+
+    # A PATCH echoing the mask (or omitting the key) keeps the stored token, not `***`.
+    status, _headers, body = wired.json(
+        "PATCH", "/api/v1/batteries/example_native", {"patch": {"mapping": {"host": "127.0.0.1", "serial": "EXAMPLE0000001", "token": "***", "allow_unreachable": "true"}}}
+    )
+    assert status == 200, body
+    assert body["config"]["mapping"]["token"] == "***"
+
+    # A malformed connection is refused with the key named, before any probe.
+    status, _headers, body = wired.json(
+        "PATCH", "/api/v1/batteries/example_native", {"patch": {"mapping": {"host": "http://example.invalid", "serial": "EXAMPLE0000001"}}}
+    )
+    assert status == 400, (status, body)
+    assert "host" in body["error"]["message"]
+
+    status, _headers, body = wired.json("DELETE", "/api/v1/batteries/example_native")
+    assert status == 200
+    note("battery zendure_native: save-time validation, token masked in /batteries and /config")

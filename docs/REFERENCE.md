@@ -249,7 +249,8 @@ Panel: **Battery fleet**. Per battery card:
 | Search | Filters locally over device name, manufacturer, model, platform and entity id; falls back to the server's entity-text search when the local filter finds nothing. Discovery caps at 50 rows per read, so a device beyond the cap (a bridge device on a busy instance) is found by searching its name or serial — the copy says so. |
 | `id` | slug, auto-slugified and made unique on selection |
 | `Name` | free text |
-| `Driver` | `zendure`, `zendure_mqtt` or `generic` (auto-suggested: `zendure` on `platform: zendure_ha` or a Zendure-only role, `zendure_mqtt` for a Zendure device on `platform: mqtt`). The `Control path` select is shown for `zendure` only; choosing `zendure_mqtt` states that the device's own entities are written and that no other controller (the Zendure-HA integration) may manage the same inverter |
+| `Driver` | `zendure`, `zendure_mqtt`, `zendure_native` or `generic` (auto-suggested: `zendure` on `platform: zendure_ha` or a Zendure-only role, `zendure_mqtt` for a Zendure device on `platform: mqtt`; `zendure_native` is chosen by hand because no registry row identifies a device that has no integration). The `Control path` select is shown for `zendure` only; choosing `zendure_mqtt` states that the device's own entities are written and that no other controller (the Zendure-HA integration) may manage the same inverter; choosing `zendure_native` states that only the device's local API is used and that it must be enabled in the Zendure app (HEMS), and shows the connection fields instead of entity roles |
+| `zendure_native` connection fields | `host` (IP address or mDNS name), `serial` (`sn` the device reports), `port` (empty = 80/443), `scheme` (`http`/`https`), `api_path` (default `/properties`) and an optional `token` (password field: stored, sent as `Authorization: Bearer`, shown masked and never echoed). Malformed values are rejected inline (bare host, 1…65535 port, http/https, `/`-prefixed path, 0…60 s timeout); the server additionally reads the device once on save and refuses an unreachable host or a mismatched serial unless `allow_unreachable` was set in the stored mapping. One battery per inverter: a second battery with the same `host`+`serial` is journaled as `driver_conflict` and not driven |
 | `Capacity (kWh, usable AC side)` | step 0.1; in `learned` mode it is the seed/fallback |
 | `Capacity source` | `manual` (use the typed capacity) or `learned` (measure the pack's real usable capacity); learned states the 10-point / 20 %-of-limit / 3-window / 30-day rules inline |
 | `Minimum SoC (%)` / `Maximum SoC (%)` | 0–100 |
@@ -657,7 +658,9 @@ finite number > 0`); `PATCH /api/v1/config` reports it per key and nothing is ap
 
 **Secrets are never echoed** — any settings key whose name contains `key`, `token`, `secret`,
 `password` or `passwd` is reported with type `password` and its value replaced by `***` when set (for
-example `solar.api_key`). The form shows `(a value is set; leave empty to keep it)` and only sends a
+example `solar.api_key`). The same masking applies to battery mapping credentials (a
+`zendure_native` `token`): a read-back shows `***`, and a PATCH that echoes the mask or omits the key
+keeps the stored value. The form shows `(a value is set; leave empty to keep it)` and only sends a
 new value when the user types one.
 
 #### Advanced (never folded) set — frozen
@@ -677,7 +680,7 @@ new value when the user types one.
 | --- | --- | --- | --- |
 | `id` | str | required | stable slug, unique |
 | `name` | str | — | display name |
-| `driver` | str | required | `zendure`, `zendure_mqtt` or `generic` |
+| `driver` | str | required | `zendure`, `zendure_mqtt`, `zendure_native` or `generic` |
 | `capacity_kwh` | float | required | must be > 0; usable AC-side capacity. In `learned` mode this is the seed/fallback |
 | `capacity_source` | str | `manual` | `manual` uses `capacity_kwh`; `learned` uses the estimate measured from the pack's own cycles once it is confident and fresh (SPEC 5). Validated at save time |
 | `min_soc_pct` | float | `10.0` | must be < `max_soc_pct`, both in 0…100 |
@@ -688,8 +691,8 @@ new value when the user types one.
 | `eta_discharge` | float | `0.95` | must be in (0, 1] |
 | `price_eur` | float | `0.0` | ≥ 0; 0 = unknown purchase price, no derived wear |
 | `cycle_life` | float | `0.0` | ≥ 0; 0 = unknown rated cycles, no derived wear |
-| `control_path` | str | `auto` | how the driver must write: `auto` (driver preference), `manager` (the Zendure manager's system-wide `manual_power`) or `device` (the inverter's own `ac_mode` + `input_limit`/`output_limit`). Validated at save time: `manager` needs `manual_power_entity` + `operation_entity`, `device` needs `charge_limit_entity` + `discharge_limit_entity`. Ignored by `zendure_mqtt` (one path) and by drivers without paths of their own |
-| `mapping` | dict | `{}` | must be non-empty: "confirm the entity mapping in the UI" |
+| `control_path` | str | `auto` | how the driver must write: `auto` (driver preference), `manager` (the Zendure manager's system-wide `manual_power`) or `device` (the inverter's own `ac_mode` + `input_limit`/`output_limit`). Validated at save time: `manager` needs `manual_power_entity` + `operation_entity`, `device` needs `charge_limit_entity` + `discharge_limit_entity`. Ignored by `zendure_mqtt` (one path), by `zendure_native` (the device's own HTTP API is the only path) and by drivers without paths of their own |
+| `mapping` | dict | `{}` | must be non-empty: "confirm the entity mapping in the UI". `zendure`, `zendure_mqtt` and `generic` map entity ids; `zendure_native` maps connection settings (`host`, `serial`, optional `scheme`/`port`/`api_path`/`token`/`timeout_s`/`insecure_tls`/`allow_unreachable`). A `token` (or any `password`/`secret`/`api_key`) value is stored for the driver, reported as `***` by every API/UI read-back, and kept when a PATCH omits it or echoes the mask |
 | `enabled` | bool | `true` | disabled batteries are excluded from aggregate, allocation and safety |
 
 Derived/validated helpers:

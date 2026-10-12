@@ -78,5 +78,6 @@ def test_ui_renders_and_settings_ia_holds():
         "the batteries card shows the effective capacity, marked learned",
         "the batteries card states the estimate's sample count and last update",
         "the batteries card states the configured seed next to the effective value",
+        "the native driver's connection settings are validated in the wizard",
     ):
         assert needle in proc.stdout, f"the render check no longer reports {needle!r}:\n{proc.stdout}"

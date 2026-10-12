@@ -123,6 +123,7 @@ energy_manager/
     control/drivers/base.py         WP2B BatteryDriver protocol
     control/drivers/zendure.py      WP2B Zendure driver
     control/drivers/generic.py      WP2B entity-mapping driver
+    control/drivers/native.py       WP2B native Zendure zenSDK HTTP driver
     engine.py                       WP2B application core, owns threads and shared state
     api.py                          WP2B HTTP JSON API (frozen contract §10)
     notify.py                       WP2B HA notifications + persistent notices
@@ -363,7 +364,7 @@ forecast — and only an explicit `price.feed_in_eur_per_kwh = 0` forces a zero 
 class BatteryConfig:
     id: str                 # stable slug chosen at runtime, e.g. "battery_1"
     name: str
-    driver: str             # "zendure" | "generic"
+    driver: str             # "zendure" | "zendure_mqtt" | "zendure_native" | "generic"
     capacity_kwh: float     # usable AC-side capacity
     min_soc_pct: float
     max_soc_pct: float
@@ -425,6 +426,28 @@ mapping and requires explicit user confirmation before the mapping is stored.
 − discharge), or the pair `charge_power_entity` + `discharge_power_entity`, plus optional
 `mode_select_entity`/`mode_manual_value`, `soc_entity`, `capacity_entity`. A generic battery with no
 usable setpoint entity must be rejected at save time with a clear message, not at dispatch time.
+
+`driver: zendure_native` (0.15.0) talks to the inverter's own local zenSDK HTTP API with the
+standard library alone -- no `zendure_ha` entities, no MQTT broker, no cloud. Its `mapping` holds
+**connection settings**, not entities: `host` and `serial` required, `scheme` (`http`/`https`),
+`port`, `api_path` (default `/properties`), optional `token` (sent as `Authorization: Bearer`),
+`timeout_s`, `insecure_tls` and `allow_unreachable`. `GET <api_path>/report` supplies SoC, the
+measured AC pair, PV, the device's own limits and per-pack voltages; `POST <api_path>/write` sends
+`{"sn": …, "properties": {acMode, inputLimit, outputLimit, smartMode}}` with the property sign
+convention (magnitudes plus direction; positive charge maps to `inputLimit`, never a negative
+number -- see `docs/EXTERNAL_APIS.md` section 6). Writes are clamped to the configured limit **and**
+the device's reported maximum, and every write is read back against the device's own limit echo
+within 5 W; a mismatch or timeout is a driver error, so the existing failsafe hold decides what
+happens next. `read_cell_voltage()` exposes the lowest `packData[].minVol` (0.01 V) for a low-voltage
+guard, and the driver reports no capacity in kWh because the device does not:
+`capacity_kwh` stays the user's figure. One battery per inverter: a second battery with the same
+`host`+`serial` is refused (only the first is driven), because both would overwrite each other's
+limits. Saving a native battery probes the device once (bounded to
+5 s): an unreachable host, a report with no properties or a mismatched serial is refused at save
+time with the reason named, while `allow_unreachable` is the explicit opt-out (the card then shows
+the read error). The doc records what is verified from the vendor documentation/source versus what
+still needs live-hardware validation; the local MQTT transport is documented there as planned work,
+not stubbed.
 
 Aggregation for optimisation uses `capacity_kwh`, summed power limits and capacity-weighted
 efficiencies; per-battery allocation then honours each battery's own limits (§8.3) and spends the
@@ -756,6 +779,19 @@ respect device limits when writing, verify read-back after each write inside tol
 mismatch as a driver error (not a silent success). It must never write to `soc_set`/`min_soc` on
 every tick — SoC floors are expressed as optimized power, with the device SoC limits configured
 separately and rarely.
+
+`native.py` (0.15.0) must: speak the device's local HTTP JSON API with `urllib`/`http.client`/`ssl`
+only (no third-party dependency), address the device by its required `sn`, read SoC / the measured
+AC pair / PV / the device's own limits / pack voltages, write charge and discharge as the property
+command shape (`inputLimit`/`outputLimit` magnitudes plus `acMode`, `smartMode` part of every
+command), clamp to the device's own maximum as well as the configured limit, verify every write
+against the device's own read-back inside a bounded window (mismatch or timeout = `driver_error`, so
+the failsafe hold path stays in charge), degrade every transport/parse failure into a note/`last_error`
+without ever raising out of `read_state`/`apply`, and expose the optional `read_cell_voltage()` hook.
+It reads and writes no Home Assistant entities at all, so the battery works without `zendure_ha`;
+saving it probes the device once and refuses a malformed or unreachable config unless the user set
+`allow_unreachable`. The transport contract and its documented-vs-assumed split live in
+`docs/EXTERNAL_APIS.md` section 6.
 
 ### 9.3 Safety (`control/safety.py`, pure functions, unit-tested)
 `check(requested_w, plan_slot, batteries, state, settings, now) -> SafetyDecision(allowed_w,
@@ -1460,6 +1496,17 @@ round, with the reason:
   switches source through the normal dirty/Save flow. Alternatives rejected: writing the learned
   value back to ``capacity_kwh`` (destroys the seed and the manual fallback) and trusting a single
   cycle (one bad meter sample would redefine the pack).
+
+- **§5/§9.2 (native Zendure transport; requested 2026-10-12, "drive Zendure hardware directly over
+  its local API")** — the device's own local zenSDK HTTP API (`GET /properties/report`,
+  `POST /properties/write`) is added as driver `zendure_native` with stdlib-only `urllib`/`ssl`: its
+  `mapping` carries connection settings (`host`, required `serial`, optional `scheme`/`port`/`token`/
+  `api_path`/`timeout_s`/`insecure_tls`/`allow_unreachable`), it needs no `zendure_ha` entities,
+  clamps to the device's own maxima, verifies every write against the device's limit echo (mismatch
+  or timeout = `driver_error`), exposes `read_cell_voltage()` from `packData[].minVol`, and refuses
+  an unreachable/mismatched-serial config at save time unless `allow_unreachable` is set. The local
+  MQTT transport is documented as planned work (it needs a broker), never stubbed; the
+  verified-vs-assumed split is in `docs/EXTERNAL_APIS.md` section 6.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

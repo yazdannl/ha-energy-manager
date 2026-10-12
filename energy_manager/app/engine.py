@@ -1266,7 +1266,9 @@ class Engine:
         drivers: dict[str, Any] = {}
         # A Zendure manager has ONE system-wide manual_power entity: two batteries sharing it would
         # fight over the same setpoint, so only the first one gets a driver (docs/EXTERNAL_APIS 6).
-        claimed: dict[tuple[str, str], str] = {}
+        # A native device is addressed by host+serial, so two batteries pointing at the same
+        # inverter would overwrite each other's limits; only the first one gets a driver too.
+        claimed: dict[tuple[str, ...], str] = {}
         if self._ha is not None:
             for config in sorted(configs, key=lambda c: c.id):
                 if not config.enabled:
@@ -1286,6 +1288,19 @@ class Engine:
                             )
                             break
                         claimed[(key, entity)] = config.id
+                if prepared.driver == driver_registry.ZendureNativeDriver.driver_name:
+                    host = str(prepared.mapping.get("host") or "").strip().lower()
+                    serial = str(prepared.mapping.get("serial") or "").strip()
+                    if host and serial:
+                        key = ("device", host, serial)
+                        owner = claimed.get(key)
+                        if owner:
+                            conflict = (
+                                f"device {host} (serial {serial}) is already controlled by "
+                                f"battery {owner}; two batteries cannot drive the same inverter"
+                            )
+                        else:
+                            claimed[key] = config.id
                 if conflict:
                     self._journal.event(
                         "error", "driver_conflict", f"battery {config.id}: {conflict}",
@@ -1391,7 +1406,12 @@ class Engine:
             raise ValueError(f"invalid battery config: {exc}") from None
         # Validate what the driver will actually use: Zendure roles resolve from the registry at
         # runtime, so a config that only maps the SoC sensor is complete on a manager install.
-        problems = driver_registry.validate_config(self.resolved_config(candidate))
+        effective = self.resolved_config(candidate)
+        problems = driver_registry.validate_config(effective)
+        if not problems:
+            # One bounded device read (SPEC 5): an unreachable native device or a serial that does
+            # not match is refused at save time, never discovered at dispatch time.
+            problems = driver_registry.probe_config(effective)
         if problems:
             raise ValueError("; ".join(problems))
         adder = getattr(self._settings, "add_battery", None)
@@ -1410,8 +1430,13 @@ class Engine:
             raise KeyError(battery_id)
         known = {field.name for field in fields(BatteryConfig)}
         clean = {key: value for key, value in patch.items() if key in known and key != "id"}
+        if "mapping" in clean and isinstance(clean["mapping"], Mapping):
+            clean["mapping"] = _merge_mapping_patch(current.mapping, clean["mapping"])
         candidate = replace(current, **clean)
-        problems = driver_registry.validate_config(self.resolved_config(candidate))
+        effective = self.resolved_config(candidate)
+        problems = driver_registry.validate_config(effective)
+        if not problems:
+            problems = driver_registry.probe_config(effective)
         if problems:
             raise ValueError("; ".join(problems))
         self._settings.update_battery(battery_id, clean)
@@ -3156,6 +3181,19 @@ def _status_list(value: Any) -> list[ProviderStatus]:
     if isinstance(value, (list, tuple)):
         return [item for item in value if isinstance(item, ProviderStatus)]
     return []
+
+
+def _merge_mapping_patch(current: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[str, str]:
+    """Patch mapping with stored credentials preserved (see config.merge_mapping_patch).
+
+    Lazy like :func:`_battery_view`: this module must boot without WP2A's config module, and
+    without it there is nothing to preserve (no config round-trip exists).
+    """
+    try:
+        from .config import merge_mapping_patch
+    except ImportError:  # standalone engine without WP2A's config module
+        return {str(key): str(value) for key, value in patch.items()}
+    return merge_mapping_patch(current, patch)
 
 
 def _battery_view(config: BatteryConfig) -> dict[str, Any]:

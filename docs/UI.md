@@ -327,6 +327,14 @@ if they are absent:
   manufacturer/model and derives its roles from the zenSDK property names in the entity ids, so the
   pick fills `ac_mode_entity`, `charge_limit_entity`, `discharge_limit_entity`, `soc_entity`,
   `smart_mode_entity`, `grid_input_power_entity` and the rest without a confidence score.
+- `driver` may be `zendure_native` (the device's own local zenSDK HTTP API, no integration): the
+  dialog then hides `Control path` (the device's own API is the only path), swaps the entity-role
+  inputs for the connection fields (`host`, `serial`, `port`, `scheme`, `api_path` and an optional
+  password-style `token`), validates them inline and states that the device's local API must be
+  enabled in the Zendure app. Saving probes the device once: an unreachable address or a serial the
+  device does not report is refused with the reason, while the confirmation names the host and
+  serial and asks separately for permission to write the device's AC limits. The card's `Dispatch`
+  reads `Device over zenSDK HTTP: AC mode + input/output limits (<host> over HTTP|HTTPS)`.
 - `GET /api/v1/batteries`: `capabilities` as a flat object, and `state.extra.cycles` for the cycle
   count. For the efficiency/wear block: `round_trip_efficiency_pct` (the stored input), `eta_charge`
   and `eta_discharge` (the effective values, after the even split or the override), `price_eur`,

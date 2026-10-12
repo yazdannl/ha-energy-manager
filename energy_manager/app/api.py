@@ -154,6 +154,25 @@ def _mask(key: str, value: Any) -> Any:
     return value
 
 
+def _redact_battery_rows(value: Any) -> Any:
+    """Battery settings as a client may see them: mapping credentials masked, never echoed.
+
+    The ``batteries`` setting is a list of battery objects whose ``mapping`` may carry a device
+    token (driver ``zendure_native``); ``_mask`` only inspects the top-level key, so the nested
+    credential needs its own pass (SPEC 3.3/3.4).
+    """
+    if not isinstance(value, list):
+        return value
+    try:
+        from .config import redact_battery_mapping
+    except ImportError:  # pragma: no cover - standalone api tests without WP2A's config module
+        return value
+    return [
+        {**row, "mapping": redact_battery_mapping(row.get("mapping"))} if isinstance(row, Mapping) else row
+        for row in value
+    ]
+
+
 def _coerce(meta: Mapping[str, Any], value: Any) -> Any:
     """Normalise one setting value; raises ``ApiError(400)``.  ``config`` validates for real."""
     kind = str(meta["type"])
@@ -1032,6 +1051,8 @@ class ApiServer:
         rows = self._setting_catalogue()
         for key, row in rows.items():
             row["value"] = _mask(key, row["value"])
+        if "batteries" in rows:
+            rows["batteries"]["value"] = _redact_battery_rows(rows["batteries"]["value"])
         return {
             "options": options,
             "settings": [rows[key] for key in sorted(rows)],

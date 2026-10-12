@@ -706,6 +706,97 @@ MQTT bridge (same properties, written through the bridge's own entities; magnitu
 * Driver guard: at most one setpoint write per `control.tick_seconds` (30 s) per battery, idempotent
   skip within 5 W read-back, verify after each write. Device/cloud-side throttling is **[U]**.
 
+### The device's own local zenSDK HTTP API (driver `zendure_native`, 0.15.0)
+
+Sources: `github.com/Zendure/zenSDK` (`README.md`, `docs/openapi.yaml`, `docs/en_properties.md` and
+the Python/JS samples, fetched 2026-10-12) and the vendor integration's own zenSDK transport
+(`custom_components/zendure_ha/device.py`, class `ZendureZenSdk`, tag 1.4.4 -- the same reference the
+manager facts above come from).  **Live-hardware validation is still pending**: no device is
+reachable from the build machine, so the tests prove the transport, parsing, clamping and
+read-back pipeline against this contract, not firmware behaviour.  Everything marked **[U]** below
+is an assumption the driver is defensive about.
+
+**Enablement [V].** Under EN 18031 the device's local HTTP API is off by default; the Zendure app
+must *add HEMS and exit to apply* before it answers.  A device with it disabled refuses the
+connection or answers 401; the driver turns either into `available=false` + a `last_error`, never
+into a fabricated value.
+
+**Endpoints [V]** (plain HTTP on the port the device advertises, port 80 in every vendor example;
+mDNS service `_zendure._tcp`, name `Zendure-<Model>-<Last12MAC>`, advertises host and HTTP port):
+
+```
+GET  http://<device-ip>/properties/report
+  -> {"sn": "<serial>", "product": "...", "properties": { ... }, "packData": [ ... ]}
+
+POST http://<device-ip>/properties/write
+  Content-Type: application/json; charset=UTF-8
+  {"id": 1, "sn": "<serial>", "properties": {"inputLimit": 600, "outputLimit": 0,
+                                                "acMode": 1, "smartMode": 1}}
+  -> 200 with a JSON object (the reference transport ignores the body)  [V]
+     401 = API disabled / credential rejected; 400 = malformed request      [V] (openapi)
+```
+
+* `sn` is required in every write and is the device-addressing field; the driver also checks the
+  `sn` the report returns against the configured serial (a mismatched report is refused, never
+  written to).  The wizard takes host and serial by hand: mDNS discovery is documented but **not
+  implemented** here.
+* The reference transporter sends no `Authorization` header at all (it talks to a plain
+  `http://<ipAddress>/properties/...` URL), and the iobroker/community implementations report no
+  keys or authentication beyond the address.  The openapi lists a 401 for `/properties/write` but no
+  security scheme, so the driver's optional `token` mapping sends `Authorization: Bearer <token>`
+  -- **assumed [U]**, only needed on firmware that rejects unauthenticated writes; a token is
+  stored in settings, masked in every API/UI read-back and never logged.
+* `scheme` is `http` or `https`; https verification is on by default and `insecure_tls=true` is the
+  explicit opt-out for a self-signed device certificate **[U]** (no vendor TLS documentation).
+* HTTP status, a timeout, malformed JSON and a non-object payload all become a short `last_error`;
+  none of them can crash a tick or fabricate a number.
+
+**Property vocabulary [V]** (`docs/en_properties.md`; units as documented): read
+`electricLevel` (%), the measured AC pair `gridInputPower`/`outputHomePower` (W),
+`solarInputPower` and `solarPower1..6` (W), `packInputPower`/`outputPackPower` (W, the pack flow),
+`chargeMaxLimit` (W), `inverseMaxPower` (W), `hyperTmp` (0.1 K), `timestamp`/`ts`, and per pack in
+`packData`: `socLevel`, `power`, `totalVol` (V), `maxVol`/`minVol` (0.01 V), `maxTemp` (0.1 K),
+`batcur` (A, 16-bit two's complement / 10), `state`, `heatState`.  Write `acMode` (1 = input /
+charge, 2 = output / discharge), `inputLimit`/`outputLimit` (W, non-negative magnitudes),
+`socSet`/`minSoc` (%), `smartMode`, `gridReverse`, `inverseMaxPower`.
+
+The **sign convention is the property one**: the device never sees models.py's negative-charge
+numbers.  The driver maps `+charge W -> inputLimit = +W, outputLimit = 0, acMode = 1` and
+`-discharge W -> outputLimit = +W, inputLimit = 0, acMode = 2`; a hold writes both limits 0 with
+`smartMode = 0`.  (This is the mirror image of the Zendure-HA manager's `manual_power`, which is the
+*opposite* of models.py -- see the first subsection above.)  `smartMode: 1` is the vendor's
+"parameters are not written to flash" RAM mode and is part of every command, exactly as the
+reference implementation sends it.
+
+**Implemented write/read-back sequence.**  After every write the driver re-reads
+`/properties/report` inside the bounded retry window and requires the device's own limit echo
+(`inputLimit - outputLimit`) to match the target within 5 W (the vendor's `POWER_TOLERANCE`),
+falling back to the measured pair; a mismatch or timeout is a `driver_error`, which is what makes
+the existing failsafe hold run.  Writes are clamped to the configured limit *and* the device's own
+`chargeMaxLimit` / `inverseMaxPower` when it reports a positive value (per-model values vary by
+firmware, so both bounds apply).  The device reports **no capacity in kWh**: `capacity_kwh` stays
+the user's figure and is never derived from pack voltages; `packData[].minVol` (0.01 V) is exposed
+through the optional `read_cell_voltage()` hook for a low-voltage guard.
+
+**Not modelled [U]:** off-grid output keeps `smartMode` on for a hold in the reference
+implementation (`pwr_offgrid != 0`); a device with a battery-backup port may therefore keep
+inverting while the add-on's hold writes 0 W of AC limits.  SoC limits (`socSet`/`minSoc`) are read
+but never written; the add-on's own SoC clamp stays authoritative.
+
+**Planned: the device's local MQTT path (not implemented in 0.15.0).**  The device is an MQTT
+*client*, not a broker: `POST /rpc` with `{"sn": ..., "method": "HA.Mqtt.SetConfig", "params":
+{"config": {"enable": true, "server": "<host>", "port": 1883, "protocol": "mqtt", "username":
+"...", "password": "..."}}}` points it at a broker, and it publishes/subscribes on
+`iot/<productKey>/<deviceId>/properties/{report,read,write}` with the same property vocabulary
+**[V]** (vendor README `examples/openHAB`, `HA.Mqtt.GetStatus`/`GetConfig` via `GET /rpc`; the
+reference integration subscribes to exactly those topics).  It is not implemented here because it
+needs a broker (or an MQTT 3.1.1 client plus broker configuration and TLS) that is not achievable
+stdlib-only within this task; the transport that *is* stdlib-only (this HTTP API) covers the same
+read/write surface.  Exact remaining work: a minimal MQTT client (CONNECT/SUBSCRIBE/PUBLISH/PING,
+optional TLS) as `control/drivers/native_mqtt.py`, the `POST /rpc` config step, topic routing per
+`deviceId`, and a fake in-process broker for tests.  No stub is shipped; the HTTP driver is the
+only native transport.
+
 ---
 
 ## 7. Defensive assumptions (what code must do for every **[U]**)
@@ -738,6 +829,11 @@ MQTT bridge (same properties, written through the bridge's own entities; magnitu
 | 24 | HA location may be unset (`latitude: 0.0`) | `resolve_location` fails loudly; solar disabled with a visible warning; never invent coordinates. |
 | 25 | Full state dump size | Never poll `/api/states` in the tick loop; resolve entity ids once (registry / user mapping) and read only mapped entities. |
 | 26 | External rate budgets | Forecast.Solar keyless 12/h/IP (≤8/h planned); Energy-Charts undocumented -> 1 call per refresh with cache; NASA POWER has no documented keyless budget -> at most one request per location per day (daily-cached profile); Zendure no documented budget -> ≤1 write per tick, idempotent. |
+| 27 | Zendure local API disabled by default (EN 18031) | Treat connection-refused/401 as a read error: `available=false`, the exact reason in `last_error`, no write attempted, no value fabricated. Never cache a stale reading as fresh. |
+| 28 | Zendure local API token scheme undocumented | Send the optional token only as `Authorization: Bearer`; store it, mask it in every API/UI read-back, never log it; a 401 names the local API and the token as possible causes without echoing either. |
+| 29 | Zendure per-model maxima and firmware units vary | Clamp to `min(configured, device-reported)` and ignore a zero/absent device maximum rather than treating it as "no power allowed"; parse every unit from the documented table, verify every write against the device's own echo inside 5 W, and treat a mismatch/timeout as `driver_error`. |
+| 30 | Zendure local HTTP server may be slow or degrade (cloud blocked) | Bounded per-request timeout (default 3 s, save-time probe ≤5 s), at most one write per tick, read-back retries bounded, and every failure path returns a driver error instead of raising into the tick. |
+| 31 | Zendure off-grid output keeps `smartMode` on for a hold | Document the ceiling; never claim a hold means the device stopped inverting. The add-on's claim is limited to the AC limit properties it wrote and verified. |
 
 ---
 

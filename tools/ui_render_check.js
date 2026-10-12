@@ -258,8 +258,16 @@ function classTokens(text) {
     A.dispatchPathText({ control_path: "device" }, { control_path: "device_limits" }) === "Inverter: AC mode + limits (chosen)"
     && A.dispatchPathText({ control_path: "auto" }, { control_path: "manager_manual_power" }) === "Zendure manager: manual power (auto)"
     && A.dispatchPathText({}, { driver: "zendure_mqtt", control_path: "device_limits" }) === "Inverter over MQTT: AC mode + limits (the device's own entities)"
+    && A.dispatchPathText({}, { driver: "zendure_native", connection: { host: "example.invalid", scheme: "http" } }) === "Device over zenSDK HTTP: AC mode + input/output limits (example.invalid over HTTP)"
     && A.dispatchPathText({}, {}) === "unknown (auto)",
     A.dispatchPathText({ control_path: "device" }, { control_path: "device_limits" }));
+  // The native driver has no entities: its wizard fields are the connection settings, and the
+  // client refuses a malformed host/serial before the server's own save-time probe would.
+  const nativeProblems = A.batteryNativeConnectionProblems({ host: "http://example.invalid", serial: "", scheme: "ftp", port: "70000" });
+  check("the native driver's connection settings are validated in the wizard",
+    nativeProblems.length >= 4
+    && A.batteryNativeConnectionProblems({ host: "device.example.invalid", serial: "EXAMPLE0000001" }).length === 0,
+    JSON.stringify(nativeProblems));
   // A Zendure inverter bridged by Home Assistant's own MQTT integration is a driver of its own:
   // the device is identified by platform + manufacturer/model, and each row's role follows from
   // the zenSDK property name it carries (no confidence score is involved).

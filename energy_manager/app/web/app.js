@@ -911,6 +911,14 @@
       // One path only: the device's own AC mode and limits, through the MQTT bridge's entities.
       return "Inverter over MQTT: AC mode + limits (the device's own entities)";
     }
+    if (capabilities && capabilities.driver === NATIVE_ZENDURE_DRIVER) {
+      // The add-on speaks the device's own zenSDK HTTP API: no HA entity is involved.
+      var connection = capabilities.connection || {};
+      var where = connection.host
+        ? " (" + connection.host + (String(connection.scheme) === "https" ? " over HTTPS" : " over HTTP") + ")"
+        : "";
+      return "Device over zenSDK HTTP: AC mode + input/output limits" + where;
+    }
     var chosen = String(config && config.control_path || "auto");
     return label + (["manager", "device"].indexOf(chosen) >= 0 ? " (chosen)" : " (auto)");
   }
@@ -2189,7 +2197,10 @@
       ["pv_power_entity", "PV input power sensor (solarInputPower)"],
       ["smart_mode_entity", "Device smart mode (written with every command)"],
       ["operation_entity", "Zendure manager operation select (kept off, optional)"]
-    ]
+    ],
+    // The device's own local zenSDK HTTP API: no HA entities at all, so the "roles" are the
+    // connection settings the driver posts to and reads the device identity from.
+    zendure_native: []
   };
   var NON_ENTITY_ROLES = {
     mode_manual_value: "Manual mode value (e.g. manual)",
@@ -2200,8 +2211,49 @@
   var BATTERY_DRIVER_LABELS = {
     generic: "generic (a setpoint or charge/discharge pair)",
     zendure: "zendure (the Zendure-HA integration)",
-    zendure_mqtt: "zendure_mqtt (a device bridged by MQTT)"
+    zendure_mqtt: "zendure_mqtt (a device bridged by MQTT)",
+    zendure_native: "zendure_native (the device's own zenSDK HTTP API, no integration)"
   };
+
+  // The native driver's mapping keys are connection settings; they mirror
+  // control/drivers/native.py so a typed value and a validated value can never disagree.
+  var NATIVE_CONNECTION_FIELDS = [
+    ["host", "Device IP address or mDNS name", "the device's own address on the LAN"],
+    ["serial", "Device serial number (sn)", "the serial the device reports"],
+    ["port", "HTTP port (empty = 80 for http, 443 for https)", "80"],
+    ["scheme", "Scheme (http or https)", "http"],
+    ["api_path", "API base path", "/properties"],
+    ["token", "API token (optional)", "empty = no Authorization header"]
+  ];
+
+  /** Connection problems of a zendure_native mapping (mirrors control/drivers/native.py). */
+  function batteryNativeConnectionProblems(mapping) {
+    mapping = mapping || {};
+    var problems = [];
+    var host = String(mapping.host || "").trim();
+    if (!host) problems.push("A native Zendure battery needs the device's IP address or hostname.");
+    else if (/:\/\//.test(host) || host.indexOf("/") >= 0 || /\s/.test(host)) {
+      problems.push("The device host must be a bare IP address or hostname (no scheme, port or path).");
+    }
+    var serial = String(mapping.serial || "").trim();
+    if (!serial) problems.push("A native Zendure battery needs the device serial number (sn).");
+    else if (/\s/.test(serial)) problems.push("The device serial must not contain spaces.");
+    var scheme = String(mapping.scheme || "http").trim().toLowerCase();
+    if (scheme !== "http" && scheme !== "https") problems.push("The scheme must be http or https.");
+    var port = String(mapping.port || "").trim();
+    if (port) {
+      var portValue = numeric(port);
+      if (portValue == null || portValue < 1 || portValue > 65535) problems.push("The HTTP port must be a whole number between 1 and 65535.");
+    }
+    var apiPath = String(mapping.api_path || "/properties").trim();
+    if (apiPath.charAt(0) !== "/" || /\s/.test(apiPath)) problems.push("The API base path must start with / and contain no spaces.");
+    var timeout = String(mapping.timeout_s || "").trim();
+    if (timeout) {
+      var timeoutValue = numeric(timeout);
+      if (timeoutValue == null || timeoutValue <= 0 || timeoutValue > 60) problems.push("The HTTP timeout must be between 0 and 60 seconds.");
+    }
+    return problems;
+  }
 
   /* ---- battery discovery picker (SPEC §5/§10) -----------------------------------------------
    * /discover?kind=battery returns one row per (entity, role), so a battery is only obvious once
@@ -2237,6 +2289,9 @@
    * same vocabulary the server driver resolves (`control/drivers/zendure.py`), so a pick here and a
    * runtime resolve agree. */
   var MQTT_ZENDURE_DRIVER = "zendure_mqtt";
+  // The native driver talks to the inverter's own local zenSDK HTTP API.  No entity registry row
+  // can identify it (there is no integration), so it is only ever chosen manually in the wizard.
+  var NATIVE_ZENDURE_DRIVER = "zendure_native";
   // [entity-id suffix, role slug, mapping key]
   var MQTT_ZENDURE_PROPERTIES = [
     ["inputlimit", "charge_limit", "charge_limit_entity"],
@@ -3131,7 +3186,8 @@
     var fields = {
       id: String(source.id || ""),
       name: String(source.name || ""),
-      driver: source.driver === "zendure" ? "zendure" : "generic",
+      driver: ["generic", "zendure", MQTT_ZENDURE_DRIVER, NATIVE_ZENDURE_DRIVER].indexOf(String(source.driver)) >= 0
+        ? String(source.driver) : "generic",
       capacity_kwh: isNum(source.capacity_kwh) ? source.capacity_kwh : 5.0,
       min_soc_pct: isNum(source.min_soc_pct) ? source.min_soc_pct : 10.0,
       max_soc_pct: isNum(source.max_soc_pct) ? source.max_soc_pct : 90.0,
@@ -3168,7 +3224,7 @@
     }
 
     var driverSelect = el("select", { id: "battery-driver" });
-    ["generic", "zendure", MQTT_ZENDURE_DRIVER].forEach(function (driver) {
+    ["generic", "zendure", MQTT_ZENDURE_DRIVER, NATIVE_ZENDURE_DRIVER].forEach(function (driver) {
       var option = el("option", { value: driver, text: BATTERY_DRIVER_LABELS[driver] || driver });
       if (driver === fields.driver) option.selected = true;
       driverSelect.appendChild(option);
@@ -3191,13 +3247,18 @@
     // The MQTT bridge driver needs a warning of its own: it drives the *device*, so a second
     // battery pointing at the same inverter (or a manager still managing it) would fight it.
     var mqttDriverNote = el("p", { class: "field-help", text: "The MQTT bridge's own entities: the add-on writes the device's AC mode and input/output limits, so the Zendure-HA integration must not manage the same inverter at the same time — disable this battery's twin there first, and map the Zendure manager's operation select above if that integration stays installed." });
+    // The native driver needs neither the integration nor a broker; it does need the device's own
+    // local API enabled, and the server proves the connection (and the serial) before saving.
+    var nativeDriverNote = el("p", { class: "field-help", text: "The device's own local HTTP (zenSDK) API: no Zendure-HA entities and no MQTT broker are needed. Enable the device's local API first (in the Zendure app, add HEMS and exit to apply), then save — the add-on reads the device and checks the serial before the battery is stored. Every write is read back from the device before it is reported as applied." });
     // Only the Zendure-HA driver has two paths to choose between. A Zendure MQTT battery has one:
     // the device's own AC mode and limits, written through the bridge's own entities.
     function updateControlPathVisibility() {
       var zendureHa = driverSelect.value === "zendure";
+      var native = driverSelect.value === NATIVE_ZENDURE_DRIVER;
       controlPathField.style.display = zendureHa ? "" : "none";
       controlPathNote.style.display = zendureHa ? "" : "none";
       mqttDriverNote.style.display = driverSelect.value === MQTT_ZENDURE_DRIVER ? "" : "none";
+      nativeDriverNote.style.display = native ? "" : "none";
     }
     driverSelect.addEventListener("change", updateControlPathVisibility);
 
@@ -3220,6 +3281,7 @@
       controlPathField,
       controlPathNote,
       mqttDriverNote,
+      nativeDriverNote,
       fieldRow("capacity_kwh", "Capacity (kWh, usable AC side)", fields.capacity_kwh, "0.1", "0.1"),
       el("label", { class: "field", for: "battery-capacity-source" }, [el("span", { text: "Capacity source" }), capacitySourceSelect]),
       capacitySourceNote,
@@ -3336,6 +3398,25 @@
     var mappingHost = el("div", { class: "fields" });
     function renderMappingRows() {
       clear(mappingHost);
+      if (driverSelect.value === NATIVE_ZENDURE_DRIVER) {
+        // A stored credential is read back masked; the field starts empty so an untouched form
+        // never re-sends it, and the server keeps the stored value when the key is absent.
+        if (mapping.token === "***") delete mapping.token;
+        NATIVE_CONNECTION_FIELDS.forEach(function (field) {
+          var key = field[0];
+          var input = key === "token"
+            ? el("input", { type: "password", value: "", placeholder: field[2], autocomplete: "off" })
+            : el("input", { type: "text", value: mapping[key] || "", placeholder: field[2] });
+          input.addEventListener("input", function () {
+            var text = input.value.trim();
+            if (text) mapping[key] = text; else delete mapping[key];
+          });
+          inputs["map:" + key] = input;
+          mappingHost.appendChild(el("label", { class: "field" }, [el("span", { text: field[1] }), el("span", { class: "field-key", text: key }), input]));
+        });
+        mappingHost.appendChild(el("p", { class: "field-help", text: "The driver reads SoC, the measured AC power pair, PV, the device's own limits and pack voltages, and writes the AC direction plus both limits. Capacity in kWh is not reported by the device, so the value above stays the user's figure." }));
+        return;
+      }
       var roles = BATTERY_ROLES[driverSelect.value] || BATTERY_ROLES.generic;
       roles.forEach(function (role) {
         var input = el("input", { type: "text", value: mapping[role[0]] || "", placeholder: "entity id (empty = unused)" });
@@ -3575,6 +3656,9 @@
       if (config.driver === MQTT_ZENDURE_DRIVER && !config.mapping.ac_mode_entity) {
         problems.push("A Zendure MQTT battery needs the AC mode select (acMode) so the driver can pick the direction (Input/Output mode).");
       }
+      if (config.driver === NATIVE_ZENDURE_DRIVER) {
+        batteryNativeConnectionProblems(config.mapping).forEach(function (problem) { problems.push(problem); });
+      }
       return problems;
     }
 
@@ -3598,12 +3682,21 @@
       }
       var payloadConfig = Object.assign({}, config);
       delete payloadConfig.__efficiency;
+      var nativeDriver = config.driver === NATIVE_ZENDURE_DRIVER;
+      var connectionText = nativeDriver
+        ? "Device " + String(config.mapping.host || "") + ", serial " + String(config.mapping.serial || "") +
+          ", over " + String(config.mapping.scheme || "http") + ":" + String(config.mapping.port || "(default)") + ". "
+        : "";
       confirmAction({
         title: (editing ? "Save changes to " : "Add ") + config.name + "?",
-        body: "Driver " + config.driver + ", " + config.capacity_kwh + " kWh, " + config.min_soc_pct + "–" + config.max_soc_pct + " % SoC. " + efficiencyText + ". Mapping: " + mappingText,
+        body: nativeDriver
+          ? "Driver " + config.driver + ", " + config.capacity_kwh + " kWh, " + config.min_soc_pct + "–" + config.max_soc_pct + " % SoC. " + efficiencyText + ". " + connectionText + "The add-on reads the device and checks its serial before saving, so an unreachable device or a wrong serial is refused here."
+          : "Driver " + config.driver + ", " + config.capacity_kwh + " kWh, " + config.min_soc_pct + "–" + config.max_soc_pct + " % SoC. " + efficiencyText + ". Mapping: " + mappingText,
         confirmLabel: editing ? "Save changes" : "Add battery",
         requireCheck: true,
-        checkLabel: "I confirm these entities belong to this battery"
+        checkLabel: nativeDriver
+          ? "I confirm the add-on may write this device's AC limits"
+          : "I confirm these entities belong to this battery"
       }).then(function (ok) {
         if (!ok) return;
         performWrite(save, body, function () {
@@ -5182,6 +5275,7 @@
     batteryEfficiencyPayload: batteryEfficiencyPayload,
     batteryWear: batteryWear,
     dispatchPathText: dispatchPathText,
+    batteryNativeConnectionProblems: batteryNativeConnectionProblems,
     derivedWearEur: derivedWearEur,
     roundTripPct: roundTripPct,
     storedKwhCostEur: storedKwhCostEur,
