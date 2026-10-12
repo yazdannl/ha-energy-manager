@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.11.0
+
+- **A battery can be added and driven through the inverter's own MQTT bridge.** A SolarFlow whose
+local MQTT feature is on publishes its zenSDK properties itself, and Home Assistant's `mqtt`
+integration turns each into an entity (`number.<serial>_inputlimit`, `select.<serial>_acmode`,
+`sensor.<serial>_electriclevel`, `switch.<serial>_smartmode`, ...). The new `zendure_mqtt` driver
+writes those directly: the AC mode select for the direction, the two magnitude limits for the power,
+and the device's own `smartmode` switch (on for a live command, off for a hold) — the Zendure-HA
+integration sets exactly that flag with every AC command, and the inverter only acts on the limits
+while it is set. No manager is involved and nothing waits for a P1 event. If the Zendure-HA
+integration still manages the same inverter, its `operation` select can be mapped so the driver keeps
+it `off` — otherwise it re-writes both limits on every P1 event. Add it with **Driver → zendure_mqtt**
+in the battery dialog, or pick the device in **Find a battery**.
+- **The battery picker now recognises a Zendure MQTT device and prefills the whole mapping.** The
+device is identified by its platform plus manufacturer/model (Zendure / solarFlow…), and each row's
+role is read from the zenSDK property name it carries — no confidence score, so the device-level
+`electricLevel` always wins over a pack's `socLevel`, and the pick fills `ac_mode_entity`,
+`charge_limit_entity`, `discharge_limit_entity`, `soc_entity`, `soc_target_entity`, `min_soc_entity`,
+`output_power_entity`, `grid_input_power_entity`, `pv_power_entity` and `smart_mode_entity` plus the
+`max_charge_w`/`max_discharge_w` the limit entities state. Discovery caps at 50 rows per read
+(SPEC 10) and sorts by confidence, so the bridge device — whose property names score lower than the
+integration's translation-key matches — is found by searching its device name or serial; the picker
+says so when a read comes back without a battery.
+- The **Driver** dropdown says where the entities come from, `Control path` is hidden for drivers that
+have only one path, and the MQTT choice states plainly that no other controller may manage the same
+inverter at the same time. `Dispatch` on the battery card reads *Inverter over MQTT: AC mode +
+limits (the device's own entities)*.
+- Save-time validation follows the control layer: the driver list is no longer duplicated in
+`config.py`, so a battery is checked against exactly the drivers the dispatcher can build.
+
 ## 0.10.1
 
 - **A battery can now be told which write path to use, and a Zendure inverter can be driven

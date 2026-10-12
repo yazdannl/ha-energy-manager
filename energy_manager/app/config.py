@@ -20,6 +20,9 @@ from zoneinfo import ZoneInfo
 from typing import Any, Mapping
 
 from .models import BatteryConfig, ConfigError
+# The control layer is the single authority on which drivers exist (SPEC 5/9.2): asking it here
+# keeps save-time validation from drifting away from the registry the dispatcher builds from.
+from .control.drivers import names as driver_names
 
 log = logging.getLogger(__name__)
 
@@ -753,7 +756,7 @@ def _require_valid_battery(config: BatteryConfig) -> None:
 def validate_battery_config(config: BatteryConfig) -> list[str]:
     """Extra SPEC.md section 5 rules beyond :meth:`BatteryConfig.validate`."""
     problems: list[str] = []
-    if config.driver not in ("zendure", "generic"):
+    if config.driver not in driver_names():
         problems.append(f"unknown driver: {config.driver}")
     if config.driver == "generic":
         mapping = config.mapping or {}

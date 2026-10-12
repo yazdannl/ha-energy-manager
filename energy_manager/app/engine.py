@@ -1054,15 +1054,17 @@ class Engine:
     def resolved_config(self, config: BatteryConfig) -> BatteryConfig:
         """The config a driver is built from: the stored mapping plus registry-resolved roles.
 
-        Only the Zendure driver resolves at runtime (SPEC 5: roles are derived from the entity
-        registry by platform + translation key).  The stored mapping always wins, and a config is
-        never mutated -- ``batteries_view`` still shows what the user confirmed.
+        Only the Zendure drivers resolve at runtime (SPEC 5: their roles are derived from the entity
+        registry -- by platform + translation key on ``zendure_ha``, by property name on an MQTT
+        bridge device).  The stored mapping always wins, and a config is never mutated --
+        ``batteries_view`` still shows what the user confirmed.
         """
-        if config.driver != driver_registry.ZendureDriver.driver_name:
+        resolver = driver_registry.resolve_mapping_for(config.driver)
+        if resolver is None:
             return config
         mapping = dict(config.mapping)
         try:
-            resolved = driver_registry.resolve_mapping(
+            resolved = resolver(
                 self._registry_entries(self._clock()),
                 anchor_entity=mapping.get("soc_entity"),
             )

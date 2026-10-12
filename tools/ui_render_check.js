@@ -237,8 +237,24 @@ function classTokens(text) {
   check("the battery card names the write path that is really in use",
     A.dispatchPathText({ control_path: "device" }, { control_path: "device_limits" }) === "Inverter: AC mode + limits (chosen)"
     && A.dispatchPathText({ control_path: "auto" }, { control_path: "manager_manual_power" }) === "Zendure manager: manual power (auto)"
+    && A.dispatchPathText({}, { driver: "zendure_mqtt", control_path: "device_limits" }) === "Inverter over MQTT: AC mode + limits (the device's own entities)"
     && A.dispatchPathText({}, {}) === "unknown (auto)",
     A.dispatchPathText({ control_path: "device" }, { control_path: "device_limits" }));
+  // A Zendure inverter bridged by Home Assistant's own MQTT integration is a driver of its own:
+  // the device is identified by platform + manufacturer/model, and each row's role follows from
+  // the zenSDK property name it carries (no confidence score is involved).
+  const mqttGroup = A.batteryGroupsFromCandidates(M.fixtures().discover.battery.candidates)
+    .filter((g) => A.batteryIsZendureMqtt(g))[0];
+  const mqttPick = mqttGroup ? A.batterySelection(mqttGroup, []) : { mapping: {}, numbers: {} };
+  check("a Zendure MQTT bridge device is picked as its own driver",
+    !!mqttGroup && A.batteryDriverFor(mqttGroup) === "zendure_mqtt"
+    && mqttPick.mapping.charge_limit_entity === "number.example_mqtt_inputlimit"
+    && mqttPick.mapping.discharge_limit_entity === "number.example_mqtt_outputlimit"
+    && mqttPick.mapping.ac_mode_entity === "select.example_mqtt_acmode"
+    && mqttPick.mapping.soc_entity === "sensor.example_mqtt_electriclevel"
+    && mqttPick.mapping.smart_mode_entity === "switch.example_mqtt_smartmode"
+    && mqttPick.numbers.max_charge_w === 1000 && mqttPick.numbers.max_discharge_w === 800,
+    JSON.stringify(mqttPick.mapping));
   check("a stale window's price is not presented as a fresh one",
     /no fresh price/.test(A.windowPriceText(staleWindow, ctx)));
   check("a fresh window names its price source and rank",

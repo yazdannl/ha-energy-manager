@@ -11,6 +11,11 @@ Verified facts this driver is built on (docs/EXTERNAL_APIS.md section 6):
   the magnitudes, and the manager is put in ``off`` so it cannot overwrite them on its next P1 event.
   That path does not wait for a P1 event at all -- it is what makes control possible on a house
   whose only grid feed reaches Home Assistant every few minutes.
+* ``ZendureMqttDriver`` (``driver = "zendure_mqtt"``) is the same device path for a device bridged
+  by Home Assistant's own MQTT integration: the bridge publishes the zenSDK properties as
+  ``<serial>_<property>`` entities on the ``mqtt`` platform, so the roles are resolved from the
+  property name instead of a registry translation key, and the device's own ``smartMode`` switch
+  joins the plan (the ``zendure_ha`` integration sets it to 1 with every non-zero AC command).
 * Nothing is dispatched by the write itself: the manager applies the setpoint when it processes the
   next P1 event (>=2.2 s later), so read-back verification runs inside a bounded retry window
   (``BaseDriver._verify_writes``).  A setpoint that landed but whose flow has not followed inside
@@ -42,6 +47,7 @@ from ...models import DispatchResult, Reason
 from .base import (
     WRITABLE_NUMBER_DOMAINS,
     WRITABLE_SELECT_DOMAINS,
+    WRITABLE_SWITCH_DOMAINS,
     BaseDriver,
     DriverError,
     _Write,
@@ -51,6 +57,29 @@ from .base import (
 )
 
 ZENDURE_PLATFORM = "zendure_ha"
+
+#: Platform of Home Assistant's own MQTT integration: a Zendure device bridged by the local MQTT
+#: feature publishes one entity per zenSDK property (docs/EXTERNAL_APIS.md section 6).
+MQTT_PLATFORM = "mqtt"
+
+#: zenSDK property (as the MQTT bridge spells it, camelCase) -> driver mapping key.  The bridge
+#: names every entity ``<serial>_<property>`` and carries no ``translation_key``, which is why this
+#: driver resolves roles from the property suffix instead of a registry translation key.
+MQTT_PROPERTY_TO_MAPPING: dict[str, str] = {
+    "inputlimit": "charge_limit_entity",
+    "outputlimit": "discharge_limit_entity",
+    "acmode": "ac_mode_entity",
+    "electriclevel": "soc_entity",
+    "outputhomepower": "output_power_entity",
+    "gridinputpower": "grid_input_power_entity",
+    "solarinputpower": "pv_power_entity",
+    "socset": "soc_target_entity",
+    "minsoc": "min_soc_entity",
+    "smartmode": "smart_mode_entity",
+}
+
+#: mapping keys this driver resolves from the registry, for the mapping wizard.
+MQTT_MAPPING_ROLES = tuple(MQTT_PROPERTY_TO_MAPPING.values())
 
 log = logging.getLogger(__name__)
 
@@ -144,9 +173,60 @@ def resolve_mapping(
     return resolved
 
 
+def is_zendure_mqtt_entry(entry: dict[str, Any]) -> bool:
+    """True for entity-registry rows of a device bridged by Home Assistant's MQTT integration.
+
+    The device publishes the zenSDK properties itself (local MQTT feature), so its rows carry no
+    integration domain to match on and no ``translation_key`` -- the platform and the property name
+    inside the entity id are all there is (docs/EXTERNAL_APIS.md section 6).
+    """
+    return str(entry.get("platform") or "") == MQTT_PLATFORM
+
+
+def mqtt_property_of(entity_id: str) -> str | None:
+    """The zenSDK property an MQTT bridge entity carries (``<serial>_inputlimit`` -> inputLimit)."""
+    object_id = str(entity_id or "").split(".", 1)[-1].lower()
+    for property_name in MQTT_PROPERTY_TO_MAPPING:
+        if object_id.endswith(f"_{property_name}"):
+            return property_name
+    return None
+
+
+def resolve_mqtt_mapping(
+    entries: Iterable[dict[str, Any]],
+    device_id: str | None = None,
+    anchor_entity: str | None = None,
+) -> dict[str, str]:
+    """Resolve mapping keys from one MQTT bridge device's own property entities.
+
+    Like :func:`resolve_mapping`, one device only (``device_id``, else the device that owns
+    ``anchor_entity``, else the lowest device id) so two inverters never mix into one battery, and
+    a property this driver has no mapping key for is simply left out.
+    """
+    candidates = [entry for entry in entries if is_zendure_mqtt_entry(entry)]
+    by_device: dict[str, list[dict[str, Any]]] = {}
+    for entry in candidates:
+        by_device.setdefault(str(entry.get("device_id") or ""), []).append(entry)
+    if device_id is None and anchor_entity:
+        for entry in candidates:
+            if str(entry.get("entity_id") or "") == str(anchor_entity):
+                device_id = str(entry.get("device_id") or "") or None
+                break
+    if device_id is None:
+        device_id = next((key for key in sorted(by_device) if key), None)
+    resolved: dict[str, str] = {}
+    for entry in sorted(by_device.get(device_id or "", []), key=lambda e: str(e.get("entity_id") or "")):
+        entity_id = entry.get("entity_id")
+        if not is_entity_id(entity_id):
+            continue
+        key = MQTT_PROPERTY_TO_MAPPING.get(mqtt_property_of(str(entity_id)) or "")
+        if key and key not in resolved:
+            resolved[key] = str(entity_id)
+    return resolved
+
+
 class ZendureDriver(BaseDriver):
     """Zendure SolarFlow battery behind the ``zendure_ha`` integration."""
-
     driver_name = "zendure"
     default_tolerance_w = ZENDURE_TOLERANCE_W
 
@@ -450,17 +530,19 @@ class ZendureDriver(BaseDriver):
         # Device path (SPEC 9.2, appendix A): magnitudes on the inverter's own AC limits -- input
         # for charging, output for discharging -- with the direction as a separate select.  The
         # device applies these itself (local zenSDK/MQTT), so this path does not wait for the
-        # manager's next P1 event.  The manager is put into ``off`` whenever its select is mapped:
-        # while it is not off it re-writes the same two properties on every P1 event.
-        quiet = self._manager_quiet_write()
-        if quiet is not None:
-            writes.append(quiet)
+        # manager's next P1 event.  Anything that would overwrite them is quieted first.
+        writes.extend(self._quiet_writes(target_w))
         mode = self._ac_mode_write(target_w)
         if mode is not None:
             writes.append(mode)
         writes.append(self.make_write(mapping["charge_limit_entity"], max(0.0, target_w)))
         writes.append(self.make_write(mapping["discharge_limit_entity"], max(0.0, -target_w)))
         return writes
+
+    def _quiet_writes(self, target_w: float) -> list[_Write]:
+        """Writes that take another controller out of the loop before the AC limits."""
+        quiet = self._manager_quiet_write()
+        return [quiet] if quiet is not None else []
 
     def _manager_quiet_write(self) -> _Write | None:
         """Put the Zendure manager into ``off`` on the device path (None when it already is).
@@ -506,6 +588,12 @@ class ZendureDriver(BaseDriver):
         for option in options.get("options") or []:
             if wanted in str(option).strip().lower():
                 return str(option)
+        # The entity published no options (or none matches).  Its current state may still be the
+        # option the device uses -- returning it makes the caller skip an identical write instead
+        # of guessing a string this select may reject.
+        current = str((state or {}).get("state") or "").strip()
+        if current and wanted in current.lower():
+            return current
         return DEFAULT_AC_MODE_VALUES.get(wanted)
 
     def _operation_off_value(self) -> str:
@@ -705,3 +793,123 @@ class ZendureDriver(BaseDriver):
             "min_soc_pct": self._number(mapping.get("min_soc_entity")),
             "soc_pct": self._read_soc(),
         }
+
+
+class ZendureMqttDriver(ZendureDriver):
+    """A Zendure inverter driven through Home Assistant's own MQTT integration (SPEC 5 and 9.2).
+
+    The local MQTT feature makes the device publish its zenSDK properties itself, one entity each
+    (``number.<serial>_inputlimit``, ``select.<serial>_acmode``, ``sensor.<serial>_electriclevel``...),
+    so this driver needs no manager: it writes the AC direction select plus the two magnitude limits
+    and lets the device report them back.  That is ``ZendureDriver``'s ``device`` control path with
+    three differences:
+
+    * roles are resolved from the property name in the entity id (the bridge sets no
+      ``translation_key``), never from ``zendure_ha``,
+    * the device's own ``smartMode`` switch is part of the plan: the ``zendure_ha`` integration sets
+      it to 1 with every non-zero AC command and to 0 in ``power_off()``, and the device only acts
+      on the AC limits while it is set,
+    * ``control_path`` does not apply -- there is no manager to choose between.
+    """
+
+    driver_name = "zendure_mqtt"
+    default_tolerance_w = ZENDURE_TOLERANCE_W
+
+    #: keys that make the path usable at all (the rest are optional extras).
+    required_keys: tuple[str, ...] = (
+        "charge_limit_entity",
+        "discharge_limit_entity",
+        "ac_mode_entity",
+    )
+
+    @classmethod
+    def validate_mapping(cls, mapping: dict[str, str]) -> list[str]:
+        mapping = {key: value for key, value in (mapping or {}).items() if value}
+        problems: list[str] = []
+        if not (mapping.get("charge_limit_entity") and mapping.get("discharge_limit_entity")):
+            problems.append(
+                "mapping: zendure_mqtt needs charge_limit_entity (inputLimit) and "
+                "discharge_limit_entity (outputLimit)"
+            )
+        if not mapping.get("ac_mode_entity"):
+            problems.append(
+                "mapping: zendure_mqtt needs ac_mode_entity (the AC mode select, Input/Output)"
+            )
+        for key in ("charge_limit_entity", "discharge_limit_entity", "soc_target_entity", "min_soc_entity"):
+            entity_id = mapping.get(key)
+            if entity_id and entity_id.split(".", 1)[0] not in WRITABLE_NUMBER_DOMAINS:
+                problems.append(f"mapping: {key} must be a number entity")
+        for key in ("ac_mode_entity", "operation_entity"):
+            entity_id = mapping.get(key)
+            if entity_id and entity_id.split(".", 1)[0] not in WRITABLE_SELECT_DOMAINS:
+                problems.append(f"mapping: {key} must be a select entity")
+        for key in ("smart_mode_entity",):
+            entity_id = mapping.get(key)
+            if entity_id and entity_id.split(".", 1)[0] not in WRITABLE_SWITCH_DOMAINS:
+                problems.append(f"mapping: {key} must be a switch entity")
+        for key in (
+            "soc_entity",
+            "output_power_entity",
+            "grid_input_power_entity",
+            "pv_power_entity",
+            "capacity_entity",
+        ):
+            entity_id = mapping.get(key)
+            if entity_id and not is_entity_id(entity_id):
+                problems.append(f"mapping: {key} is not an entity id")
+        return problems
+
+    def capabilities(self) -> dict[str, Any]:
+        caps = super().capabilities()
+        mapping = self.effective_mapping()
+        caps.update(
+            {
+                "manager": None,
+                "platform": MQTT_PLATFORM,
+                "control_path": self._control_path(),
+                "smart_mode_entity": mapping.get("smart_mode_entity"),
+                "device_properties": sorted(MQTT_PROPERTY_TO_MAPPING),
+            }
+        )
+        return caps
+
+    # -- mapping helpers ---------------------------------------------------------------
+
+    def _control_path(self) -> str:
+        """This driver has one path only: the inverter's own AC limits."""
+        return "device_limits" if self._device_limits_mapped() else "unresolved"
+
+    def _unresolved_message(self) -> str:
+        return (
+            "zendure_mqtt needs charge_limit_entity (inputLimit) and discharge_limit_entity "
+            "(outputLimit)"
+        )
+
+    # -- writes -----------------------------------------------------------------------
+
+    def _quiet_writes(self, target_w: float) -> list[_Write]:
+        """Manager ``off`` (when mapped) and then the device's own smart-mode switch."""
+        writes = super()._quiet_writes(target_w)
+        smart = self._smart_mode_write(target_w)
+        if smart is not None:
+            writes.append(smart)
+        return writes
+
+    def _smart_mode_write(self, target_w: float) -> _Write | None:
+        """The device's ``smartMode`` switch: on for a live setpoint, off for a hold.
+
+        ``zendure_ha`` writes ``smartMode: 1`` with every non-zero AC command and 0 in
+        ``power_off()`` (docs/EXTERNAL_APIS.md section 6), and the inverter only applies
+        ``inputLimit``/``outputLimit`` while it is set.  Only a change is written, so an unchanged
+        tick costs no MQTT write.
+        """
+        entity = self.effective_mapping().get("smart_mode_entity")
+        if not is_entity_id(entity):
+            return None
+        wanted = abs(target_w) > self.tolerance_w
+        current = str((self._state(entity) or {}).get("state") or "").strip().lower()
+        if current in ("on", "true", "1") and wanted:
+            return None
+        if current in ("off", "false", "0") and not wanted:
+            return None
+        return self.make_write(str(entity), wanted)

@@ -244,11 +244,11 @@ Panel: **Battery fleet**. Per battery card:
 
 | Field | Detail |
 | --- | --- |
-| `Find a battery` block | Reads `/discover?kind=battery` once on open, groups rows per device, lists only devices that could be a battery (known battery platform, or a control role plus a state role where the control entity is writable — `number`/`select`/`input_number`/`input_select`/`switch`); ranked by control-readiness, then mappable roles, then confidence. Each row shows device label, model/manufacturer, platform, mappable-role count and a `control-ready` / `partial — missing …` / `control entities are read-only` badge. `Select` fills the form below. |
-| Search | Filters locally over device name, manufacturer, model, platform and entity id; falls back to the server's entity-text search when the local filter finds nothing. |
+| `Find a battery` block | Reads `/discover?kind=battery` once on open, groups rows per device, lists only devices that could be a battery (known battery platform, a Zendure device on the `mqtt` platform, or a control role plus a state role where the control entity is writable — `number`/`select`/`input_number`/`input_select`/`switch`); ranked by control-readiness, then mappable roles, then confidence. Each row shows device label, model/manufacturer, platform, mappable-role count and a `control-ready` / `partial — missing …` / `control entities are read-only` badge. `Select` fills the form below. A Zendure MQTT bridge device is identified by its platform plus manufacturer/model and its roles come from the zenSDK property names, so its pick never depends on a confidence score. |
+| Search | Filters locally over device name, manufacturer, model, platform and entity id; falls back to the server's entity-text search when the local filter finds nothing. Discovery caps at 50 rows per read, so a device beyond the cap (a bridge device on a busy instance) is found by searching its name or serial — the copy says so. |
 | `id` | slug, auto-slugified and made unique on selection |
 | `Name` | free text |
-| `Driver` | `zendure` or `generic` (auto-suggested: `zendure` on `platform: zendure_ha` or a Zendure-only role) |
+| `Driver` | `zendure`, `zendure_mqtt` or `generic` (auto-suggested: `zendure` on `platform: zendure_ha` or a Zendure-only role, `zendure_mqtt` for a Zendure device on `platform: mqtt`). The `Control path` select is shown for `zendure` only; choosing `zendure_mqtt` states that the device's own entities are written and that no other controller (the Zendure-HA integration) may manage the same inverter |
 | `Capacity (kWh, usable AC side)` | step 0.1 |
 | `Minimum SoC (%)` / `Maximum SoC (%)` | 0–100 |
 | `Max charge power (W)` / `Max discharge power (W)` | step 50 |
@@ -659,7 +659,7 @@ new value when the user types one.
 | --- | --- | --- | --- |
 | `id` | str | required | stable slug, unique |
 | `name` | str | — | display name |
-| `driver` | str | required | `zendure` or `generic` |
+| `driver` | str | required | `zendure`, `zendure_mqtt` or `generic` |
 | `capacity_kwh` | float | required | must be > 0; usable AC-side capacity |
 | `min_soc_pct` | float | `10.0` | must be < `max_soc_pct`, both in 0…100 |
 | `max_soc_pct` | float | `100.0` | — |
@@ -669,7 +669,7 @@ new value when the user types one.
 | `eta_discharge` | float | `0.95` | must be in (0, 1] |
 | `price_eur` | float | `0.0` | ≥ 0; 0 = unknown purchase price, no derived wear |
 | `cycle_life` | float | `0.0` | ≥ 0; 0 = unknown rated cycles, no derived wear |
-| `control_path` | str | `auto` | how the driver must write: `auto` (driver preference), `manager` (the Zendure manager's system-wide `manual_power`) or `device` (the inverter's own `ac_mode` + `input_limit`/`output_limit`). Validated at save time: `manager` needs `manual_power_entity` + `operation_entity`, `device` needs `charge_limit_entity` + `discharge_limit_entity`. Ignored by drivers without paths of their own |
+| `control_path` | str | `auto` | how the driver must write: `auto` (driver preference), `manager` (the Zendure manager's system-wide `manual_power`) or `device` (the inverter's own `ac_mode` + `input_limit`/`output_limit`). Validated at save time: `manager` needs `manual_power_entity` + `operation_entity`, `device` needs `charge_limit_entity` + `discharge_limit_entity`. Ignored by `zendure_mqtt` (one path) and by drivers without paths of their own |
 | `mapping` | dict | `{}` | must be non-empty: "confirm the entity mapping in the UI" |
 | `enabled` | bool | `true` | disabled batteries are excluded from aggregate, allocation and safety |
 
@@ -1233,16 +1233,29 @@ Writes go through the HA service API or state-setting where no service exists.
   reported as `commanded` — not an error, because the fail-safe hold a driver error triggers would
   revoke a command the device is about to apply. The plan execution line compares measured vs planned
   separately, so "commanded but not following" stays visible.
-- **Zendure driver**: two write paths, chosen by `control_path` (`auto` = manager first). *Manager*:
-  switch the manager into manual dispatch (`operation = manual`) before commanding power, express
-  charge/discharge with the device's own semantics, re-assert manual mode while in control (its smart
-  modes overwrite external writes), and write a hold on shutdown/fatal error because the integration
-  has no watchdog — but note it applies a setpoint only on the manager's next P1 event, so a slow
-  house P1 feed bounds how fast any of this lands. *Device*: the `ac_mode` select (direction) plus
-  the `input_limit` / `output_limit` numbers (magnitudes) straight on the inverter, with the manager
-  put in `off` so it cannot overwrite them; this path needs no P1 event and is confirmed by the
-  device's own property echo. Either way it never writes `soc_set` or `min_soc` every tick — SoC
-  floors are expressed as optimised power.
+- **Zendure driver** (`zendure`): two write paths, chosen by `control_path` (`auto` = manager
+  first). *Manager*: switch the manager into manual dispatch (`operation = manual`) before commanding
+  power, express charge/discharge with the device's own semantics, re-assert manual mode while in
+  control (its smart modes overwrite external writes), and write a hold on shutdown/fatal error
+  because the integration has no watchdog — but note it applies a setpoint only on the manager's next
+  P1 event, so a slow house P1 feed bounds how fast any of this lands. *Device*: the `ac_mode` select
+  (direction) plus the `input_limit` / `output_limit` numbers (magnitudes) straight on the inverter,
+  with the manager put in `off` so it cannot overwrite them; this path needs no P1 event and is
+  confirmed by the device's own property echo. Either way it never writes `soc_set` or `min_soc`
+  every tick — SoC floors are expressed as optimised power.
+- **Zendure MQTT driver** (`zendure_mqtt`): the same device path for an inverter whose local MQTT
+  feature bridges its zenSDK properties into Home Assistant's own `mqtt` integration
+  (`number.<serial>_inputlimit`, `select.<serial>_acmode`, `sensor.<serial>_electriclevel`, ...).
+  Roles are resolved from the property name in the entity id (the bridge sets no `translation_key`),
+  `control_path` does not apply, and the device's `smartmode` switch joins the plan (on for a live
+  command, off for a hold) because the device only acts on the AC limits while it is set. Mapping
+  keys: `charge_limit_entity` (`inputlimit`), `discharge_limit_entity` (`outputlimit`),
+  `ac_mode_entity` (`acmode`), `soc_entity` (`electriclevel`), `soc_target_entity` (`socset`),
+  `min_soc_entity` (`minsoc`), `output_power_entity` (`outputhomepower`),
+  `grid_input_power_entity` (`gridinputpower`), `pv_power_entity` (`solarinputpower`),
+  `smart_mode_entity` (`smartmode`), plus the optional `operation_entity`/`operation_off_value` pair
+  that keeps the Zendure-HA manager `off` while this driver controls the same device. The first
+  three are required; a save without them is refused, naming the key.
 - **Generic driver**: `power_setpoint_entity` (signed W, + charge / − discharge) or the pair
   `charge_power_entity` + `discharge_power_entity`, plus optional mode select/manual value, SoC and
   capacity entities. A generic battery with no usable setpoint is rejected at **save** time, not at

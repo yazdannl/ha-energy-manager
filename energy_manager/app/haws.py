@@ -494,20 +494,23 @@ class _RoleHint:
 
 _ROLE_HINTS: dict[str, tuple[_RoleHint, ...]] = {
     "battery": (
-        _RoleHint("charge_limit", ("input_limit", "charge_limit", "charge_power"), ("charge", "input_limit"), "power"),
-        _RoleHint("discharge_limit", ("output_limit", "discharge_limit", "discharge_power"), ("discharge", "output_limit"), "power"),
+        _RoleHint("charge_limit", ("input_limit", "inputlimit", "charge_limit", "charge_power"), ("charge", "input_limit", "inputlimit"), "power"),
+        _RoleHint("discharge_limit", ("output_limit", "outputlimit", "discharge_limit", "discharge_power"), ("discharge", "output_limit", "outputlimit"), "power"),
         _RoleHint("power_setpoint", ("power_setpoint", "setpoint"), ("setpoint", "target_power"), "power"),
-        _RoleHint("soc", ("electric_level", "battery_level", "soc", "state_of_charge"), ("soc", "battery_level", "electric_level"), "battery", ("%",)),
+        _RoleHint("soc", ("electric_level", "electriclevel", "battery_level", "soc", "state_of_charge"), ("soc", "battery_level", "electric_level", "electriclevel"), "battery", ("%",)),
         _RoleHint("capacity", ("total_kwh", "capacity"), ("capacity", "total_kwh"), "energy", ("kWh",)),
         # Usable energy above min_soc is not the installed capacity: on a partly empty battery it
         # reads near zero (or negative), which is why it must never be offered as `capacity`.
         _RoleHint("available_energy", ("available_kwh",), ("available_kwh", "usable_energy"), "energy", ("kWh",)),
-        _RoleHint("pv_power", ("solar_input_power", "pv_power", "solar_power"), ("solar_input", "pv_power", "solar_power"), "power"),
-        _RoleHint("output_power", ("output_home_power", "output_power"), ("output_home", "output_power"), "power"),
-        _RoleHint("manual_mode", ("ac_mode", "manual_mode"), ("ac_mode", "manual"), None),
+        _RoleHint("pv_power", ("solar_input_power", "solarinputpower", "pv_power", "solar_power"), ("solar_input", "solarinputpower", "pv_power", "solar_power"), "power"),
+        _RoleHint("output_power", ("output_home_power", "outputhomepower", "output_power"), ("output_home", "outputhomepower", "output_power"), "power"),
+        # Grid-side AC input power (the charge side of the measured pair).
+        _RoleHint("grid_input_power", ("grid_input_power", "gridinputpower"), ("grid_input", "gridinputpower"), "power"),
+        _RoleHint("manual_mode", ("ac_mode", "acmode", "manual_mode"), ("ac_mode", "acmode", "manual"), None),
+        _RoleHint("smart_mode", ("smart_mode", "smartmode"), ("smart_mode", "smartmode"), None),
         _RoleHint("connection", ("connection", "connected"), ("connection", "connected"), None),
-        _RoleHint("min_soc", ("min_soc",), ("min_soc",), None, ("%",)),
-        _RoleHint("soc_target", ("soc_set", "soc_target"), ("soc_set", "target_soc"), None, ("%",)),
+        _RoleHint("min_soc", ("min_soc", "minsoc"), ("min_soc", "minsoc"), None, ("%",)),
+        _RoleHint("soc_target", ("soc_set", "socset", "soc_target"), ("soc_set", "socset", "target_soc"), None, ("%",)),
     ),
     "price": (
         _RoleHint("price_now", ("electricity_price", "current_price", "energy_price", "price"), ("price", "tariff"), "monetary", ("€/kWh", "EUR/kWh")),

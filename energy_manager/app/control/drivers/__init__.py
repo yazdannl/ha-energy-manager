@@ -25,11 +25,19 @@ from .base import (
     parse_soc_pct,
 )
 from .generic import GenericDriver
-from .zendure import ZendureDriver, resolve_mapping
+from .zendure import ZendureDriver, ZendureMqttDriver, resolve_mapping, resolve_mqtt_mapping
 
 DRIVERS: dict[str, type[BaseDriver]] = {
     GenericDriver.driver_name: GenericDriver,
     ZendureDriver.driver_name: ZendureDriver,
+    ZendureMqttDriver.driver_name: ZendureMqttDriver,
+}
+
+#: Drivers that resolve their roles from the entity registry at runtime, by platform
+#: (SPEC section 5: a stored mapping stays authoritative, missing roles are filled in).
+MAPPING_RESOLVERS: dict[str, Any] = {
+    ZendureDriver.driver_name: resolve_mapping,
+    ZendureMqttDriver.driver_name: resolve_mqtt_mapping,
 }
 
 #: ``haws.discover_candidates`` role slug -> battery mapping key, per driver.
@@ -49,6 +57,7 @@ ROLE_TO_MAPPING: dict[str, dict[str, str]] = {
         "capacity": "capacity_entity",
         "pv_power": "pv_power_entity",
         "output_power": "output_power_entity",
+        "grid_input_power": "grid_input_power_entity",
         # The manager's manual control select: the driver needs `operation = manual` before it may
         # command power (appendix A), and `ac_mode` is per-device direction it never writes.
         "manual_mode": "operation_entity",
@@ -58,6 +67,22 @@ ROLE_TO_MAPPING: dict[str, dict[str, str]] = {
         # gets its own role: before the split both matched the `capacity` role and the wizard could
         # write a partly-empty battery's "available" reading into `capacity_entity`.
         "available_energy": "available_kwh_entity",
+    },
+    "zendure_mqtt": {
+        # A Zendure device bridged by Home Assistant's own MQTT integration: one entity per zenSDK
+        # property, named after it (`_inputlimit`, `_acmode`, `_electriclevel`).
+        "charge_limit": "charge_limit_entity",
+        "discharge_limit": "discharge_limit_entity",
+        "soc": "soc_entity",
+        "output_power": "output_power_entity",
+        "grid_input_power": "grid_input_power_entity",
+        "pv_power": "pv_power_entity",
+        "min_soc": "min_soc_entity",
+        "soc_target": "soc_target_entity",
+        # `manual_mode` is the AC direction select on this platform, and `smart_mode` the device's
+        # own switch the driver asserts with every command.
+        "manual_mode": "ac_mode_entity",
+        "smart_mode": "smart_mode_entity",
     },
 }
 
@@ -73,6 +98,11 @@ def driver_class(driver_name: str) -> type[BaseDriver] | None:
 def role_to_mapping(driver_name: str, role: str) -> str | None:
     """Translate a discovery role slug into this driver's mapping key."""
     return ROLE_TO_MAPPING.get(driver_name, {}).get(role)
+
+
+def resolve_mapping_for(driver_name: str) -> Any | None:
+    """The registry resolver of a driver (``None`` when it resolves no roles at runtime)."""
+    return MAPPING_RESOLVERS.get(driver_name)
 
 
 def validate_config(config: BatteryConfig) -> list[str]:
@@ -122,8 +152,10 @@ __all__ = [
     "DriverError",
     "GenericDriver",
     "HAFacade",
+    "MAPPING_RESOLVERS",
     "ROLE_TO_MAPPING",
     "ZendureDriver",
+    "ZendureMqttDriver",
     "create",
     "driver_class",
     "names",
@@ -131,6 +163,8 @@ __all__ = [
     "parse_number",
     "parse_soc_pct",
     "resolve_mapping",
+    "resolve_mapping_for",
+    "resolve_mqtt_mapping",
     "role_to_mapping",
     "validate_config",
 ]

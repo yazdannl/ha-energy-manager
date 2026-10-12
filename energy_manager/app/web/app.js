@@ -907,6 +907,10 @@
   function dispatchPathText(config, capabilities) {
     var path = capabilities && capabilities.control_path ? String(capabilities.control_path) : "";
     var label = DISPATCH_PATHS[path] || (path || "unknown");
+    if (capabilities && capabilities.driver === MQTT_ZENDURE_DRIVER) {
+      // One path only: the device's own AC mode and limits, through the MQTT bridge's entities.
+      return "Inverter over MQTT: AC mode + limits (the device's own entities)";
+    }
     var chosen = String(config && config.control_path || "auto");
     return label + (["manager", "device"].indexOf(chosen) >= 0 ? " (chosen)" : " (auto)");
   }
@@ -2166,10 +2170,38 @@
       ["available_kwh_entity", "Usable energy above the minimum SoC (kWh)"],
       ["pv_power_entity", "PV power sensor"],
       ["output_power_entity", "Output power sensor"],
+      ["grid_input_power_entity", "Grid input power sensor"],
+      ["smart_mode_entity", "Device smart mode switch"],
       ["ac_mode_entity", "AC mode entity"]
+    ],
+    // A Zendure device bridged by Home Assistant's own MQTT integration publishes one entity per
+    // zenSDK property (`<serial>_inputlimit`, `<serial>_acmode`, ...): there is no manager to pick
+    // and no control path, the device's own AC limits *are* the control path.
+    zendure_mqtt: [
+      ["ac_mode_entity", "AC mode select (Input/Output mode)"],
+      ["charge_limit_entity", "AC charge limit (inputLimit)"],
+      ["discharge_limit_entity", "AC output limit (outputLimit)"],
+      ["soc_entity", "State of charge sensor (electricLevel)"],
+      ["soc_target_entity", "SoC target (socSet)"],
+      ["min_soc_entity", "Minimum SoC (minSoc)"],
+      ["output_power_entity", "Output power sensor (outputHomePower)"],
+      ["grid_input_power_entity", "Grid input power sensor (gridInputPower)"],
+      ["pv_power_entity", "PV input power sensor (solarInputPower)"],
+      ["smart_mode_entity", "Device smart mode (written with every command)"],
+      ["operation_entity", "Zendure manager operation select (kept off, optional)"]
     ]
   };
-  var NON_ENTITY_ROLES = { mode_manual_value: "Manual mode value (e.g. manual)" };
+  var NON_ENTITY_ROLES = {
+    mode_manual_value: "Manual mode value (e.g. manual)",
+    operation_off_value: "Manager off value (e.g. off)"
+  };
+  // Driver ids as the dropdown shows them: the id is what the server validates, the label says
+  // where the entities come from.
+  var BATTERY_DRIVER_LABELS = {
+    generic: "generic (a setpoint or charge/discharge pair)",
+    zendure: "zendure (the Zendure-HA integration)",
+    zendure_mqtt: "zendure_mqtt (a device bridged by MQTT)"
+  };
 
   /* ---- battery discovery picker (SPEC §5/§10) -----------------------------------------------
    * /discover?kind=battery returns one row per (entity, role), so a battery is only obvious once
@@ -2196,6 +2228,89 @@
   var BATTERY_MEASUREMENT_ROLES = ["soc", "capacity", "available_energy", "output_power", "pv_power", "connection"];
   // Same floor as haws.suggested_mapping: a weaker suggestion is not mapped anywhere.
   var BATTERY_MIN_CONFIDENCE = 0.5;
+
+  /* A Zendure device bridged by Home Assistant's MQTT integration (local MQTT feature) publishes
+   * its own zenSDK properties, one entity per property, named `<serial>_<property>` in camelCase
+   * (`number.<serial>_inputlimit`, `select.<serial>_acmode`, `sensor.<serial>_electriclevel`).
+   * There is nothing to score: the device is identified by its platform plus manufacturer/model,
+   * and each row's role follows from the property name it carries. The suffix table below is the
+   * same vocabulary the server driver resolves (`control/drivers/zendure.py`), so a pick here and a
+   * runtime resolve agree. */
+  var MQTT_ZENDURE_DRIVER = "zendure_mqtt";
+  // [entity-id suffix, role slug, mapping key]
+  var MQTT_ZENDURE_PROPERTIES = [
+    ["inputlimit", "charge_limit", "charge_limit_entity"],
+    ["outputlimit", "discharge_limit", "discharge_limit_entity"],
+    ["acmode", "manual_mode", "ac_mode_entity"],
+    ["electriclevel", "soc", "soc_entity"],
+    ["outputhomepower", "output_power", "output_power_entity"],
+    ["gridinputpower", "grid_input_power", "grid_input_power_entity"],
+    ["solarinputpower", "pv_power", "pv_power_entity"],
+    ["socset", "soc_target", "soc_target_entity"],
+    ["minsoc", "min_soc", "min_soc_entity"],
+    ["smartmode", "smart_mode", "smart_mode_entity"]
+  ];
+  // `mqtt` alone is every device on the broker, so the *device* has to look like a Zendure
+  // inverter: manufacturer or model text (case-insensitive).
+  var MQTT_ZENDURE_IDENTITY = /zendure|solarflow|hyper|superbase|aio/i;
+
+  /** True for a group that is a Zendure inverter seen through the MQTT bridge. */
+  function batteryIsZendureMqtt(group) {
+    var platforms = (group && group.platforms) || [];
+    if (platforms.indexOf("mqtt") < 0) return false;
+    var text = [group.manufacturer, group.model, group.deviceName]
+      .filter(function (part) { return !!part; })
+      .join(" ");
+    return MQTT_ZENDURE_IDENTITY.test(text);
+  }
+
+  /** The zenSDK property suffix of an MQTT bridge entity id (`..._inputlimit` -> `inputlimit`). */
+  function mqttPropertySuffix(entityId) {
+    var objectId = String(entityId || "").toLowerCase().split(".").pop();
+    var found = "";
+    MQTT_ZENDURE_PROPERTIES.forEach(function (entry) {
+      if (found) return;
+      var suffix = "_" + entry[0];
+      if (objectId.slice(-suffix.length) === suffix) found = entry[0];
+    });
+    return found;
+  }
+
+  /** Deterministic roles, mapping keys and numbers of one MQTT bridge device.
+   *  No confidence is involved: the property name says which role an entity carries, and only the
+   *  first row per property is taken (so a pack's `socLevel` can never displace `electricLevel`). */
+  function mqttZendureGroup(group) {
+    var roles = {};
+    var mapping = {};
+    var keyRoles = {};
+    var skipped = [];
+    var rows = ((group && group.rows) || []).slice().sort(function (a, b) {
+      return String(a.entity_id || "") < String(b.entity_id || "") ? -1 : 1;
+    });
+    rows.forEach(function (row) {
+      var suffix = mqttPropertySuffix(row.entity_id);
+      if (!suffix) return;
+      var match = null;
+      MQTT_ZENDURE_PROPERTIES.forEach(function (entry) {
+        if (!match && entry[0] === suffix) match = entry;
+      });
+      if (!match) return;
+      var role = match[1];
+      if (roles[role]) return;
+      if (BATTERY_WRITABLE_ROLES.indexOf(role) >= 0 && !batteryIsWritable(row)) {
+        if (skipped.indexOf(role) < 0) skipped.push(role);
+        return;
+      }
+      roles[role] = row;
+      mapping[match[2]] = String(row.entity_id || "");
+      keyRoles[match[2]] = role;
+    });
+    var missing = [];
+    ["charge_limit", "discharge_limit", "manual_mode", "soc"].forEach(function (role) {
+      if (!roles[role]) missing.push(role);
+    });
+    return { roles: roles, mapping: mapping, keyRoles: keyRoles, skipped: skipped, missing: missing };
+  }
 
   function batteryDomainOf(row) {
     return String(row && row.entity_id || "").split(".")[0].toLowerCase();
@@ -2272,6 +2387,10 @@
    *  sensor-preferred for a measurement role. Control roles whose only match is read-only are
    *  reported separately so the dialog can say so instead of mapping an unusable entity. */
   function batteryGroupRoles(group) {
+    if (batteryIsZendureMqtt(group)) {
+      var found = mqttZendureGroup(group);
+      return { chosen: found.roles, skipped: found.skipped };
+    }
     var chosen = {};
     var skipped = [];
     group.rows.forEach(function (row) {
@@ -2298,6 +2417,24 @@
   /** Which roles this group can map, whether it can be driven at all, and why it is a picker
    *  row in the first place. Returns null when the group is not plausibly a battery. */
   function batteryGroupInfo(group) {
+    if (batteryIsZendureMqtt(group)) {
+      // Identity comes from the device, roles from the property names: a bridge group is a picker
+      // row on its own terms, never on a confidence score, and a device without a capacity sensor
+      // is not "partial" -- capacity_kwh is a form field.
+      var mqtt = mqttZendureGroup(group);
+      var mqttRoles = Object.keys(mqtt.roles).sort();
+      return {
+        roles: mqtt.roles,
+        mappable: mqttRoles,
+        skipped: mqtt.skipped,
+        writableControl: mqttRoles.indexOf("charge_limit") >= 0 && mqttRoles.indexOf("discharge_limit") >= 0,
+        readOnlyControl: false,
+        controlReady: mqtt.missing.length === 0,
+        missing: mqtt.missing,
+        viaPlatform: true,
+        confidence: mqttRoles.length
+      };
+    }
     var found = batteryGroupRoles(group);
     var chosen = found.chosen;
     var keys = batteryRoleKeys(null);
@@ -2439,6 +2576,10 @@
 
   /** Roles -> mapping keys for one driver, plus the role each key came from. */
   function batteryMappingFor(group, driver) {
+    if (driver === MQTT_ZENDURE_DRIVER) {
+      var mqtt = mqttZendureGroup(group);
+      return { mapping: mqtt.mapping, roles: mqtt.roles, keyRoles: mqtt.keyRoles };
+    }
     var keys = batteryRoleKeys(driver);
     var roles = batteryGroupRoles(group).chosen;
     var mapping = {};
@@ -2454,6 +2595,7 @@
 
   /** zendure when the platform says so or a role maps to a zendure-only key, else generic. */
   function batteryDriverFor(group) {
+    if (batteryIsZendureMqtt(group)) return MQTT_ZENDURE_DRIVER;
     if ((group.platforms || []).some(function (platform) { return BATTERY_PLATFORMS.indexOf(platform) >= 0; })) {
       return "zendure";
     }
@@ -2973,8 +3115,8 @@
     }
 
     var driverSelect = el("select", { id: "battery-driver" });
-    ["generic", "zendure"].forEach(function (driver) {
-      var option = el("option", { value: driver, text: driver });
+    ["generic", "zendure", MQTT_ZENDURE_DRIVER].forEach(function (driver) {
+      var option = el("option", { value: driver, text: BATTERY_DRIVER_LABELS[driver] || driver });
       if (driver === fields.driver) option.selected = true;
       driverSelect.appendChild(option);
     });
@@ -2992,13 +3134,27 @@
     // The manager only applies its setpoint on the next P1 event and re-writes the inverter's own
     // limits on every one of those events, so the device path takes the manager out of the loop.
     var controlPathNote = el("p", { class: "field-help", text: "Manager: one system-wide setpoint, applied on the manager's next meter (P1) update — needs a fast grid feed. Inverter: the device's own AC direction and input/output limits, applied immediately, with the Zendure manager kept switched off. Both are bounded by this battery's SoC window and power limits." });
+    var controlPathField = el("label", { class: "field", for: "battery-control-path" }, [el("span", { text: "Control path" }), controlPathSelect]);
+    // The MQTT bridge driver needs a warning of its own: it drives the *device*, so a second
+    // battery pointing at the same inverter (or a manager still managing it) would fight it.
+    var mqttDriverNote = el("p", { class: "field-help", text: "The MQTT bridge's own entities: the add-on writes the device's AC mode and input/output limits, so the Zendure-HA integration must not manage the same inverter at the same time — disable this battery's twin there first, and map the Zendure manager's operation select above if that integration stays installed." });
+    // Only the Zendure-HA driver has two paths to choose between. A Zendure MQTT battery has one:
+    // the device's own AC mode and limits, written through the bridge's own entities.
+    function updateControlPathVisibility() {
+      var zendureHa = driverSelect.value === "zendure";
+      controlPathField.style.display = zendureHa ? "" : "none";
+      controlPathNote.style.display = zendureHa ? "" : "none";
+      mqttDriverNote.style.display = driverSelect.value === MQTT_ZENDURE_DRIVER ? "" : "none";
+    }
+    driverSelect.addEventListener("change", updateControlPathVisibility);
 
     var identity = el("div", { class: "fields" }, [
       textRow("id", "Battery id (slug)", fields.id, editing),
       textRow("name", "Name", fields.name),
       el("label", { class: "field", for: "battery-driver" }, [el("span", { text: "Driver" }), driverSelect]),
-      el("label", { class: "field", for: "battery-control-path" }, [el("span", { text: "Control path" }), controlPathSelect]),
+      controlPathField,
       controlPathNote,
+      mqttDriverNote,
       fieldRow("capacity_kwh", "Capacity (kWh, usable AC side)", fields.capacity_kwh, "0.1", "0.1"),
       fieldRow("min_soc_pct", "Minimum SoC (%)", fields.min_soc_pct, "1", "0", "100"),
       fieldRow("max_soc_pct", "Maximum SoC (%)", fields.max_soc_pct, "1", "0", "100"),
@@ -3127,6 +3283,7 @@
       });
     }
     renderMappingRows();
+    updateControlPathVisibility();
     driverSelect.addEventListener("change", renderMappingRows);
 
     var searchInput = el("input", { type: "search", placeholder: "filter entity candidates (optional)", "aria-label": "Search entity candidates" });
@@ -3192,7 +3349,7 @@
         var message = needle
           ? "No battery matched “" + needle + "”. The id and the entity table below are the manual path."
           : (rowCount
-              ? "Discovery returned " + rowCount + " candidate row(s), but no group of them is a battery: rows are grouped per device, so a server that reports no device_id cannot be picked. Type the id and map entities by hand below."
+              ? "Discovery returned " + rowCount + " candidate row(s), but no group of them is a battery: rows are grouped per device, so a server that reports no device_id cannot be picked. Discovery caps at 50 rows per read, so a device may sit beyond them — search for its name or serial (the box above) to ask the server for it. Type the id and map entities by hand below."
               : "Discovery returned no candidate rows here. Type the id and map entities by hand below.");
         pickerHost.appendChild(el("p", { class: "muted", text: message }));
         return;
@@ -3221,6 +3378,7 @@
       if (!editing) inputs.id.value = selection.id;
       inputs.name.value = selection.name;
       driverSelect.value = selection.driver;
+      updateControlPathVisibility();
       // Select means "use this battery's discovery mapping": replace the entity keys and keep
       // anything typed by hand for the non-entity roles (mode_manual_value is never discovered).
       // ponytail: switching the driver dropdown afterwards re-renders the rows for that driver, so
@@ -3342,6 +3500,12 @@
       }
       if (config.driver === "zendure" && config.control_path === "manager" && !(config.mapping.manual_power_entity && config.mapping.operation_entity)) {
         problems.push("Control path 'Zendure manager' needs both the manager manual_power entity and its operation select.");
+      }
+      if (config.driver === MQTT_ZENDURE_DRIVER && !(config.mapping.charge_limit_entity && config.mapping.discharge_limit_entity)) {
+        problems.push("A Zendure MQTT battery needs both the AC charge limit (inputLimit) and the AC output limit (outputLimit) entity: the device applies them itself and reports them back.");
+      }
+      if (config.driver === MQTT_ZENDURE_DRIVER && !config.mapping.ac_mode_entity) {
+        problems.push("A Zendure MQTT battery needs the AC mode select (acMode) so the driver can pick the direction (Input/Output mode).");
       }
       return problems;
     }
@@ -4818,6 +4982,9 @@
     batterySearchGroups: batterySearchGroups,
     batterySlugFor: batterySlugFor,
     batterySelection: batterySelection,
+    batteryIsZendureMqtt: batteryIsZendureMqtt,
+    mqttZendureGroup: mqttZendureGroup,
+    batteryDriverFor: batteryDriverFor,
     basePath: basePath,
     apiPath: apiPath,
     isMock: MOCK,

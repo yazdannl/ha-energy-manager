@@ -15,22 +15,22 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **685 passed** (two consecutive runs) |
+| Test suite | `python3 -m pytest tests -q` | **694 passed** (two consecutive runs) |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 93 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
-| Headless UI render check | `node tools/ui_render_check.js` | **77 passed, 0 failed**, exit 0 |
+| Headless UI render check | `node tools/ui_render_check.js` | **78 passed, 0 failed**, exit 0 |
 
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (79 files, documentation excluded)**:
-  `28fdad8a997460965eee2bfa9b4dac594f9c6589e2ce1cad8606ba2667b5675b`
+  `29a20d627034d1634d0d529b3ba1aa2d1ad1eaab3db17d335fbff5582bd2c566`
 * **path list of the same 79 files** (detects an added, removed or renamed file):
   `999c72a0ad237efad84631e1c196871fbab19aaf4e46b1e3e55f351c7c988ad5`
 
-The 0.10.0 tree's code + tests digest was `784dbf04…` and 0.9.1's `fc5f9d44…`; 0.10.1 (§8.9) changed
-file contents only - it added no file, so the path-list digest above is the same one, which is exactly
-what that recipe is for.
+The 0.10.1 tree's code + tests digest was `28fdad8a…`, 0.10.0's `784dbf04…` and 0.9.1's
+`fc5f9d44…`; 0.11.0 (§8.10) changed file contents only - it added no file, so the path-list digest
+above is the same one, which is exactly what that recipe is for.
 
 The recipe sorts the file list **and** the per-file manifest under `LC_ALL=C`, so the digest is
 independent of `find` order and of the locale; a single `sort` is not enough. An earlier revision of
@@ -875,6 +875,75 @@ putting the manager `off` affects every device of that manager, so a mixed fleet
 for all of them. A `commanded` result is deliberately not a failure and not a measurement: the plan
 execution line (measured vs planned) is what turns it into "the device did not follow".
 
+### 8.10 Driving an inverter through its own MQTT bridge (0.11.0)
+
+The owner asked for the control path the live instance actually has: "I also need an option to add the
+battery/inverter and control it through its mqtt device, and we can select a zendure mqtt device to
+prefill the required fields". The device is connected with its **local MQTT** feature, so it exists
+twice in Home Assistant: as a `zendure_ha` device (the integration's entities) and as an `mqtt`
+device carrying the raw zenSDK properties, one entity each.
+
+Live read-only evidence (2026-10-12): the `mqtt` device reports model `solarFlow800Plus`, firmware
+2.0.59, and 34 entities - `number.<serial>_inputlimit` (`power`, `[0, 1000]`), `number.<serial>_outputlimit`
+(`power`, `[0, 800]`), `number.<serial>_inversemaxpower` (`[200, 800]`), `number.<serial>_socset`
+(`[70, 100]` %), `number.<serial>_minsoc` (`[5, 50]` %), `select.<serial>_acmode` (options `Input
+mode` / `Output mode`), `select.<serial>_gridreverse`, `switch.<serial>_smartmode` (live `off`),
+`sensor.<serial>_electriclevel` (%), `sensor.<serial>_gridinputpower` / `_outputhomepower` /
+`_solarinputpower` (W), plus per-pack rows (`sensor.<serial>_<pack-serial>_soclevel`, `_power`, ...).
+The bridge sets **no** `translation_key`, so the property name inside the entity id is the only role
+information there is.
+
+What 0.11.0 adds:
+
+* `ZendureMqttDriver` (`driver = "zendure_mqtt"`), a subclass of the Zendure device path: it writes
+  the AC mode select, the two magnitude limits, and the device's own `smartmode` switch (on for a
+  non-zero target, off for a hold), and it keeps the Zendure-HA manager `off` when the user maps its
+  `operation` select. `validate_mapping` requires `charge_limit_entity`, `discharge_limit_entity` and
+  `ac_mode_entity` and checks the domain of every key, so a wrong pick is refused at save time.
+* `resolve_mqtt_mapping(entries, device_id|anchor_entity)`: the runtime resolver for this driver
+  (registered in `driver_registry.MAPPING_RESOLVERS`), matching `<serial>_<property>` suffixes on the
+  `mqtt` platform. Live check on the owner's instance: anchored on the device's SoC entity it
+  resolved all ten keys (`charge_limit`, `discharge_limit`, `ac_mode`, `soc`, `soc_target`, `min_soc`,
+  `output_power`, `grid_input_power`, `pv_power`, `smart_mode`) to that device's own rows, and
+  nothing from the 24 other `mqtt` devices in the registry.
+* Discovery vocabulary: the battery role hints learned the camelCase property names
+  (`inputlimit`, `outputlimit`, `acmode`, `electriclevel`, `outputhomepower`, `gridinputpower`,
+  `solarinputpower`, `socset`, `minsoc`, `smartmode`) and two new roles (`grid_input_power`,
+  `smart_mode`), so those rows are in the payload at all; `ROLE_TO_MAPPING["zendure_mqtt"]` maps the
+  roles onto this driver's keys (`manual_mode` -> `ac_mode_entity`, `smart_mode` ->
+  `smart_mode_entity`).
+* The picker identifies a Zendure bridge device by platform plus manufacturer/model and derives each
+  role from the property name - no confidence floor, so `electricLevel` always wins over a pack's
+  `socLevel` - and fills the whole mapping plus the `max_charge_w`/`max_discharge_w` the limit
+  entities state. `Control path` is hidden for drivers with one path, and the MQTT choice says no
+  other controller may manage the same inverter.
+* `config.py` no longer keeps its own driver list: save-time validation asks
+  `control/drivers.names()`, so a battery is checked against exactly the drivers the dispatcher can
+  build.
+
+Gates: 694 tests (was 685: +9 driver/resolver/API/mock-contract), the headless render check 78 passed
+/ 0 failed (was 77), the selfcheck still **33/33**, `tools/audit.sh` clean over 93 files, `compileall`
+clean. New tests: `tests/test_wp5_zendure.py::test_mqtt_charge_quiets_the_manager_switches_smart_mode_and_writes_the_limits`,
+`::test_mqtt_discharge_uses_output_mode_and_output_limit`,
+`::test_mqtt_hold_zeroes_both_limits_and_switches_smart_mode_off`,
+`::test_mqtt_writes_only_what_would_change`,
+`::test_mqtt_reports_commanded_until_the_device_echoes_the_limits`,
+`::test_mqtt_driver_is_refused_without_its_control_entities`,
+`::test_mqtt_roles_are_resolved_from_the_property_names_of_one_device`,
+`::test_mqtt_battery_is_validated_by_the_registry`,
+`tests/test_wp5_api_contract.py::test_battery_mqtt_driver_is_validated_and_round_trips`, plus the
+extended picker assertions in `tests/test_wp3_mock_contract.py`.
+
+Honest limits: the bridge entities were read live, but no write has been made to the inverter from
+this side - the first real command is the add-on's own once the owner adds the battery in the UI. The
+property semantics are taken from the device's own entity ranges (magnitudes from 0, so no sign
+inversion) and from the integration's `smartMode` usage (source, section 6 of EXTERNAL_APIS); if a
+firmware build ignores the limits while `smartMode` is off, the driver's own `commanded`/plan-execution
+reporting is what will show it. `ac_mode` option strings are matched case-insensitively against the
+entity's own options because the labels are localised. Putting the manager `off` affects every device
+of that manager, and two batteries pointing at the same inverter would fight each other - the dialog
+says so and nothing is written outside the mapped entities.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
@@ -968,7 +1037,7 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 685 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 694 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 

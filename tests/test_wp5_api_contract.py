@@ -811,3 +811,49 @@ def test_battery_control_path_is_validated_and_round_trips(wired):
     status, _headers, body = wired.json("DELETE", "/api/v1/batteries/example_zendure")
     assert status == 200
     note("battery control_path: auto default, device path save-time validation, 400s name the key")
+
+
+def test_battery_mqtt_driver_is_validated_and_round_trips(wired):
+    """SPEC 5/9.2: a battery driven through the MQTT bridge is a driver, not a mapping trick.
+
+    The MQTT bridge publishes the inverter's own properties, so the driver needs the AC mode select
+    and both AC limits and nothing else; a mapping without them is refused at save time with the
+    missing key named, exactly like the Zendure-HA paths.
+    """
+    payload = {
+        "config": {
+            "id": "example_mqtt",
+            "name": "Example MQTT inverter",
+            "driver": "zendure_mqtt",
+            "capacity_kwh": 2.4,
+            "mapping": {
+                "ac_mode_entity": "select.example_mqtt_acmode",
+                "charge_limit_entity": "number.example_mqtt_inputlimit",
+                "discharge_limit_entity": "number.example_mqtt_outputlimit",
+                "soc_entity": "sensor.example_mqtt_electriclevel",
+                "smart_mode_entity": "switch.example_mqtt_smartmode",
+            },
+        }
+    }
+    status, _headers, body = wired.json("POST", "/api/v1/batteries", payload)
+    assert status == 201, body
+    assert body["config"]["driver"] == "zendure_mqtt"
+
+    # Dropping the direction select is refused at save time, naming ac_mode_entity.
+    status, _headers, body = wired.json(
+        "PATCH", "/api/v1/batteries/example_mqtt", {"patch": {"mapping": {"ac_mode_entity": ""}}}
+    )
+    assert status == 400, (status, body)
+    assert "ac_mode_entity" in body["error"]["message"]
+
+    # A sensor cannot be a control entity either: the domain is checked, not just the key.
+    status, _headers, body = wired.json(
+        "PATCH",
+        "/api/v1/batteries/example_mqtt",
+        {"patch": {"mapping": {"ac_mode_entity": "sensor.example_mqtt_electriclevel"}}},
+    )
+    assert status == 400, (status, body)
+    assert "select" in body["error"]["message"]
+    status, _headers, body = wired.json("DELETE", "/api/v1/batteries/example_mqtt")
+    assert status == 200
+    note("battery zendure_mqtt: 201 with the bridge mapping, 400s name the missing/mistyped key")

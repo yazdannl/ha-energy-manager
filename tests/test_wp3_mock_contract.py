@@ -671,8 +671,26 @@ def test_mock_battery_discovery_carries_the_picker_fields(fixtures):
     data = json.loads(proc.stdout)
 
     labels = [group["label"] for group in data["groups"]]
-    assert labels == ["Example Battery 1", "Example Sensor Bank"], labels
-    battery, sensors = data["groups"]
+    assert labels == ["Example MQTT inverter", "Example Battery 1", "Example Sensor Bank"], labels
+    mqtt, battery, sensors = data["groups"]
+    # A device bridged by the MQTT integration is picked as a driver of its own: the platform plus
+    # the manufacturer/model identify it, and each row's role follows from the zenSDK property name
+    # it carries -- never from a confidence score against the zendure_ha rows.
+    assert mqtt["deviceId"] == "example_dev_mqtt"
+    assert mqtt["platform"] == "mqtt" and mqtt["writableControl"] is True and mqtt["controlReady"] is True
+    assert mqtt["selection"]["driver"] == "zendure_mqtt"
+    assert mqtt["selection"]["id"] == "example_mqtt_inverter"
+    assert mqtt["selection"]["mapping"] == {
+        "charge_limit_entity": "number.example_mqtt_inputlimit",
+        "discharge_limit_entity": "number.example_mqtt_outputlimit",
+        "ac_mode_entity": "select.example_mqtt_acmode",
+        "soc_entity": "sensor.example_mqtt_electriclevel",
+        "output_power_entity": "sensor.example_mqtt_outputhomepower",
+        "grid_input_power_entity": "sensor.example_mqtt_gridinputpower",
+        "smart_mode_entity": "switch.example_mqtt_smartmode",
+    }
+    # Only the numbers discovery states: the AC limits' own ranges.
+    assert mqtt["selection"]["numbers"] == {"max_charge_w": 1000, "max_discharge_w": 800}
     assert battery["deviceId"] == "example_dev_battery_1"
     assert battery["platform"] == "zendure_ha" and battery["writableControl"] is True
     assert battery["controlReady"] is True, "the mock's zendure battery must be the first picker row"

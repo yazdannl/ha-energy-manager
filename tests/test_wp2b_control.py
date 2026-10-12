@@ -172,7 +172,7 @@ def system_state(**overrides) -> SystemState:
 
 
 def test_registry_lists_the_shipped_drivers():
-    assert registry.names() == ["generic", "zendure"]
+    assert registry.names() == ["generic", "zendure", "zendure_mqtt"]
 
 
 def test_validate_config_rejects_unusable_mappings_at_save_time():

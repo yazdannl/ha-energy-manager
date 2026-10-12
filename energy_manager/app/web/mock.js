@@ -426,6 +426,10 @@
     // picker must list it as read-only and never map a sensor to a control role.
     var DEVICE_BATTERY = { device_id: "example_dev_battery_1", device_name: "Example Battery 1", manufacturer: "ExampleCorp", model: "Model One" };
     var DEVICE_SENSORS = { device_id: "example_dev_sensor_bank", device_name: "Example Sensor Bank", manufacturer: "ExampleCorp", model: "Model Two" };
+    // A Zendure inverter bridged by Home Assistant's own MQTT integration: one entity per zenSDK
+    // property, named after it, on the `mqtt` platform. The picker identifies the device by
+    // platform + manufacturer/model and reads each row's role from the property name.
+    var DEVICE_MQTT = { device_id: "example_dev_mqtt", device_name: "Example MQTT inverter", manufacturer: "Zendure", model: "solarFlow800Plus" };
     var all = {
       battery: [
         Object.assign({ entity_id: "number.example_battery_input_limit", name: "Example battery input limit", unit: "W", device_class: "power", state: "-240", platform: "zendure_ha", suggested_role: "power_setpoint", confidence: 0.86, min: -800, max: 800 }, DEVICE_BATTERY),
@@ -433,6 +437,13 @@
         Object.assign({ entity_id: "sensor.example_battery_capacity", name: "Example battery capacity", unit: "kWh", device_class: "energy_storage", state: "12.0", platform: "zendure_ha", suggested_role: "capacity", confidence: 0.74, min: null, max: null }, DEVICE_BATTERY),
         Object.assign({ entity_id: "select.example_battery_mode", name: "Example battery mode", unit: null, device_class: null, state: "manual", platform: "zendure_ha", suggested_role: "manual_mode", confidence: 0.68, min: null, max: null }, DEVICE_BATTERY),
         Object.assign({ entity_id: "sensor.example_battery_output_home_power", name: "Example battery output power", unit: "W", device_class: "power", state: "240", platform: "zendure_ha", suggested_role: "output_power", confidence: 0.55, min: null, max: null }, DEVICE_BATTERY),
+        Object.assign({ entity_id: "number.example_mqtt_inputlimit", name: "inputLimit", unit: null, device_class: "power", state: "0", platform: "mqtt", suggested_role: "charge_limit", confidence: 0.45, min: 0, max: 1000 }, DEVICE_MQTT),
+        Object.assign({ entity_id: "number.example_mqtt_outputlimit", name: "outputLimit", unit: null, device_class: "power", state: "0", platform: "mqtt", suggested_role: "discharge_limit", confidence: 0.45, min: 0, max: 800 }, DEVICE_MQTT),
+        Object.assign({ entity_id: "select.example_mqtt_acmode", name: "acMode", unit: null, device_class: null, state: "Output mode", platform: "mqtt", suggested_role: "manual_mode", confidence: 0.3, min: null, max: null }, DEVICE_MQTT),
+        Object.assign({ entity_id: "switch.example_mqtt_smartmode", name: "smartMode", unit: null, device_class: null, state: "off", platform: "mqtt", suggested_role: "smart_mode", confidence: 0.3, min: null, max: null }, DEVICE_MQTT),
+        Object.assign({ entity_id: "sensor.example_mqtt_electriclevel", name: "electricLevel", unit: "%", device_class: "battery", state: "41", platform: "mqtt", suggested_role: "soc", confidence: 0.55, min: null, max: null }, DEVICE_MQTT),
+        Object.assign({ entity_id: "sensor.example_mqtt_outputhomepower", name: "outputHomePower", unit: "W", device_class: "power", state: "0", platform: "mqtt", suggested_role: "output_power", confidence: 0.45, min: null, max: null }, DEVICE_MQTT),
+        Object.assign({ entity_id: "sensor.example_mqtt_gridinputpower", name: "gridInputPower", unit: "W", device_class: "power", state: "0", platform: "mqtt", suggested_role: "grid_input_power", confidence: 0.45, min: null, max: null }, DEVICE_MQTT),
         Object.assign({ entity_id: "sensor.example_sensor_bank_power", name: "Example sensor bank power", unit: "W", device_class: "power", state: "120", platform: "example_integration", suggested_role: "power_setpoint", confidence: 0.9, min: null, max: null }, DEVICE_SENSORS),
         Object.assign({ entity_id: "sensor.example_sensor_bank_soc", name: "Example sensor bank state of charge", unit: "%", device_class: "battery", state: "41.0", platform: "example_integration", suggested_role: "soc", confidence: 0.88, min: null, max: null }, DEVICE_SENSORS),
         Object.assign({ entity_id: "sensor.example_sensor_bank_capacity", name: "Example sensor bank capacity", unit: "kWh", device_class: "energy_storage", state: "5.0", platform: "example_integration", suggested_role: "capacity", confidence: 0.8, min: null, max: null }, DEVICE_SENSORS)

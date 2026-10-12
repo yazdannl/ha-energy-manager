@@ -542,6 +542,55 @@ Idempotence: the integration skips a write when
 * All of them re-assert their own setpoint on every P1 event, so an external controller that writes
   device limits while any smart mode is active is overwritten within seconds.
 
+### MQTT bridge: the device's own property entities — **[V]** (live registry + live values)
+
+A SolarFlow whose **local MQTT** feature is enabled publishes its zenSDK properties itself, and
+Home Assistant's own `mqtt` integration turns each one into an entity (MQTT discovery). The device
+then exists **twice** in the registry: as a `zendure_ha` device (the integration's own entities) and
+as an `mqtt` device carrying the raw property vocabulary. Live 2026-10-12, SF800 Plus (fw 2.0.59):
+
+| entity (`<serial>` = device serial) | domain | live state / attributes |
+| --- | --- | --- |
+| `number.<serial>_inputlimit` | number | W magnitude, `power`, `[0, 1000]` — AC charge limit |
+| `number.<serial>_outputlimit` | number | W magnitude, `power`, `[0, 800]` — AC output limit |
+| `number.<serial>_inversemaxpower` | number | W, `power`, `[200, 800]` — the inverter's own AC rating |
+| `number.<serial>_socset` | number | %, `battery`, `[70, 100]` |
+| `number.<serial>_minsoc` | number | %, `battery`, `[5, 50]` |
+| `select.<serial>_acmode` | select | options `Input mode` / `Output mode` (**localised labels** — never hardcode the option string) |
+| `select.<serial>_gridreverse` | select | `Allow backflow` / `Disallow backflow` |
+| `switch.<serial>_smartmode` | switch | on / off — see below |
+| `switch.<serial>_lampswitch` | switch | on / off |
+| `sensor.<serial>_electriclevel` | sensor | %, `battery` — **the device-level SoC** (authoritative) |
+| `sensor.<serial>_gridinputpower` | sensor | W, `power` — grid draw while AC charging |
+| `sensor.<serial>_outputhomepower` | sensor | W, `power` — AC output to the home |
+| `sensor.<serial>_solarinputpower` | sensor | W, `power` — PV input |
+| `sensor.<serial>_<pack-serial>_soclevel`, `_power`, `_state`, ... | sensor | per-pack diagnostics; the pack's `socLevel` is **not** the device SoC |
+
+Facts a driver must build on:
+
+1. **No manager, no P1 event.** These entities write the device's own properties (`properties/write`
+   over the local MQTT link), so the inverter applies them immediately and reports them back on its
+   own cadence (~5 s live). Nothing here waits for the Zendure-HA manager's P1 handling.
+2. **The limits are magnitudes, not signs.** `acmode` picks the direction and
+   `inputlimit`/`outputlimit` are non-negative W (the zenSDK *cloud* protocol's
+   `inputLimit: -power` convention does **not** apply to these entities — their ranges start at 0).
+   Charge: `acmode = Input mode`, `inputlimit = X`, `outputlimit = 0`. Discharge: `acmode = Output
+   mode`, `outputlimit = X`, `inputlimit = 0`. Hold: both 0, direction untouched.
+3. **`smartmode` must be on for a live AC command.** The integration writes
+   `smartMode: 1` with every non-zero AC command and `0` in `power_off()` (§6 above), and the device
+   only acts on the AC limits while it is set. Mirror that: set it on for a non-zero target, off for
+   a hold, and only when it would change.
+4. **The manager still wins if it is not `off`.** While the Zendure-HA manager is in any other mode
+   it re-writes `inputLimit`/`outputLimit` on every P1 event (§6 above), so an MQTT-driven battery
+   must have its `operation` select kept `off` (or the integration uninstalled).
+5. **Raw units differ from the entity values.** In the raw zenSDK protocol `socSet`/`minSoc` are
+   per-mille (`1000` = 100 %, `50` = 5 %) and temperatures are in 0.1 K; the MQTT bridge already
+   converts to percent and °C/K for the entities above, so never re-scale a bridge value.
+6. **The 50-row discovery cap matters here.** `/api/v1/discover` caps at 50 rows per request
+   (SPEC 10) and sorts by confidence, and these property names score lower than the integration's
+   translation-key matches — so the picker finds the bridge device by **searching its device name or
+   serial** (all its entity ids carry the serial).
+
 ### Minimal write sequences (recommended driver behaviour)
 
 Manager path (system-wide setpoint, applied on the manager's next P1 event):
@@ -562,6 +611,16 @@ Device path (the inverter's own AC limits, applied by the device itself):
 (c) hold at 0 W       number input_limit -> 0; number output_limit -> 0  (direction kept)
 ```
 
+MQTT bridge (same properties, written through the bridge's own entities; magnitudes, no manager):
+
+```
+(d) charge at X W     switch smart_mode -> on; select ac_mode -> "Input mode";
+                      number inputlimit -> X; number outputlimit -> 0
+    discharge at Y W  switch smart_mode -> on; select ac_mode -> "Output mode";
+                      number outputlimit -> Y; number inputlimit -> 0
+    hold at 0 W       number inputlimit -> 0; number outputlimit -> 0; switch smart_mode -> off
+```
+
 * Manager: write `operation` before the first power write; verify the select state read-back.
 * Manager: after the manual_power write, read back `output_home_power`/`grid_input_power` within a
   bounded timeout (the next P1 event). A command that landed but has not been followed inside that
@@ -576,7 +635,10 @@ Device path (the inverter's own AC limits, applied by the device itself):
   the write even before any AC flow shows. The manager must be `off` on this path: while it is not,
   it re-writes both properties (and runs its smart modes) on every P1 event. Its `off` mode performs
   one `power_off()`, which the next tick's limits write replaces.
-* Neither path needs `smartMode`; a device-path hold leaves `acMode` alone (limits 0 is the hold).
+* The **MQTT bridge** path writes the same properties through the bridge's own entities (item 3
+  above): magnitudes, `smartMode` on for a live command and off for a hold, the manager's `operation`
+  select kept `off` when it is mapped, and the direction select left alone on a hold. The manager
+  path and the `zendure_ha` device path do not write `smartMode` at all.
 * "Hold" only means **AC = 0**. DC PV keeps charging the battery: `acMode`/`inputLimit`/`outputLimit`
   govern AC only, `solar_input_power` is independent, and at SOCFULL the surplus can bypass to the
   home (`exports_bypass` / `gridReverse`). Never assume SoC follows the AC plan; keep the add-on's own

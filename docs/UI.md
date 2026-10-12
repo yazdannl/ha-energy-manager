@@ -320,6 +320,13 @@ if they are absent:
   the card shows both as `Dispatch`, and the dialog offers the three choices with a save-time refusal
   when the chosen path lacks its entities. Dispatch codes include `commanded` (in force, not yet
   confirmed by the device), which the Plan view states in words instead of reporting a failure.
+- `driver` may be `zendure_mqtt` (a Zendure inverter bridged by Home Assistant's own MQTT
+  integration): the dialog then hides `Control path` (one path only), states that the device's own AC
+  mode and limits are written, and `Dispatch` reads `Inverter over MQTT: AC mode + limits (the
+  device's own entities)`. `/discover?kind=battery` identifies such a device by platform plus
+  manufacturer/model and derives its roles from the zenSDK property names in the entity ids, so the
+  pick fills `ac_mode_entity`, `charge_limit_entity`, `discharge_limit_entity`, `soc_entity`,
+  `smart_mode_entity`, `grid_input_power_entity` and the rest without a confidence score.
 - `GET /api/v1/batteries`: `capabilities` as a flat object, and `state.extra.cycles` for the cycle
   count. For the efficiency/wear block: `round_trip_efficiency_pct` (the stored input), `eta_charge`
   and `eta_discharge` (the effective values, after the even split or the override), `price_eur`,

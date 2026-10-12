@@ -20,7 +20,12 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "energy_manager"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from app.control.drivers.zendure import MANAGER_SIGN, ZendureDriver  # noqa: E402
+from app.control.drivers.zendure import (  # noqa: E402
+    MANAGER_SIGN,
+    ZendureDriver,
+    ZendureMqttDriver,
+    resolve_mqtt_mapping,
+)
 from app.models import BatteryConfig, Reason  # noqa: E402
 from fake_ha import FakeHAFacade, FakeHAState  # noqa: E402
 
@@ -332,3 +337,229 @@ def test_a_bogus_control_path_is_rejected_by_the_battery_config():
         control_path="inverter-ish",
     )
     assert any("control_path" in problem for problem in config.validate())
+
+
+# ------------------------------------------------------- MQTT bridge driver (zendure_mqtt)
+
+MQTT_INPUT_LIMIT = "number.example_mqtt_inputlimit"
+MQTT_OUTPUT_LIMIT = "number.example_mqtt_outputlimit"
+MQTT_AC_MODE = "select.example_mqtt_acmode"
+MQTT_SOC = "sensor.example_mqtt_electriclevel"
+MQTT_GRID_IN = "sensor.example_mqtt_gridinputpower"
+MQTT_OUTPUT = "sensor.example_mqtt_outputhomepower"
+MQTT_PV = "sensor.example_mqtt_solarinputpower"
+MQTT_SMART = "switch.example_mqtt_smartmode"
+MQTT_MANAGER = "select.example_manager_operation"
+
+MQTT_MAPPING = {
+    "charge_limit_entity": MQTT_INPUT_LIMIT,
+    "discharge_limit_entity": MQTT_OUTPUT_LIMIT,
+    "ac_mode_entity": MQTT_AC_MODE,
+    "soc_entity": MQTT_SOC,
+    "grid_input_power_entity": MQTT_GRID_IN,
+    "output_power_entity": MQTT_OUTPUT,
+    "pv_power_entity": MQTT_PV,
+    "smart_mode_entity": MQTT_SMART,
+    "operation_entity": MQTT_MANAGER,
+    "operation_off_value": "off",
+}
+
+
+def make_mqtt_state() -> FakeHAState:
+    """One MQTT bridge device: the same properties the local MQTT feature publishes."""
+    return FakeHAState(
+        {
+            MQTT_INPUT_LIMIT: {"state": "0", "attributes": {"min": 0, "max": 1000}},
+            MQTT_OUTPUT_LIMIT: {"state": "0", "attributes": {"min": 0, "max": 800}},
+            MQTT_AC_MODE: {
+                "state": "Output mode",  # the last command was a discharge; a charge must flip it
+                "attributes": {"options": ["Input mode", "Output mode"]},
+            },
+            MQTT_SOC: {
+                "state": "40",
+                "attributes": {"unit_of_measurement": "%", "device_class": "battery"},
+            },
+            MQTT_GRID_IN: {"state": "0", "attributes": {"unit_of_measurement": "W"}},
+            MQTT_OUTPUT: {"state": "0", "attributes": {"unit_of_measurement": "W"}},
+            MQTT_PV: {"state": "120", "attributes": {"unit_of_measurement": "W"}},
+            MQTT_SMART: {"state": "off", "attributes": {}},
+            MQTT_MANAGER: {"state": "manual", "attributes": {"options": ["off", "manual", "smart"]}},
+        }
+    )
+
+
+def make_mqtt_driver(state: FakeHAState, mapping: dict[str, str] | None = None) -> ZendureMqttDriver:
+    config = BatteryConfig(
+        id="example_mqtt",
+        name="Example MQTT inverter",
+        driver="zendure_mqtt",
+        capacity_kwh=2.4,
+        min_soc_pct=10.0,
+        max_soc_pct=100.0,
+        max_charge_w=800.0,
+        max_discharge_w=800.0,
+        eta_charge=0.95,
+        eta_discharge=0.95,
+        mapping=dict(mapping or MQTT_MAPPING),
+    )
+    return ZendureMqttDriver(config, FakeHAFacade(state), sleep=lambda _seconds: None)
+
+
+def test_mqtt_charge_quiets_the_manager_switches_smart_mode_and_writes_the_limits():
+    """The bridge path: manager off, smartMode on, direction select, then the two magnitudes.
+
+    The MQTT bridge publishes the device's own properties, so the limits are applied by the
+    inverter itself (no P1 event involved) and its report of them is real evidence.  ``smartMode``
+    joins the plan because the ``zendure_ha`` integration sets it to 1 with every non-zero AC
+    command and the device only acts on the limits while it is set.
+    """
+    state = make_mqtt_state()
+    driver = make_mqtt_driver(state)
+    assert driver.capabilities()["control_path"] == "device_limits"
+    assert driver.capabilities()["manager"] is None
+
+    result = driver.apply(800.0, dry_run=False)
+    assert result.ok is True, result.message
+    assert result.code == Reason.OK  # the limits echo back from the device
+    assert result.applied_w == pytest.approx(800.0)
+
+    order = [call[2].get("entity_id") for call in state.service_calls]
+    assert order[:4] == [MQTT_MANAGER, MQTT_SMART, MQTT_AC_MODE, MQTT_INPUT_LIMIT], order
+    assert state.states[MQTT_MANAGER]["state"] == "off"
+    assert state.states[MQTT_SMART]["state"] == "on"
+    # the option string comes from the entity, not from a hardcoded "input"
+    assert state.states[MQTT_AC_MODE]["state"] == "Input mode"
+    assert float(state.states[MQTT_INPUT_LIMIT]["state"]) == pytest.approx(800.0)
+    assert float(state.states[MQTT_OUTPUT_LIMIT]["state"]) == pytest.approx(0.0)
+    # there is no manager setpoint on this path at all
+    assert MANUAL not in order
+
+
+def test_mqtt_discharge_uses_output_mode_and_output_limit():
+    state = make_mqtt_state()
+    driver = make_mqtt_driver(state)
+    result = driver.apply(-600.0, dry_run=False)
+    assert result.ok is True, result.message
+    assert result.applied_w == pytest.approx(-600.0)
+    assert state.states[MQTT_AC_MODE]["state"] == "Output mode"
+    assert float(state.states[MQTT_OUTPUT_LIMIT]["state"]) == pytest.approx(600.0)
+    assert float(state.states[MQTT_INPUT_LIMIT]["state"]) == pytest.approx(0.0)
+    assert state.states[MQTT_SMART]["state"] == "on"
+
+
+def test_mqtt_hold_zeroes_both_limits_and_switches_smart_mode_off():
+    state = make_mqtt_state()
+    state.write_state(MQTT_SMART, "on")
+    state.write_state(MQTT_AC_MODE, "Output mode")
+    driver = make_mqtt_driver(state)
+
+    result = driver.hold(dry_run=False)
+    assert result.ok is True, result.message
+    assert float(state.states[MQTT_INPUT_LIMIT]["state"]) == pytest.approx(0.0)
+    assert float(state.states[MQTT_OUTPUT_LIMIT]["state"]) == pytest.approx(0.0)
+    assert state.states[MQTT_SMART]["state"] == "off"
+    # a hold only zeroes the magnitudes: flipping the direction would be a pointless write
+    assert MQTT_AC_MODE not in [call[2].get("entity_id") for call in state.service_calls]
+
+
+def test_mqtt_writes_only_what_would_change():
+    state = make_mqtt_state()
+    state.write_state(MQTT_SMART, "on")
+    driver = make_mqtt_driver(state)
+    driver.apply(400.0, dry_run=False)
+    calls = [call[2].get("entity_id") for call in state.service_calls]
+    assert MQTT_SMART not in calls, "smartMode was already on"
+    assert MQTT_MANAGER in calls, "the manager was still in manual"
+
+    state.service_calls.clear()
+    driver.apply(400.0, dry_run=False)
+    calls = [call[2].get("entity_id") for call in state.service_calls]
+    # nothing left to quiet and the direction already reads "Input mode": only the magnitudes
+    assert calls == [MQTT_INPUT_LIMIT, MQTT_OUTPUT_LIMIT], calls
+
+
+def test_mqtt_reports_commanded_until_the_device_echoes_the_limits():
+    state = make_mqtt_state()
+    state.never_apply.add(MQTT_INPUT_LIMIT)  # the bridge accepted nothing
+    driver = make_mqtt_driver(state)
+
+    result = driver.apply(800.0, dry_run=False)
+    assert result.ok is True, result.message
+    assert result.code == Reason.COMMANDED
+    assert result.applied_w == pytest.approx(800.0)
+    assert result.readback_w == pytest.approx(0.0)
+    assert "not confirmed" in result.message
+
+
+def test_mqtt_driver_is_refused_without_its_control_entities():
+    problems = ZendureMqttDriver.validate_mapping({"charge_limit_entity": MQTT_INPUT_LIMIT})
+    assert any("discharge_limit_entity" in problem for problem in problems)
+    assert any("ac_mode_entity" in problem for problem in problems)
+
+    problems = ZendureMqttDriver.validate_mapping({**MQTT_MAPPING, "ac_mode_entity": MQTT_SOC})
+    assert any("ac_mode_entity must be a select" in problem for problem in problems)
+
+    problems = ZendureMqttDriver.validate_mapping({**MQTT_MAPPING, "smart_mode_entity": MQTT_INPUT_LIMIT})
+    assert any("smart_mode_entity must be a switch" in problem for problem in problems)
+
+    problems = ZendureMqttDriver.validate_mapping({**MQTT_MAPPING, "charge_limit_entity": MQTT_AC_MODE})
+    assert any("charge_limit_entity must be a number" in problem for problem in problems)
+
+
+def test_mqtt_roles_are_resolved_from_the_property_names_of_one_device():
+    """The bridge sets no translation key: the property name in the entity id is the role."""
+    entries = [
+        {"entity_id": "number.example_a_inputlimit", "platform": "mqtt", "device_id": "dev_a"},
+        {"entity_id": "number.example_a_outputlimit", "platform": "mqtt", "device_id": "dev_a"},
+        {"entity_id": "select.example_a_acmode", "platform": "mqtt", "device_id": "dev_a"},
+        {"entity_id": "sensor.example_a_electriclevel", "platform": "mqtt", "device_id": "dev_a"},
+        {"entity_id": "sensor.example_a_gridinputpower", "platform": "mqtt", "device_id": "dev_a"},
+        {"entity_id": "switch.example_a_smartmode", "platform": "mqtt", "device_id": "dev_a"},
+        # a pack-level reading carries no mapping key and must be left alone
+        {"entity_id": "sensor.example_a_pack_soclevel", "platform": "mqtt", "device_id": "dev_a"},
+        # another device of the same bridge, and another integration entirely
+        {"entity_id": "number.example_b_inputlimit", "platform": "mqtt", "device_id": "dev_b"},
+        {"entity_id": "number.example_c_input_limit", "platform": "zendure_ha", "device_id": "dev_c"},
+    ]
+    resolved = resolve_mqtt_mapping(entries, "dev_a")
+    assert resolved == {
+        "charge_limit_entity": "number.example_a_inputlimit",
+        "discharge_limit_entity": "number.example_a_outputlimit",
+        "ac_mode_entity": "select.example_a_acmode",
+        "soc_entity": "sensor.example_a_electriclevel",
+        "grid_input_power_entity": "sensor.example_a_gridinputpower",
+        "smart_mode_entity": "switch.example_a_smartmode",
+    }
+    # without a device id the anchor entity picks the device (the stored SoC role)
+    anchored = resolve_mqtt_mapping(entries, anchor_entity="sensor.example_a_electriclevel")
+    assert anchored["charge_limit_entity"] == "number.example_a_inputlimit"
+    # and a different device resolves only its own rows
+    other = resolve_mqtt_mapping(entries, "dev_b")
+    assert other == {"charge_limit_entity": "number.example_b_inputlimit"}
+
+
+def test_mqtt_battery_is_validated_by_the_registry():
+    from app.control import drivers as registry  # local import: the module list is what is under test
+
+    config = BatteryConfig(
+        id="example_mqtt",
+        name="Example MQTT inverter",
+        driver="zendure_mqtt",
+        capacity_kwh=2.4,
+        mapping=dict(MQTT_MAPPING),
+    )
+    assert registry.validate_config(config) == []
+    assert registry.driver_class("zendure_mqtt") is ZendureMqttDriver
+    assert registry.role_to_mapping("zendure_mqtt", "manual_mode") == "ac_mode_entity"
+    assert registry.role_to_mapping("zendure_mqtt", "smart_mode") == "smart_mode_entity"
+
+    broken = BatteryConfig(
+        id="example_mqtt",
+        name="Example MQTT inverter",
+        driver="zendure_mqtt",
+        capacity_kwh=2.4,
+        mapping={"soc_entity": MQTT_SOC},
+    )
+    problems = registry.validate_config(broken)
+    assert any("charge_limit_entity" in problem for problem in problems)
+    assert any("ac_mode_entity" in problem for problem in problems)
