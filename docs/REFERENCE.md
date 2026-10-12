@@ -166,6 +166,9 @@ disclosure. Rows: `Estimated net cost`, `Baseline net cost (no battery)`, `Savin
 Extra lines: `Charged from grid: … · charged from PV: …`, `Battery shares in this plan: <name> <W>…`,
 and the efficiency note with the break-even explanation and worked example. A negative saving adds
 `The plan is more expensive than doing nothing over this horizon; check the price source and settings.`
+When `plan.maintenance.active` is true, a `maintenance plan` badge precedes the summary numbers with
+the sentence `Maintenance plan: a due/overdue full charge for <ids> — the optimiser targets <x> %
+before the deadline, in the cheapest slots, so the BMS can balance the cells.`
 
 **Next actions** — a vertical `.window-list` of the contiguous action windows, so a 360 px screen
 never splits the time/action/reason relationship. One summary line above the list adds the windows
@@ -238,7 +241,7 @@ Panel: **Battery fleet**. Per battery card:
 | Cycle count | from `state.extra.cycles`, else `not reported` |
 | Limits & SoC window | charge/discharge limits, min/max SoC |
 | Mapping | list of mapped entities plus `mapping resolved` / `needs confirmation` badge |
-| Live values | power, SoC, energy, temperature, read age, **cell voltage** (lowest per-cell V, or `not reported`) and a **Protection** state (`off`, `normal`, `discharge blocked` or `emergency charge active`), with a `low cell voltage` badge on a latched battery |
+| Live values | power, SoC, energy, temperature, read age, **cell voltage** (lowest per-cell V, or `not reported`), a **Protection** state (`off`, `normal`, `discharge blocked` or `emergency charge active`) with a `low cell voltage` badge on a latched battery, and a **Maintenance** state (`off`, `due in N days (target x %)`, `due now`, `overdue` plus `last completed …`/`at target`), with a `full charge overdue` badge while the deadline has passed |
 | Actions | enable/disable (confirm when enabling), `Test discharge` (disabled unless `mode=auto` and dry run off; confirm + checkbox), edit, delete (confirm + checkbox) |
 
 **Add/edit wizard**
@@ -342,7 +345,7 @@ typed entity id is always accepted.
 
 - the group rail (`.settings-rail`, side by side with the form above 720 px via
   `.settings-columns`), one group at a time, ordered
-  `General, Price, Solar, Load, Grid, Optimizer, Control, Safety, Notify, Batteries`, with each
+  `General, Price, Solar, Load, Grid, Optimizer, Control, Safety, Maintenance, Notify, Batteries`, with each
   entry counting keys that **differ from their default** (`n customised` / `defaults`) and a legend
   line saying that unsaved edits are counted in the save bar instead;
 - `search` (matches key, label, help, group); while a query is active the cards hide and every match
@@ -622,6 +625,21 @@ not let a plan override — the SoC/grid limits (`optimizer.reserve_soc_pct`,
 the patch's final state, so moving cutoff and warning together in one `PATCH /api/v1/config` is
 judged as a whole. The ordering is validated even while `cell_voltage_enabled` is false.
 
+#### Maintenance (scheduled full charge)
+
+| Key | Type | Default | Bounds | Label — help |
+| --- | --- | --- | --- | --- |
+| `maintenance.full_charge_enabled` | bool | `false` | — | **Scheduled full charge** — reach the target SoC at least every interval so the BMS can balance its cells; the optimiser charges in the cheapest slots before the deadline while advisory still writes nothing |
+| `maintenance.full_charge_interval_days` | int | `30` | 1…365 | **Full-charge interval (days)** *(advanced)* — how often every enabled battery must reach the target SoC |
+| `maintenance.full_charge_target_soc_pct` | float | `100` | 50…100 | **Full-charge target %** *(advanced)* — terminal SoC the plan aims for while a full charge is due; a higher `optimizer.target_soc_pct_end` still wins |
+
+Per-battery runtime state (`last_completed`, `next_due`, `first_seen`, `overdue_alerted_at`) is
+never a setting: it lives in the store profile (`kind='maintenance'`, `key='full_charge'`) and is
+reported on `GET /api/v1/batteries` (`maintenance`) and inside the `full_charge` block on
+`GET /api/v1/status`. A battery with no history is due immediately; reaching the target
+(measured SoC ≥ target − 1 point) records `last_completed` and moves the deadline an interval out;
+a deadline past `due + 24 h` raises the rate-limited `full_charge_overdue` alert and keeps trying.
+
 #### Notify
 
 | Key | Type | Default | Bounds | Label — help |
@@ -685,9 +703,10 @@ new value when the user types one.
 `price.fixed_day_price_eur_per_kwh`, `price.fixed_night_price_eur_per_kwh`, `grid.power_entity`,
 `solar.enabled`, `solar.source`, `solar.measured_entity`, `optimizer.horizon_hours`,
 `optimizer.allow_grid_charge`,
-`optimizer.min_spread_eur_per_kwh`, plus the ten Safety keys. Everything else is `advanced: true`
-(this includes the advanced wear override `optimizer.cycle_cost_eur_per_kwh` and
-`solar.nasa_irradiance`).
+`optimizer.min_spread_eur_per_kwh`, `maintenance.full_charge_enabled`, plus the ten Safety keys.
+Everything else is `advanced: true` (this includes the advanced wear override
+`optimizer.cycle_cost_eur_per_kwh`, `solar.nasa_irradiance` and the two
+`maintenance.full_charge_*` tuning keys).
 
 ### 3.4 Battery configuration fields (`models.BatteryConfig`)
 
@@ -1092,6 +1111,9 @@ export only when allow_export and sell > 0   (exporting at an unknown/zero sell 
 energy transition:  e_{i+1} = e_i + dt*p_i*eta_chg     (p_i >= 0)
                     e_{i+1} = e_i + dt*p_i/eta_dis     (p_i < 0)   # exact at p = 0
 optimizer.target_soc_pct_end : hard terminal constraint when set
+maintenance target        : while a tracked battery is due, the higher of
+                            maintenance.full_charge_target_soc_pct and optimizer.target_soc_pct_end
+                            (SPEC 8.1, 0.17.0); an inactive block changes nothing
 ```
 
 **DP mechanics**:
@@ -1106,7 +1128,8 @@ optimizer.target_soc_pct_end : hard terminal constraint when set
 - Complexity target `slots * states * actions <= 2 000 000`; exceeding it widens the step.
 - Terminal target: tried hard (`TARGET_HARD_PENALTY = 1e6`); if the terminal error exceeds half the
   effective step it is retried soft (`TARGET_SOFT_PENALTY = 2.0`) and the plan is marked
-  `feasible: false`, `infeasible_reason: terminal_target_unreachable`.
+  `feasible: false`, `infeasible_reason: terminal_target_unreachable`. The scheduled-full-charge
+  target goes through this same path, so charging slots keep the stable `terminal_target` reason.
 - Grid-limit violations found in the reconstructed plan yield
   `infeasible_reason: grid_limits_infeasible`. No slots yields `no_forecast_slots`.
 
@@ -1522,12 +1545,12 @@ supplies it (which is why publishing a port would hand battery control to anyone
 | Method & route | Body / query | Returns |
 | --- | --- | --- |
 | `GET /api/v1/health` | — | `{status, version, uptime_s, commit}` |
-| `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]` (each with `cell_voltage_v`), `cell_voltage{enabled,cutoff_v,warning_v,resume_v,emergency_charge_power_w,latched[],batteries[{battery_id,voltage_v,fresh,seen,latched,block_discharge,force_charge_w,reason,note}]}` (additive, 0.16.0), `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
-| `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, slot_minutes, feasible, infeasible_reason, mode, dry_run, sources{}, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; `slot_minutes` is the plan's own resolution (the UI never assumes one); with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` and `slot_minutes: null` |
+| `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]` (each with `cell_voltage_v`), `cell_voltage{enabled,cutoff_v,warning_v,resume_v,emergency_charge_power_w,latched[],batteries[{battery_id,voltage_v,fresh,seen,latched,block_discharge,force_charge_w,reason,note}]}` (additive, 0.16.0), `full_charge{enabled,interval_days,target_soc_pct,overdue_grace_hours,active,due,overdue,batteries[],plan{…}}` (additive, 0.17.0), `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
+| `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, slot_minutes, feasible, infeasible_reason, mode, dry_run, sources{}, maintenance, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh, maintenance{enabled,active,due,overdue,target_soc_pct,effective_target_soc_pct,interval_days,overdue_grace_hours,batteries[],due_batteries[],overdue_batteries[]} (additive, 0.17.0)}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; `slot_minutes` is the plan's own resolution (the UI never assumes one); with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` and `slot_minutes: null` |
 | `GET /api/v1/plan/execution` | `hours` | additive (0.10.0): `{generated_at, slot_minutes, now, floors{reserve_soc_pct, min_soc_pct, floor_soc_pct}, batteries[{id, name, min_soc_pct, floor_soc_pct, capacity_kwh}], progress{…}, slots[{t, dispatch, actual}]}` — the same slot grid as `/plan`, joined with the persisted 5-minute actuals and the dispatch log. `dispatch` is the last attempt per battery in that slot (`requested_w`, `applied_w`, `ok`, `dry_run`, `clamped`, `code`, `reason`, `message`, `records`, `batteries[]`) and `actual` the measured aggregate (`samples`, `coverage_pct`, `pv_kw`, `load_kw`, `grid_kw`, `battery_kw`, `planned_kw`, `measured_kw`, `import_kwh`, `export_kwh`, `charged_kwh`, `discharged_kwh`, `soc_kwh_start`, `soc_kwh_end`). Both are `null` for a slot nothing was measured or dispatched in — never a fabricated zero |
 | `POST /api/v1/plan/recompute` | — | `{queued: true}` (async; poll status) |
 | `GET /api/v1/forecast` | `kind=price\|solar\|load`, `hours` | `{kind, generated_at, source, stale, slots, provider, contract, notes[], reason, hint}` |
-| `GET /api/v1/batteries` | — | `{batteries: [{config, state, capabilities, mapping_resolved, discovery[], capacity_source, capacity_kwh, capacity_learned_kwh, capacity_samples, capacity_updated_at, effective_capacity_kwh, capacity_reason, capacity{source,configured_kwh,learned_kwh,samples,updated_at,effective_kwh,reason,stale,confident,applied}}]}` (the capacity fields are additive, SPEC 5) |
+| `GET /api/v1/batteries` | — | `{batteries: [{config, state, capabilities, mapping_resolved, discovery[], capacity_source, capacity_kwh, capacity_learned_kwh, capacity_samples, capacity_updated_at, effective_capacity_kwh, capacity_reason, capacity{source,configured_kwh,learned_kwh,samples,updated_at,effective_kwh,reason,stale,confident,applied}, maintenance{id,watching,state,due,overdue,at_target,due_at,due_in_days,last_completed,first_seen,target_soc_pct,interval_days,soc_pct} (additive, 0.17.0)}]}` (the capacity fields are additive, SPEC 5) |
 | `POST /api/v1/batteries` | `{config}` | 201 `{config}` |
 | `PATCH /api/v1/batteries/{id}` | `{patch}` | `{config}` |
 | `DELETE /api/v1/batteries/{id}` | — | result |

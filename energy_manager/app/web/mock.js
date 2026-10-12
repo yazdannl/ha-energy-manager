@@ -22,6 +22,21 @@
   var MOCK_CYCLE_LIFE = 6000;
   // Delivered energy per full cycle is usable kWh x eta_discharge, so a full cycle costs price/life.
   var MOCK_WEAR = round(MOCK_PRICE_EUR / (MOCK_CYCLE_LIFE * (CAP_KWH * (90.0 - 10.0) / 100.0) * MOCK_ETA), 9);
+  // SPEC 8.1 scheduled full-charge maintenance: the demo plan has one due battery, so the Plan view
+  // exercises the maintenance banner and the Batteries card the per-battery "due" state.
+  var MOCK_MAINTENANCE = {
+    enabled: true,
+    active: true,
+    due: true,
+    overdue: false,
+    target_soc_pct: 100.0,
+    effective_target_soc_pct: 100.0,
+    interval_days: 30,
+    overdue_grace_hours: 24.0,
+    batteries: ["battery_1"],
+    due_batteries: ["battery_1"],
+    overdue_batteries: []
+  };
 
   /** Mirrors config.py: keep a derived round_trip_efficiency_pct and wear_eur_per_kwh on every
    *  read-back config. Both are derived, never stored (SPEC 5). */
@@ -311,8 +326,10 @@
         eta_discharge: MOCK_ETA,
         round_trip_efficiency: roundTrip,
         wear_eur_per_kwh: MOCK_WEAR,
-        break_even_sell_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR
+        break_even_sell_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR,
+        maintenance: MOCK_MAINTENANCE
       },
+      maintenance: MOCK_MAINTENANCE,
       slots: slots,
       batteries: [{ id: "battery_1", name: "Example Battery 1", share_w: slots.length ? slots[0].power_w : 0, round_trip_efficiency: roundTrip, wear_eur_per_kwh: MOCK_WEAR, break_even_sell_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR }]
     };
@@ -439,6 +456,23 @@
         stale: false,
         confident: true,
         applied: true
+      },
+      // SPEC 8.1: this battery's full-charge cycle is due, so the card shows "due now" and the
+      // mock plan above targets 100 %.
+      maintenance: {
+        id: "battery_1",
+        watching: true,
+        state: "due",
+        due: true,
+        overdue: false,
+        at_target: false,
+        due_at: iso(Date.now() - 3600000),
+        due_in_days: -0.042,
+        last_completed: iso(Date.now() - 31 * 86400000),
+        first_seen: iso(Date.now() - 61 * 86400000),
+        target_soc_pct: 100.0,
+        interval_days: 30,
+        soc_pct: 62.5
       }
     };
   }
@@ -587,6 +621,10 @@
     ["protection.cell_voltage_resume_v", "float", 3.18, "Resume cell voltage", "At or above this the latch clears and normal planning resumes; must be above the cutoff.", "safety", null],
     ["protection.emergency_charge_power_w", "float", 0, "Emergency charge power W", "Charge power for a latched battery, capped by its own max charge. 0 = use max_charge_w.", "safety", null],
 
+    ["maintenance.full_charge_enabled", "bool", false, "Scheduled full charge", "Reach the target SoC at least every interval so the BMS can balance its cells. The optimiser charges in the cheapest slots before the deadline; advisory still plans it and writes nothing.", "maintenance", null],
+    ["maintenance.full_charge_interval_days", "int", 30, "Full-charge interval (days)", "How often every enabled battery must reach the target SoC.", "maintenance", null],
+    ["maintenance.full_charge_target_soc_pct", "float", 100.0, "Full-charge target %", "Terminal SoC the plan aims for while a full charge is due; a higher optimizer.target_soc_pct_end still wins.", "maintenance", null],
+
     ["notify.enabled", "bool", true, "Notifications", "", "notify", null],
     ["notify.persistent", "bool", true, "Persistent notification", "Also create an HA persistent notification.", "notify", null],
     ["notify.mobile_service", "str", "", "Mobile service", "e.g. notify.example_mobile_app; empty = off.", "notify", null],
@@ -677,7 +715,9 @@
     "control.grid_follow_max_w", "control.replan_minutes", "control.stale_plan_seconds",
     "control.stale_state_seconds", "control.tick_seconds", "currency", "grid.export_entity",
     "grid.import_entity", "latitude_override", "load.base_kwh_per_day", "load.entity",
-    "load.mode", "load.temperature_entity", "log_level", "longitude_override", "notify.events",
+    "load.mode", "load.temperature_entity", "log_level", "longitude_override",
+    "maintenance.full_charge_interval_days", "maintenance.full_charge_target_soc_pct",
+    "notify.events",
     "notify.mobile_service", "notify.persistent", "optimizer.cycle_cost_eur_per_kwh",
     "optimizer.power_steps",
     "optimizer.salvage_multiplier", "optimizer.slot_minutes", "optimizer.soc_step_kwh",

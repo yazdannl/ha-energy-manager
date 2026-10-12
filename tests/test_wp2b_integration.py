@@ -304,6 +304,8 @@ def test_real_engine_battery_view_and_stop_route(wired):
         "capacity_updated_at",
         "effective_capacity_kwh",
         "capacity_reason",
+        # SPEC 8.1 scheduled full-charge maintenance (additive): the per-battery state.
+        "maintenance",
     }
     assert isinstance(record["cycles"], float)
     assert record["state"]["extra"]["cycles"] == record["cycles"]

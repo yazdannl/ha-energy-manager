@@ -80,6 +80,14 @@ def test_ui_renders_and_settings_ia_holds():
         "the batteries card states the configured seed next to the effective value",
         "the batteries card states the lowest cell voltage",
         "the batteries card marks a latched battery",
+        # SPEC 8.1 scheduled full-charge maintenance: the card states its due/overdue state and the
+        # Plan view marks a plan that charges to the ceiling for it.
+        "the batteries card states the maintenance state and its target",
+        "the batteries card states when the last full charge completed",
+        "an overdue battery is marked, not coloured only",
+        "the maintenance state of an unwatched battery reads off, never an invented due date",
+        "the plan view marks a maintenance plan from its payload",
+        "a non-active maintenance block adds no banner",
         "the native driver's connection settings are validated in the wizard",
     ):
         assert needle in proc.stdout, f"the render check no longer reports {needle!r}:\n{proc.stdout}"

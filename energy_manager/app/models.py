@@ -463,6 +463,11 @@ class PlanSummary:
     eta_discharge: float | None = None
     round_trip_efficiency: float | None = None
     break_even_sell_eur_per_kwh: float | None = None
+    #: Scheduled full-charge maintenance (SPEC 8.1, additive 0.17.0): the plan-level block
+    #: (``enabled``/``active``/``due``/``target_soc_pct``/``batteries``) when a battery's deadline
+    #: falls inside the horizon, else ``None``. The optimiser attaches it verbatim; the API and UI
+    #: read it through ``getattr`` so an older stored summary yields ``None`` instead of failing.
+    maintenance: dict[str, Any] | None = None
 
 
 @dataclass
@@ -479,6 +484,9 @@ class Plan:
     mode: str = Mode.ADVISORY.value
     dry_run: bool = True
     sources: dict[str, str] = field(default_factory=dict)
+    #: Additive (0.17.0): the same scheduled-full-charge block as ``summary.maintenance``, surfaced
+    #: at the top of ``GET /api/v1/plan`` for clients that read the plan but not its summary.
+    maintenance: dict[str, Any] | None = None
 
     def slot_at(self, when: datetime) -> PlanSlot | None:
         for slot in self.slots:

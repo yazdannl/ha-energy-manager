@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.17.0
+
+- **A scheduled full charge keeps the pack balanced.** New `maintenance.full_charge_enabled`
+  (off by default) asks the plan to reach `maintenance.full_charge_target_soc_pct` (default 100)
+  every `maintenance.full_charge_interval_days` (default 30) days so the BMS can balance its cells.
+  While a tracked battery is due, the optimiser reuses the existing terminal-target mechanism —
+  keeping the higher of the maintenance target and `optimizer.target_soc_pct_end` — so it charges
+  in the cheapest slots before the deadline instead of force-charging at peak. Charging slots keep
+  the stable `terminal_target` reason, and the plan carries an additive `maintenance` block
+  (`enabled`, `active`, `due`, `target_soc_pct`, the affected `batteries`) that the Plan view marks.
+- **Completion is measured, never faked.** The per-battery runtime state (`last_completed`,
+  `next_due`, `first_seen`, `overdue_alerted_at`) lives in the store profile, not in user settings.
+  A measured SoC at or above the target minus one point records the completion and moves the
+  deadline a whole interval out; the due-date arithmetic keeps the local wall-clock time across
+  DST and month boundaries. A deadline past `due + 24 h` raises the rate-limited
+  `full_charge_overdue` alert and the cycle keeps trying; a missing or stale reading changes
+  nothing. A battery with no history is due immediately, and one already at target completes on the
+  first check.
+- **Disabled or off changes nothing.** With the feature off no target and no profile record are
+  written; `off` plans nothing at all, and advisory still plans the charge without writing to
+  hardware (the normal dispatch safety pipeline is untouched). `GET /api/v1/batteries` gains a
+  per-battery `maintenance` state, `GET /api/v1/status` and `GET /api/v1/plan` gain the plan-level
+  block, and the Batteries card shows `due in N days` / `due now` / `overdue` / `last completed` /
+  `off`.
+
 ## 0.16.0
 
 - **A critically low cell now charges the pack out of danger instead of letting it discharge.**

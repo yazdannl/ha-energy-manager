@@ -457,6 +457,9 @@ class Store:
             mode=row["mode"] or "advisory",
             dry_run=bool(row["dry_run"]),
             sources={str(k): str(v) for k, v in sources.items()},
+            # Additive (0.17.0): the maintenance block rides in summary_json; keep the top-level
+            # field consistent for a plan restored from the store.
+            maintenance=getattr(summary, "maintenance", None),
         )
 
     # ------------------------------------------------------------------ dispatch log

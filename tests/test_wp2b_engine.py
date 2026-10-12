@@ -1641,6 +1641,8 @@ def test_batteries_view_reports_cycles_and_flat_capabilities():
         "capacity_updated_at",
         "effective_capacity_kwh",
         "capacity_reason",
+        # SPEC 8.1 scheduled full-charge maintenance (additive): the per-battery state.
+        "maintenance",
     }
 
 

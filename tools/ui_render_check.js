@@ -167,6 +167,29 @@ function classTokens(text) {
     cellText.slice(0, 240),
   );
 
+  /* ---------- 1a3. scheduled full-charge maintenance (SPEC 8.1) ---------- */
+  console.log("\n1a3. batteries card: full-charge maintenance");
+  const maintenanceCardText = allText(view());
+  check(
+    "the batteries card states the maintenance state and its target",
+    /Maintenance/.test(maintenanceCardText) && /due now/.test(maintenanceCardText)
+      && /target 100 %/.test(maintenanceCardText),
+    maintenanceCardText.slice(0, 240),
+  );
+  check(
+    "the batteries card states when the last full charge completed",
+    /last completed/.test(maintenanceCardText),
+    maintenanceCardText.slice(0, 240),
+  );
+  check(
+    "an overdue battery is marked, not coloured only",
+    /overdue/.test(A.maintenanceText({ watching: true, overdue: true, target_soc_pct: 100 })),
+  );
+  check(
+    "the maintenance state of an unwatched battery reads off, never an invented due date",
+    A.maintenanceText({ watching: false }) === "off",
+  );
+
   /* ---------- 1b. quiet refresh ---------- */
   // A background refresh must update in place, never duplicate the answer and never re-render the
   // route (UI_REVIEW §3.5). This runs before the settings checks so no dirty-form guard is active.
@@ -329,6 +352,11 @@ function classTokens(text) {
     && /SoC/.test(factText) && /Grid cost/.test(factText), factText.slice(0, 160));
   check("the rendered rows mark the window that is running now",
     byClass(view(), "badge-info").length >= 1, `${byClass(view(), "badge-info").length} now badges`);
+  check("the plan view marks a maintenance plan from its payload",
+    /Maintenance plan/.test(allText(view())) && A.maintenancePlanText(livePlanFixture.maintenance).length > 0,
+    allText(view()).slice(0, 240));
+  check("a non-active maintenance block adds no banner",
+    A.maintenancePlanText({ active: false, target_soc_pct: 100, batteries: ["battery_1"] }) === "");
   check("the rendered execution line states what happened",
     mockWindows.some((win) => win.dispatch || win.actual)
     && /(applied|not written|measured|not dispatchable|no dispatch recorded)/.test(byClass(view(), "window-status").map((n) => n.textContent).join(" | ")),

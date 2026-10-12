@@ -292,6 +292,9 @@ def plan_summary_dict(summary: PlanSummary) -> dict[str, Any]:
     payload["eta_discharge"] = getattr(summary, "eta_discharge", None)
     payload["round_trip_efficiency"] = getattr(summary, "round_trip_efficiency", None)
     payload["break_even_sell_eur_per_kwh"] = getattr(summary, "break_even_sell_eur_per_kwh", None)
+    # Additive (0.17.0): scheduled full-charge maintenance.  ``None`` when a summary was restored
+    # from a store written before the field existed, or when no battery is due in this horizon.
+    payload["maintenance"] = getattr(summary, "maintenance", None)
     return payload
 
 
@@ -305,6 +308,7 @@ def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dic
             "feasible": False,
             "infeasible_reason": "no_plan",
             "summary": plan_summary_dict(PlanSummary()),
+            "maintenance": None,
             "slots": [],
             "batteries": [],
         }
@@ -323,6 +327,9 @@ def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dic
         "dry_run": plan.dry_run,
         "sources": dict(plan.sources),
         "summary": plan_summary_dict(plan.summary),
+        # Additive (0.17.0): the same block as ``summary.maintenance`` at the top level, so a client
+        # that reads the plan without walking its summary still sees why it charges to the ceiling.
+        "maintenance": getattr(plan, "maintenance", None),
         "slots": [
             {
                 "t": to_iso(slot.t),
@@ -565,6 +572,7 @@ def status_dict(
     pending_holds: Sequence[str] = (),
     mode_persisted: bool = True,
     cell_voltage: Mapping[str, Any] | None = None,
+    full_charge: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     now = state.now or datetime.now(timezone.utc)
     override = None
@@ -662,6 +670,9 @@ def status_dict(
         "override": override,
         # Additive (0.16.0): the cell-voltage guard's thresholds, latch and per-battery readings.
         "cell_voltage": dict(cell_voltage) if cell_voltage is not None else None,
+        # Additive (0.17.0): scheduled full-charge maintenance (settings, per-battery state and the
+        # plan-level block).  ``None`` only when the caller did not provide it.
+        "full_charge": dict(full_charge) if full_charge is not None else None,
         "alerts": [
             {
                 "ts": to_iso(alert.ts),
@@ -817,6 +828,7 @@ class ApiServer:
             pending = getattr(engine, "pending_holds", None)
             persisted = getattr(engine, "mode_persisted", None)
             cell_voltage = getattr(engine, "cell_voltage_status", None)
+            full_charge = getattr(engine, "full_charge_status", None)
             return self._json(
                 status_dict(
                     state,
@@ -824,6 +836,7 @@ class ApiServer:
                     pending() if callable(pending) else (),
                     persisted() if callable(persisted) else True,
                     cell_voltage() if callable(cell_voltage) else None,
+                    full_charge() if callable(full_charge) else None,
                 )
             )
 

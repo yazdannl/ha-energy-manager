@@ -1351,6 +1351,32 @@
     return [12, 24, 36, 48].indexOf(value) >= 0 ? value : 36;
   }
 
+  // Scheduled full-charge maintenance (SPEC 8.1): the plan-level block as one plain sentence.
+  function maintenancePlanText(maintenance) {
+    if (!maintenance || maintenance.active !== true) return "";
+    var target = isNum(maintenance.target_soc_pct) ? fmtPct(maintenance.target_soc_pct, 0) : "the configured target";
+    var ids = Array.isArray(maintenance.batteries) ? maintenance.batteries : [];
+    var who = ids.length ? ids.join(", ") : "the fleet";
+    var when = maintenance.overdue === true ? "overdue" : (maintenance.due === true ? "due" : "scheduled within this horizon");
+    return "Maintenance plan: a " + when + " full charge for " + who + " — the optimiser targets " + target +
+      " before the deadline, in the cheapest slots, so the BMS can balance the cells.";
+  }
+
+  // The per-battery maintenance state as one plain sentence ("due in N days / active / last
+  // completed / overdue"), never colour alone (SPEC 13.1).
+  function maintenanceText(row) {
+    if (!row || row.watching !== true) return "off";
+    var target = isNum(row.target_soc_pct) ? fmtPct(row.target_soc_pct, 0) : "the target";
+    var parts = [];
+    if (row.overdue) parts.push("overdue — " + target + " not reached by the deadline");
+    else if (row.due) parts.push("due now — target " + target);
+    else if (isNum(row.due_in_days)) parts.push("due in " + Math.max(0, row.due_in_days).toFixed(row.due_in_days < 10 ? 1 : 0) + " days (target " + target + ")");
+    else parts.push("scheduled — target " + target);
+    if (row.at_target) parts.push("at target");
+    if (row.last_completed) parts.push("last completed " + timeAgo(row.last_completed));
+    return parts.join(" · ");
+  }
+
   function planFlags(plan) {
     var slots = plan.slots || [];
     var stale = slots.filter(function (s) { return s.price_stale; }).length;
@@ -1394,6 +1420,13 @@
       el("strong", { class: savingKnown && s.saved_eur < 0 ? "answer-loss" : "answer-gain", text: savingText }),
       " against doing nothing (the same consumption and tariffs, battery idle)."
     ]));
+    // A maintenance plan says why it charges to the ceiling before the summary numbers (SPEC 8.1).
+    var maintenance = maintenancePlanText(plan.maintenance || (plan.summary && plan.summary.maintenance));
+    if (maintenance) {
+      body.appendChild(el("p", { class: "legend-note" }, [
+        badge("maintenance plan", "info"), " ", maintenance
+      ]));
+    }
     var stats = [
       // "Net" because it can be negative: an export-heavy horizon earns more than it spends.
       ["Estimated net cost", fmtEur(s.cost_estimate_eur)],
@@ -3137,6 +3170,7 @@
           " ",
           st.stale ? badge("stale state", "stale") : null,
           guardRow && guardRow.block_discharge ? badge("low cell voltage", "err") : null,
+          record.maintenance && record.maintenance.overdue ? badge("full charge overdue", "warn") : null,
           st.available ? null : badge("unavailable", "err")
         ]),
         actions
@@ -3149,6 +3183,7 @@
         el("li", null, [el("span", { class: "stat-label", text: "Capacity" }), el("span", { class: "stat-value", text: fmtKwh(cap.effective) + (cap.source === "learned" ? " learned" : "") })]),
         el("li", null, [el("span", { class: "stat-label", text: "Cell voltage" }), el("span", { class: "stat-value", text: cellVoltage == null ? "not reported" : cellVoltage.toFixed(3) + " V" })]),
         el("li", null, [el("span", { class: "stat-label", text: "Protection" }), el("span", { class: "stat-value", text: guardText })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Maintenance" }), el("span", { class: "stat-value", text: maintenanceText(record.maintenance) })]),
         el("li", null, [el("span", { class: "stat-label", text: "Round trip" }), el("span", { class: "stat-value", text: eff ? fmtPct(eff.round_trip_pct) : "--" })]),
         el("li", null, [el("span", { class: "stat-label", text: "Cycles" }), el("span", { class: "stat-value", text: cycles == null ? "not reported" : cycles.toFixed(1) + " cycles" })]),
         el("li", null, [el("span", { class: "stat-label", text: "Limits" }), el("span", { class: "stat-value", text: fmtPower(config.max_charge_w) + " charge / " + fmtPower(config.max_discharge_w) + " discharge" })]),
@@ -3982,7 +4017,7 @@
 
   // The API returns settings sorted by key, which interleaves groups; present them in a stable
   // reading order instead (unknown groups go last, alphabetically).
-  var GROUP_ORDER = ["General", "Price", "Solar", "Load", "Grid", "Optimizer", "Control", "Safety", "Notify", "Batteries"];
+  var GROUP_ORDER = ["General", "Price", "Solar", "Load", "Grid", "Optimizer", "Control", "Safety", "Maintenance", "Notify", "Batteries"];
 
   function isSafetySetting(descriptor) {
     if (descriptor && AUTHORITY_KEYS.indexOf(descriptor.key) >= 0) return true;
@@ -5314,6 +5349,8 @@
     breakEvenSellEur: breakEvenSellEur,
     planEfficiency: planEfficiency,
     planBreakEvenEur: planBreakEvenEur,
+    maintenancePlanText: maintenancePlanText,
+    maintenanceText: maintenanceText,
     planSlotMinutes: planSlotMinutes,
     planActionWindows: planActionWindows,
     windowFacts: windowFacts,

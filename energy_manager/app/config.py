@@ -194,6 +194,14 @@ DEFAULTS: dict[str, Any] = {
     "protection.cell_voltage_cutoff_v": 3.00,
     "protection.cell_voltage_resume_v": 3.18,
     "protection.emergency_charge_power_w": 0.0,
+    # -- scheduled full-charge maintenance (SPEC 8.1, 0.17.0) ------------------------------
+    # Off by default. When on, a pack must reach ``full_charge_target_soc_pct`` at least every
+    # ``full_charge_interval_days`` days so the BMS can balance its cells; the plan aims for the
+    # target in the cheapest slots before the deadline. Per-battery runtime state (last completed,
+    # next due) lives in the store profile, never in these user settings.
+    "maintenance.full_charge_enabled": False,
+    "maintenance.full_charge_interval_days": 30,
+    "maintenance.full_charge_target_soc_pct": 100.0,
     # -- notifications ---------------------------------------------------------------------
     "notify.enabled": True,
     "notify.persistent": True,
@@ -387,6 +395,9 @@ SETTINGS_META: dict[str, _Meta] = {
     "protection.cell_voltage_cutoff_v": _Meta("float", "safety", "Cutoff cell voltage", "Below this the battery is latched into an emergency charge and may not discharge.", minimum=0.0, maximum=10.0),
     "protection.cell_voltage_resume_v": _Meta("float", "safety", "Resume cell voltage", "At or above this the latch clears and normal planning resumes; must be above the cutoff.", minimum=0.0, maximum=10.0),
     "protection.emergency_charge_power_w": _Meta("float", "safety", "Emergency charge power W", "Charge power for a latched battery, capped by its own max charge. 0 = use max_charge_w.", minimum=0.0, maximum=100000.0),
+    "maintenance.full_charge_enabled": _Meta("bool", "maintenance", "Scheduled full charge", "Reach the target SoC at least every interval so the BMS can balance its cells. The optimiser charges in the cheapest slots before the deadline; advisory still plans it and writes nothing."),
+    "maintenance.full_charge_interval_days": _Meta("int", "maintenance", "Full-charge interval (days)", "How often every enabled battery must reach the target SoC.", minimum=1, maximum=365, advanced=True),
+    "maintenance.full_charge_target_soc_pct": _Meta("float", "maintenance", "Full-charge target %", "Terminal SoC the plan aims for while a full charge is due; a higher optimizer.target_soc_pct_end still wins.", minimum=50.0, maximum=100.0, advanced=True),
     "notify.enabled": _Meta("bool", "notify", "Notifications", ""),
     "notify.persistent": _Meta("bool", "notify", "Persistent notification", "Also create an HA persistent notification.", advanced=True),
     "notify.mobile_service": _Meta("str", "notify", "Mobile service", "e.g. notify.example_mobile_app; empty = off.", advanced=True),

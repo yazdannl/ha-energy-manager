@@ -23,6 +23,11 @@ no MQTT, no cloud account, and no YAML to install by hand.
   bias correction and an optional outdoor-temperature term.
 - **Learns your PV.** With bias correction on, realised PV is compared with the forecast per
   hour-of-day bucket and the forecast is scaled to match what the array actually does.
+- **Keeps the pack balanced.** Optionally schedule a full charge every N days (off by default) so
+  the BMS can balance its cells: while a battery is due, the plan aims for the target SoC in the
+  cheapest slots before the deadline instead of force-charging at peak. Reaching the target is
+  measured, an overdue cycle alerts and keeps trying, and advisory mode still plans it without
+  writing.
 - **Explains itself.** Every planning decision and every blocked dispatch carries a stable reason
   slug, visible in the log, so "why didn't it charge?" always has an answer.
 - **Shows the money.** Savings are accounted against a do-nothing baseline (defined below) and
@@ -121,6 +126,7 @@ disclosure per group).
 | `solar.sources` / `solar.merge_strategy` | unset / `weighted_mean` | Optional merge list `[{source, weight, ...}]` that combines several forecasts into one series: `forecast_solar`, `ha_energy` (every solar-forecast provider already configured in your Home Assistant **Energy dashboard**, e.g. Solcast), `capacity` and `derived`, each with a finite weight `> 0`. The strategy is `weighted_mean`, `median` or `max`; a failed source is skipped, and an empty list keeps `solar.source` alone. The Solar card edits the list with add/remove/reorder. |
 | `optimizer.allow_export` | `false` | Export scheduling stays off until you enable it. |
 | `protection.cell_voltage_enabled` | `false` | Watch the lowest cell voltage (a mapped `cell_voltage_entity`, or the `zendure_native` driver's own read) and latch an emergency charge below `protection.cell_voltage_cutoff_v`; blocked from discharging until it recovers to `protection.cell_voltage_resume_v`. `protection.emergency_charge_power_w` 0 = the battery's own `max_charge_w`. See the safety model. |
+| `maintenance.full_charge_enabled` | `false` | Reach `maintenance.full_charge_target_soc_pct` (default 100) every `maintenance.full_charge_interval_days` (default 30) days so the BMS can balance its cells. While a battery is due the plan uses the terminal-target mechanism in the cheapest slots before the deadline; the due date and last completion are per-battery runtime data, an overdue cycle alerts and keeps trying, and advisory mode never writes. |
 
 If the **Meter** card is left empty, the add-on resolves the meter from your Home Assistant **Energy
 dashboard** (the same grid source the Energy panel already uses): the dashboard's signed power sensor

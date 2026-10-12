@@ -241,6 +241,9 @@ protection.cell_voltage_warning_v 3.10 # advisory per-cell threshold inside the 
 protection.cell_voltage_cutoff_v  3.00 # below this: latch emergency charge, block discharge
 protection.cell_voltage_resume_v  3.18 # at/above this: clear the latch and plan normally
 protection.emergency_charge_power_w 0  # 0 = use the battery's own max_charge_w
+maintenance.full_charge_enabled false  # 0.17.0: reach the target SoC every interval so the BMS can balance
+maintenance.full_charge_interval_days 30   # 1..365; how often every enabled battery must reach the target
+maintenance.full_charge_target_soc_pct 100 # 50..100; terminal target while a full charge is due
 notify.enabled           true
 notify.persistent        true        # HA persistent notification
 notify.mobile_service    ""          # e.g. notify.example_mobile_app, empty = off
@@ -705,6 +708,18 @@ left idle for that reason reports `Reason.EFFICIENCY_LOSS`, which is distinct fr
 `optimizer.min_spread_eur_per_kwh` floor (`Reason.SPREAD_BELOW_THRESHOLD`). `optimizer.target_soc_pct_end` adds a hard terminal constraint when set
 (infeasible target ⇒ drop to a soft penalty and raise an alert, never crash).
 
+Scheduled full-charge maintenance (0.17.0) reuses that same terminal-target mechanism: while a
+tracked battery is due, the solver aims for ``maintenance.full_charge_target_soc_pct`` (or the
+higher ``optimizer.target_soc_pct_end`` when the user set one) so the DP charges in the cheapest
+slots before the deadline. The engine computes the per-battery due dates (``app/full_charge.py``)
+and passes a maintenance block to ``solve``; a block whose ``active`` is false never changes the
+terminal target, so a non-due battery cannot distort the schedule. Reaching charging slots keep
+the stable ``terminal_target`` reason. Reaching the target (measured SoC ≥ target − 1 point)
+records ``last_completed`` and moves the due date an interval out; a deadline past ``due + 24 h``
+raises a rate-limited ``full_charge_overdue`` alert and keeps trying, never marking a completion
+it did not observe. Due-date arithmetic keeps the local wall-clock time across DST
+(``full_charge.add_days_local``).
+
 ### 8.2 Algorithm (`optimize/dp.py`)
 Dynamic programming over discretised energy:
 
@@ -1003,6 +1018,11 @@ settings(key TEXT PK, value_json TEXT, updated_at TEXT)
 meta(key TEXT PK, value TEXT)
 ```
 
+Scheduled-full-charge runtime state is not a new table: it is a per-battery record in the existing
+``learning_profiles`` profile store (``kind='maintenance'``, ``key='full_charge'``) with
+``last_completed``/``next_due``/``first_seen``/``overdue_alerted_at`` per battery id. A missing or
+unreadable profile means "no history" (the battery is due immediately), never an invented date.
+
 Retention: `measurements`/`actuals` raw rows trimmed to 400 days on a daily maintenance run,
 `dispatch_log` to 20 000 rows, `events` to 5 000, and plans to the `plans_rows` (default 200) most
 recent, whose `plan_slots` rows go with them. Measurements are upserted into 5-minute buckets, and
@@ -1067,13 +1087,15 @@ Views (hash routing `#/dashboard`, `#/plan`, `#/forecasts`, `#/batteries`, `#/sa
    "Stop now" and mode switches with a confirmation step for `auto`.
 2. **Plan** — main timeline: price bars + PV/load areas + SoC line + charge/discharge bars in one
    aligned chart, per-slot table with reason, plan summary (cost, baseline, saving, cycles), horizon
-   selector (12/24/36/48 h), "Recompute" button, feasibility warnings.
+   selector (12/24/36/48 h), "Recompute" button, feasibility warnings, and a marked maintenance
+   plan when the payload's `maintenance.active` is true (0.17.0).
 3. **Forecasts** — three panels (price, solar, load) with source, freshness badge, `stale` greying,
    P10/P90 band for load, per-day totals, plus accuracy summary (MAPE/bias) with a 14-day trend.
 4. **Batteries** — card per battery: live power/SoC/limits/efficiency, mapping state
    (resolved vs needs confirmation), add/edit wizard using `/api/v1/discover` with role assignment
    and a confirm step, per-battery enable toggle, bounded test discharge (disabled unless `auto` and
-   not `dry_run`), computed round-trip efficiency and cycle count.
+   not `dry_run`), computed round-trip efficiency and cycle count, and the scheduled-full-charge
+   state (due in N days / due now / overdue / last completed / off, 0.17.0).
 5. **Savings** — today/week/month/year/all, savings chart vs baseline, import/export kWh, realised
    arbitrage vs self-consumption split, a *Measured battery flows* panel (charged/discharged kWh,
    charge cost and discharge value, with per-series coverage where a measurement was missing), and a
@@ -1553,6 +1575,14 @@ round, with the reason:
   dry-run alert and log with stable reasons (`cell_voltage_guard`, `cell_voltage_emergency_charge`,
   `cell_voltage_stale`) without writing; `/status` gains a `cell_voltage` block and each battery a
   `cell_voltage_v`, and the Batteries card states the voltage and marks a latched battery.
+
+- **§3/§8.1/§11/§13 (scheduled full-charge maintenance; requested 2026-10-12, "schedule a periodic
+  full charge so the BMS can balance")** — `maintenance.full_charge_*` ships disabled (`enabled
+  false`, interval 30 days, target 100 %), per-battery runtime state (last completed, next due) is
+  kept in the store profile rather than user settings, and while a battery is due the plan reuses
+  the existing terminal-target mechanism with the higher of the maintenance target and
+  `optimizer.target_soc_pct_end`; reaching the target records the completion and alerts are
+  rate-limited, never a faked completion.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

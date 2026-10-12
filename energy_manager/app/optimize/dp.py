@@ -32,6 +32,7 @@ are exact while everything else is quantised; upgrade path is a finer grid plus 
 from __future__ import annotations
 
 import logging
+import math
 from bisect import bisect_right
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -309,6 +310,14 @@ def align_slots(
             replace(slot, buy=flat_buy, sell=flat_sell, price_stale=True) for slot in out
         ]
     return out
+
+
+def _finite_float(value: Any) -> float | None:
+    """A finite float for a settings/override value, else ``None`` (never a guess)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _median(values: Sequence[float]) -> float:
@@ -771,6 +780,7 @@ def _summary(
     cycle_cost_eur: float = 0.0,
     objective_eur: float = 0.0,
     wear_eur_per_kwh: float = 0.0,
+    maintenance: Mapping[str, Any] | None = None,
 ) -> PlanSummary:
     cost = 0.0
     for s in plan_slots:
@@ -817,6 +827,9 @@ def _summary(
     summary.break_even_sell_eur_per_kwh = aggregate_break_even_sell_eur_per_kwh(
         agg.eta_charge, agg.eta_discharge, median_buy_eur_per_kwh(plan_slots), wear_eur_per_kwh
     )
+    # Scheduled full-charge maintenance (SPEC 8.1): the block the engine computed, carried verbatim
+    # so the API/UI can say which batteries the plan charges to balance and against which deadline.
+    summary.maintenance = dict(maintenance) if maintenance else None
     return summary
 
 
@@ -843,8 +856,16 @@ def solve(
     source_names: Mapping[str, str] | None = None,
     mode: str = "advisory",
     dry_run: bool = True,
+    maintenance: Mapping[str, Any] | None = None,
 ) -> Plan:
-    """Solve the horizon and return a ``Plan`` (SPEC 8.2).  Deterministic."""
+    """Solve the horizon and return a ``Plan`` (SPEC 8.2).  Deterministic.
+
+    ``maintenance`` is the scheduled-full-charge block from ``app.full_charge.plan_block``: while it
+    is ``active`` the plan aims for the higher of ``optimizer.target_soc_pct_end`` and the
+    maintenance target, reusing the existing hard terminal-target machinery so the DP charges in
+    the cheapest slots before the deadline.  When it is absent or inactive the terminal target is
+    exactly the user's setting: a non-due battery never distorts the schedule.
+    """
     now = generated_at or utcnow()
     sources = dict(source_names or {})
     if options.wear_eur_per_kwh <= 0.0 and aggregate.wear_eur_per_kwh > 0.0:
@@ -852,6 +873,16 @@ def solve(
         # of the per-battery derived wear (SPEC 5). A non-zero setting is the advanced override
         # and wins. Resolved here so every caller (API recompute, tests, selfcheck) agrees.
         options = replace(options, wear_eur_per_kwh=aggregate.wear_eur_per_kwh)
+    active_maintenance: dict[str, Any] | None = None
+    target_soc_pct_end = options.target_soc_pct_end
+    if maintenance and maintenance.get("active"):
+        active_maintenance = dict(maintenance)
+        configured = _finite_float(active_maintenance.get("target_soc_pct"))
+        if configured is not None:
+            current = _finite_float(target_soc_pct_end)
+            target_soc_pct_end = configured if current is None else max(current, configured)
+            active_maintenance["effective_target_soc_pct"] = target_soc_pct_end
+        options = replace(options, target_soc_pct_end=target_soc_pct_end)
     horizon_start = slots[0].t if slots else quarter_floor(now, options.slot_minutes)
     horizon_end = (
         slots[-1].t + timedelta(minutes=options.slot_minutes)
@@ -872,6 +903,7 @@ def solve(
             mode=mode,
             dry_run=dry_run,
             sources=sources,
+            maintenance=active_maintenance,
         )
 
     if not slots:
@@ -899,7 +931,10 @@ def solve(
             )
             for s in slots
         ]
-        return make_plan(plan_slots, _summary(plan_slots, aggregate, dt, 0, 0.0))
+        return make_plan(
+            plan_slots,
+            _summary(plan_slots, aggregate, dt, 0, 0.0, maintenance=active_maintenance),
+        )
 
     dt = options.slot_minutes / 60.0
     # Stored energy only delivers eta_dis AC per stored kWh, so the terminal value is the buy
@@ -940,6 +975,7 @@ def solve(
             cycle_cost_eur=result.cycle_cost_eur,
             objective_eur=result.objective_eur,
             wear_eur_per_kwh=options.wear_eur_per_kwh,
+            maintenance=active_maintenance,
         ),
     )
     if infeasible is not None:
@@ -969,6 +1005,7 @@ def solve_from_forecasts(
     now: datetime | None = None,
     mode: str = "advisory",
     dry_run: bool = True,
+    maintenance: Mapping[str, Any] | None = None,
 ) -> Plan:
     """Align the three forecasts, then solve.  Raises ``ValueError`` when inputs are unusable."""
     moment = now or utcnow()
@@ -993,4 +1030,5 @@ def solve_from_forecasts(
         source_names=sources,
         mode=mode,
         dry_run=dry_run,
+        maintenance=maintenance,
     )

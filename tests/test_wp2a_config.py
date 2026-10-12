@@ -75,6 +75,9 @@ SPEC_KEYS = {
     "control.stale_plan_seconds",
     "control.stale_state_seconds",
     "control.failsafe_on_error",
+    "maintenance.full_charge_enabled",
+    "maintenance.full_charge_interval_days",
+    "maintenance.full_charge_target_soc_pct",
     "notify.enabled",
     "notify.persistent",
     "notify.mobile_service",
@@ -594,6 +597,9 @@ ADVANCED_KEYS = {
     "optimizer.salvage_multiplier",
     "optimizer.cycle_cost_eur_per_kwh",
     "optimizer.target_soc_pct_end",
+    # SPEC 8.1 scheduled full-charge maintenance: the two tuning knobs fold, the on/off stays essential.
+    "maintenance.full_charge_interval_days",
+    "maintenance.full_charge_target_soc_pct",
 }
 
 

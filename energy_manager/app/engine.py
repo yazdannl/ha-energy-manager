@@ -26,6 +26,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from . import analytics
 from . import capacity as capacity_learning
+from . import full_charge
 from .control import drivers as driver_registry
 from .control.dispatcher import Dispatcher, TickOutcome
 from .control.drivers.base import IDEMPOTENT_TOLERANCE_W, HAFacade
@@ -349,6 +350,11 @@ class Engine:
         self._cell_voltage_latch: dict[str, dict[str, Any]] = {}
         self._cell_voltage_readings: dict[str, dict[str, Any]] = {}
         self._cell_voltage_loaded = False
+        # Scheduled full-charge maintenance (SPEC 8.1): the per-battery runtime record (last
+        # completed, next due) lives in the store profile, so it survives a restart without ever
+        # being written to the user's settings.
+        self._full_charge_state: dict[str, full_charge.BatteryRecord] = {}
+        self._full_charge_loaded = False
 
         # PV bias: sources.solar owns the learned profile (it applies it while fetching), so only
         # fall back to the in-engine EWMA when it is unavailable.  Learning is delegated in
@@ -1343,6 +1349,15 @@ class Engine:
             if any(c.driver == driver_registry.ZendureDriver.driver_name for c in configs)
             else []
         )
+        # Scheduled full-charge maintenance (SPEC 8.1): every card states its own due date, last
+        # completion and whether the current plan is charging for it.
+        try:
+            maintenance = {
+                row.get("id"): row for row in self.full_charge_status().get("batteries", [])
+            }
+        except Exception as exc:  # pragma: no cover - a status read must never break the view
+            log.debug("full-charge status failed: %s", exc)
+            maintenance = {}
         views: list[dict[str, Any]] = []
         for config in configs:
             driver = self._drivers.get(config.id)
@@ -1387,6 +1402,15 @@ class Engine:
                         "stale": bool(capacity_info.get("stale")),
                         "confident": bool(capacity_info.get("confident")),
                         "applied": bool(effective_status.get("applied")),
+                    },
+                    "maintenance": maintenance.get(config.id)
+                    or {
+                        "id": config.id,
+                        "watching": False,
+                        "state": "disabled",
+                        "due": False,
+                        "overdue": False,
+                        "at_target": False,
                     },
                 }
             )
@@ -1766,6 +1790,9 @@ class Engine:
             self._state.batteries = list(outcome.battery_states)
             self._clear_expired_override(moment)
         self._note_ha_read(outcome.battery_states)
+        # Scheduled full-charge maintenance: record a completion the moment a fresh reading reaches
+        # the target, so the next replan drops the terminal target (SPEC 8.1).
+        self._evaluate_full_charge(moment)
         self._apply_measurements(measurements, moment)
         self._record_accuracy(moment, measurements, plan)
         if outcome.stale_input:
@@ -2036,6 +2063,122 @@ class Engine:
                 + ", ".join(item.battery_id for item in stale),
                 {"batteries": [item.battery_id for item in stale]},
             )
+
+    # -- scheduled full-charge maintenance (SPEC 8.1) --------------------------------
+
+    def _load_full_charge_state(self) -> dict[str, full_charge.BatteryRecord]:
+        """Restore the per-battery records so a restart keeps its due dates."""
+        if self._full_charge_loaded:
+            return self._full_charge_state
+        self._full_charge_loaded = True
+        stored = self._store_call("profile_get", full_charge.STATE_KIND, full_charge.STATE_KEY)
+        payload = stored[1] if isinstance(stored, tuple) and len(stored) == 2 else stored
+        restored = full_charge.parse_state(payload)
+        if restored:
+            with self._lock:
+                self._full_charge_state = restored
+        return self._full_charge_state
+
+    def _persist_full_charge_state(self) -> None:
+        with self._lock:
+            snapshot = dict(self._full_charge_state)
+        if not snapshot:
+            return
+        self._store_call(
+            "profile_put",
+            full_charge.STATE_KIND,
+            full_charge.STATE_KEY,
+            full_charge.dump_state(snapshot, self._clock()),
+        )
+
+    def _full_charge_settings(self) -> full_charge.FullChargeSettings:
+        return full_charge.FullChargeSettings.from_settings(self._settings)
+
+    def _full_charge_zone(self):
+        return full_charge.resolve_zone(self._settings.get("timezone"))
+
+    def _evaluate_full_charge(self, now: datetime, *, persist: bool = True) -> dict[str, Any]:
+        """Advance every battery's full-charge cycle and return the status the API/UI reads.
+
+        Runs on every tick and before every replan, so a completion is recorded as soon as a fresh
+        measurement reaches the target.  A stale or missing SoC never completes a cycle and never
+        fakes a number (SPEC 8.1); the overdue alert is raised through the normal rate-limited
+        alert path and the cycle keeps trying.
+        """
+        settings = self._full_charge_settings()
+        records = self._load_full_charge_state()
+        configs = sorted(self.battery_configs(), key=lambda config: config.id)
+        with self._lock:
+            fresh = {
+                battery.id: battery.soc_pct
+                for battery in self._state.batteries
+                if battery.available and not battery.stale and battery.soc_pct is not None
+            }
+        updated, rows, changed, completed, overdue = full_charge.evaluate(
+            records,
+            batteries=[(config.id, bool(config.enabled)) for config in configs],
+            soc_by_id=fresh,
+            now=now,
+            settings=settings,
+            tz=self._full_charge_zone(),
+        )
+        with self._lock:
+            self._full_charge_state = updated
+        if persist and changed:
+            self._persist_full_charge_state()
+        for battery_id in completed:
+            self._journal.event(
+                "info",
+                "full_charge_complete",
+                f"full charge complete for {battery_id}: measured SoC reached the target",
+                {"battery_id": battery_id, "target_soc_pct": settings.target_soc_pct},
+            )
+            # Drop the terminal target on the next plan promptly instead of waiting for the plan
+            # to age out; the completed cycle should not keep charging toward a met target.
+            self.request_replan("full_charge_complete")
+        for row in overdue:
+            self._alert(
+                "warning",
+                "full_charge_overdue",
+                f"full charge overdue for {row.get('id')}: the pack has not reached "
+                f"{settings.target_soc_pct:g}% by the deadline",
+                {
+                    "battery_id": row.get("id"),
+                    "due_at": row.get("due_at"),
+                    "target_soc_pct": settings.target_soc_pct,
+                },
+            )
+        return self._full_charge_block_from(settings, rows=rows, now=now)
+
+    def _full_charge_block_from(
+        self, settings: full_charge.FullChargeSettings, *, rows: Sequence[Mapping[str, Any]], now: datetime
+    ) -> dict[str, Any]:
+        horizon_hours = int(
+            clamp(int(self._settings.get("optimizer.horizon_hours", 30) or 30), 12, 48)
+        )
+        plan = full_charge.plan_block(
+            rows, settings, horizon_end=now + timedelta(hours=horizon_hours)
+        )
+        watched = [row for row in rows if row.get("watching")]
+        return {
+            "enabled": settings.enabled,
+            "interval_days": settings.interval_days,
+            "target_soc_pct": settings.target_soc_pct,
+            "overdue_grace_hours": full_charge.OVERDUE_GRACE_HOURS,
+            "active": bool(plan.get("active")),
+            "due": any(row.get("due") for row in watched),
+            "overdue": any(row.get("overdue") for row in watched),
+            "batteries": [dict(row) for row in rows],
+            "plan": plan,
+        }
+
+    def full_charge_status(self, now: datetime | None = None) -> dict[str, Any]:
+        """Scheduled-full-charge status for the API/UI (additive, SPEC 10).
+
+        Always evaluated on demand so a client that reads it before the first tick still gets the
+        real per-battery state, never a fabricated one.
+        """
+        return self._evaluate_full_charge(now or self._clock())
 
     def recover_live_writes(self) -> list[dict[str, Any]]:
         """Neutralise setpoints a previous run left behind, before taking control (audit 2).
@@ -2435,6 +2578,9 @@ class Engine:
         configs = self.effective_battery_configs()
         start_kwh = self._live_energy_kwh(configs)
         mode = str(self.snapshot().mode)
+        # While a full charge is due inside this horizon the plan aims for the maintenance target in
+        # the cheapest slots; otherwise the user's own terminal target is untouched (SPEC 8.1).
+        maintenance = self.full_charge_status(now).get("plan")
         try:
             plan = dp.solve_from_forecasts(
                 price,
@@ -2446,6 +2592,7 @@ class Engine:
                 now=now,
                 mode=mode,
                 dry_run=bool(self.snapshot().dry_run),
+                maintenance=maintenance,
             )
         except ValueError as exc:
             self._journal.event("warning", "plan_infeasible", str(exc)[:200], {"reason": reason})
