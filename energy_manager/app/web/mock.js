@@ -521,6 +521,8 @@
     ["solar.performance_ratio", "float", 0.85, "Performance ratio", "capacity only. Inverter, temperature and soiling losses applied to the clear-sky estimate.", "solar", null],
     ["solar.weather_entity", "str", "", "Weather entity", "capacity only. HA weather entity whose hourly cloud coverage attenuates the estimate. Unset = clear-sky, refined by the measured-PV correction.", "solar", null],
     ["solar.nasa_irradiance", "bool", true, "NASA irradiance", "capacity/derived only. NASA POWER's observed hourly irradiance (keyless, 2-3 day latency) adds a per-hour clearness factor where the weather entity has no cloud data, and refines the meter-derived array fit.", "solar", null],
+    ["solar.sources", "json", [], "Forecast sources", "Merge several PV forecasts into one: an ordered list of {source, weight, ...}. source is forecast_solar, ha_energy (any solar-forecast provider the HA Energy dashboard already has), capacity or derived; weight is a finite number > 0. Empty = use solar.source alone.", "solar", null],
+    ["solar.merge_strategy", "str", "weighted_mean", "Merge strategy", "How several sources become one value per slot: weighted_mean = the weighted average (default), median = the middle value, max = the most optimistic source.", "solar", ["weighted_mean", "median", "max"]],
 
     ["load.mode", "str", "auto", "Load source", "auto uses the load entity if mapped, else derived.", "load", ["auto", "entity", "derived"]],
     ["load.entity", "str", "", "Load entity", "Runtime-picked load power sensor.", "load", null],
@@ -583,7 +585,14 @@
       "solar.capacity_wp": 5800,
       "solar.measured_entity": "sensor.example_pv_power",
       "solar.planes": [{ kwp: 4.0, tilt_deg: 35, azimuth_deg: 180, damping: 0.0 }],
-      "solar.api_key": "example-personal-key"
+      "solar.api_key": "example-personal-key",
+      // 0.12.0 multi-source merge: the demo configures two sources so the Solar card shows the
+      // weight and status columns; the single-source keys above stay set but hidden by the merge.
+      "solar.sources": [
+        { source: "ha_energy", weight: 2, name: "HA Energy forecast" },
+        { source: "capacity", weight: 1, capacity_wp: 5800 }
+      ],
+      "solar.merge_strategy": "weighted_mean"
     },
     batteries: null,
     pendingHolds: [],
@@ -650,6 +659,7 @@
     "price.scale_divisor", "price.source", "price.static_schedule", "price.unit",
     "price.vat_pct", "solar.api_key", "solar.azimuth_deg", "solar.bias_correction",
     "solar.capacity_wp", "solar.nasa_irradiance", "solar.performance_ratio", "solar.planes", "solar.tilt_deg",
+    "solar.sources", "solar.merge_strategy",
     "solar.weather_entity", "timezone"
   ];
 
@@ -855,8 +865,9 @@
 
   function providersPayload() {
     return {
-      solar: [{ kind: "solar", name: "capacity", active: true, ok: true, last_success: iso(Date.now() - 600000), last_error: null, stale: false, detail: { capacity_wp: 5800, tilt_deg: 35, azimuth_deg: 180, assumed_tilt: true, assumed_azimuth: true, performance_ratio: 0.85, cloud_attenuation: true, weather_entity: "weather.example_home", bias_correction: true, correction_applied: 1.06 } },
-              { kind: "solar", name: "cache", active: false, ok: true, last_success: iso(Date.now() - 600000), last_error: null, stale: false, detail: {} }],
+      solar: [{ kind: "solar", name: "capacity", active: true, ok: true, last_success: iso(Date.now() - 600000), last_error: null, stale: false, weight: 1.0, state: "ok", note: "", detail: { capacity_wp: 5800, tilt_deg: 35, azimuth_deg: 180, assumed_tilt: true, assumed_azimuth: true, performance_ratio: 0.85, cloud_attenuation: true, weather_entity: "weather.example_home", bias_correction: true, correction_applied: 1.06 } },
+              { kind: "solar", name: "HA Energy forecast", active: true, ok: true, last_success: iso(Date.now() - 600000), last_error: null, stale: false, weight: 2.0, state: "ok", note: "Home Assistant solar forecast: 2 provider(s), 49 points", detail: { ha_providers: 2, ha_points: 49, entry_id: null } },
+              { kind: "solar", name: "cache", active: false, ok: true, last_success: iso(Date.now() - 600000), last_error: null, stale: false, weight: null, state: "", note: "", detail: {} }],
       price: [{ kind: "price", name: "zonneplan_entity", active: true, ok: true, last_success: iso(Date.now() - 300000), last_error: null, stale: false, detail: { raw_unit: "eur_per_kwh" } },
               { kind: "price", name: "static", active: false, ok: true, last_success: null, last_error: null, stale: false, detail: {} }],
       load: [{ kind: "load", name: "statistics", active: true, ok: true, last_success: iso(Date.now() - 900000), last_error: null, stale: false, detail: { confidence: "medium" } }]

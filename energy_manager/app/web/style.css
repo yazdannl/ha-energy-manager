@@ -946,6 +946,13 @@ tbody tr:hover { background: var(--panel-2); }
 .setup-card > h3 { margin: 0; font-size: 0.95rem; }
 .setup-card > .field-help { margin: 0; }
 .setup-list { margin: 0; padding-left: var(--sp-3); display: grid; gap: var(--sp-1); font-size: 0.88rem; }
+.source-list { display: grid; gap: var(--sp-2); }
+.source-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+.source-row select { flex: 1 1 12rem; min-width: 0; }
+.source-kind { flex: 1 1 12rem; min-width: 0; }
+.source-weight-label { display: inline-flex; align-items: center; gap: var(--sp-1); font-size: 0.85rem; }
+.source-weight { width: 5rem; }
+.source-status { font-size: 0.78rem; overflow-wrap: anywhere; }
 .all-settings { margin-top: var(--sp-3); }
 
 .picker { display: grid; gap: var(--sp-2); }

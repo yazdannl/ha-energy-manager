@@ -113,7 +113,8 @@ disclosure per group).
 | `price.feed_in_energy_tax_refund` | `true` | On: the sell price is the buy price minus the feed-in cost. Off: the energy-tax component is not paid back and is subtracted too. |
 | `price.feed_in_eur_per_kwh` / `price.feed_in_entity` | unset | Optional explicit feed-in tariff or live sensor; either one overrides the derived price. |
 | `grid.power_entity` | unset | Signed grid power sensor (positive = import). Enables the load forecast and the meter-derived solar estimate. Left empty, it is read from your Home Assistant Energy dashboard. |
-| `solar.source` | `forecast_solar` | `forecast_solar` (per-plane API), `capacity` (enter the array's Wp) or `derived` (learn the array from the meter's export moments; also used automatically when `forecast_solar` has no planes and a meter resolves). |
+| `solar.source` | `forecast_solar` | The single source used when `solar.sources` is empty: `forecast_solar` (per-plane API), `capacity` (enter the array's Wp) or `derived` (learn the array from the meter's export moments; also used automatically when `forecast_solar` has no planes and a meter resolves). |
+| `solar.sources` / `solar.merge_strategy` | unset / `weighted_mean` | Optional merge list `[{source, weight, ...}]` that combines several forecasts into one series: `forecast_solar`, `ha_energy` (every solar-forecast provider already configured in your Home Assistant **Energy dashboard**, e.g. Solcast), `capacity` and `derived`, each with a finite weight `> 0`. The strategy is `weighted_mean`, `median` or `max`; a failed source is skipped, and an empty list keeps `solar.source` alone. The Solar card edits the list with add/remove/reorder. |
 | `optimizer.allow_export` | `false` | Export scheduling stays off until you enable it. |
 
 If the **Meter** card is left empty, the add-on resolves the meter from your Home Assistant **Energy
@@ -309,7 +310,9 @@ caused are not part of the number).
 ## Privacy: what leaves your system
 
 There are exactly three outbound dependencies. All are called only while the matching provider is
-enabled, and all three are keyless by default:
+enabled, and all three are keyless by default. (Reading a solar forecast that Home Assistant itself
+holds — the `ha_energy` merge source — is a local WebSocket call to your own instance, so it is not
+an outbound dependency.)
 
 - **`api.forecast.solar`** (solar forecast, enabled by default): the request carries your site
   coordinates and the plane geometry you configured (kWp, tilt, azimuth, damping) — that is what the

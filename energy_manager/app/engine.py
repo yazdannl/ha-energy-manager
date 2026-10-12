@@ -541,6 +541,11 @@ class Engine:
                 "reason": "not_configured",
                 "hint": "enable solar forecasting (solar.enabled) and add a PV plane (solar.planes)",
             }
+        # A non-empty solar.sources list is the multi-source merge (SPEC §7.1.3): the hint names the
+        # failing configured sources instead of the single solar.source path below.
+        merge_sources = self._settings.get("solar.sources") or []
+        if isinstance(merge_sources, (list, tuple)) and merge_sources:
+            return self._explain_solar_merge()
         # The hint names the setting that is actually missing for the *configured* source: the
         # capacity estimate states a watt peak, Forecast.Solar states planes (SPEC 7.1.1).
         source = str(self._settings.get("solar.source", "forecast_solar") or "forecast_solar")
@@ -581,6 +586,29 @@ class Engine:
         return {
             "reason": "no_pv_source",
             "hint": "solar is enabled but produced no forecast; check solar.source and the location",
+        }
+
+    def _explain_solar_merge(self) -> dict[str, Any]:
+        """Why a merged solar panel is empty: name the configured sources that failed."""
+        statuses = [
+            status
+            for (kind, _), status in self._provider_status.items()
+            if kind == "solar" and status.state in ("ok", "degraded", "failed")
+        ]
+        failing = sorted(statuses, key=lambda s: s.name)
+        failed = [status for status in failing if status.state == "failed"]
+        if failed:
+            hint = "; ".join(
+                f"{status.name}: {status.last_error or status.note or 'no usable forecast'}"
+                for status in failed
+            )
+            return {"reason": "provider_failed", "hint": hint}
+        return {
+            "reason": "no_pv_source",
+            "hint": (
+                "no configured solar.sources entry produced a usable series; check the sources and"
+                " the location"
+            ),
         }
 
     def _explain_load(self) -> dict[str, Any]:
@@ -2213,6 +2241,10 @@ class Engine:
         )
         for status in _status_list(statuses):
             self._remember_provider(status)
+        # Additive (0.12.0): a merged solar forecast carries one status per configured source on the
+        # forecast object, so /api/v1/providers lists each of them (kind "solar").
+        for source_status in _status_list(getattr(forecast, "sources", None)):
+            self._remember_provider(source_status)
         return forecast
 
     def _remember_provider(self, status: ProviderStatus) -> None:

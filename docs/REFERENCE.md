@@ -324,7 +324,7 @@ on the card):
 | --- | --- |
 | Price | `price.provider`, `price.export_fee_eur_per_kwh`, `price.feed_in_energy_tax_refund`; plus `price.entity` (`provider=entity`), `price.bzn` + `price.vat_pct` + `price.energy_tax_eur_per_kwh` + `price.import_fee_eur_per_kwh` (`day_ahead`), `price.contract` + `price.fixed_price_eur_per_kwh` (`fixed`, single) or the two day/night rates **and** the two window hours (`fixed_day_night`) |
 | Meter | `grid.power_entity` (searchable picker); left empty, it resolves at runtime from the Energy dashboard. The card shows the resolved roles, labels a saved value as an override, and offers `Use the Energy dashboard` to clear every explicit `grid.*` key |
-| Solar | `solar.enabled`, `solar.source`, `solar.measured_entity` unless the source is `derived`, `solar.capacity_wp` (`capacity`), `solar.planes` (`forecast_solar`) |
+| Solar | `solar.enabled`, `solar.source`, `solar.measured_entity` unless the source is `derived`, `solar.capacity_wp` (`capacity`), `solar.planes` (`forecast_solar`), plus the merge editor `solar.sources` and its `solar.merge_strategy` |
 | Battery | the fleet from `GET /api/v1/batteries` (the canonical inventory) plus a link into the wizard |
 
 Entity pickers ask `GET /api/v1/discover` and write the candidate row's `setting_key`
@@ -374,7 +374,10 @@ Always-visible price keys: the provider/contract selectors, the adders and fees
 (`price.feed_in_eur_per_kwh`, `price.feed_in_entity`, `price.feed_in_tax_inclusive`).
 
 Always-visible solar keys: `solar.source`, `solar.enabled`, `solar.bias_correction`,
-`solar.measured_entity`.
+`solar.measured_entity`, `solar.sources`, `solar.merge_strategy`. The `solar.sources` editor is a
+row per entry (source select, weight input, Move up / Move down / Remove) with an `Add source`
+button; it writes the plain list through the ordinary dirty/Save flow, and each row shows the
+provider's reported `state` and `note` when the Settings route loaded `/api/v1/providers`.
 
 Two guidance lines under the Solar group: `SOLAR_MEASURED_NOTE` (the measured entity must be the
 inverter's AC output — a meter's export register under-reports self-consumed energy) and
@@ -526,6 +529,8 @@ is the authority for the `advanced` classification (the test suite asserts the e
 | `solar.performance_ratio` | float | `0.85` | 0.5…1.1 | **Performance ratio** *(advanced)* |
 | `solar.weather_entity` | str | `""` | — | **Weather entity** *(advanced)* — hourly cloud coverage |
 | `solar.nasa_irradiance` | bool | `true` | — | **NASA irradiance** *(advanced)* — observed NASA POWER clearness per hour-of-day where the weather entity has no cloud data, and in the derived fit; cached daily per location **and timezone**, with a 3-hour backoff after a failure |
+| `solar.sources` | json | `[]` | — | **Forecast sources** *(advanced)* — ordered `[{source, weight, ...}]` (SPEC §7.1.3); empty = `solar.source` alone |
+| `solar.merge_strategy` | choice `weighted_mean\|median\|max` | `weighted_mean` | — | **Merge strategy** *(advanced)* — how several sources become one value per slot |
 
 #### Load
 
@@ -631,6 +636,15 @@ and `azimuth_deg` (default 0, 0…360, **compass bearing**: 0 = north, 90 = east
 `{morning, evening}`, each clamped to 0…1.
 
 `batteries` — a list of battery objects, validated per §3.4 and edited through the Batteries view.
+
+`solar.sources` — a list of merge entries (SPEC §7.1.3). Each needs `source` ∈
+`forecast_solar | ha_energy | capacity | derived` and accepts `weight` (default 1, a **finite number
+> 0**), an optional `name`, and the provider-specific keys for that source: `planes` / `api_key`
+(`forecast_solar`), `entry_id` (`ha_energy`), and `capacity_wp` / `tilt_deg` / `azimuth_deg` /
+`performance_ratio` / `weather_entity` / `nasa_irradiance` (`capacity` and `derived`). An unknown key
+or a bad value fails validation with a message naming the entry (`solar.sources[0].weight must be a
+finite number > 0`); `PATCH /api/v1/config` reports it per key and nothing is applied.
+`solar.merge_strategy` must be `weighted_mean`, `median` or `max`.
 
 **Group names in the API** — `SETTINGS_META.group` is lowercase; `GET /api/v1/config` title-cases it
 (`general` → `General`), and moves exactly five keys into the `Safety` group regardless of their

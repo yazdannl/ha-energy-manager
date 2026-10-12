@@ -493,6 +493,12 @@ def provider_dict(status: ProviderStatus) -> dict[str, Any]:
         "last_error": status.last_error,
         "stale": status.stale,
         "detail": dict(status.detail),
+        # Additive (0.12.0 multi-source solar): the configured weight, a coarse state and a
+        # one-line note. The coarse state is derived only when a producer left it unset, so
+        # existing providers keep exactly the same ok/active semantics.
+        "weight": status.weight,
+        "state": status.state or ("ok" if status.ok else ("disabled" if not status.active else "failed")),
+        "note": status.note or (status.last_error or ""),
     }
 
 
@@ -1081,6 +1087,13 @@ class ApiServer:
         payload["notes"] = notes
         payload["reason"] = explanation.get("reason")
         payload["hint"] = explanation.get("hint")
+        # Additive (0.12.0): one status per configured solar.sources merge entry. Absent for the
+        # single-source path, so existing consumers see the same payload as before.
+        source_rows = getattr(forecast, "sources", None)
+        if isinstance(source_rows, (list, tuple)) and source_rows:
+            payload["sources"] = [
+                provider_dict(row) for row in source_rows if isinstance(row, ProviderStatus)
+            ]
         return payload
 
     @staticmethod

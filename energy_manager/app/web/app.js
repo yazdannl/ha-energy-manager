@@ -3906,7 +3906,7 @@
 
   // Meaningful for both sources: the on/off switch, the selector itself, the bias learning and the
   // measured PV entity that learning is fitted to (the accuracy of both sources improves with it).
-  var SOLAR_FIELDS_ALWAYS = ["solar.source", "solar.enabled", "solar.bias_correction", "solar.measured_entity"];
+  var SOLAR_FIELDS_ALWAYS = ["solar.source", "solar.enabled", "solar.bias_correction", "solar.measured_entity", "solar.sources", "solar.merge_strategy"];
   // forecast_solar: the API call — per-plane geometry, plus the optional own key (keyless is
   // single-plane hourly, which is why planes is the field that really matters).
   var SOLAR_FIELDS_FORECAST_SOLAR = ["solar.planes", "solar.api_key"];
@@ -3979,6 +3979,8 @@
     if (source === "capacity") keys.push("solar.capacity_wp");
     if (source === "forecast_solar") keys.push("solar.planes");
     if (source !== "derived") keys.push("solar.measured_entity");
+    // The merge list and its strategy are part of the Solar card whatever the single source is.
+    keys.push("solar.sources", "solar.merge_strategy");
     return keys;
   }
 
@@ -4184,6 +4186,10 @@
     // can disagree, and a descriptor that reads as an empty fleet must never answer the question
     // (UI_REVIEW §3.2 / open question 3).
     var fleet = Array.isArray(data.fleet) ? data.fleet : [];
+    // Provider status is optional on the Settings route: the Solar card shows each configured merge
+    // source's state when it is available, and never invents one when the read failed.
+    var providers = (data && data.providers) || null;
+    var solarProviders = (providers && Array.isArray(providers.solar)) ? providers.solar : [];
     var descriptors = Array.isArray(config.settings) ? config.settings : [];
     if (!descriptors.length) { body.appendChild(el("p", { class: "muted", text: "The server sent no setting descriptors." })); return; }
     var dirtyValues = {};
@@ -4488,6 +4494,101 @@
       );
     }
 
+    // The merge list and its strategy (SPEC §7.1.3). The All-settings JSON row for solar.sources
+    // remains the fallback path; this editor is the normal add/remove/reorder surface and commits
+    // through the same dirty/Save flow.
+    var SOLAR_SOURCE_KINDS = ["forecast_solar", "ha_energy", "capacity", "derived"];
+    var SOLAR_SOURCE_KIND_LABELS = {
+      forecast_solar: "Forecast.Solar (API)",
+      ha_energy: "Home Assistant Energy dashboard",
+      capacity: "Array capacity (watt peak)",
+      derived: "Learn from the meter"
+    };
+
+    function solarSourceSelect(value, onChange) {
+      var select = el("select", { class: "source-kind" });
+      SOLAR_SOURCE_KINDS.forEach(function (option) {
+        var node = el("option", { value: option, text: SOLAR_SOURCE_KIND_LABELS[option] });
+        if (String(value) === option) node.selected = true;
+        select.appendChild(node);
+      });
+      select.addEventListener("change", function () { onChange(select.value); });
+      return select;
+    }
+
+    function solarSourcesEditor() {
+      var value = settingValue("solar.sources");
+      var list = Array.isArray(value) ? value.map(function (entry) { return Object.assign({}, entry); }) : [];
+      var wrap = el("div", { class: "field", dataset: { key: "solar.sources" } });
+      wrap.appendChild(el("label", { text: "Forecast sources (merge)" }));
+      wrap.appendChild(el("span", { class: "field-key", text: "solar.sources" }));
+      wrap.appendChild(el("p", { class: "field-help", text: "Merge several PV forecasts into one hourly series. Empty = the single source above is used unchanged. Each entry is {source, weight, ...}; a per-source key overrides the matching solar.* setting for that entry only." }));
+      function commit(next) { dirty("solar.sources", next, wrap); draw(); }
+      function update(index, patch) {
+        commit(list.map(function (entry, i) { return i === index ? Object.assign({}, entry, patch) : entry; }));
+      }
+      function move(index, delta) {
+        var target = index + delta;
+        if (target < 0 || target >= list.length) return;
+        var next = list.slice();
+        var item = next.splice(index, 1)[0];
+        next.splice(target, 0, item);
+        commit(next);
+      }
+      function removeAt(index) {
+        commit(list.filter(function (_entry, i) { return i !== index; }));
+      }
+      function statusFor(entry) {
+        var want = String(entry.name || entry.source || "");
+        var i;
+        for (i = 0; i < solarProviders.length; i += 1) {
+          if (String(solarProviders[i].name || "") === want) return solarProviders[i];
+        }
+        for (i = 0; i < solarProviders.length; i += 1) {
+          if (String(solarProviders[i].name || "").indexOf(want + ":") === 0) return solarProviders[i];
+        }
+        return null;
+      }
+      var rows = el("div", { class: "source-list" });
+      if (!list.length) {
+        rows.appendChild(el("p", { class: "muted", text: "No merge sources configured: the single source above is used." }));
+      }
+      list.forEach(function (entry, index) {
+        var row = el("div", { class: "source-row" });
+        row.appendChild(solarSourceSelect(entry.source, function (source) { update(index, { source: source }); }));
+        var weight = el("input", {
+          type: "number",
+          class: "source-weight",
+          min: "0",
+          step: "any",
+          value: entry.weight === undefined || entry.weight === null ? "1" : String(entry.weight)
+        });
+        weight.addEventListener("input", function () {
+          var raw = weight.value.trim();
+          var number = raw === "" ? 1 : Number(raw);
+          if (!isFinite(number) || number <= 0) return;
+          update(index, { weight: number });
+        });
+        row.appendChild(el("label", { class: "source-weight-label" }, ["Weight", weight]));
+        row.appendChild(button("Move up", "", function () { move(index, -1); }));
+        row.appendChild(button("Move down", "", function () { move(index, 1); }));
+        row.appendChild(button("Remove", "", function () { removeAt(index); }));
+        var status = statusFor(entry);
+        row.appendChild(el("span", {
+          class: "source-status badge badge-info",
+          text: status
+            ? (status.state || (status.ok ? "ok" : "failed")) + (status.note || status.last_error ? " - " + (status.note || status.last_error) : "")
+            : "no status reported yet"
+        }));
+        rows.appendChild(row);
+      });
+      wrap.appendChild(rows);
+      wrap.appendChild(button("Add source", "", function () {
+        commit(list.concat([{ source: "ha_energy", weight: 1 }]));
+      }));
+      return wrap;
+    }
+
     function solarCard() {
       var source = String(settingValue("solar.source") || "forecast_solar");
       var children = [cardField("solar.enabled"), cardField("solar.source")];
@@ -4502,7 +4603,13 @@
       if (source === "forecast_solar") children.push(cardField("solar.planes"));
       var note = solarFieldVisibility(source).note;
       if (note) children.push(el("p", { class: "field-help", text: note }));
-      return setupCard("Solar", "Optional. How the add-on should know your production.", children);
+      // The multi-source merge editor (SPEC §7.1.3): carries solar.sources on the card so the
+      // groups skip it, and owns the strategy select beside it.
+      cardKeys["solar.sources"] = true;
+      children.push(solarSourcesEditor());
+      var strategy = cardField("solar.merge_strategy");
+      if (strategy) children.push(strategy);
+      return setupCard("Solar", "Optional. How the add-on should know your production — one source, or several merged.", children);
     }
 
     function batteryCard() {
@@ -4789,13 +4896,13 @@
 
   function viewSettings(host) {
     var load = once(function () {
-      return Promise.all([get("/config"), get("/batteries")]).then(function (rows) {
-        return { config: rows[0], fleet: (rows[1] && Array.isArray(rows[1].batteries) ? rows[1].batteries : []) };
+      return Promise.all([get("/config"), get("/batteries"), get("/providers").catch(function () { return null; })]).then(function (rows) {
+        return { config: rows[0], fleet: (rows[1] && Array.isArray(rows[1].batteries) ? rows[1].batteries : []), providers: rows[2] };
       }, function (err) {
         // The config is the required read; without the fleet the Battery card says so rather than
         // guessing an empty inventory.
         return get("/config").then(function (config) {
-          return { config: config, fleet: [], fleetError: err };
+          return { config: config, fleet: [], fleetError: err, providers: null };
         });
       });
     });

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.12.0
+
+- **Several PV forecasts can be merged into one hourly input.** The planner used to take its solar
+  forecast from one provider. A new `solar.sources` list combines any mix of them instead: the
+  Forecast.Solar API (`forecast_solar`), **any solar-forecast provider already configured in your
+  Home Assistant Energy dashboard** (`ha_energy` — read locally over the WebSocket
+  `energy/solar_forecast` command, so Solcast and friends work without re-entering the array), the
+  watt-peak estimate (`capacity`), and the meter-derived one (`derived`). Each entry carries a
+  finite `weight > 0` and may override the matching `solar.*` setting (planes, watt peak, geometry,
+  weather entity, ...) for that source only. `solar.merge_strategy` picks `weighted_mean` (default),
+  `median` or `max`. Every source is aligned onto the same 15-minute grid with the existing
+  interpolation, so hourly and 15-minute sources mix cleanly; a failed or empty source is skipped
+  with a note and the rest still produce a forecast. **An empty `solar.sources` (the shipped
+  default) leaves today's single-source path byte-for-byte unchanged**, and if no source produces a
+  usable series the single-source chain runs as the fallback. Bias correction and NASA clearness
+  keep working inside each source before the merge. The Solar card shows the configured sources
+  with their weight and status and can add, remove and reorder them through the normal dirty/Save
+  flow; the JSON field in All settings remains the fallback editor. Each configured source is
+  reported with `name`, `weight`, `state` (`ok | degraded | failed | disabled`) and a short note on
+  the solar provider list and in `/api/v1/forecast?kind=solar`. New settings are validated: a
+  malformed entry is reported per key and never crashes the engine.
+
 ## 0.11.0
 
 - **A battery can be added and driven through the inverter's own MQTT bridge.** A SolarFlow whose

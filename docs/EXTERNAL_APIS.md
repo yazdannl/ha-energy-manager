@@ -438,6 +438,49 @@ parent_device_id, primary_config_entry, serial_number, sw_version, via_device_id
   arrays are migrated to the unified shape on load (storage minor version 3), so a modern payload is
   flat. **[V]** (source + live)
 
+### `energy/solar_forecast` — **[V]** (source, 0.12.0 multi-source merge)
+
+* Request: `{"type": "energy/solar_forecast"}`. **No parameters**, no admin requirement
+  (`websocket_api.websocket_command` with no `require_admin`) — the read-only companion of
+  `energy/save_prefs`. **[V]** (core `energy/websocket_api.py`, `ws_solar_forecast`).
+* It is answered from the Energy dashboard's own `energy_sources` entries whose `type == "solar"`:
+  every configured `config_entry_solar_forecast` id is looked up in the config-entry registry, its
+  platform's `async_get_solar_forecast(hass, config_entry_id)` is awaited, and non-`None` results
+  are collected. Platforms that register this energy platform include `forecast_solar` and the
+  Solcast/other solar-forecast integrations. **[V]** (source).
+* Result shape — a mapping keyed by the **opaque config entry id** (never a domain or entity id),
+  each value carrying `wh_hours`, whose keys are ISO-8601 timestamps and whose values are **watt
+  hours for the period starting at that stamp** (the `forecast_solar` energy platform emits
+  `timestamp.isoformat(): val` from `data.wh_period`):
+
+  ```json
+  {
+    "example_config_entry_a": {
+      "wh_hours": {
+        "2026-01-05T12:00:00+00:00": 1000,
+        "2026-01-05T13:00:00+00:00": 1500
+      }
+    },
+    "example_config_entry_b": {
+      "wh_hours": { "2026-01-05T12:00:00+00:00": 500 }
+    }
+  }
+  ```
+
+  The inner object is a TypedDict (`SolarForecastType`), so a platform can only add keys, never
+  change `wh_hours`. **[V]** (core `energy/types.py`).
+* An unset dashboard or no solar source answers `{}` (not an error); a config entry that no longer
+  exists or whose domain registers no energy platform is silently skipped. A provider that returns
+  `None` is skipped. **[V]** (source).
+* Required normalisation: sum several providers point-by-point when no `entry_id` is selected;
+  convert Wh for each period to average kW using the **next** stamp's own period length (the last
+  point assumes one hour, clamped to 1 min … 3 h) before aligning onto the 15-minute grid. Zero
+  values at exact midnight are omitted by the `forecast_solar` platform (it cannot distinguish them
+  from a missing point); a zero elsewhere is a real forecast value. **[V]** (source).
+* A missing command (`unknown_command`), an unreachable WebSocket or no data is a **note on the
+  `ha_energy` source**, never a failed forecast: the other merge sources still produce one
+  (SPEC.md §7.1.3).
+
 ### Frames, pings, limits
 
 * Server heartbeat: Core sends WebSocket **PING** control frames every 55 s (`heartbeat=55`), the

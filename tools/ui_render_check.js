@@ -363,6 +363,19 @@ function classTokens(text) {
   const cardFields = [...byClass(view(), "setup-cards")[0]?.querySelectorAll("[data-key]") || []].map((f) => f.dataset.key);
   check("every card key is rendered on a card", [...cardKeys].every((key) => cardFields.includes(key)), `cards render ${cardFields.join(", ")}`);
 
+  // SPEC 7.1.3: the Solar card owns the merge list. The mock configures two sources, so the editor
+  // must render one row per source with its weight input and its status chip.
+  const solarCardNode = [...(byClass(view(), "setup-cards")[0]?.querySelectorAll(".setup-card") || [])]
+    .find((card) => /How the add-on should know your production/.test(card.textContent)) || null;
+  const sourceRows = solarCardNode ? solarCardNode.querySelectorAll(".source-row") : [];
+  const sourceWeights = solarCardNode ? solarCardNode.querySelectorAll(".source-weight") : [];
+  const sourceStatuses = solarCardNode ? solarCardNode.querySelectorAll(".source-status") : [];
+  check("the Solar card renders the merge-source editor", !!solarCardNode && sourceRows.length === 2 && sourceWeights.length === 2,
+    `${sourceRows.length} rows, ${sourceWeights.length} weights`);
+  check("each merge source shows a weight and a status", sourceStatuses.length === 2
+    && [...sourceStatuses].every((n) => /(ok|degraded|failed|disabled|no status)/.test(n.textContent)),
+    [...sourceStatuses].map((n) => n.textContent).join(" | "));
+
   // SPEC 3: the Meter card names the Energy-dashboard fallback and lets a saved override go back
   // to it. The mock serves the dashboard roles and mirrors the engine's grid_resolution().
   function meterCardNode() {

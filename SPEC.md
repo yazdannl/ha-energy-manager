@@ -204,6 +204,8 @@ solar.api_key            ""   # optional forecast.solar personal key (raises rat
 solar.bias_correction    true # learn multiplicative correction from measured PV
 solar.measured_entity    ""   # runtime-picked PV power sensor for bias learning
 solar.nasa_irradiance    true # capacity/derived only: observed NASA POWER clearness per hour-of-day
+solar.sources            []   # merge several sources into one: [{source, weight, ...}] (§7.1.3)
+solar.merge_strategy     weighted_mean|median|max   # how several sources become one value per slot
 load.mode                auto|entity|derived   # auto uses load entity if mapped else derived
 load.entity              ""   # runtime-picked load power sensor
 load.temperature_entity  ""   # optional outdoor temperature for the regression term
@@ -556,6 +558,41 @@ size does not change between refreshes.
 The forecast itself is then the §7.1.1 capacity model, so
 `solar.tilt_deg`, `solar.azimuth_deg`, `solar.performance_ratio` and `solar.weather_entity` apply
 unchanged, and the forecast carries a note that the learned size is a conservative lower bound.
+
+#### 7.1.3 Multi-source merge (`solar.sources`, 0.12.0)
+One provider is rarely the best estimate at every hour, and Home Assistant may already be running
+several solar-forecast integrations. `solar.sources` is an **ordered** list of entries
+`{source, weight, ...provider-specific keys}`; while it is empty (the shipped default) the
+single-source `solar.source` path above runs unchanged. A non-empty list builds one series per
+source on the same 15-minute grid and merges them per slot:
+
+* **Sources.** `forecast_solar` (the §7.1 API), `ha_energy` (whatever solar-forecast providers the
+  Home Assistant Energy dashboard has configured, read over the WebSocket command
+  `energy/solar_forecast` — Solcast, Forecast.Solar and any other integration that registers an
+  energy platform), `capacity` and `derived` (§7.1.1/§7.1.2). Provider-specific keys (`planes`,
+  `api_key`, `capacity_wp`, `tilt_deg`, `azimuth_deg`, `performance_ratio`, `weather_entity`,
+  `nasa_irradiance`, and `entry_id`/`name` for `ha_energy`) override the matching `solar.*` setting
+  for that entry only; an unknown key is a validation error.
+* **Alignment.** Each source's samples are placed on the grid with the same linear interpolation and
+  timezone conventions the single-source path uses, so a mix of hourly and 15-minute sources lines
+  up without a special case.
+* **Merge.** `solar.merge_strategy` = `weighted_mean` (default: `Σ wᵢ·vᵢ / Σ wᵢ` over the sources
+  present at that slot), `median` (equal say per source, ignoring weights) or `max` (the most
+  optimistic source). Weights must be finite and `> 0`. A source that is disabled, empty or failed
+  is skipped with a note; the remaining sources still produce a forecast. If **no** source produces
+  a usable series, the §7.1/§7.1.1/§7.1.2 single-source chain runs as the fallback and the notes say
+  so. Bias correction (and NASA clearness where it applies) keeps working inside each source before
+  the merge, so the merged curve is corrected once, per source.
+* **Status.** Every configured source is reported with its name, weight and a coarse state
+  (`ok | degraded | failed | disabled`) plus a one-line note, on the solar provider list and in the
+  `/api/v1/forecast?kind=solar` payload (`sources`). The Solar setup card renders the same list and
+  can add, remove and reorder entries through the ordinary dirty/Save flow; the JSON field in All
+  settings is the fallback editing path.
+
+The websocket contract is recorded in docs/EXTERNAL_APIS.md section 5: the command takes no
+parameters and answers `{config_entry_id: {"wh_hours": {<ISO timestamp>: <Wh>}}}`; several providers
+are summed point by point, and one `entry_id` selects a single provider. A missing command, an empty
+dashboard or an unavailable provider is a note, never a failed forecast.
 
 ### 7.2 Load (`sources/load.py`)
 Sources in priority order, all producing 15-minute `LoadForecast` slots with `p10/p50/p90`:
@@ -1337,6 +1374,26 @@ round, with the reason:
   the dashboard's roles, and a `Use the Energy dashboard` button that clears `grid.power_entity`,
   `grid.import_entity` and `grid.export_entity` through the normal dirty/Save flow. Additive
   payload key; the settings themselves stay blank ("runtime default everywhere").
+
+- **§3/§7.1.3/§10/§13.2 (multi-source PV forecast merge; requested 2026-10-12, "combine several
+  solar forecast providers into one hourly forecast")** — a single provider is an assumption about
+  which service is most accurate, and the live install already had more than one forecast source
+  available. Two coupled choices drove the design. (a) Home Assistant exposes every provider the
+  Energy dashboard has configured through the read-only, non-admin `energy/solar_forecast`
+  WebSocket command, so the new `ha_energy` source reads them there instead of asking the user to
+  repeat the array's geometry; its response is keyed by the dashboard's own config entry id, so an
+  entry may select one with `entry_id` or sum all of them. (b) The merge is a new `solar.sources`
+  list rather than a change to `solar.source`, because an empty list must keep today's single-source
+  path byte-for-byte; the pure `merge_solar_series` function aligns each source with the existing
+  interpolation/timezone rules and merges with `solar.merge_strategy` (`weighted_mean` default,
+  `median`, `max`), skipping failed sources and falling back to the single-source chain only when
+  none produces a usable series. Per-source status (`name`, `weight`, `state`, `note`) is additive on
+  `ProviderStatus`/`SolarForecast` and exposed on the solar provider list and the solar forecast
+  payload; the Solar card renders the list with add/remove/reorder through the normal dirty/Save
+  flow. The alternatives considered and rejected: a per-slot provider election (needs a
+  trust model the data cannot support), silently reading all HA providers without a settings list
+  (no way to weight or disable one), and storing merged values back into `solar.source` (would lose
+  the "empty list = unchanged" guarantee).
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

@@ -343,6 +343,8 @@ class SolarForecast:
     planes: list[dict[str, Any]] = field(default_factory=list)
     correction_applied: float = 1.0
     notes: list[str] = field(default_factory=list)
+    # Additive (0.12.0): one status per configured merge source, empty for the single-source path.
+    sources: list[ProviderStatus] = field(default_factory=list)
 
     def total_kwh(self) -> float:
         """Energy under the curve, assuming equally spaced slots."""
@@ -576,6 +578,12 @@ class ProviderStatus:
     last_error: str | None = None
     stale: bool = False
     detail: dict[str, Any] = field(default_factory=dict)
+    # Additive (0.12.0 multi-source solar merge): the configured weight, the coarse state
+    # (ok | degraded | failed | disabled; empty = derive from active/ok) and a one-line note.
+    # Existing producers leave them unset, so the frozen surface is unchanged.
+    weight: float | None = None
+    state: str = ""
+    note: str = ""
 
 
 # --------------------------------------------------------------------------------------

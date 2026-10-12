@@ -102,6 +102,10 @@ DEFAULTS: dict[str, Any] = {
     # NASA POWER observed irradiance (keyless, near-real-time): a per-hour clearness factor that
     # fills in for slots without weather-entity cloud data and refines the derived watt-peak fit.
     "solar.nasa_irradiance": True,
+    # Multi-source merge (0.12.0): an ordered list of {source, weight, ...provider keys}. Empty =
+    # today's single-source behaviour via solar.source, byte-for-byte unchanged.
+    "solar.sources": [],
+    "solar.merge_strategy": "weighted_mean",
     # -- load ---------------------------------------------------------------------------
     "load.mode": "auto",
     "load.entity": "",
@@ -168,6 +172,33 @@ _PRICE_PROVIDER_CHOICES = ("entity", "zonneplan", "day_ahead", "fixed")
 _PRICE_CONTRACT_CHOICES = ("dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night")
 _PRICE_UNIT_CHOICES = ("auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh")
 _SOLAR_SOURCE_CHOICES = ("forecast_solar", "capacity", "derived")
+#: Source types a ``solar.sources`` merge entry may name (0.12.0). ``ha_energy`` reads whatever
+#: solar-forecast providers the Home Assistant Energy dashboard already has configured.
+_SOLAR_MERGE_SOURCE_CHOICES = ("forecast_solar", "ha_energy", "capacity", "derived")
+#: How several per-source series become one (0.12.0).
+_SOLAR_MERGE_STRATEGIES = ("weighted_mean", "median", "max")
+#: Provider-specific keys a merge entry may carry, per source type. The key is the setting suffix
+#: (``capacity_wp`` -> ``solar.capacity_wp``), overlaid on the global settings for that source.
+_SOLAR_SOURCE_KEYS: dict[str, tuple[str, ...]] = {
+    "forecast_solar": ("planes", "api_key"),
+    "ha_energy": ("entry_id",),
+    "capacity": (
+        "capacity_wp",
+        "tilt_deg",
+        "azimuth_deg",
+        "performance_ratio",
+        "weather_entity",
+        "nasa_irradiance",
+    ),
+    "derived": (
+        "capacity_wp",
+        "tilt_deg",
+        "azimuth_deg",
+        "performance_ratio",
+        "weather_entity",
+        "nasa_irradiance",
+    ),
+}
 _LOAD_MODE_CHOICES = ("auto", "entity", "derived")
 _NOTIFY_EVENT_CHOICES = (
     "plan_changed",
@@ -252,6 +283,8 @@ SETTINGS_META: dict[str, _Meta] = {
     "solar.performance_ratio": _Meta("float", "solar", "Performance ratio", "Inverter, temperature and soiling losses applied to the clear-sky estimate.", minimum=0.5, maximum=1.1, advanced=True),
     "solar.weather_entity": _Meta("str", "solar", "Weather entity", "Optional HA weather entity; its hourly cloud coverage attenuates the capacity estimate. Unset = clear-sky, refined by the measured-PV correction.", advanced=True),
     "solar.nasa_irradiance": _Meta("bool", "solar", "NASA irradiance", "Refine the capacity/derived estimate with NASA POWER's observed hourly irradiance (keyless, 2-3 day latency): a per-hour clearness factor for slots without weather-entity cloud data, also used when fitting the meter-derived array. Weather-entity cloud and the measured-PV correction still win where they apply. Only the array's location is sent.", advanced=True),
+    "solar.sources": _Meta("json", "solar", "Forecast sources", "Merge several PV forecasts into one: an ordered list of {source, weight, ...}. source is forecast_solar, ha_energy (any solar-forecast provider the HA Energy dashboard already has), capacity or derived; weight is a finite number > 0. Empty = use solar.source alone. Per-source keys override the matching solar.* setting for that entry only.", advanced=True),
+    "solar.merge_strategy": _Meta("choice", "solar", "Merge strategy", "How several sources become one value per slot: weighted_mean = the weighted average (default), median = the middle value (equal say per source), max = the most optimistic source. Skipped/unavailable sources never contribute.", _SOLAR_MERGE_STRATEGIES, advanced=True),
     "load.mode": _Meta("choice", "load", "Load source", "auto uses the load entity if mapped, else derived.", _LOAD_MODE_CHOICES, advanced=True),
     "load.entity": _Meta("str", "load", "Load entity", "Runtime-picked load power sensor.", advanced=True),
     "load.temperature_entity": _Meta("str", "load", "Outdoor temperature entity", "Optional regression term.", advanced=True),
@@ -833,6 +866,8 @@ def _validate_json_setting(key: str, value: Any) -> Any:
         return _validate_static_schedule(value)
     if key == "solar.planes":
         return _validate_planes(value)
+    if key == "solar.sources":
+        return _validate_solar_sources(value)
     if key == "batteries":
         if not isinstance(value, list):
             raise ConfigError("batteries must be a list")
@@ -920,6 +955,70 @@ def _validate_planes(value: Any) -> list[dict[str, Any]]:
             plane["damping"] = damping
         out.append(plane)
     return out
+
+
+def _validate_solar_sources(value: Any) -> list[dict[str, Any]]:
+    """Validate ``solar.sources`` (SPEC.md section 7.1.3): an ordered list of merge entries.
+
+    A malformed entry fails here with a message naming the entry, so ``PATCH /api/v1/config``
+    returns 400 and the engine never has to guess. Provider-specific keys are validated against
+    their own setting type (an unknown key is an error, not silently dropped).
+    """
+    if not isinstance(value, list):
+        raise ConfigError("solar.sources must be a list")
+    out: list[dict[str, Any]] = []
+    for index, entry in enumerate(value):
+        where = f"solar.sources[{index}]"
+        if not isinstance(entry, Mapping):
+            raise ConfigError(f"{where} must be an object")
+        source = str(entry.get("source", "") or "").strip().lower()
+        if source not in _SOLAR_MERGE_SOURCE_CHOICES:
+            raise ConfigError(
+                f"{where}.source must be one of {list(_SOLAR_MERGE_SOURCE_CHOICES)}"
+            )
+        weight = entry.get("weight", 1.0)
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+            raise ConfigError(f"{where}.weight must be a number")
+        weight = float(weight)
+        if not math.isfinite(weight) or weight <= 0.0:
+            raise ConfigError(f"{where}.weight must be a finite number > 0")
+        item: dict[str, Any] = {"source": source, "weight": weight}
+        name = entry.get("name")
+        if name is not None:
+            item["name"] = str(name).strip()
+        allowed = _SOLAR_SOURCE_KEYS[source]
+        for key, raw in entry.items():
+            if key in ("source", "weight", "name"):
+                continue
+            if key not in allowed:
+                raise ConfigError(
+                    f"{where} has unknown key {key!r} for source {source!r}; allowed: {list(allowed)}"
+                )
+            item[key] = _coerce_solar_source_key(f"{where}.{key}", key, raw)
+        out.append(item)
+    return out
+
+
+def _coerce_solar_source_key(where: str, key: str, raw: Any) -> Any:
+    """Validate one provider-specific merge-entry key using the matching setting's rules."""
+    if key == "planes":
+        try:
+            return _validate_planes(raw)
+        except ConfigError as err:
+            raise ConfigError(f"{where}: {err}") from None
+    if key in ("api_key", "entry_id", "weather_entity"):
+        return "" if raw is None else str(raw)
+    if key == "nasa_irradiance":
+        if not isinstance(raw, bool):
+            raise ConfigError(f"{where} must be a boolean")
+        return raw
+    meta = SETTINGS_META.get(f"solar.{key}")
+    if meta is None:
+        return raw
+    try:
+        return coerce_setting(f"solar.{key}", raw)
+    except ConfigError as err:
+        raise ConfigError(f"{where}: {err}") from None
 
 
 # --------------------------------------------------------------------------------------------

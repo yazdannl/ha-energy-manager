@@ -946,6 +946,40 @@ says so and nothing is written outside the mapped entities.
 
 ---
 
+### 8.11 Merging several PV forecasts into one input (0.12.0)
+
+The owner asked for several solar forecast providers to be combined into one hourly forecast instead
+of a single source. The design reads the Home Assistant Energy dashboard's own providers over the
+read-only, non-admin WebSocket command `energy/solar_forecast` (recorded in docs/EXTERNAL_APIS.md
+section 5, verified against core `energy/websocket_api.py` and `energy/types.py`), and merges them
+with a new ordered `solar.sources` list rather than changing `solar.source`, so an empty list keeps
+the shipped single-source path unchanged.
+
+What 0.12.0 adds:
+
+* `sources/solar.py`: the pure `merge_solar_series(grid, entries, strategy)` (weighted mean, median
+  or max; failed/empty/disabled sources skipped; gaps interpolated with the existing rules) and the
+  `ha_energy` provider (`parse_ha_energy_wh` / `ha_energy_power_series`, summing several providers or
+  selecting one by `entry_id`, converting per-period Wh to average kW). The single-source body was
+  extracted into `_forecast_solar_forecast`/`_load_single_source_forecast`; the merge path falls back
+  to it verbatim when no source produces a usable series.
+* `models.ProviderStatus` gained additive `weight`/`state`/`note`, and `SolarForecast` a `sources`
+  list; `api.provider_dict` and `_augment_forecast_payload` expose them, and `engine._fetch`
+  remembers each configured source as its own `solar` provider status. `engine._explain_solar`
+  names the failing merge sources (frozen `provider_failed`/`no_pv_source` slugs unchanged).
+* `config.py`: `solar.sources` (validated entry by entry with a clear per-entry message) and the
+  `solar.merge_strategy` choice; `docs/REFERENCE.md`, `README.md`, `CHANGELOG.md` and SPEC §7.1.3/§16
+  updated.
+* The Solar setup card renders one row per configured source (source select, weight, Move
+  up/down, Remove, status chip) plus the strategy select, all through the ordinary dirty/Save flow;
+  `tools/ui_render_check.js` asserts the two mocked rows carry a weight and a status.
+
+Gates: 729 tests (was 694: +35 merge/config/HA-payload/status tests), the headless render check 80
+passed / 0 failed (was 78), `tools/audit.sh` clean over 94 files, `compileall` clean. New tests:
+`tests/test_wp2c_solar_merge.py`. Independent review: not run for this change.
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:
@@ -1037,11 +1071,11 @@ No network access and no hardware are needed for any command below.
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 694 passed; needs pytest and PyYAML, which only the manifest test
+# 2. Full test suite (expect: 729 passed; needs pytest and PyYAML, which only the manifest test
 #    uses — the add-on itself imports nothing outside the standard library)
 python3 -m pytest tests -q
 
-# 3. R1 tripwire (expect: "audit: clean — 93 files scanned", exit 0)
+# 3. R1 tripwire (expect: "audit: clean — 94 files scanned", exit 0)
 sh tools/audit.sh
 
 # 4. End-to-end selfcheck (expect: 33/33 checks passed, exit 0)

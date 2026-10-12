@@ -569,6 +569,8 @@ ADVANCED_KEYS = {
     "solar.nasa_irradiance",
     "solar.planes",
     "solar.api_key",
+    "solar.sources",
+    "solar.merge_strategy",
     "load.mode",
     "load.entity",
     "load.temperature_entity",

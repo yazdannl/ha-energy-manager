@@ -45,11 +45,19 @@ log = logging.getLogger(__name__)
 __all__ = [
     "CACHE_TTL_S",
     "FORECAST_SOLAR_BASE",
+    "HA_SOLAR_FORECAST_COMMAND",
     "MAX_PLANES",
+    "MERGE_SOURCE_TYPES",
+    "MERGE_STRATEGIES",
+    "configured_solar_sources",
     "fetch_nasa_hourly",
     "fetch_plane",
+    "ha_energy_forecast_payload",
+    "ha_energy_power_series",
     "load_solar_forecast",
+    "merge_solar_series",
     "nasa_clearness_profile",
+    "parse_ha_energy_wh",
     "solar_bias_factors",
     "update_solar_bias",
 ]
@@ -1453,7 +1461,7 @@ def _plane_cache_key(latitude: float, longitude: float, tilt: float, azimuth: fl
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def load_solar_forecast(
+def _load_single_source_forecast(
     settings: Any,
     store: Any = None,
     client: Any = None,
@@ -1464,7 +1472,7 @@ def load_solar_forecast(
     grid_roles: Mapping[str, str] | None = None,
     ws_factory: Callable[[], Any] | None = None,
 ) -> tuple[SolarForecast, ProviderStatus]:
-    """Build the PV forecast, or an empty forecast plus a status explaining why not."""
+    """Today's single-source path (``solar.source``); the merge path only falls back here."""
     moment = now or utcnow()
     source = str(settings.get("solar.source", "forecast_solar") or "forecast_solar")
     if source in ("capacity", "derived"):
@@ -1509,6 +1517,34 @@ def load_solar_forecast(
         status.detail["reason"] = "disabled"
         forecast.notes.append("solar forecasting is disabled")
         return forecast, status
+    return _forecast_solar_forecast(
+        settings,
+        store,
+        client,
+        status=status,
+        forecast=forecast,
+        moment=moment,
+        location=location,
+        http=http,
+        grid_roles=grid_roles,
+        ws_factory=ws_factory,
+    )
+
+
+def _forecast_solar_forecast(
+    settings: Any,
+    store: Any,
+    client: Any,
+    *,
+    status: ProviderStatus,
+    forecast: SolarForecast,
+    moment: datetime,
+    location: tuple[float, float, str] | None = None,
+    http: Callable[..., Any] | None = None,
+    grid_roles: Mapping[str, str] | None = None,
+    ws_factory: Callable[[], Any] | None = None,
+) -> tuple[SolarForecast, ProviderStatus]:
+    """The Forecast.Solar planes path (SPEC.md section 7.1), shared by both entry points."""
     planes = [dict(plane) for plane in (settings.get("solar.planes") or []) if isinstance(plane, Mapping)]
     if not planes:
         # Forecast.Solar has nothing to size the array with, but the meter may: try the
@@ -1687,3 +1723,597 @@ def load_solar_forecast(
         }
     )
     return forecast, status
+
+
+# --------------------------------------------------------------------------------------------
+# Home Assistant native solar forecast (SPEC.md section 7.1.3; docs/EXTERNAL_APIS.md section 5)
+# --------------------------------------------------------------------------------------------
+#
+# Any solar-forecast provider the HA Energy dashboard has configured (Forecast.Solar, Solcast, ...)
+# can be selected without re-describing the array here. The websocket command is read-only and not
+# admin-gated; the response is keyed by the dashboard's own config entry id and each value carries
+# ``wh_hours``. A missing command or provider is a note, never a failed forecast.
+
+HA_SOLAR_FORECAST_COMMAND = "energy/solar_forecast"
+HA_ENERGY_NO_CLIENT_NOTE = "no Home Assistant WebSocket client; energy/solar_forecast cannot be read"
+HA_ENERGY_UNAVAILABLE_NOTE = "HA energy/solar_forecast unavailable ({error})"
+HA_ENERGY_EMPTY_NOTE = "the HA Energy dashboard has no solar forecast provider configured"
+HA_ENERGY_NO_ENTRY_NOTE = "no HA Energy dashboard solar provider with that config entry id"
+HA_ENERGY_OK_NOTE = "Home Assistant solar forecast: {providers} provider(s), {points} points"
+
+
+def ha_energy_forecast_payload(ws: Any) -> dict[str, Any]:
+    """Read the Energy dashboard's own solar forecast through a WebSocket client.
+
+    ``ws`` is any object with the :meth:`haws.HAWebSocket.call` surface; the command takes no
+    parameters. A non-mapping result is treated as empty rather than raising.
+    """
+    result = ws.call(HA_SOLAR_FORECAST_COMMAND)
+    return dict(result) if isinstance(result, Mapping) else {}
+
+
+def parse_ha_energy_wh(
+    payload: Mapping[str, Any], entry_id: str = ""
+) -> tuple[dict[datetime, float], int]:
+    """Combine the selected providers' ``wh_hours`` into one ``{UTC timestamp: Wh}`` mapping.
+
+    The verified contract is ``{config_entry_id: {"wh_hours": {ISO stamp: Wh}}}``
+    (docs/EXTERNAL_APIS.md section 5). ``entry_id`` selects one provider; empty selects them all and
+    sums their points, so several providers become one series. Returns ``(points, providers)``.
+    """
+    if not isinstance(payload, Mapping):
+        return {}, 0
+    selected: Mapping[str, Any] = payload
+    if entry_id:
+        value = payload.get(entry_id)
+        if value is None:
+            return {}, 0
+        selected = {entry_id: value}
+    combined: dict[datetime, float] = {}
+    providers = 0
+    for value in selected.values():
+        block = value.get("wh_hours") if isinstance(value, Mapping) else None
+        if not isinstance(block, Mapping):
+            continue
+        providers += 1
+        for stamp, wh in block.items():
+            moment = from_iso(stamp)
+            if moment is None:
+                continue
+            try:
+                number = float(wh)
+            except (TypeError, ValueError):
+                continue
+            key = moment.astimezone(timezone.utc)
+            combined[key] = combined.get(key, 0.0) + number
+    return combined, providers
+
+
+def ha_energy_power_series(wh_by_stamp: Mapping[datetime, float]) -> list[tuple[datetime, float]]:
+    """Convert per-period Wh into an average-kW series, using each point's own period length.
+
+    The Energy dashboard's forecast points are Wh for the period starting at the stamp; the next
+    stamp gives that period's length, and the last point assumes one hour. Periods are clamped to
+    one minute .. three hours so a sparse or duplicated point cannot fabricate a spike.
+    """
+    stamps = sorted(wh_by_stamp)
+    series: list[tuple[datetime, float]] = []
+    for index, stamp in enumerate(stamps):
+        hours = 1.0
+        if index + 1 < len(stamps):
+            hours = (stamps[index + 1] - stamp).total_seconds() / 3600.0
+        hours = clamp(hours, 1.0 / 60.0, 3.0)
+        series.append((stamp, max(0.0, float(wh_by_stamp[stamp]) / 1000.0 / hours)))
+    return series
+
+
+def _ha_energy_forecast(
+    settings: Any,
+    store: Any,
+    client: Any,
+    *,
+    status: ProviderStatus,
+    forecast: SolarForecast,
+    moment: datetime,
+    entry: Mapping[str, Any],
+    grid: Sequence[datetime],
+    location: tuple[float, float, str] | None = None,
+    ws_factory: Callable[[], Any] | None = None,
+    cache: dict[str, Any] | None = None,
+) -> tuple[SolarForecast, ProviderStatus]:
+    """Build one source's series from HA's own solar forecast providers (never raises)."""
+    shared = cache if cache is not None else {}
+    entry_id = str(entry.get("entry_id") or "").strip()
+    if ws_factory is None:
+        status.ok = False
+        status.detail["reason"] = "no websocket client"
+        status.last_error = HA_ENERGY_NO_CLIENT_NOTE
+        forecast.notes.append(status.last_error)
+        return forecast, status
+    if "payload" not in shared:
+        try:
+            with ws_factory() as websocket:
+                shared["payload"] = ha_energy_forecast_payload(websocket)
+        except Exception as err:  # noqa: BLE001 - an optional provider read is a note, never fatal
+            shared["payload"] = None
+            shared["error"] = err
+    if shared.get("payload") is None:
+        status.ok = False
+        status.detail["reason"] = "energy/solar_forecast unavailable"
+        status.last_error = HA_ENERGY_UNAVAILABLE_NOTE.format(
+            error=type(shared.get("error")).__name__ if shared.get("error") else "unknown error"
+        )
+        forecast.notes.append(status.last_error)
+        return forecast, status
+    points, providers = parse_ha_energy_wh(shared["payload"], entry_id)
+    if not points:
+        status.ok = False
+        status.detail["reason"] = "no HA solar forecast data"
+        status.last_error = HA_ENERGY_NO_ENTRY_NOTE if entry_id else HA_ENERGY_EMPTY_NOTE
+        forecast.notes.append(status.last_error)
+        return forecast, status
+    series = ha_energy_power_series(points)
+    zone = _zone(location[2]) if location else timezone.utc
+    bias_enabled = bool(settings.get("solar.bias_correction", True))
+    bias_payload = _bias_payload(store) if (store is not None and bias_enabled) else _empty_bias_payload()
+    factors = (
+        _decay_factors(bias_payload["factors"], bias_payload.get("updated_at"), moment)
+        if bias_enabled
+        else [1.0] * 24
+    )
+    uncertainty = DEFAULT_UNCERTAINTY_PCT
+    if bias_enabled and bias_payload.get("mape_pct") is not None:
+        uncertainty = clamp(float(bias_payload["mape_pct"]), 5.0, 60.0)
+    applied: list[float] = []
+    slots: list[SolarSlot] = []
+    for slot_time in grid:
+        factor = factors[slot_time.astimezone(zone).hour] if bias_enabled else 1.0
+        applied.append(factor)
+        slots.append(
+            SolarSlot(
+                t=slot_time,
+                pv_kw=max(0.0, _interpolate(series, slot_time)) * factor,
+                uncertainty_pct=uncertainty,
+            )
+        )
+    forecast.slots = slots
+    forecast.correction_applied = sum(applied) / len(applied) if applied else 1.0
+    status.ok = True
+    status.last_success = moment
+    status.stale = False
+    status.detail.update(
+        {
+            "ha_providers": providers,
+            "ha_points": len(points),
+            "entry_id": entry_id or None,
+            "bias_correction": bias_enabled,
+            "correction_applied": round(forecast.correction_applied, 4),
+        }
+    )
+    forecast.notes.append(HA_ENERGY_OK_NOTE.format(providers=providers, points=len(points)))
+    return forecast, status
+
+
+# --------------------------------------------------------------------------------------------
+# Multi-source merge (SPEC.md section 7.1.3)
+# --------------------------------------------------------------------------------------------
+
+#: The merge strategies ``solar.merge_strategy`` accepts (config.py validates the setting).
+MERGE_STRATEGIES = ("weighted_mean", "median", "max")
+MERGE_SOURCE_TYPES = ("forecast_solar", "ha_energy", "capacity", "derived")
+#: Provider-specific merge keys that override the matching ``solar.*`` setting for that source only.
+_SOURCE_SETTING_KEYS = (
+    "planes",
+    "api_key",
+    "capacity_wp",
+    "tilt_deg",
+    "azimuth_deg",
+    "performance_ratio",
+    "weather_entity",
+    "nasa_irradiance",
+)
+MERGE_NO_SOURCE_NOTE = "no configured merge source produced a usable forecast; using solar.source alone"
+MERGE_NOTE = "merged {count} source(s) with {strategy}{weights}"
+
+
+class _SourceOverlay:
+    """Settings proxy pinning one merge entry's provider-specific keys over the globals."""
+
+    def __init__(self, settings: Any, entry: Mapping[str, Any]) -> None:
+        self._settings = settings
+        self._overrides = {
+            f"solar.{key}": entry[key] for key in _SOURCE_SETTING_KEYS if key in entry
+        }
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._overrides:
+            return self._overrides[key]
+        return self._settings.get(key, default)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._settings, name)
+
+
+def configured_solar_sources(settings: Any) -> list[dict[str, Any]]:
+    """The validated ``solar.sources`` entries, or ``[]`` for today's single-source path.
+
+    Defensive on read: a value that predates validation (or a hand-edited DB row) is skipped with a
+    note instead of raising, so a malformed entry can never crash the engine (SPEC.md R2).
+    """
+    raw = settings.get("solar.sources")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            continue
+        source = str(entry.get("source", "") or "").strip().lower()
+        if source not in MERGE_SOURCE_TYPES:
+            log.warning("ignoring solar.sources entry with unknown source %r", source)
+            continue
+        try:
+            weight = float(entry.get("weight", 1.0))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(weight) or weight <= 0.0:
+            continue
+        item = dict(entry)
+        item["source"] = source
+        item["weight"] = weight
+        out.append(item)
+    return out
+
+
+def merge_solar_series(
+    grid: Sequence[datetime],
+    entries: Sequence[Mapping[str, Any]],
+    strategy: str = "weighted_mean",
+) -> tuple[list[float], list[dict[str, Any]]]:
+    """Pure, deterministic merge of per-source PV series onto one grid (SPEC.md section 7.1.3).
+
+    ``entries`` is an ordered sequence of mappings: ``name`` (str), ``series`` (an iterable of
+    ``(timestamp, pv_kw)`` samples, or empty/None when the provider produced nothing), ``weight``
+    (finite > 0), an optional ``state`` (``ok|degraded|failed|disabled``) and an optional ``note``.
+    Each series is aligned to ``grid`` with the same linear interpolation the single-source path
+    uses (:func:`_interpolate`), so timezone and slot conventions are shared.
+
+    Returns ``(values, report)``: one merged kW value per grid slot (0.0 when nothing contributes)
+    and one report row per entry with ``name``, ``weight``, ``state``, ``note`` and ``points``. An
+    empty series is skipped as ``failed``; a ``disabled`` entry is skipped and never contributes.
+    Ties are resolved deterministically (``median`` of an even count is the mean of the two middle
+    values, in the entries' order).
+    """
+    chosen = strategy if strategy in MERGE_STRATEGIES else "weighted_mean"
+    aligned: list[tuple[str, list[tuple[datetime, float]], float]] = []
+    report: list[dict[str, Any]] = []
+    for entry in entries:
+        name = str(entry.get("name") or entry.get("source") or "source")
+        state = str(entry.get("state") or "")
+        note = str(entry.get("note") or "")
+        try:
+            weight = float(entry.get("weight", 1.0))
+        except (TypeError, ValueError):
+            weight = 1.0
+        raw_series = entry.get("series") or []
+        series: list[tuple[datetime, float]] = []
+        for sample in raw_series:
+            try:
+                stamp, value = sample
+                series.append((stamp, float(value)))
+            except (TypeError, ValueError):
+                continue
+        if state == "disabled":
+            report.append({"name": name, "weight": weight, "state": "disabled", "note": note, "points": 0})
+            continue
+        if not series:
+            report.append(
+                {
+                    "name": name,
+                    "weight": weight,
+                    "state": "failed",
+                    "note": note or "no usable forecast",
+                    "points": 0,
+                }
+            )
+            continue
+        report.append({"name": name, "weight": weight, "state": state or "ok", "note": note, "points": len(series)})
+        aligned.append((name, series, weight))
+    values: list[float] = []
+    for slot in grid:
+        picked = [(_interpolate(series, slot), weight) for _, series, weight in aligned]
+        values.append(_merge_values(picked, chosen))
+    return values, report
+
+
+def _merge_values(picked: Sequence[tuple[float, float]], strategy: str) -> float:
+    """Combine the per-source values present at one slot with ``strategy`` (pure)."""
+    if not picked:
+        return 0.0
+    if strategy == "max":
+        return max(value for value, _ in picked)
+    if strategy == "median":
+        ordered = sorted(value for value, _ in picked)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) / 2.0
+    total = sum(weight for _, weight in picked)
+    if total <= 0:
+        return 0.0
+    return sum(value * weight for value, weight in picked) / total
+
+
+def _source_display_name(entry: Mapping[str, Any], index: int, seen: set[str]) -> str:
+    """A stable, unique status name for one configured source (never instance data in code)."""
+    name = str(entry.get("name") or "").strip()
+    if not name:
+        name = str(entry.get("source") or "source")
+        entry_id = str(entry.get("entry_id") or "").strip()
+        if entry_id:
+            name = f"{name}:{entry_id[:8]}"
+    if name in seen:
+        suffix = 2
+        while f"{name} #{suffix}" in seen:
+            suffix += 1
+        name = f"{name} #{suffix}"
+    seen.add(name)
+    return name
+
+
+def _merge_state(sub_status: ProviderStatus, series: Sequence[Any]) -> str:
+    """The coarse state for one merged source: ok | degraded | failed | disabled."""
+    if not sub_status.active:
+        return "disabled"
+    if not series or not sub_status.ok:
+        return "failed"
+    if sub_status.stale or sub_status.state == "degraded":
+        return "degraded"
+    return "ok"
+
+
+def _dispatch_merge_source(
+    settings: Any,
+    store: Any,
+    client: Any,
+    *,
+    entry: Mapping[str, Any],
+    status: ProviderStatus,
+    forecast: SolarForecast,
+    moment: datetime,
+    grid: Sequence[datetime],
+    location: tuple[float, float, str] | None,
+    http: Callable[..., Any] | None,
+    grid_roles: Mapping[str, str] | None,
+    ws_factory: Callable[[], Any] | None,
+    ha_cache: dict[str, Any],
+) -> tuple[SolarForecast, ProviderStatus]:
+    """Run one configured source; an unknown source is a status, never an exception."""
+    source = str(entry.get("source") or "")
+    if source == "forecast_solar":
+        return _forecast_solar_forecast(
+            settings, store, client, status=status, forecast=forecast, moment=moment,
+            location=location, http=http, grid_roles=grid_roles, ws_factory=ws_factory,
+        )
+    if source == "capacity":
+        return _capacity_forecast(
+            settings, store, client, status=status, forecast=forecast, moment=moment,
+            location=location, http=http,
+        )
+    if source == "derived":
+        return _derived_forecast(
+            settings, store, client, status=status, forecast=forecast, moment=moment,
+            location=location, http=http, grid_roles=grid_roles, ws_factory=ws_factory,
+        )
+    if source == "ha_energy":
+        return _ha_energy_forecast(
+            settings, store, client, status=status, forecast=forecast, moment=moment,
+            entry=entry, grid=grid, location=location, ws_factory=ws_factory, cache=ha_cache,
+        )
+    status.ok = False
+    status.last_error = f"unknown solar source: {source}"
+    return forecast, status
+
+
+def _load_merged_forecast(
+    settings: Any,
+    store: Any,
+    client: Any,
+    *,
+    sources: Sequence[Mapping[str, Any]],
+    location: tuple[float, float, str] | None,
+    moment: datetime,
+    http: Callable[..., Any] | None,
+    grid_roles: Mapping[str, str] | None,
+    ws_factory: Callable[[], Any] | None,
+) -> tuple[SolarForecast, ProviderStatus]:
+    """Combine the configured sources onto one grid; fall back to ``solar.source`` when none works."""
+    strategy = str(settings.get("solar.merge_strategy", "weighted_mean") or "weighted_mean")
+    if strategy not in MERGE_STRATEGIES:
+        strategy = "weighted_mean"
+    status = ProviderStatus(kind="solar", name="merge", active=True)
+    forecast = SolarForecast(generated_at=moment, source="merge")
+    if not bool(settings.get("solar.enabled", True)):
+        status.active = False
+        status.ok = True
+        status.state = "disabled"
+        status.detail["reason"] = "disabled"
+        forecast.notes.append("solar forecasting is disabled")
+        disabled_seen: set[str] = set()
+        forecast.sources = [
+            ProviderStatus(
+                kind="solar",
+                name=_source_display_name(entry, index, disabled_seen),
+                active=False,
+                ok=True,
+                state="disabled",
+                weight=float(entry.get("weight", 1.0)),
+                note="solar forecasting is disabled",
+            )
+            for index, entry in enumerate(sources)
+        ]
+        return forecast, status
+
+    horizon = horizon_hours(settings)
+    start = quarter_floor(moment, SLOT_MINUTES)
+    grid = slot_range(start, start + timedelta(hours=horizon), SLOT_MINUTES)
+    ha_cache: dict[str, Any] = {}
+    seen: set[str] = set()
+    entries: list[dict[str, Any]] = []
+    statuses: list[ProviderStatus] = []
+    included: list[tuple[str, SolarForecast]] = []
+    any_series = False
+    for index, entry in enumerate(sources):
+        name = _source_display_name(entry, index, seen)
+        overlay = _SourceOverlay(settings, entry)
+        source = str(entry.get("source") or "")
+        sub_status = ProviderStatus(kind="solar", name=name, active=True)
+        sub_forecast = SolarForecast(generated_at=moment, source=source)
+        sub_forecast, sub_status = _dispatch_merge_source(
+            overlay,
+            store,
+            client,
+            entry=entry,
+            status=sub_status,
+            forecast=sub_forecast,
+            moment=moment,
+            grid=grid,
+            location=location,
+            http=http,
+            grid_roles=grid_roles,
+            ws_factory=ws_factory,
+            ha_cache=ha_cache,
+        )
+        series = [(slot.t, float(slot.pv_kw)) for slot in (sub_forecast.slots or [])]
+        state = _merge_state(sub_status, series)
+        note = sub_status.last_error or (sub_forecast.notes[0] if sub_forecast.notes else "")
+        weight = float(entry.get("weight", 1.0))
+        if series:
+            any_series = True
+            included.append((name, sub_forecast))
+        entries.append({"name": name, "series": series, "weight": weight, "state": state, "note": note})
+        statuses.append(
+            ProviderStatus(
+                kind="solar",
+                name=name,
+                active=True,
+                ok=state in ("ok", "degraded"),
+                stale=bool(sub_status.stale),
+                last_error=None if state in ("ok", "degraded") else (sub_status.last_error or "no usable forecast"),
+                weight=weight,
+                state=state,
+                note=note,
+                detail=dict(sub_status.detail) | {"source": source, "slots": len(series)},
+            )
+        )
+
+    if not any_series:
+        fallback, fallback_status = _load_single_source_forecast(
+            settings,
+            store,
+            client,
+            location=location,
+            now=moment,
+            http=http,
+            grid_roles=grid_roles,
+            ws_factory=ws_factory,
+        )
+        fallback.notes.append(MERGE_NO_SOURCE_NOTE)
+        fallback.sources = statuses
+        return fallback, fallback_status
+
+    values, report = merge_solar_series(grid, entries, strategy)
+    by_index = {row["name"]: row for row in report}
+    for status_row in statuses:
+        row = by_index.get(status_row.name)
+        if row is not None:
+            status_row.state = str(row["state"])
+            status_row.ok = status_row.state in ("ok", "degraded")
+            status_row.note = str(row["note"] or status_row.note)
+            if status_row.state == "failed":
+                status_row.last_error = status_row.last_error or "no usable forecast"
+            elif status_row.state in ("ok", "degraded"):
+                status_row.last_error = None
+    uncertainty_by_slot: dict[datetime, float] = {}
+    for name, sub_forecast in included:
+        for slot in sub_forecast.slots:
+            current = uncertainty_by_slot.get(slot.t, 0.0)
+            uncertainty_by_slot[slot.t] = max(current, float(slot.uncertainty_pct or DEFAULT_UNCERTAINTY_PCT))
+    forecast.slots = [
+        SolarSlot(t=slot, pv_kw=max(0.0, values[index]), uncertainty_pct=uncertainty_by_slot.get(slot, DEFAULT_UNCERTAINTY_PCT))
+        for index, slot in enumerate(grid)
+    ]
+    forecast.sources = statuses
+    forecast.stale = any(row.stale for row in statuses)
+    used = [row.name for row in statuses if row.state in ("ok", "degraded")]
+    weights = ", ".join(
+        f"{row.name}={row.weight:g}" for row in statuses if row.state in ("ok", "degraded")
+    )
+    forecast.notes.append(
+        MERGE_NOTE.format(count=len(used), strategy=strategy, weights=f" ({weights})" if weights else "")
+    )
+    for row in statuses:
+        if row.state in ("ok", "degraded") and row.note:
+            forecast.notes.append(f"{row.name}: {row.note}")
+        elif row.state == "failed":
+            forecast.notes.append(f"{row.name}: skipped ({row.last_error})")
+    forecast.correction_applied = sum(
+        float(getattr(sub, "correction_applied", 1.0) or 1.0) for _, sub in included
+    ) / len(included) if included else 1.0
+    status.ok = True
+    status.last_success = moment
+    status.stale = forecast.stale
+    status.detail.update(
+        {
+            "strategy": strategy,
+            "sources": [row.name for row in statuses],
+            "sources_used": used,
+            "sources_failed": [row.name for row in statuses if row.state == "failed"],
+            "weights": {row.name: row.weight for row in statuses},
+            "correction_applied": round(forecast.correction_applied, 4),
+        }
+    )
+    return forecast, status
+
+
+def load_solar_forecast(
+    settings: Any,
+    store: Any = None,
+    client: Any = None,
+    *,
+    location: tuple[float, float, str] | None = None,
+    now: datetime | None = None,
+    http: Callable[..., Any] | None = None,
+    grid_roles: Mapping[str, str] | None = None,
+    ws_factory: Callable[[], Any] | None = None,
+) -> tuple[SolarForecast, ProviderStatus]:
+    """Build the PV forecast, or an empty forecast plus a status explaining why not.
+
+    ``solar.sources`` empty (the default) keeps the single-source ``solar.source`` path exactly as
+    before. A non-empty list merges every configured source onto the plan grid (SPEC.md 7.1.3); when
+    no source produces a usable series the single-source chain runs as the fallback.
+    """
+    moment = now or utcnow()
+    sources = configured_solar_sources(settings)
+    if not sources:
+        return _load_single_source_forecast(
+            settings,
+            store,
+            client,
+            location=location,
+            now=moment,
+            http=http,
+            grid_roles=grid_roles,
+            ws_factory=ws_factory,
+        )
+    return _load_merged_forecast(
+        settings,
+        store,
+        client,
+        sources=sources,
+        location=location,
+        moment=moment,
+        http=http,
+        grid_roles=grid_roles,
+        ws_factory=ws_factory,
+    )
+
