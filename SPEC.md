@@ -878,6 +878,12 @@ Details the UI needs, so they are contract and not implementation detail:
   can gate them behind a confirmation step.
 * `/savings` totals include `arbitrage_kwh` and `self_consumption_kwh` so the UI can split realised value
   between price arbitrage and avoided self-consumption.
+* `/savings` buckets and totals carry the measured AC battery flows `charged_kwh`, `discharged_kwh`,
+  `charge_cost_eur` (priced with the buy series at flow time) and `discharge_value_eur` (priced with
+  the sell series), per-bucket coverage flags `grid_measured`, `load_measured`, `pv_measured` and
+  `battery_measured`, and totals `measured_buckets` counts (additive, 0.13.0). A flow not measured
+  for every interval of a bucket is `null`/unknown, never the planned value; only a confirmed
+  measurement earns battery credit.
 * `/batteries` returns a flat `capabilities` object and a cycle count.
 * `/log` entries have `kind` ∈ `dispatch|event|alert`; dispatch entries carry
   `detail.{requested_w, applied_w, battery_id, mode, dry_run}`.
@@ -904,11 +910,14 @@ dispatch_log(id PK, ts TEXT, battery_id TEXT, requested_w REAL, applied_w REAL, 
              mode TEXT, dry_run INTEGER, result TEXT, code TEXT, message TEXT)
 measurements(ts TEXT, entity_role TEXT, value REAL, unit TEXT, PRIMARY KEY(ts, entity_role))
 actuals(ts TEXT PK, pv_kw REAL, load_kw REAL, grid_kw REAL, battery_kw REAL, soc_kwh REAL,
-        price_buy REAL, plan_power_w REAL, dispatch_power_w REAL)
+        price_buy REAL, price_sell REAL, plan_power_w REAL, dispatch_power_w REAL)
 forecast_cache(kind TEXT, key TEXT, fetched_at TEXT, payload_json TEXT, PRIMARY KEY(kind,key))
 learning_profiles(kind TEXT, key TEXT, updated_at TEXT, payload_json TEXT, PRIMARY KEY(kind,key))
 savings_daily(day TEXT PK, import_kwh REAL, export_kwh REAL, cost_eur REAL, revenue_eur REAL,
-              baseline_cost_eur REAL, savings_eur REAL, pv_kwh REAL, battery_cycles REAL)
+              baseline_cost_eur REAL, savings_eur REAL, pv_kwh REAL, battery_cycles REAL,
+              charged_kwh REAL, discharged_kwh REAL, charge_cost_eur REAL, discharge_value_eur REAL,
+              grid_measured INTEGER, load_measured INTEGER, pv_measured INTEGER,
+              battery_measured INTEGER)
 events(id PK, ts TEXT, level TEXT, code TEXT, message TEXT, payload_json TEXT)
 settings(key TEXT PK, value_json TEXT, updated_at TEXT)
 meta(key TEXT PK, value TEXT)
@@ -925,6 +934,15 @@ and tariff — import cost minus export revenue, with no battery flows — so `s
 actual` (net). When the load is not knowable (no load forecast or measurement), baseline and savings
 are `null`/unknown, never a fabricated zero. This definition must appear in the UI and in `docs/ARCHITECTURE.md`,
 because it is the number the user will judge the add-on by.
+
+Savings are earned only by measured energy: `charged_kwh`/`discharged_kwh` integrate the measured AC
+battery power over time (a clamped or ramp-limited write counts the measured power, not the request),
+and `charge_cost_eur`/`discharge_value_eur` price those flows with the buy/sell series in force at
+flow time. A dry-run, blocked, stale-refused or unconfirmed-setpoint interval is never credited; if
+any interval in a day lacks a confirmed measurement, that day's battery flows and cycle count are
+`null`/unknown rather than a planned or partially measured number. `grid_measured`, `load_measured`,
+`pv_measured` and `battery_measured` record which measured series were present for every interval of
+the day; rows written before these columns existed keep working and read as unknown.
 
 ---
 
@@ -977,7 +995,9 @@ Views (hash routing `#/dashboard`, `#/plan`, `#/forecasts`, `#/batteries`, `#/sa
    and a confirm step, per-battery enable toggle, bounded test discharge (disabled unless `auto` and
    not `dry_run`), computed round-trip efficiency and cycle count.
 5. **Savings** — today/week/month/year/all, savings chart vs baseline, import/export kWh, realised
-   arbitrage vs self-consumption split, plain-language explanation of the baseline definition.
+   arbitrage vs self-consumption split, a *Measured battery flows* panel (charged/discharged kWh,
+   charge cost and discharge value, with per-series coverage where a measurement was missing), and a
+   plain-language explanation of the baseline definition.
 6. **Settings** — grouped, searchable form generated from `GET /api/v1/config` (no hand-written
    field list per key), immediate validation errors from the PATCH response, safety group visually
    separated with an "are you sure" step for limits that can move hardware.
@@ -1394,6 +1414,16 @@ round, with the reason:
   trust model the data cannot support), silently reading all HA providers without a settings list
   (no way to weight or disable one), and storing merged values back into `solar.source` (would lose
   the "empty list = unchanged" guarantee).
+
+- **§10/§11/§13 (measured savings; requested 2026-10-12, "savings must be earned by energy the
+  battery actually moved, not by plan values")** — the savings pipeline integrates only confirmed
+  measured AC battery power (`BatteryState.power_measured`; the generic driver's setpoint read-back
+  and a Zendure whose measured pair is incomplete report unconfirmed), adds
+  `charged_kwh`/`discharged_kwh`/`charge_cost_eur`/`discharge_value_eur` and per-day coverage flags
+  (`grid_measured`/`load_measured`/`pv_measured`/`battery_measured`) to `savings_daily` via
+  forward-only migration 2, and exposes them on `/api/v1/savings` and the Savings view with a
+  `measured_buckets` coverage count; a missing or unconfirmed measurement is `null`/unknown, never
+  the planned value.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

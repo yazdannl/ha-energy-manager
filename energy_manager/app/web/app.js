@@ -3618,7 +3618,12 @@
       statCard("Import", fmtKwh(t.import_kwh), "from the grid"),
       statCard("Export", fmtKwh(t.export_kwh), "to the grid"),
       statCard("PV", fmtKwh(t.pv_kwh), "produced"),
-      statCard("Cycles", isNum(t.cycles) ? t.cycles.toFixed(2) + " cycles" : "--", "battery throughput")
+      statCard(
+        "Cycles",
+        isNum(t.discharged_kwh) && isNum(t.cycles) ? t.cycles.toFixed(2) + " cycles" : "--",
+        isNum(t.discharged_kwh) ? "measured battery throughput" : "unknown: no confirmed battery measurement",
+        isNum(t.discharged_kwh) ? false : "unknown"
+      )
     ]);
     body.appendChild(cards);
     // Coverage first: a partial baseline is scope, not a total (UI_REVIEW §3.6).
@@ -3653,6 +3658,32 @@
     } else {
       body.appendChild(el("p", { class: "legend-note", text: "This backend version does not report the arbitrage / self-consumption split yet." }));
     }
+    // Measured battery flows (0.13.0): only energy the battery really moved earns credit, so these
+    // are integrated from confirmed power readings and priced at flow time.  Null means no bucket
+    // in the range had a complete measurement: unknown, never a planned value.
+    var batteryFlowsKnown = isNum(t.charged_kwh) || isNum(t.discharged_kwh);
+    body.appendChild(el("div", { class: "banner banner-info" }, [
+      el("p", { class: "banner-title", text: "Measured battery flows" }),
+      el("p", { text: "These are energy flows the battery actually moved: measured AC power integrated over time, not what the plan asked for. A dry-run, blocked, stale-refused or unconfirmed setpoint earns no flow credit; a clamped write counts only the measured power." })
+    ]));
+    if (batteryFlowsKnown) {
+      body.appendChild(el("ul", { class: "stat-row" }, [
+        el("li", null, [el("span", { class: "stat-label", text: "Charged (measured)" }), el("span", { class: "stat-value", text: fmtKwh(t.charged_kwh) })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Discharged (measured)" }), el("span", { class: "stat-value", text: fmtKwh(t.discharged_kwh) })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Charge cost (measured, at buy)" }), el("span", { class: "stat-value", text: fmtEur(t.charge_cost_eur) })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Discharge value (measured, at sell)" }), el("span", { class: "stat-value", text: fmtEur(t.discharge_value_eur) })])
+      ]));
+    } else {
+      body.appendChild(el("p", { class: "legend-note", text: "No confirmed battery measurement in this range, so the measured battery flows are unknown (--): a planned or requested setpoint is not counted as delivered energy." }));
+    }
+    var measured = t.measured_buckets;
+    if (measured && buckets.length) {
+      var names = [["grid", "grid"], ["load", "load"], ["pv", "PV"], ["battery", "battery"]];
+      var parts = names.map(function (pair) {
+        return pair[1] + " " + (measured[pair[0]] || 0) + " of " + buckets.length;
+      });
+      body.appendChild(el("p", { class: "legend-note", text: "Measured-series coverage (buckets with every interval measured): " + parts.join(", ") + ". A bucket missing a series reports its flows as unknown, not as zero." }));
+    }
     body.appendChild(el("div", { class: "banner banner-info" }, [
       el("p", { class: "banner-title", text: "How the baseline is defined" }),
       el("p", { text: payload.baseline_note || BASELINE_FALLBACK }),
@@ -3668,9 +3699,25 @@
       body.appendChild(el("p", { class: "legend-note", text: covered + " of " + buckets.length + " buckets have a baseline (a load forecast to re-price against). A bucket without one shows -- for baseline and savings: unknown, not zero." }));
     }
     var rows = buckets.map(function (b) {
-      return [b.key || "", fmtDateTime(b.start) + " – " + fmtDateTime(b.end), fmtKwh(b.import_kwh), fmtKwh(b.export_kwh), fmtKwh(b.pv_kwh), fmtEur(b.cost_eur), fmtEur(b.revenue_eur), b.baseline_cost_eur == null ? "--" : fmtEur(b.baseline_cost_eur), b.savings_eur == null ? "--" : fmtEur(b.savings_eur), isNum(b.cycles) ? b.cycles.toFixed(2) + " cycles" : "--"];
+      var flow = function (key, fmt) { return b[key] == null ? "--" : fmt(b[key]); };
+      return [
+        b.key || "",
+        fmtDateTime(b.start) + " – " + fmtDateTime(b.end),
+        fmtKwh(b.import_kwh),
+        fmtKwh(b.export_kwh),
+        fmtKwh(b.pv_kwh),
+        fmtEur(b.cost_eur),
+        fmtEur(b.revenue_eur),
+        b.baseline_cost_eur == null ? "--" : fmtEur(b.baseline_cost_eur),
+        b.savings_eur == null ? "--" : fmtEur(b.savings_eur),
+        b.battery_measured ? (isNum(b.cycles) ? b.cycles.toFixed(2) + " cycles" : "--") : "-- (unmeasured)",
+        flow("charged_kwh", fmtKwh),
+        flow("discharged_kwh", fmtKwh),
+        flow("charge_cost_eur", fmtEur),
+        flow("discharge_value_eur", fmtEur)
+      ];
     });
-    body.appendChild(table("Buckets for range " + payload.range, ["Bucket", "Period", "Import", "Export", "PV", "Cost", "Revenue", "Baseline", "Savings", "Cycles"], rows));
+    body.appendChild(table("Buckets for range " + payload.range, ["Bucket", "Period", "Import", "Export", "PV", "Cost", "Revenue", "Baseline", "Savings", "Cycles", "Charged (measured)", "Discharged (measured)", "Charge cost", "Discharge value"], rows));
   }
 
   function viewSavings(host, query) {
@@ -3688,7 +3735,7 @@
     });
     select.addEventListener("change", function () { root.location.hash = "#/savings?range=" + select.value; });
     controls.body.appendChild(el("div", { class: "toolbar" }, [el("label", { for: "savings-range" }, ["Range ", select])]));
-    controls.body.appendChild(el("p", { class: "legend-note", text: "Savings are computed from the stored actuals and the same prices, so trimming history never changes them. Baseline and savings are null (shown as --) when there is no load forecast to re-price against." }));
+    controls.body.appendChild(el("p", { class: "legend-note", text: "Savings are computed from the stored actuals and the same prices, so trimming history never changes them. Baseline and savings are null (shown as --) when there is no load forecast to re-price against. Measured battery flows count only confirmed measurements — a dry-run, blocked or unconfirmed setpoint earns nothing." }));
 
     asyncPanel(host, "Totals", { load: load, render: renderSavingsTotals });
     asyncPanel(host, "Savings vs baseline", {

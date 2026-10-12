@@ -753,6 +753,11 @@
       var cost = round(base * 0.82, 2);
       var revenue = round(0.18 + 0.05 * Math.abs(wobble(i + 7)), 2);
       var known = baselineKnown(range, i, n);
+      // A bucket is "battery measured" only when every interval was a confirmed flow reading; the
+      // oldest bucket and the `all` range stay unknown so the UI always exercises the -- path.
+      var batteryOk = known && i % 3 !== 0;
+      var charged = batteryOk ? round(1.1 + 0.2 * Math.abs(wobble(i + 11)), 2) : null;
+      var discharged = batteryOk ? round(0.9 + 0.2 * Math.abs(wobble(i + 13)), 2) : null;
       out.push({
         key: labelFor(range, begin, i),
         start: iso(begin),
@@ -764,7 +769,15 @@
         revenue_eur: revenue,
         baseline_cost_eur: known ? base : null,
         savings_eur: known ? round(base - (cost - revenue), 2) : null,
-        cycles: round(0.4 + 0.05 * Math.abs(wobble(i + 9)), 2)
+        cycles: round(0.4 + 0.05 * Math.abs(wobble(i + 9)), 2),
+        charged_kwh: charged,
+        discharged_kwh: discharged,
+        charge_cost_eur: batteryOk ? round(charged * 0.18, 2) : null,
+        discharge_value_eur: batteryOk ? round(discharged * 0.07, 2) : null,
+        grid_measured: true,
+        load_measured: known,
+        pv_measured: true,
+        battery_measured: batteryOk
       });
     }
     return out;
@@ -785,9 +798,12 @@
       import_kwh: 0, export_kwh: 0, pv_kwh: 0, cost_eur: 0, revenue_eur: 0, cycles: 0,
       baseline_cost_eur: null, savings_eur: null,
       arbitrage_kwh: 2.1 * buckets.length, self_consumption_kwh: 3.8 * buckets.length,
-      battery_throughput_kwh: 5.9 * buckets.length, buckets: buckets.length
+      battery_throughput_kwh: 5.9 * buckets.length, buckets: buckets.length,
+      charged_kwh: null, discharged_kwh: null, charge_cost_eur: null, discharge_value_eur: null,
+      measured_buckets: { grid: 0, load: 0, pv: 0, battery: 0 }
     };
     var knownBaseline = false;
+    var flowSeen = { charged_kwh: false, discharged_kwh: false, charge_cost_eur: false, discharge_value_eur: false };
     buckets.forEach(function (b) {
       totals.import_kwh += b.import_kwh;
       totals.export_kwh += b.export_kwh;
@@ -795,6 +811,14 @@
       totals.cost_eur += b.cost_eur;
       totals.revenue_eur += b.revenue_eur;
       totals.cycles += b.cycles;
+      ["grid", "load", "pv", "battery"].forEach(function (name) {
+        if (b[name + "_measured"]) totals.measured_buckets[name] += 1;
+      });
+      ["charged_kwh", "discharged_kwh", "charge_cost_eur", "discharge_value_eur"].forEach(function (key) {
+        if (b[key] == null) return;
+        if (!flowSeen[key]) { totals[key] = 0; flowSeen[key] = true; }
+        totals[key] += b[key];
+      });
       if (b.baseline_cost_eur !== null) {
         knownBaseline = true;
         totals.baseline_cost_eur += b.baseline_cost_eur;
@@ -805,7 +829,9 @@
       totals.baseline_cost_eur = null;
       totals.savings_eur = null;
     }
-    Object.keys(totals).forEach(function (k) { if (typeof totals[k] === "number") totals[k] = round(totals[k], 2); });
+    Object.keys(totals).forEach(function (k) {
+      if (typeof totals[k] === "number") totals[k] = round(totals[k], 2);
+    });
     return { range: range || "month", buckets: buckets, totals: totals, baseline_note: BASELINE_NOTE };
   }
 

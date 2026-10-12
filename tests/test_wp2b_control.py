@@ -337,6 +337,15 @@ def test_generic_driver_reads_soc_and_capacity_units():
     assert parse_energy_kwh("1.5", {"unit_of_measurement": "kWh"}) == 1.5
 
 
+def test_generic_driver_setpoint_is_not_a_measured_flow():
+    """0.13.0: the value a generic driver writes and reads back is a command, not delivered energy."""
+    ha = FakeHA({"number.example_power": {"state": "640", "attributes": {}}})
+    driver = registry.create(config(mapping={"power_setpoint_entity": "number.example_power"}), ha)
+    state = driver.read_state()
+    assert state.power_w == 640.0
+    assert state.power_measured is False, "a setpoint read-back must never count as measured flow"
+
+
 def test_generic_driver_unsupported_domain_is_rejected_at_save_time():
     ha = FakeHA({"sensor.example_power": {"state": "0", "attributes": {}}})
     with_sensor = battery_with_sensor_mapping()

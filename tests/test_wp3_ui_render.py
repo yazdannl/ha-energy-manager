@@ -66,5 +66,12 @@ def test_ui_renders_and_settings_ia_holds():
         "a measured window compares measured with planned",
         "a stale window says the dispatcher refuses it (stale_input)",
         "the rendered rows carry facts, context, status and price provenance",
+        # SPEC 11 measured savings: only confirmed battery flow earns credit, and an unmeasured
+        # bucket stays unknown.
+        "the savings payload carries measured battery flows and per-bucket coverage",
+        "the savings view labels measured battery flows",
+        "the savings view states measured-series coverage",
+        "an unmeasured bucket reports its cycle energy as unknown, not planned",
+        "a measured bucket renders its charged and discharged energy",
     ):
         assert needle in proc.stdout, f"the render check no longer reports {needle!r}:\n{proc.stdout}"

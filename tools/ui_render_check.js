@@ -292,6 +292,33 @@ function classTokens(text) {
     && /(applied|not written|measured|not dispatchable|no dispatch recorded)/.test(byClass(view(), "window-status").map((n) => n.textContent).join(" | ")),
     byClass(view(), "window-status").map((n) => n.textContent).join(" | ").slice(0, 160));
 
+  /* ---------- 1d. savings: measured battery flows only (0.13.0) ---------- */
+  console.log("\n1d. savings measured battery flows");
+  await goto("/savings");
+  const savingsMonth = await M.handle("GET", "/api/v1/savings?range=month");
+  const monthBuckets = savingsMonth.buckets || [];
+  check("the savings payload carries measured battery flows and per-bucket coverage",
+    monthBuckets.length > 0
+    && monthBuckets.every((b) => "charged_kwh" in b && "discharged_kwh" in b && "battery_measured" in b)
+    && monthBuckets.some((b) => b.charged_kwh != null)
+    && monthBuckets.some((b) => b.battery_measured === false),
+    `${monthBuckets.length} buckets`);
+  const savingsText = allText(view());
+  check("the savings view labels measured battery flows",
+    /Measured battery flows/.test(savingsText) && /Charged \(measured\)/.test(savingsText)
+    && /Discharged \(measured\)/.test(savingsText) && /Charge cost/.test(savingsText),
+    savingsText.slice(0, 160));
+  check("the savings view states measured-series coverage",
+    /Measured-series coverage/.test(savingsText) && /battery \d+ of \d+/.test(savingsText),
+    savingsText.slice(0, 200));
+  const savingsCells = view().querySelectorAll("td").map((node) => node.textContent);
+  check("an unmeasured bucket reports its cycle energy as unknown, not planned",
+    savingsCells.indexOf("-- (unmeasured)") >= 0);
+  check("a measured bucket renders its charged and discharged energy",
+    /Charged \(measured\)[\s\S]*?kWh/.test(savingsText)
+    && /Discharged \(measured\)[\s\S]*?kWh/.test(savingsText),
+    savingsText.slice(0, 200));
+
   /* ---------- 2. settings structure ---------- */
   console.log("\n2. settings IA (every key present, groups, folding)");
   await goto("/settings");

@@ -19,7 +19,7 @@ from app import engine as engine_module  # noqa: E402
 from app.engine import Engine  # noqa: E402
 from app.grid import GridMapping  # noqa: E402
 from app.main import _FakeHA, _FakeStore, _selfcheck_settings, _selfcheck_sources  # noqa: E402
-from app.models import BatteryConfig, Mode, ProviderStatus, Reason, from_iso  # noqa: E402
+from app.models import BatteryConfig, BatteryState, Mode, ProviderStatus, Reason, from_iso  # noqa: E402
 
 PUBLISHED_ENTITIES = {
     "sensor.sem_autopilot_state",
@@ -382,6 +382,152 @@ def test_savings_accumulate_into_daily_rows():
     assert totals["import_kwh"] > 0
     assert abs(totals["savings_eur"] - (totals["baseline_cost_eur"] - totals["cost_eur"] + totals["revenue_eur"])) < 1e-9
     assert engine.savings_totals("month")["savings_eur"] == totals["savings_eur"]
+
+
+def measured_battery(**overrides) -> BatteryState:
+    """A confirmed measured reading for the selfcheck battery (deterministic savings tests)."""
+    values = dict(
+        id="example_battery_1",
+        available=True,
+        soc_pct=55.0,
+        power_w=0.0,
+        capacity_kwh=5.0,
+        power_measured=True,
+    )
+    values.update(overrides)
+    return BatteryState(**values)
+
+
+def savings_tick(engine, clock, values, batteries, *, minutes=30):
+    """Drive one savings interval with an explicit battery reading (bypasses the driver)."""
+    engine._state.batteries = list(batteries)  # noqa: SLF001 - the reading is the input under test
+    engine._last_sample_at = clock.now - timedelta(minutes=minutes)  # noqa: SLF001
+    engine._savings_tick(values, clock.now)  # noqa: SLF001
+    return dict(engine._savings_today)  # noqa: SLF001
+
+
+def test_savings_never_credits_a_dry_run_command():
+    """A dry-run/advisory dispatch writes nothing; the generic setpoint read-back is not energy."""
+    engine, store, _ha, clock, _settings = build_engine()
+    engine.plan_now("test")
+    engine.tick_now()
+    clock.advance(seconds=30)
+    engine.tick_now()
+    row = store.savings.get(clock.now.date().isoformat(), {})
+    assert row.get("battery_measured") == 0
+    assert row.get("charged_kwh") is None and row.get("discharged_kwh") is None
+    assert row.get("battery_cycles") is None
+    assert engine.battery_cycles() == 0.0, "a command must never become delivered cycles"
+
+
+def test_savings_credit_only_measured_battery_flow():
+    """0.13.0: a dry-run/blocked/failed dispatch earns zero, and a clamp counts the measured power."""
+    engine, _store, _ha, clock, _settings = build_engine()
+    engine.plan_now("test")
+    values = {"grid_w": 500.0, "load_w": 1200.0, "pv_w": 300.0}
+    # The plan may ask for a charge, but the battery measured 0 W: zero delivered energy, and the
+    # series is confirmed-measured (so the zero is known, not unknown).
+    dry = savings_tick(engine, clock, values, [measured_battery(power_w=0.0)])
+    assert dry["battery_measured"] == 1
+    assert dry["charged_kwh"] == 0.0 and dry["discharged_kwh"] == 0.0
+    assert dry["battery_cycles"] == 0.0
+
+    # A clamped write (plan asked more): integrate the measured 250 W only.
+    clamped_engine, _store2, _ha2, clamped_clock, _settings2 = build_engine()
+    clamped_engine.plan_now("test")
+    clamped = savings_tick(
+        clamped_engine, clamped_clock, values, [measured_battery(power_w=250.0)], minutes=60
+    )
+    assert abs(clamped["charged_kwh"] - 0.25) < 1e-9
+    assert clamped["battery_measured"] == 1
+
+    # A confirmed discharge is priced with the sell series in force at flow time.
+    discharge_engine, _store3, _ha3, discharge_clock, _settings3 = build_engine()
+    discharge_engine.plan_now("test")
+    slot = discharge_engine.active_plan().slot_at(discharge_clock.now)
+    discharged = savings_tick(
+        discharge_engine, discharge_clock, values, [measured_battery(power_w=-500.0)], minutes=60
+    )
+    assert abs(discharged["discharged_kwh"] - 0.5) < 1e-9
+    assert abs(discharged["discharge_value_eur"] - slot.sell * 0.5) < 1e-9
+    assert abs(discharged["charge_cost_eur"]) < 1e-9
+
+
+def test_savings_measurement_gap_is_unknown_not_planned():
+    """An unconfirmed setpoint never substitutes for a measurement the battery did not provide."""
+    engine, _store, _ha, clock, _settings = build_engine()
+    engine.plan_now("test")
+    values = {"grid_w": 500.0, "load_w": 1200.0, "pv_w": 300.0}
+    first = savings_tick(engine, clock, values, [measured_battery(power_w=500.0)])
+    assert first["battery_measured"] == 1 and first["charged_kwh"] > 0.0
+    # The only value now is a setpoint we wrote (power_measured False, e.g. a generic driver or a
+    # Zendure setpoint whose measured pair went missing): the day's flow is unknown, not planned.
+    clock.advance(minutes=30)
+    gap = savings_tick(
+        engine, clock, values, [measured_battery(power_w=800.0, power_measured=False)]
+    )
+    assert gap["battery_measured"] == 0
+    assert gap["charged_kwh"] is None and gap["battery_cycles"] is None
+    # It stays unknown: a later confirmed interval cannot repair an incomplete day into a partial
+    # total that would look fully measured.
+    clock.advance(minutes=30)
+    later = savings_tick(engine, clock, values, [measured_battery(power_w=500.0)])
+    assert later["charged_kwh"] is None
+    assert later["battery_measured"] == 0
+
+
+def test_savings_midnight_rollover_keeps_each_days_measured_flow():
+    clock = Clock(datetime(2026, 1, 1, 23, 50, tzinfo=timezone.utc))
+    engine, store, _ha, clock, _settings = build_engine(clock=clock)
+    engine.plan_now("test")
+    values = {"grid_w": 500.0, "load_w": 1200.0, "pv_w": 300.0}
+    yesterday = savings_tick(engine, clock, values, [measured_battery(power_w=1000.0)], minutes=10)
+    assert yesterday["day"] == "2026-01-01"
+    assert abs(yesterday["charged_kwh"] - 1.0 / 6.0) < 1e-9  # 1 kW for 10 minutes
+    clock.advance(minutes=20)  # 00:10 next day
+    today = savings_tick(engine, clock, values, [measured_battery(power_w=500.0)], minutes=10)
+    assert today["day"] == "2026-01-02"
+    assert abs(today["charged_kwh"] - 0.5 / 6.0) < 1e-9
+    # Yesterday was flushed under its own day before the new one began; today is still in memory
+    # until the next flush.
+    assert abs(store.savings["2026-01-01"]["charged_kwh"] - 1.0 / 6.0) < 1e-9
+    engine._flush_savings()  # noqa: SLF001
+    assert abs(store.savings["2026-01-02"]["charged_kwh"] - 0.5 / 6.0) < 1e-9
+
+
+def test_savings_totals_aggregate_measured_flows_across_ranges():
+    engine, store, _ha, _clock, _settings = build_engine()
+    store.savings = {
+        "2025-12-31": {
+            "day": "2025-12-31",
+            "charged_kwh": 1.0,
+            "discharged_kwh": 0.5,
+            "charge_cost_eur": 0.2,
+            "discharge_value_eur": 0.05,
+            "battery_measured": 1,
+        },
+        "2026-01-01": {
+            "day": "2026-01-01",
+            "charged_kwh": 2.0,
+            "discharged_kwh": 1.0,
+            "charge_cost_eur": 0.4,
+            "discharge_value_eur": 0.1,
+            "battery_measured": 1,
+        },
+        "2025-01-05": {"day": "2025-01-05", "charged_kwh": None, "battery_measured": 0},
+    }
+    _day, day_totals = engine.savings("day")
+    assert abs(day_totals["charged_kwh"] - 2.0) < 1e-9
+    assert abs(day_totals["discharge_value_eur"] - 0.1) < 1e-9
+    week_buckets, week_totals = engine.savings("week")
+    assert abs(week_totals["charged_kwh"] - 3.0) < 1e-9
+    assert abs(week_totals["discharged_kwh"] - 1.5) < 1e-9
+    assert week_totals["measured_buckets"]["battery"] == 2
+    all_buckets, all_totals = engine.savings("all")
+    # The 2025-01-05 row is a measured gap: its bucket reports unknown, so the range total is a
+    # sum of the two measured days only and the bucket flags zero coverage for those days.
+    assert abs(all_totals["charged_kwh"] - 3.0) < 1e-9
+    assert all_buckets and all_totals["measured_buckets"]["battery"] == 2
 
 
 def test_plan_execution_joins_measured_actuals_and_dispatches():

@@ -300,6 +300,14 @@ class FakeEngine:
             baseline_cost_eur=0.8,
             savings_eur=0.25,
             cycles=0.5,
+            charged_kwh=2.0,
+            discharged_kwh=1.5,
+            charge_cost_eur=0.3,
+            discharge_value_eur=0.08,
+            grid_measured=True,
+            load_measured=True,
+            pv_measured=True,
+            battery_measured=True,
         )
         return [bucket], {
             "import_kwh": 3.0,
@@ -308,6 +316,11 @@ class FakeEngine:
             "cycles": 0.5,
             "arbitrage_kwh": 0.75,
             "self_consumption_kwh": 1.25,
+            "charged_kwh": 2.0,
+            "discharged_kwh": 1.5,
+            "charge_cost_eur": 0.3,
+            "discharge_value_eur": 0.08,
+            "measured_buckets": {"grid": 1, "load": 1, "pv": 1, "battery": 1},
         }
 
     def accuracy(self, days):
@@ -773,6 +786,13 @@ def test_savings_accuracy_log_and_providers_routes():
     assert body["baseline_note"].startswith("Baseline:")
     assert body["buckets"][0]["key"] == "2026-01-01"
     assert body["totals"]["savings_eur"] == 0.25
+    # SPEC 11 (0.13.0): measured battery flows and per-bucket coverage travel additively.
+    assert body["buckets"][0]["charged_kwh"] == 2.0
+    assert body["buckets"][0]["discharged_kwh"] == 1.5
+    assert body["buckets"][0]["battery_measured"] is True
+    assert body["buckets"][0]["grid_measured"] is True
+    assert body["totals"]["discharge_value_eur"] == 0.08
+    assert body["totals"]["measured_buckets"]["battery"] == 1
     # SPEC 10: the split the UI explains the savings with
     assert body["totals"]["arbitrage_kwh"] == 0.75
     assert body["totals"]["self_consumption_kwh"] == 1.25

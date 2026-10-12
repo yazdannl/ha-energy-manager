@@ -302,6 +302,15 @@ from), the baseline cannot be computed: the baseline and the savings for that bu
 Baselines are computed **before** old raw rows are trimmed and stored in `savings_daily`, so the
 history stays comparable across retention limits.
 
+Battery credit is **measured, not planned**. `charged_kwh` and `discharged_kwh` integrate only
+confirmed AC power readings, and `charge_cost_eur`/`discharge_value_eur` price those flows with the
+buy/sell price in force at flow time. A dry-run, blocked or stale-refused dispatch, a setpoint the
+battery never confirmed, or a driver that only reads back the value it wrote (the generic driver, or
+a Zendure with an incomplete measured pair) earns **no** flow credit: the day's battery flows and
+cycle count are reported as **unknown** (`--`) instead of the planned value. Each day also records
+which series (grid, load, PV, battery) were measured for every interval, and the Savings view shows
+that coverage and the measured flows under the per-bucket detail.
+
 Two honest caveats: the baseline is a counterfactual re-pricing of the *same* kWh, not a measured
 change in your bill, and it only includes the price components present in the price series you
 selected (fixed charges, taxes outside that series and any behaviour change the add-on itself

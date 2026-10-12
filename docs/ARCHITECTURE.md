@@ -219,6 +219,13 @@ is recomputed per day from the `actuals` rows before trimming, and the same defi
 the UI and in the README. It is a counterfactual re-pricing rather than a measured bill change, and
 it only covers price components present in the selected price series.
 
+Battery credit is measured, not planned (0.13.0): `charged_kwh`/`discharged_kwh` integrate only
+confirmed AC flow readings and are priced at the buy/sell series in force at flow time. A dry-run,
+blocked, stale-refused or unconfirmed-setpoint interval is never credited, and a day with any
+unmeasured interval reports its battery flows and cycle count as `null` rather than a partial or
+planned number. Each `savings_daily` row also records which of the grid, load, PV and battery series
+were measured for every interval.
+
 ## Deliberate simplifications
 
 These are conscious trade-offs, not accidents. Each has an upgrade path.

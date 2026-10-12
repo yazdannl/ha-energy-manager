@@ -23,6 +23,14 @@ BASELINE_NOTE = (
 #: Google-style "one bucket per X" for each range.
 _BUCKET_LENGTHS = {"day": 1, "week": 1, "month": 1, "year": 30, "all": 30}
 
+#: Measured series whose presence a savings bucket reports (0.13.0).  Battery flow is "measured"
+#: only when the driver read a real flow back, never merely because a setpoint was written.
+MEASURED_SERIES = ("grid", "load", "pv", "battery")
+
+#: Per-day measured battery flow fields.  ``None`` means "not fully measured today", so the bucket
+#: reports unknown instead of a smaller number that looks measured (0.13.0).
+MEASURED_FLOWS = ("charged_kwh", "discharged_kwh", "charge_cost_eur", "discharge_value_eur")
+
 
 def range_bounds(range_key: str, now: datetime) -> tuple[datetime, datetime]:
     """Start/end of a savings range, both inclusive of ``now``."""
@@ -121,6 +129,12 @@ def savings_from_daily(
     # empty bucket stays a plain zero (no activity, nothing to be unsure about).
     baseline_known: set[str] = set()
     bucket_rows: set[str] = set()
+    # Per-bucket coverage of each measured series and per-bucket sums of the measured battery
+    # flows.  A series is covered only when every row in the bucket had it; a flow is known only
+    # when every row carried it (a gap makes the day unknown, never a smaller measured number).
+    measured_series: dict[str, set[str]] = {}
+    flow_sums: dict[str, dict[str, float]] = {}
+    flow_known: dict[str, set[str]] = {}
 
     for row in rows:
         day = _parse_day(row.get("day") or row.get("ts"))
@@ -131,9 +145,27 @@ def savings_from_daily(
         if bucket is None:
             bucket = _empty_bucket(key, range_key)
             buckets[key] = bucket
-        cycles = float(row.get("battery_cycles") or row.get("cycles") or 0.0)
+        series = measured_series.setdefault(key, set(MEASURED_SERIES))
+        for name in MEASURED_SERIES:
+            if not row.get(f"{name}_measured"):
+                series.discard(name)
+        known = flow_known.setdefault(key, set(MEASURED_FLOWS))
+        sums = flow_sums.setdefault(key, {name: 0.0 for name in MEASURED_FLOWS})
+        for name in MEASURED_FLOWS:
+            value = row.get(name)
+            if value is None:
+                known.discard(name)
+            else:
+                sums[name] += float(value)
+        # The realised battery throughput is measured discharge when the flow is known; legacy
+        # rows (and pre-0.13 rows) fall back to the stored cycle estimate.
+        discharged = row.get("discharged_kwh")
+        if discharged is not None:
+            throughput = max(0.0, float(discharged))
+        else:
+            cycles = float(row.get("battery_cycles") or row.get("cycles") or 0.0)
+            throughput = max(0.0, cycles) * max(0.0, float(capacity_kwh))
         export_kwh = float(row.get("export_kwh") or 0.0)
-        throughput = max(0.0, cycles) * max(0.0, float(capacity_kwh))
         arbitrage_kwh += min(throughput, export_kwh)
         self_consumption_kwh += max(0.0, throughput - export_kwh)
         bucket.import_kwh += float(row.get("import_kwh") or 0.0)
@@ -145,7 +177,7 @@ def savings_from_daily(
         if row.get("baseline_cost_eur") is not None:
             baseline_known.add(key)
             bucket.baseline_cost_eur += float(row.get("baseline_cost_eur") or 0.0)
-        bucket.cycles += cycles
+        bucket.cycles += float(row.get("battery_cycles") or 0.0)
         if key in baseline_known:
             bucket.savings_eur = bucket.baseline_cost_eur - (bucket.cost_eur - bucket.revenue_eur)
 
@@ -154,7 +186,20 @@ def savings_from_daily(
         bucket = buckets[key]
         if key in bucket_rows and key not in baseline_known:
             bucket = replace(bucket, baseline_cost_eur=None, savings_eur=None)
+        if key in bucket_rows:
+            known = flow_known.get(key, set())
+            sums = flow_sums.get(key, {})
+            bucket = replace(
+                bucket,
+                **{name: (float(sums.get(name, 0.0)) if name in known else None) for name in MEASURED_FLOWS},
+                **{f"{name}_measured": name in measured_series.get(key, set()) for name in MEASURED_SERIES},
+            )
         ordered.append(bucket)
+
+    def _total_flow(name: str) -> float | None:
+        values = [getattr(b, name) for b in ordered if getattr(b, name) is not None]
+        return sum(values) if values else None
+
     totals = {
         "import_kwh": sum(b.import_kwh for b in ordered),
         "export_kwh": sum(b.export_kwh for b in ordered),
@@ -172,6 +217,15 @@ def savings_from_daily(
         "self_consumption_kwh": self_consumption_kwh,
         "battery_throughput_kwh": arbitrage_kwh + self_consumption_kwh,
         "buckets": float(len(ordered)),
+        # Additive (0.13.0): measured battery flows and how many buckets actually measured each
+        # series.  ``None`` for a flow means no bucket in this range had a complete measurement.
+        "charged_kwh": _total_flow("charged_kwh"),
+        "discharged_kwh": _total_flow("discharged_kwh"),
+        "charge_cost_eur": _total_flow("charge_cost_eur"),
+        "discharge_value_eur": _total_flow("discharge_value_eur"),
+        "measured_buckets": {
+            name: sum(1 for b in ordered if getattr(b, f"{name}_measured")) for name in MEASURED_SERIES
+        },
     }
     return ordered, totals
 
@@ -190,7 +244,12 @@ def daily_row_delta(
     capacity_kwh: float,
     now: datetime,
 ) -> dict[str, Any]:
-    """Accumulate one tick into a ``savings_daily`` row (SPEC 11)."""
+    """Accumulate one tick into a ``savings_daily`` row (SPEC 11).
+
+    ``battery_kw`` must be a *measured* flow; ``None`` means no confirmed measurement for this
+    interval, which makes the day's battery flows and cycle count unknown rather than a planned
+    value (0.13.0).  The grid/load/PV coverage flags record which measured series were present.
+    """
     row = dict(previous or {})
     row["day"] = day
     hours = clamp(float(dt_hours), 0.0, 1.0)
@@ -209,12 +268,25 @@ def daily_row_delta(
         do_nothing_import = max(0.0, float(load_kw) - float(pv_kw or 0.0))
         do_nothing_export = max(0.0, float(pv_kw or 0.0) - float(load_kw))
         baseline = buy * do_nothing_import * hours - sell * do_nothing_export * hours
-    cycles = 0.0
-    if battery_kw is not None and capacity_kwh > 0:
-        cycles = max(0.0, -float(battery_kw)) * hours / capacity_kwh
 
     def add(key: str, value: float) -> None:
         row[key] = float(row.get(key) or 0.0) + value
+
+    def add_known(key: str, value: float | None) -> None:
+        # A gap poisons the day: a partially measured total is unknown, never a smaller number
+        # that would look measured (0.13.0).
+        if value is None or (key in row and row[key] is None):
+            row[key] = None
+        else:
+            add(key, value)
+
+    def cover(key: str, present: bool) -> None:
+        # Coverage can only be lost: one unmeasured interval makes the day's series incomplete.
+        if present:
+            if row.get(key) is None:
+                row[key] = 1
+        else:
+            row[key] = 0
 
     add("import_kwh", import_kwh)
     add("export_kwh", export_kwh)
@@ -226,7 +298,24 @@ def daily_row_delta(
         row["baseline_cost_eur"] = None
     else:
         add("baseline_cost_eur", baseline)
-    add("battery_cycles", cycles)
+    # Measured AC battery flows: only real, confirmed flow earns credit.  This covers charging and
+    # discharging (a clamped or ramp-limited write counts what was measured, not what was asked)
+    # and prices each leg with the price series in force at flow time.
+    if battery_kw is not None:
+        charged = max(0.0, float(battery_kw)) * hours
+        discharged = max(0.0, -float(battery_kw)) * hours
+        add_known("charged_kwh", charged)
+        add_known("discharged_kwh", discharged)
+        add_known("charge_cost_eur", buy * charged if price_buy is not None else None)
+        add_known("discharge_value_eur", sell * discharged if price_sell is not None else None)
+        add_known("battery_cycles", discharged / capacity_kwh if capacity_kwh > 0 else 0.0)
+    else:
+        for key in ("charged_kwh", "discharged_kwh", "charge_cost_eur", "discharge_value_eur", "battery_cycles"):
+            row[key] = None
+    cover("grid_measured", grid_kw is not None)
+    cover("load_measured", load_kw is not None)
+    cover("pv_measured", pv_kw is not None)
+    cover("battery_measured", battery_kw is not None)
     known_baseline = row.get("baseline_cost_eur")
     if known_baseline is None:
         row["savings_eur"] = None

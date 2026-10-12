@@ -209,6 +209,25 @@ def test_manager_power_is_read_back_with_the_models_sign_convention():
     assert state.states[OUTPUT]["state"] == "600.0"  # discharging shows on output_home
 
 
+def test_power_measured_only_when_the_measured_pair_is_present():
+    """0.13.0: the setpoint fallback is a command, so savings must not credit it as delivered energy."""
+    state = make_state()
+    driver = make_driver(state)
+    state.states[GRID_IN] = {"state": "400", "attributes": {}}
+    state.states[OUTPUT] = {"state": "0", "attributes": {}}
+    measured = driver.read_state()
+    assert measured.power_w == pytest.approx(400.0)
+    assert measured.power_measured is True
+
+    # Only the setpoint is readable (the measured pair went missing): unconfirmed, not creditable.
+    state.states.pop(GRID_IN)
+    state.states.pop(OUTPUT)
+    state.states[MANUAL] = {"state": "-500", "attributes": {}}
+    commanded = driver.read_state()
+    assert commanded.power_w == pytest.approx(500.0)
+    assert commanded.power_measured is False
+
+
 # -- device path: the inverter's own AC limits, no manager, no P1 event ---------------------
 
 

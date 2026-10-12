@@ -466,6 +466,11 @@ class ZendureDriver(BaseDriver):
         # input_limit/output_limit are magnitudes: charge adds, discharge subtracts.
         return abs(charge or 0.0) - abs(discharge or 0.0)
 
+    def _power_is_measured(self) -> bool:
+        """0.13.0: only the complete measured pair counts as delivered battery energy."""
+        drawn, output = self._measured_pair()
+        return drawn is not None and output is not None
+
     def _read_soc(self) -> float | None:
         entity_id = self.effective_mapping().get("soc_entity")
         state = self._state(entity_id)

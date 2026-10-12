@@ -515,6 +515,16 @@ def savings_bucket_dict(bucket: SavingsBucket) -> dict[str, Any]:
         "baseline_cost_eur": bucket.baseline_cost_eur,
         "savings_eur": bucket.savings_eur,
         "cycles": bucket.cycles,
+        # Additive (0.13.0 measured savings): measured AC battery flows and their value at flow
+        # time, plus the per-bucket coverage flags.  None = unknown, never a fabricated zero.
+        "charged_kwh": bucket.charged_kwh,
+        "discharged_kwh": bucket.discharged_kwh,
+        "charge_cost_eur": bucket.charge_cost_eur,
+        "discharge_value_eur": bucket.discharge_value_eur,
+        "grid_measured": bucket.grid_measured,
+        "load_measured": bucket.load_measured,
+        "pv_measured": bucket.pv_measured,
+        "battery_measured": bucket.battery_measured,
     }
 
 

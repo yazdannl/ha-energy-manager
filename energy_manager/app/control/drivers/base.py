@@ -341,6 +341,8 @@ class BaseDriver:
                 pv_power_w=self._read_pv_power(),
                 temperature_c=None,
                 read_at=moment,
+                # Only a confirmed measurement may stand in for delivered battery energy.
+                power_measured=power is not None and self._power_is_measured(),
                 # Only a failed transport read, or a commanded setpoint the measurement keeps
                 # ignoring, blocks control (audit finding 1).
                 stale=(not available) or frozen,
@@ -373,6 +375,14 @@ class BaseDriver:
 
     def _read_power(self) -> float | None:
         raise NotImplementedError
+
+    def _power_is_measured(self) -> bool:
+        """True when ``_read_power`` returned a real flow, not a setpoint this add-on wrote.
+
+        Setpoint-only drivers (see ``generic.py``) read back the value they command, so their power
+        is unconfirmed and must not be credited to savings as delivered energy (0.13.0).
+        """
+        return False
 
     def _read_soc(self) -> float | None:
         return None

@@ -303,9 +303,11 @@ Panels: **Savings range** (controls), **Totals**, **Savings vs baseline**, **Per
 | Answer first | the saving/loss line, then `Baseline available for N of M periods`; the comparable baseline and actual net cost cover **the same periods** |
 | Unknown handling | `--`, a distinct `Unknown` card flag and an explicit banner when `savings_eur` / `baseline_cost_eur` are `null`; `Loss` and `Stale` are separate flags; unknown is never rendered as zero |
 | Split row | `Battery energy for arbitrage` and `Battery energy for self-consumption`, or a note that the backend does not report the split |
+| Measured battery flows | a `Measured battery flows` banner, then `Charged (measured)`, `Discharged (measured)`, `Charge cost (measured, at buy)`, `Discharge value (measured, at sell)`; `--` when no bucket had a confirmed measurement. A dry-run, blocked or unconfirmed setpoint earns nothing |
+| Coverage | `Measured-series coverage (buckets with every interval measured): grid N of M, load N of M, PV N of M, battery N of M` |
 | Baseline banner | `How the baseline is defined` — server `baseline_note`, plus the counterfactual re-pricing caveat |
 | Chart | savings bars + solid actual net cost / long-dashed baseline cost lines; null series are skipped, not plotted as 0 |
-| Per-bucket table | `Bucket`, `Period`, `Import`, `Export`, `PV`, `Cost`, `Revenue`, `Baseline`, `Savings`, `Cycles` |
+| Per-bucket table | `Bucket`, `Period`, `Import`, `Export`, `PV`, `Cost`, `Revenue`, `Baseline`, `Savings`, `Cycles` (or `-- (unmeasured)`), `Charged (measured)`, `Discharged (measured)`, `Charge cost`, `Discharge value` |
 
 ### 2.8 Settings
 
@@ -1283,9 +1285,14 @@ Writes go through the HA service API or state-setting where no service exists.
 
 ```
 import_kwh  = max(0, grid_kw) * dt_h
+battery_flows = measured AC battery_kw only (None -> unknown, never the plan)
+charged_kwh   = max(0, battery_kw) * dt_h
+discharged_kwh= max(0, −battery_kw) * dt_h
 export_kwh  = max(0, −grid_kw) * dt_h
 cost        = buy * import_kwh
 revenue     = sell * export_kwh
+charge_cost_eur      = buy  * charged_kwh        # priced at flow time
+discharge_value_eur  = sell * discharged_kwh
 do_nothing_import = max(0, load_kw − pv_kw)
 do_nothing_export = max(0, pv_kw − load_kw)
 baseline    = buy*do_nothing_import*dt_h − sell*do_nothing_export*dt_h      # net, battery idle
@@ -1296,6 +1303,15 @@ savings     = baseline − (cost − revenue)
 `baseline` and `savings` are `None` (unknown) when the load is not knowable — never a fabricated
 zero. `dt_h` is clamped to 1 h.
 
+**Measured-only battery credit (0.13.0).** `battery_kw` is passed only when the driver confirmed a
+real flow measurement (``BatteryState.power_measured``). A setpoint read back by the generic driver,
+or a Zendure reading that fell back to ``manual_power`` because the measured pair was incomplete, is
+an unconfirmed command and is passed as `None`. One unmeasured interval poisons the day: `charged_kwh`,
+`discharged_kwh`, `charge_cost_eur`, `discharge_value_eur` and `battery_cycles` become `None` and stay
+unknown, never a smaller partial total. Each day also records the coverage of the grid, load, PV and
+battery series (`grid_measured`, `load_measured`, `pv_measured`, `battery_measured`); rows written
+before these columns existed carry `NULL` and read as unknown.
+
 **Ranges** (`range_bounds`): `day` = today from midnight; `week` = 7 days; `month` = 30 days;
 `year` = 365 days; `all` = since epoch. Buckets are days, except `year`/`all`, which bucket per month
 (`_BUCKET_LENGTHS` = 1 day, 30 days for year/all). Empty buckets are kept so the chart stays steady.
@@ -1303,12 +1319,19 @@ zero. `dt_h` is clamped to 1 h.
 **Totals and split** (`savings_from_daily`):
 
 ```
-arbitrage_kwh         = Σ min(cycles * capacity_kwh, export_kwh)      # discharged energy that was exported
-self_consumption_kwh  = Σ max(0, cycles*capacity_kwh − export_kwh)    # the rest displaced import
-battery_throughput_kwh = arbitrage + self_consumption                  # documented estimate
+arbitrage_kwh         = Σ min(throughput, export_kwh)                 # discharged energy that was exported
+self_consumption_kwh  = Σ max(0, throughput − export_kwh)             # the rest displaced import
+battery_throughput_kwh = arbitrage + self_consumption                  # measured discharge when known, else the cycle estimate
 totals: import_kwh, export_kwh, pv_kwh, cost_eur, revenue_eur, baseline_cost_eur, savings_eur,
-        cycles, arbitrage_kwh, self_consumption_kwh, battery_throughput_kwh, buckets
+        cycles, arbitrage_kwh, self_consumption_kwh, battery_throughput_kwh, buckets,
+        charged_kwh, discharged_kwh, charge_cost_eur, discharge_value_eur,   # 0.13.0, None = unknown
+        measured_buckets {grid, load, pv, battery}                            # buckets fully measured
 ```
+
+A per-bucket flow is `None` unless every row in the bucket measured it; totals sum the known buckets
+and the per-series `measured_buckets` counts say how many did. Buckets carry the same flags as
+booleans (`grid_measured`, `load_measured`, `pv_measured`, `battery_measured`). All of this is
+additive: a legacy row with no such columns reports unknown rather than crashing.
 
 Baselines are computed **before** the daily maintenance trim and stored in `savings_daily`, so the
 numbers stay comparable after raw rows are gone.
@@ -1460,7 +1483,7 @@ supplies it (which is why publishing a port would hand battery control to anyone
 | `POST /api/v1/stop` | — | `{mode, override_cleared, stopped[{battery_id, ok, applied_w, code, message, dry_run}]}` |
 | `POST /api/v1/override` | `{power_w, minutes, battery_id?}` | `{override}` |
 | `DELETE /api/v1/override` | — | `{}` |
-| `GET /api/v1/savings` | `range=day\|week\|month\|year\|all` | `{range, buckets[], totals{}, baseline_note}` |
+| `GET /api/v1/savings` | `range=day\|week\|month\|year\|all` | `{range, buckets[], totals{}, baseline_note}`; additive 0.13.0: buckets carry `charged_kwh`, `discharged_kwh`, `charge_cost_eur`, `discharge_value_eur` and `grid_measured`/`load_measured`/`pv_measured`/`battery_measured` flags, totals add the same flows plus `measured_buckets` counts (`null` = no confirmed measurement) |
 | `GET /api/v1/accuracy` | `days=14` | `{pv, load, price: AccuracyReport}` |
 | `GET /api/v1/log` | `limit`, `level`, `kind` | `{entries[{ts, kind, level, code, message, detail}]}` |
 | `GET /api/v1/providers` | — | `{solar[], price[], load[]}` |
@@ -1491,9 +1514,9 @@ connection per thread.
 | --- | --- |
 | `plans`, `plan_slots` | what was planned (per-slot timestamp, prices, PV, load, SoC, power, action, reason) |
 | `measurements` | 5-minute bucketed raw samples per role |
-| `actuals` | per-tick ground truth (pv, load, grid, battery, soc, price, plan/dispatch power) |
+| `actuals` | per-tick ground truth (pv, load, grid, measured battery, soc, buy/sell price, plan/dispatch power) |
 | `dispatch_log` | requested vs applied power, mode, dry run, result, code, message |
-| `savings_daily` | the accounting: import/export kWh, cost, revenue, baseline, savings, PV, cycles |
+| `savings_daily` | the accounting: import/export kWh, cost, revenue, baseline, savings, PV, cycles, measured charged/discharged kWh and their value, per-series coverage flags |
 | `learning_profiles` | PV and load corrections, derived solar capacity, and the live-write latch |
 | `forecast_cache` | cached provider payloads with fetch timestamps |
 | `events` | events and alerts |

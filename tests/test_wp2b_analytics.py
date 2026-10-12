@@ -162,6 +162,131 @@ def test_daily_row_delta_accumulates_and_defines_the_baseline():
     assert abs(again["revenue_eur"] - 0.0125) < 1e-9
 
 
+def flow_row(day: str, charged: float = 1.0, discharged: float = 0.5, *, measured: bool = True) -> dict:
+    """A 0.13.0 savings_daily row with measured AC battery flows (or a measurement gap)."""
+    row = daily_row(day, savings=0.5)
+    row.update(
+        {
+            "charged_kwh": charged if measured else None,
+            "discharged_kwh": discharged if measured else None,
+            "charge_cost_eur": charged * 0.2 if measured else None,
+            "discharge_value_eur": discharged * 0.05 if measured else None,
+            "grid_measured": 1 if measured else 0,
+            "load_measured": 1 if measured else 0,
+            "pv_measured": 1 if measured else 0,
+            "battery_measured": 1 if measured else 0,
+        }
+    )
+    return row
+
+
+def test_daily_row_delta_measured_battery_flows_and_coverage():
+    """0.13.0: measured AC flows, priced at flow time, with per-series coverage flags."""
+    row = analytics.daily_row_delta(
+        None,
+        day="2026-01-01",
+        dt_hours=0.5,
+        grid_kw=1.0,
+        load_kw=1.5,
+        pv_kw=0.5,
+        battery_kw=1.0,
+        price_buy=0.3,
+        price_sell=0.05,
+        capacity_kwh=5.0,
+        now=NOW,
+    )
+    assert abs(row["charged_kwh"] - 0.5) < 1e-9
+    assert abs(row["discharged_kwh"]) < 1e-9
+    assert abs(row["charge_cost_eur"] - 0.15) < 1e-9
+    assert abs(row["discharge_value_eur"]) < 1e-9
+    assert row["grid_measured"] == 1 and row["load_measured"] == 1 and row["battery_measured"] == 1
+    # A measurement gap makes the battery series unknown and poisons the day's flows: never a
+    # smaller partial total that looks measured, and never the planned value.
+    gap = analytics.daily_row_delta(
+        row,
+        day="2026-01-01",
+        dt_hours=0.5,
+        grid_kw=1.0,
+        load_kw=1.5,
+        pv_kw=0.5,
+        battery_kw=None,
+        price_buy=0.3,
+        price_sell=0.05,
+        capacity_kwh=5.0,
+        now=NOW,
+    )
+    assert gap["charged_kwh"] is None and gap["discharged_kwh"] is None
+    assert gap["charge_cost_eur"] is None and gap["discharge_value_eur"] is None
+    assert gap["battery_cycles"] is None
+    assert gap["battery_measured"] == 0
+    recovered = analytics.daily_row_delta(
+        gap,
+        day="2026-01-01",
+        dt_hours=0.5,
+        grid_kw=1.0,
+        load_kw=1.5,
+        pv_kw=0.5,
+        battery_kw=1.0,
+        price_buy=0.3,
+        price_sell=0.05,
+        capacity_kwh=5.0,
+        now=NOW,
+    )
+    assert recovered["charged_kwh"] is None, "a measured interval cannot repair an incomplete day"
+    # A missing grid/PV interval is recorded too, so the bucket can say which series were present.
+    missing = analytics.daily_row_delta(
+        None,
+        day="2026-01-01",
+        dt_hours=0.5,
+        grid_kw=None,
+        load_kw=1.0,
+        pv_kw=None,
+        battery_kw=0.0,
+        price_buy=0.3,
+        price_sell=0.05,
+        capacity_kwh=5.0,
+        now=NOW,
+    )
+    assert missing["grid_measured"] == 0 and missing["pv_measured"] == 0 and missing["load_measured"] == 1
+    assert missing["charged_kwh"] == 0.0, "a measured zero flow is known, not unknown"
+
+
+def test_savings_from_daily_totals_measured_flows_and_coverage():
+    rows = [
+        flow_row("2026-01-01", 2.0, 1.0),
+        flow_row("2025-12-31", 1.0, 0.5, measured=False),
+    ]
+    buckets, totals = analytics.savings_from_daily(rows, "week", NOW)
+    by_key = {bucket.key: bucket for bucket in buckets}
+    assert by_key["2026-01-01"].charged_kwh == 2.0
+    assert by_key["2026-01-01"].discharged_kwh == 1.0
+    assert by_key["2026-01-01"].battery_measured is True
+    assert by_key["2025-12-31"].charged_kwh is None
+    assert by_key["2025-12-31"].battery_measured is False
+    # Totals sum only the measured buckets; a range with no measurement stays None.
+    assert totals["charged_kwh"] == 2.0
+    assert totals["discharged_kwh"] == 1.0
+    assert abs(totals["charge_cost_eur"] - 0.4) < 1e-9
+    assert abs(totals["discharge_value_eur"] - 0.05) < 1e-9
+    assert totals["measured_buckets"]["battery"] == 1
+    assert totals["measured_buckets"]["grid"] == 1
+    # The measured discharge, not the cycle estimate, is what the arbitrage split counts now.
+    assert abs(totals["battery_throughput_kwh"] - 1.0) < 1e-9
+
+
+def test_savings_daily_legacy_rows_stay_readable_as_unknown():
+    """Rows written before 0.13.0 carry no measured-flow columns: unknown, never a crash."""
+    legacy = daily_row("2026-01-01", savings=1.0)
+    buckets, totals = analytics.savings_from_daily([legacy], "day", NOW, capacity_kwh=5.0)
+    assert buckets[0].savings_eur == 1.0
+    assert buckets[0].charged_kwh is None and buckets[0].discharged_kwh is None
+    assert buckets[0].battery_measured is False and buckets[0].grid_measured is False
+    assert totals["charged_kwh"] is None
+    assert totals["measured_buckets"] == {"grid": 0, "load": 0, "pv": 0, "battery": 0}
+    # The legacy cycle estimate still drives the estimate-only arbitrage split.
+    assert totals["arbitrage_kwh"] > 0.0
+
+
 def test_accuracy_reports_mape_bias_and_series():
     samples = [
         analytics.AccuracySample(ts=NOW - timedelta(days=1), forecast=2.0, actual=2.5),

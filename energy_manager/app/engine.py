@@ -1764,7 +1764,13 @@ class Engine:
         slot = plan.slot_at(now) if plan is not None else None
         battery_kw = None
         with self._lock:
-            powers = [b.power_w for b in self._state.batteries if b.power_w is not None]
+            # 0.13.0: only a confirmed measurement may be persisted as battery flow, so a dry-run,
+            # blocked or unconfirmed setpoint never becomes a measured actual.
+            powers = [
+                b.power_w
+                for b in self._state.batteries
+                if b.power_w is not None and b.power_measured and b.available and not b.stale
+            ]
             energies = [b.energy_kwh for b in self._state.batteries if b.energy_kwh is not None]
         if powers:
             battery_kw = sum(float(p) for p in powers) / 1000.0
@@ -1776,6 +1782,7 @@ class Engine:
             "battery_kw": battery_kw,
             "soc_kwh": sum(float(e) for e in energies) if energies else None,
             "price_buy": slot.buy if slot is not None else self._price_now(now),
+            "price_sell": slot.sell if slot is not None else None,
             "plan_power_w": slot.power_w if slot is not None else None,
             "dispatch_power_w": battery_kw * 1000.0 if battery_kw is not None else None,
         }
@@ -1790,6 +1797,7 @@ class Engine:
             battery_kw=row["battery_kw"],
             soc_kwh=row["soc_kwh"],
             price_buy=row["price_buy"],
+            price_sell=row["price_sell"],
             plan_power_w=row["plan_power_w"],
             dispatch_power_w=row["dispatch_power_w"],
         )
@@ -1804,10 +1812,25 @@ class Engine:
             return
         plan = self.active_plan()
         slot = plan.slot_at(now) if plan is not None else None
-        capacity = sum(config.capacity_kwh for config in self.battery_configs() if config.enabled)
-        with self._lock:
-            powers = [b.power_w for b in self._state.batteries if b.power_w is not None]
-            battery_kw = sum(float(p) for p in powers) / 1000.0 if powers else None
+        configs = [config for config in self.battery_configs() if config.enabled]
+        capacity = sum(config.capacity_kwh for config in configs)
+        if not configs:
+            # Nothing configured can move: a zero flow is measured-truthful here, not unknown.
+            battery_kw: float | None = 0.0
+        else:
+            with self._lock:
+                measured = {
+                    b.id: float(b.power_w)
+                    for b in self._state.batteries
+                    if b.power_w is not None and b.power_measured and b.available and not b.stale
+                }
+            # Every enabled battery must be confirmed: a partial aggregate would earn credit for
+            # energy an unmeasured battery may never have moved (0.13.0).
+            battery_kw = (
+                sum(measured.values()) / 1000.0
+                if set(measured) >= {config.id for config in configs}
+                else None
+            )
         with self._lock:
             carried_day = str(self._savings_today.get("day") or "")
         if carried_day and carried_day != now.date().isoformat():
@@ -1853,12 +1876,25 @@ class Engine:
             baseline_cost_eur=None if row.get("baseline_cost_eur") is None else float(row["baseline_cost_eur"]),
             savings_eur=None if row.get("savings_eur") is None else float(row["savings_eur"]),
             pv_kwh=float(row.get("pv_kwh") or 0.0),
-            battery_cycles=float(row.get("battery_cycles") or 0.0),
+            # None means "no confirmed battery measurement today": unknown, never a planned value.
+            battery_cycles=None if row.get("battery_cycles") is None else float(row["battery_cycles"]),
+            charged_kwh=self._savings_optional("charged_kwh"),
+            discharged_kwh=self._savings_optional("discharged_kwh"),
+            charge_cost_eur=self._savings_optional("charge_cost_eur"),
+            discharge_value_eur=self._savings_optional("discharge_value_eur"),
+            grid_measured=self._savings_cover("grid_measured"),
+            load_measured=self._savings_cover("load_measured"),
+            pv_measured=self._savings_cover("pv_measured"),
+            battery_measured=self._savings_cover("battery_measured"),
         )
 
     def _savings_optional(self, key: str) -> float | None:
         value = self._savings_today.get(key)
         return None if value is None else float(value)
+
+    def _savings_cover(self, key: str) -> int:
+        """Per-day coverage flag: 1 only when every interval measured that series."""
+        return int(self._savings_today.get(key) or 0)
 
     def _replan_loop(self) -> None:
         while not self._stop.is_set():

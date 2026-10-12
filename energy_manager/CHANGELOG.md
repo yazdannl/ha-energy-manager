@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.13.0
+
+- **Savings are now earned only by energy the battery actually moved.** The savings accounting used
+  to derive battery cycles from whatever power the driver reported, and some drivers read back the
+  setpoint they had written — so a dry-run, blocked or stale-refused dispatch, or a setpoint the
+  battery never confirmed, could still show up as delivered energy. Battery flow is now counted only
+  when the driver read a real measurement back: a setpoint-only reading (the generic driver, or a
+  Zendure whose measured pair went missing) reports the day's battery flow and cycle count as
+  **unknown**, never as the planned value. `BatteryState` gains `power_measured`, the Zendure driver
+  sets it for the complete measured pair, and `actuals.battery_kw` is left empty rather than filled
+  from a command.
+- **Measured AC battery flows are accounted per day and per range.** `savings_daily` gains
+  `charged_kwh`, `discharged_kwh`, `charge_cost_eur` (priced with the buy series at flow time) and
+  `discharge_value_eur` (priced with the sell series), plus per-day coverage flags for the grid,
+  load, PV and battery series. `/api/v1/savings` exposes them on every bucket and in the totals
+  (with `measured_buckets` counts), and the Savings view shows them under a clearly labelled
+  *Measured battery flows* heading together with the coverage. A measurement gap makes the flow
+  unknown (`--`), never a smaller partial total that would look measured.
+- **Nothing else changed shape.** New columns are added by a forward-only schema migration; rows
+  written before this version keep working and report the new fields as unknown. All API additions
+  are additive.
+
 ## 0.12.0
 
 - **Several PV forecasts can be merged into one hourly input.** The planner used to take its solar

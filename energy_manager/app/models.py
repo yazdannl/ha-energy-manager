@@ -278,6 +278,10 @@ class BatteryState:
     read_at: datetime | None = None
     last_error: str | None = None
     stale: bool = False
+    # Additive (0.13.0 measured savings): True only when ``power_w`` is a real flow measurement.
+    # Drivers whose power entity is the setpoint they wrote report False, because a commanded value
+    # is not proof the battery moved energy; savings must never be earned by an unconfirmed command.
+    power_measured: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
     def age_seconds(self, now: datetime | None = None) -> float | None:
@@ -555,6 +559,18 @@ class SavingsBucket:
     baseline_cost_eur: float = 0.0
     savings_eur: float = 0.0
     cycles: float = 0.0
+    # Additive (0.13.0 measured savings): measured AC battery flows and what they were worth at
+    # flow time.  None = unknown (no confirmed measurement for every interval in the bucket),
+    # never a fabricated 0.  ``battery_measured`` is the bucket's coverage flag; the others mirror
+    # the measured series the grid/load/PV accounting was built from.
+    charged_kwh: float | None = None
+    discharged_kwh: float | None = None
+    charge_cost_eur: float | None = None
+    discharge_value_eur: float | None = None
+    grid_measured: bool = False
+    load_measured: bool = False
+    pv_measured: bool = False
+    battery_measured: bool = False
 
 
 @dataclass

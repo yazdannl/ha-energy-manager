@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,7 +21,7 @@ from app.models import (  # noqa: E402
     PlanSlot,
     PlanSummary,
 )
-from app.store import SCHEMA_VERSION, Store  # noqa: E402
+from app.store import MIGRATIONS, SCHEMA_VERSION, Store  # noqa: E402
 
 NOW = datetime(2026, 1, 5, 12, 0, tzinfo=timezone.utc)
 
@@ -192,6 +193,55 @@ def test_savings_upsert_and_range(store):
     assert len(store.savings_daily_range("2026-01-01", "2026-01-05")) == 1
     with pytest.raises(ValueError):
         store.upsert_savings_daily("2026-01-05", nonsense=1.0)
+
+
+def test_savings_measured_flow_columns_round_trip(store):
+    """0.13.0 additions are additive: an old-style call leaves them None, a new one stores them."""
+    store.upsert_savings_daily("2026-01-01", import_kwh=1.0)
+    legacy = store.savings_daily_range("2026-01-01", "2026-01-01")[0]
+    assert legacy["charged_kwh"] is None and legacy["battery_measured"] is None
+    store.upsert_savings_daily(
+        "2026-01-02",
+        charged_kwh=1.5,
+        discharged_kwh=1.0,
+        charge_cost_eur=0.3,
+        discharge_value_eur=0.05,
+        grid_measured=1,
+        load_measured=1,
+        pv_measured=0,
+        battery_measured=1,
+    )
+    fresh = store.savings_daily_range("2026-01-02", "2026-01-02")[0]
+    assert fresh["charged_kwh"] == 1.5 and fresh["discharged_kwh"] == 1.0
+    assert fresh["charge_cost_eur"] == 0.3 and fresh["discharge_value_eur"] == 0.05
+    assert fresh["battery_measured"] == 1 and fresh["pv_measured"] == 0
+
+
+def test_schema_v2_migrates_a_v1_database_and_keeps_its_rows(tmp_path):
+    """A database written by 0.12.0 opens, migrates forward and reports old rows as unknown."""
+    path = tmp_path / "v1.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version(version) VALUES(1)")
+    for statement in MIGRATIONS[0][1]:
+        conn.execute(statement)
+    conn.execute(
+        "INSERT INTO savings_daily(day, import_kwh, cost_eur, baseline_cost_eur, savings_eur, battery_cycles)"
+        " VALUES('2026-01-01', 2.0, 0.4, 0.6, 0.2, 0.5)"
+    )
+    conn.commit()
+    conn.close()
+    store = Store(path)
+    try:
+        row = store.savings_daily_range("2026-01-01", "2026-01-01")[0]
+        assert row["savings_eur"] == 0.2 and row["battery_cycles"] == 0.5
+        assert row["charged_kwh"] is None and row["battery_measured"] is None  # unknown, not 0
+        store.upsert_savings_daily("2026-01-02", charged_kwh=1.5, battery_measured=1)
+        assert store.savings_daily_range("2026-01-02", "2026-01-02")[0]["charged_kwh"] == 1.5
+        version = store.connection.execute("SELECT version FROM schema_version").fetchone()[0]
+        assert version == SCHEMA_VERSION == 2
+    finally:
+        store.close()
 
 
 def make_plan(moment, slots=2):

@@ -39,7 +39,7 @@ from .models import (
 
 __all__ = ["DEFAULT_RETENTION", "SCHEMA_VERSION", "Store"]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Forward-only. Append new (version, statements) entries; never edit a released entry.
 MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
@@ -171,6 +171,25 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
             "CREATE INDEX IF NOT EXISTS idx_actuals_ts ON actuals(ts)",
         ),
     ),
+    (
+        2,
+        (
+            # 0.13.0 measured savings: measured AC battery flows, their value at flow time, and the
+            # per-day coverage flags for the series the accounting was built from.  Forward-only
+            # ALTERs: old rows keep their NULLs, which the aggregator reports as unknown.
+            "ALTER TABLE savings_daily ADD COLUMN charged_kwh REAL",
+            "ALTER TABLE savings_daily ADD COLUMN discharged_kwh REAL",
+            "ALTER TABLE savings_daily ADD COLUMN charge_cost_eur REAL",
+            "ALTER TABLE savings_daily ADD COLUMN discharge_value_eur REAL",
+            "ALTER TABLE savings_daily ADD COLUMN grid_measured INTEGER",
+            "ALTER TABLE savings_daily ADD COLUMN load_measured INTEGER",
+            "ALTER TABLE savings_daily ADD COLUMN pv_measured INTEGER",
+            "ALTER TABLE savings_daily ADD COLUMN battery_measured INTEGER",
+            # Sell price at measurement time, so a measured discharge can be priced the same way a
+            # measured import already is (price_buy).
+            "ALTER TABLE actuals ADD COLUMN price_sell REAL",
+        ),
+    ),
 ]
 
 #: Retention policy used by :meth:`Store.trim` (SPEC.md section 11).
@@ -189,6 +208,7 @@ _ACTUAL_COLUMNS = (
     "battery_kw",
     "soc_kwh",
     "price_buy",
+    "price_sell",
     "plan_power_w",
     "dispatch_power_w",
 )
@@ -202,6 +222,14 @@ _SAVINGS_COLUMNS = (
     "savings_eur",
     "pv_kwh",
     "battery_cycles",
+    "charged_kwh",
+    "discharged_kwh",
+    "charge_cost_eur",
+    "discharge_value_eur",
+    "grid_measured",
+    "load_measured",
+    "pv_measured",
+    "battery_measured",
 )
 
 
