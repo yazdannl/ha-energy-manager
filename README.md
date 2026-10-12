@@ -120,6 +120,7 @@ disclosure per group).
 | `solar.source` | `forecast_solar` | The single source used when `solar.sources` is empty: `forecast_solar` (per-plane API), `capacity` (enter the array's Wp) or `derived` (learn the array from the meter's export moments; also used automatically when `forecast_solar` has no planes and a meter resolves). |
 | `solar.sources` / `solar.merge_strategy` | unset / `weighted_mean` | Optional merge list `[{source, weight, ...}]` that combines several forecasts into one series: `forecast_solar`, `ha_energy` (every solar-forecast provider already configured in your Home Assistant **Energy dashboard**, e.g. Solcast), `capacity` and `derived`, each with a finite weight `> 0`. The strategy is `weighted_mean`, `median` or `max`; a failed source is skipped, and an empty list keeps `solar.source` alone. The Solar card edits the list with add/remove/reorder. |
 | `optimizer.allow_export` | `false` | Export scheduling stays off until you enable it. |
+| `protection.cell_voltage_enabled` | `false` | Watch the lowest cell voltage (a mapped `cell_voltage_entity`, or the `zendure_native` driver's own read) and latch an emergency charge below `protection.cell_voltage_cutoff_v`; blocked from discharging until it recovers to `protection.cell_voltage_resume_v`. `protection.emergency_charge_power_w` 0 = the battery's own `max_charge_w`. See the safety model. |
 
 If the **Meter** card is left empty, the add-on resolves the meter from your Home Assistant **Energy
 dashboard** (the same grid source the Energy panel already uses): the dashboard's signed power sensor
@@ -270,22 +271,31 @@ The shipped defaults cannot move hardware, and the guarantees are enforced in co
    computed, validated and logged as a dry-run dispatch instead of being sent.
 4. Every requested power passes an ordered check before it reaches a device: mode, override/kill
    switch, measurement staleness (hold if older than the configured limit), Home Assistant and
-   battery availability, SoC floor and ceiling, per-battery and aggregate power limits, grid import
-   and export limits, and finally a 1000 W per tick ramp limit. The checks are pure functions, so
-   the whole table is unit-tested without hardware.
-5. **No interleaved writers.** Control ticks, `Stop now` and mode changes are serialised behind one
+   battery availability, the cell-voltage guard, SoC floor and ceiling, per-battery and aggregate
+   power limits, grid import and export limits, and finally a 1000 W per tick ramp limit. The checks
+   are pure functions, so the whole table is unit-tested without hardware.
+5. **Minimum cell-voltage protection (off by default).** With `protection.cell_voltage_enabled` on,
+   the add-on watches the lowest **cell** voltage — a mapped `cell_voltage_entity`, or the
+   `zendure_native` driver's own read — and never guesses one. Below the cutoff the battery is
+   latched into an emergency charge (discharge blocked, charged at
+   `min(max_charge_w, emergency_charge_power_w or max_charge_w)` regardless of price/plan, still
+   inside max SoC and the ramp); between cutoff and resume it is only blocked from discharging; at
+   or above resume the latch clears. A stale reading keeps the previous latch (fail-safe) and is
+   noted, a never-seen voltage leaves it inactive, and the latch survives a restart. `advisory` and
+   `dry_run` still alert and log it, without a write.
+6. **No interleaved writers.** Control ticks, `Stop now` and mode changes are serialised behind one
    engine control lock, and every battery driver serialises its own device writes, so a stop cannot
    race a tick that is already writing and the exit hold cannot interleave with one. If the process
    is killed before it can hold and a setpoint was live, the persisted latch makes the next start
    neutralise it.
-6. **`Stop now` is atomic and honest.** Authority is revoked first (mode `advisory`, persisted and
+7. **`Stop now` is atomic and honest.** Authority is revoked first (mode `advisory`, persisted and
    published), any in-flight tick is drained, and only then is hardware neutralised — for real, and
    only where a setpoint was actually left running. The response reports the mode that is really in
    force, and `pending_holds` in the status shows a neutralising hold that is still outstanding.
-7. **Leaving live control is a real write.** Switching to `advisory`/`off`, turning `dry_run` back
+8. **Leaving live control is a real write.** Switching to `advisory`/`off`, turning `dry_run` back
    on, or PATCHing the settings while the add-on is live neutralises the batteries for real instead
    of merely stopping new setpoints.
-8. A blocked or clamped action is always visible: an alert, a dispatch-log row and a banner in the
+9. A blocked or clamped action is always visible: an alert, a dispatch-log row and a banner in the
    UI, each with a stable reason slug. On an unrecoverable error the failsafe writes 0 W (hold)
    rather than guessing a setpoint.
 

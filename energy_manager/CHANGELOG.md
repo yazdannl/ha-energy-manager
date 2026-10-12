@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.16.0
+
+- **A critically low cell now charges the pack out of danger instead of letting it discharge.**
+  With `protection.cell_voltage_enabled` on (off by default) the add-on watches the **lowest cell
+  voltage** — a mapped `cell_voltage_entity` (read like every other measurement, with the same
+  freshness rules), or the `zendure_native` driver's own `read_cell_voltage()` hook when no entity
+  is mapped. Below `protection.cell_voltage_cutoff_v` the battery is **latched**: discharge is
+  blocked and it is charged at `min(max_charge_w, protection.emergency_charge_power_w or
+  max_charge_w)` regardless of price or plan, still respecting max SoC and the per-tick ramp.
+  Between the cutoff and `protection.cell_voltage_resume_v` it is blocked from discharging only; at
+  or above the resume voltage the latch clears and normal planning returns. The two stable reasons
+  `cell_voltage_guard` and `cell_voltage_emergency_charge` appear in the dispatch log and as
+  rate-limited alerts. `protection.cell_voltage_warning_v` is the advisory threshold inside the
+  band and must sit above the cutoff (as must the resume voltage), validated at save time.
+- **The guard fails safe and survives a restart.** A stale or unreadable voltage keeps the previous
+  latch (and its emergency charge) and raises a `cell_voltage_stale` note; a battery whose voltage
+  was never seen stays inactive, and a zero or missing reading is never treated as a voltage. The
+  per-battery latch is stored in the runtime profile and restored on boot, so a restart cannot
+  silently resume discharging a pack that was charging out of a low cell.
+- **Advisory and dry-run still see it, without a write.** The guard is evaluated before the
+  authority gate, so advisory/off and dry-run log the reason and raise the alert but issue no
+  service call; `auto` with dry run off writes the emergency charge for real. The status API gains
+  a `cell_voltage` block (thresholds, latch, per-battery readings) and each battery a
+  `cell_voltage_v`, and the Batteries card states the voltage and marks a latched battery.
+- **The guard is a pure, ordered clause of `control.safety.check`** (SPEC 9.3 clause 4b) and is
+  unit-tested without hardware, alongside the existing SoC/power/grid/ramp clauses whose order and
+  semantics are unchanged.
+
 ## 0.15.0
 
 - **Zendure hardware can now be driven directly, with no `zendure_ha` integration.** The new

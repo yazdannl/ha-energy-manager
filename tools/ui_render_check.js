@@ -153,6 +153,20 @@ function classTokens(text) {
     capacityText.slice(0, 240),
   );
 
+  /* ---------- 1a2. cell-voltage protection on the Batteries card (SPEC 9.3) ---------- */
+  console.log("\n1a2. batteries card: cell voltage and the guard");
+  const cellText = allText(view());
+  check(
+    "the batteries card states the lowest cell voltage",
+    /Cell voltage/.test(cellText) && /3\.050 V/.test(cellText),
+    cellText.slice(0, 240),
+  );
+  check(
+    "the batteries card marks a latched battery",
+    /low cell voltage/.test(cellText) && /discharge blocked/.test(cellText),
+    cellText.slice(0, 240),
+  );
+
   /* ---------- 1b. quiet refresh ---------- */
   // A background refresh must update in place, never duplicate the answer and never re-render the
   // route (UI_REVIEW §3.5). This runs before the settings checks so no dirty-form guard is active.

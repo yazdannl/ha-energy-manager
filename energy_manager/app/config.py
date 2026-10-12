@@ -35,6 +35,8 @@ __all__ = [
     "coerce_setting",
     "load_options",
     "merge_mapping_patch",
+    "protection_patch_errors",
+    "protection_problem",
     "redact_battery_mapping",
     "resolve_location",
     "setting_descriptors",
@@ -183,6 +185,15 @@ DEFAULTS: dict[str, Any] = {
     "control.stale_state_seconds": 180,
     "control.stale_plan_seconds": 1800,
     "control.failsafe_on_error": True,
+    # -- cell-voltage protection (SPEC 9.3 clause 4b, 0.16.0) -----------------------------
+    # Disabled by default. Voltages are per cell, never a pack total; enabling it needs a real
+    # min-cell-voltage source (a mapped entity, or the zendure_native driver's own read).
+    # ``emergency_charge_power_w`` 0 means "use the battery's own max_charge_w".
+    "protection.cell_voltage_enabled": False,
+    "protection.cell_voltage_warning_v": 3.10,
+    "protection.cell_voltage_cutoff_v": 3.00,
+    "protection.cell_voltage_resume_v": 3.18,
+    "protection.emergency_charge_power_w": 0.0,
     # -- notifications ---------------------------------------------------------------------
     "notify.enabled": True,
     "notify.persistent": True,
@@ -201,6 +212,16 @@ DEFAULTS: dict[str, Any] = {
 
 #: Add-on options whose stored value wins; a mismatch is warned about at load (never flipped).
 OPTION_OVERRIDE_KEYS = ("mode", "dry_run")
+
+#: The cell-voltage protection keys (SPEC 3/9.3). They are validated as a group, because the
+#: ordering constraints span keys: ``warning_v`` and ``resume_v`` must both sit above ``cutoff_v``.
+_PROTECTION_KEYS = (
+    "protection.cell_voltage_enabled",
+    "protection.cell_voltage_warning_v",
+    "protection.cell_voltage_cutoff_v",
+    "protection.cell_voltage_resume_v",
+    "protection.emergency_charge_power_w",
+)
 
 _MODE_CHOICES = ("off", "advisory", "auto")
 _LOG_CHOICES = ("debug", "info", "warning", "error")
@@ -361,12 +382,65 @@ SETTINGS_META: dict[str, _Meta] = {
     "control.stale_state_seconds": _Meta("int", "control", "Stale state seconds", "Older measurement means hold power.", minimum=5, maximum=3600, advanced=True),
     "control.stale_plan_seconds": _Meta("int", "control", "Stale plan seconds", "Refuse to dispatch an active plan older than this.", minimum=60, maximum=86400, advanced=True),
     "control.failsafe_on_error": _Meta("bool", "control", "Fail safe on error", "Write 0 W on unrecoverable error."),
+    "protection.cell_voltage_enabled": _Meta("bool", "safety", "Cell-voltage protection", "Watch the lowest cell voltage and charge the pack out of danger. Needs a min-cell-voltage entity mapped on the battery, or the zendure_native driver's own read; never a pack total."),
+    "protection.cell_voltage_warning_v": _Meta("float", "safety", "Warning cell voltage", "Volts per cell; must be above the cutoff. Informational only.", minimum=0.0, maximum=10.0),
+    "protection.cell_voltage_cutoff_v": _Meta("float", "safety", "Cutoff cell voltage", "Below this the battery is latched into an emergency charge and may not discharge.", minimum=0.0, maximum=10.0),
+    "protection.cell_voltage_resume_v": _Meta("float", "safety", "Resume cell voltage", "At or above this the latch clears and normal planning resumes; must be above the cutoff.", minimum=0.0, maximum=10.0),
+    "protection.emergency_charge_power_w": _Meta("float", "safety", "Emergency charge power W", "Charge power for a latched battery, capped by its own max charge. 0 = use max_charge_w.", minimum=0.0, maximum=100000.0),
     "notify.enabled": _Meta("bool", "notify", "Notifications", ""),
     "notify.persistent": _Meta("bool", "notify", "Persistent notification", "Also create an HA persistent notification.", advanced=True),
     "notify.mobile_service": _Meta("str", "notify", "Mobile service", "e.g. notify.example_mobile_app; empty = off.", advanced=True),
     "notify.events": _Meta("multi_choice", "notify", "Notify on events", "", _NOTIFY_EVENT_CHOICES, advanced=True),
     "batteries": _Meta("json", "batteries", "Batteries", "Managed by the battery wizard, not the settings form.", advanced=True),
 }
+
+
+def _number_or(value: Any, fallback: float) -> float:
+    """A finite float for a settings value, else the fallback (never raises, never guesses)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return float(fallback)
+    number = float(value)
+    return number if math.isfinite(number) else float(fallback)
+
+
+def protection_problem(values: Mapping[str, Any]) -> str | None:
+    """Cross-key validation of the protection trio (SPEC 3/9.3): warning and resume above cutoff.
+
+    Applies regardless of ``cell_voltage_enabled``: an ordering that is invalid while disabled
+    would silently become dangerous the moment it is switched on.
+    """
+    cutoff = _number_or(values.get("protection.cell_voltage_cutoff_v"), 3.00)
+    warning = _number_or(values.get("protection.cell_voltage_warning_v"), 3.10)
+    resume = _number_or(values.get("protection.cell_voltage_resume_v"), 3.18)
+    if warning <= cutoff:
+        return "protection.cell_voltage_warning_v must be above protection.cell_voltage_cutoff_v"
+    if resume <= cutoff:
+        return "protection.cell_voltage_resume_v must be above protection.cell_voltage_cutoff_v"
+    return None
+
+
+def protection_patch_errors(
+    values: Mapping[str, Any], current: Mapping[str, Any]
+) -> dict[str, str]:
+    """Per-key errors for a protection patch, judged on the patch's *final* state.
+
+    A save that moves cutoff and warning together must be accepted or rejected as a whole, never
+    rejected because the first key happened to be applied before the second.
+    """
+    pending = {key: value for key, value in values.items() if key in _PROTECTION_KEYS}
+    if not pending:
+        return {}
+    effective = {key: current.get(key) for key in _PROTECTION_KEYS}
+    errors: dict[str, str] = {}
+    for key, value in pending.items():
+        try:
+            effective[key] = coerce_setting(key, value)
+        except ConfigError as err:
+            errors[key] = str(err)
+    if errors:
+        return errors
+    problem = protection_problem(effective)
+    return {key: problem for key in pending} if problem else {}
 
 
 def load_options(path: str = "/data/options.json") -> dict:
@@ -631,20 +705,40 @@ class Settings:
     def set(self, key: str, value: Any) -> Any:
         """Validate and persist one setting; returns the coerced value."""
         coerced = coerce_setting(key, value)
+        if key in _PROTECTION_KEYS:
+            # Single-key saves are still judged against the trio's current values (SPEC 3/9.3).
+            problem = protection_patch_errors(
+                {key: coerced}, {name: self.get(name) for name in _PROTECTION_KEYS}
+            ).get(key)
+            if problem:
+                raise ConfigError(problem)
+        self._persist_setting(key, coerced)
+        return coerced
+
+    def _persist_setting(self, key: str, coerced: Any) -> None:
         if key == "batteries":
             raise ConfigError("use the battery helpers to change batteries")
         if self.store is not None:
             self.store.set_setting(key, coerced)
         self._memory[key] = coerced
-        return coerced
 
     def update(self, values: Mapping[str, Any]) -> tuple[list[str], list[dict[str, str]]]:
-        """Apply a settings patch; returns ``(applied keys, errors)``."""
+        """Apply a settings patch; returns ``(applied keys, errors)``.
+
+        The protection trio is validated as a whole first, so a patch that moves several of its
+        keys at once is judged on its final state rather than on a half-applied one.
+        """
         applied: list[str] = []
         errors: list[dict[str, str]] = []
+        protection_errors = protection_patch_errors(
+            values, {name: self.get(name) for name in _PROTECTION_KEYS}
+        )
         for key, value in values.items():
+            if key in protection_errors:
+                errors.append({"key": key, "message": protection_errors[key]})
+                continue
             try:
-                self.set(key, value)
+                self._persist_setting(key, coerce_setting(key, value))
                 applied.append(key)
             except ConfigError as err:
                 errors.append({"key": key, "message": str(err)})

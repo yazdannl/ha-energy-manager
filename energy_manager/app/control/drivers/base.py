@@ -355,6 +355,8 @@ class BaseDriver:
                     "timestamps_seen": bool(timestamps_seen),
                     "stalled_polls": self._stall_polls,
                     "frozen": frozen,
+                    # Optional mapped min-cell voltage (SPEC 9.2/9.3): per cell, never a guess.
+                    "cell_voltage_v": self._mapped_cell_voltage(),
                 },
             )
         except Exception as exc:  # pragma: no cover - defensive, HA facade must not raise
@@ -407,9 +409,18 @@ class BaseDriver:
 
         A driver that can read a real cell voltage (``zendure_native``) overrides this so a
         low-voltage guard can act on it.  The default is None -- an unreadable cell voltage is
-        never guessed from a pack total voltage.
+        never guessed from a pack total voltage.  The hook is the *fallback*: a battery with a
+        ``cell_voltage_entity`` mapped reads that entity instead (``_mapped_cell_voltage``).
         """
         return None
+
+    def _mapped_cell_voltage(self) -> float | None:
+        """The mapped ``cell_voltage_entity`` value in V, else None (per cell, never a guess)."""
+        entity_id = self.config.mapping.get("cell_voltage_entity")
+        if not is_entity_id(entity_id):
+            return None
+        value = self._number(entity_id)
+        return value if value is not None and value > 0.0 else None
 
     # -- writing ----------------------------------------------------------------------
 

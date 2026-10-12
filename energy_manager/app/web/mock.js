@@ -374,7 +374,8 @@
       read_at: iso(Date.now() - 20000),
       last_error: null,
       stale: false,
-      extra: { cycles: 128.5, name: "Example Battery 1" }
+      cell_voltage_v: 3.05,
+      extra: { cycles: 128.5, name: "Example Battery 1", cell_voltage_v: 3.05 }
     };
   }
 
@@ -401,7 +402,8 @@
           mode_select_entity: "select.example_battery_mode",
           mode_manual_value: "manual",
           soc_entity: "sensor.example_battery_soc_1",
-          capacity_entity: "sensor.example_battery_capacity"
+          capacity_entity: "sensor.example_battery_capacity",
+          cell_voltage_entity: "sensor.example_battery_cell_voltage"
         },
         enabled: db.batteryEnabled
       }),
@@ -578,6 +580,12 @@
     ["control.stale_state_seconds", "int", 180, "Stale state seconds", "Older measurement means hold power.", "control", null],
     ["control.stale_plan_seconds", "int", 1800, "Stale plan seconds", "Refuse to dispatch an active plan older than this.", "control", null],
     ["control.failsafe_on_error", "bool", true, "Fail safe on error", "Write 0 W on unrecoverable error.", "control", null],
+
+    ["protection.cell_voltage_enabled", "bool", false, "Cell-voltage protection", "Watch the lowest cell voltage and charge the pack out of danger. Needs a min-cell-voltage entity mapped on the battery, or the zendure_native driver's own read; never a pack total.", "safety", null],
+    ["protection.cell_voltage_warning_v", "float", 3.10, "Warning cell voltage", "Volts per cell; must be above the cutoff. Informational only.", "safety", null],
+    ["protection.cell_voltage_cutoff_v", "float", 3.00, "Cutoff cell voltage", "Below this the battery is latched into an emergency charge and may not discharge.", "safety", null],
+    ["protection.cell_voltage_resume_v", "float", 3.18, "Resume cell voltage", "At or above this the latch clears and normal planning resumes; must be above the cutoff.", "safety", null],
+    ["protection.emergency_charge_power_w", "float", 0, "Emergency charge power W", "Charge power for a latched battery, capped by its own max charge. 0 = use max_charge_w.", "safety", null],
 
     ["notify.enabled", "bool", true, "Notifications", "", "notify", null],
     ["notify.persistent", "bool", true, "Persistent notification", "Also create an HA persistent notification.", "notify", null],
@@ -950,6 +958,17 @@
       next_cheap_window: [iso(Date.now() + 3 * 3600000), iso(Date.now() + 4 * 3600000)],
       next_expensive_window: [iso(Date.now() + 6 * 3600000), iso(Date.now() + 7 * 3600000)],
       override: db.override,
+      cell_voltage: {
+        enabled: true,
+        cutoff_v: 3.0,
+        warning_v: 3.1,
+        resume_v: 3.18,
+        emergency_charge_power_w: 0,
+        latched: ["battery_1"],
+        batteries: [
+          { battery_id: "battery_1", voltage_v: 3.05, fresh: true, seen: true, latched: true, block_discharge: true, force_charge_w: null, reason: "cell_voltage_guard", note: "cell voltage is below the warning threshold" }
+        ]
+      },
       pending_holds: db.pendingHolds.slice(),
       mode_persisted: db.modePersisted,
       alerts: [

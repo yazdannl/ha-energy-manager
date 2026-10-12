@@ -77,12 +77,15 @@ def allocate_power(
     *,
     slot_hours: float = DEFAULT_SLOT_HOURS,
     reserve_soc_pct: float = 0.0,
+    block_discharge_ids: Sequence[str] | None = None,
 ) -> list[tuple[BatteryConfig, float]]:
     """Split ``target_w`` (AC side, + charge / - discharge) across the enabled batteries.
 
     Returns one entry per enabled battery, in stable id order, including zeros.  The sum is the
     requested total minus whatever is physically impossible.  ``reserve_soc_pct``
     (``optimizer.reserve_soc_pct``) is enforced on every battery, not on the aggregate.
+    ``block_discharge_ids`` are batteries a guard (e.g. low cell voltage) must never discharge:
+    their discharge room is zero, so the shortfall is redistributed to the others.
     """
     energies = energies_kwh or {}
     enabled = sorted((b for b in batteries if b.enabled), key=lambda b: b.id)
@@ -106,6 +109,11 @@ def allocate_power(
             reserve_soc_pct=reserve_soc_pct,
         )
         room.append(max(0.0, min(free, limit(battery))))
+    blocked = set(block_discharge_ids or ())
+    if not charging and blocked:
+        for index, battery in enumerate(enabled):
+            if battery.id in blocked:
+                room[index] = 0.0
 
     total_room = sum(room)
     allocated = [0.0] * len(enabled)

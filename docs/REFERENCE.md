@@ -238,7 +238,7 @@ Panel: **Battery fleet**. Per battery card:
 | Cycle count | from `state.extra.cycles`, else `not reported` |
 | Limits & SoC window | charge/discharge limits, min/max SoC |
 | Mapping | list of mapped entities plus `mapping resolved` / `needs confirmation` badge |
-| Live values | power, SoC, energy, temperature, read age |
+| Live values | power, SoC, energy, temperature, read age, **cell voltage** (lowest per-cell V, or `not reported`) and a **Protection** state (`off`, `normal`, `discharge blocked` or `emergency charge active`), with a `low cell voltage` badge on a latched battery |
 | Actions | enable/disable (confirm when enabling), `Test discharge` (disabled unless `mode=auto` and dry run off; confirm + checkbox), edit, delete (confirm + checkbox) |
 
 **Add/edit wizard**
@@ -272,6 +272,7 @@ Panel: **Battery fleet**. Per battery card:
 | `mode_select_entity` | Mode select entity |
 | `soc_entity` | State of charge sensor |
 | `capacity_entity` | Capacity sensor |
+| `cell_voltage_entity` | Lowest cell voltage sensor (per cell, V) |
 
 | `zendure` | Label |
 | --- | --- |
@@ -286,6 +287,7 @@ Panel: **Battery fleet**. Per battery card:
 | `available_kwh_entity` | Usable energy above the minimum SoC (kWh) |
 | `pv_power_entity` | PV power sensor |
 | `output_power_entity` | Output power sensor |
+| `cell_voltage_entity` | Lowest cell voltage sensor (per cell, V) |
 | `ac_mode_entity` | AC mode entity |
 
 Non-entity role: `mode_manual_value` — `Manual mode value (e.g. manual)`.
@@ -354,7 +356,8 @@ typed entity id is always accepted.
 - navigation-away with unsaved changes asks first.
 
 **Safety handling** — the `Safety` group never folds. Keys matching
-`reserve_soc_pct|max_grid_import_w|max_grid_export_w|allow_export|control.failsafe_on_error` are
+`reserve_soc_pct|max_grid_import_w|max_grid_export_w|allow_export|control.failsafe_on_error`, and
+every key the server puts in the `Safety` group (the `protection.cell_voltage_*` keys), are
 flagged with a `money/safety` badge and require a confirmation dialog before saving. Password fields
 are never echoed: an existing value shows `(a value is set; leave empty to keep it)` and is only sent
 when a new value is typed. `batteries` is server-managed by the wizard: the drawer renders it as a
@@ -602,11 +605,22 @@ dashboard's own roles beside it, and a `Use the Energy dashboard` button clears 
 
 #### Safety (never folded)
 
-`control.failsafe_on_error` is the one `control.*` key that lives in the Safety group. The five safety
-keys the UI never hides:
+The Safety group is never folded and is always shown. It holds the authority keys the engine will
+not let a plan override — the SoC/grid limits (`optimizer.reserve_soc_pct`,
+`optimizer.max_grid_import_w`, `optimizer.max_grid_export_w`, `optimizer.allow_export`),
+`control.failsafe_on_error`, and the cell-voltage protection keys:
 
-`optimizer.reserve_soc_pct`, `optimizer.max_grid_import_w`, `optimizer.max_grid_export_w`,
-`optimizer.allow_export`, `control.failsafe_on_error`.
+| Key | Type | Default | Bounds | Label — help |
+| --- | --- | --- | --- | --- |
+| `protection.cell_voltage_enabled` | bool | `false` | — | **Cell-voltage protection** — watch the lowest cell voltage and charge the pack out of danger; needs a mapped min-cell-voltage entity or the `zendure_native` driver's own read |
+| `protection.cell_voltage_warning_v` | float | `3.10` | 0…10 | **Warning cell voltage** — volts per cell; must be above the cutoff. Informational only |
+| `protection.cell_voltage_cutoff_v` | float | `3.00` | 0…10 | **Cutoff cell voltage** — below this the battery latches into an emergency charge and may not discharge |
+| `protection.cell_voltage_resume_v` | float | `3.18` | 0…10 | **Resume cell voltage** — at or above this the latch clears; must be above the cutoff |
+| `protection.emergency_charge_power_w` | float | `0` | 0…100000 | **Emergency charge power W** — charge power for a latched battery, capped by its own max charge; 0 = use `max_charge_w` |
+
+`warning_v` and `resume_v` must both be **above** `cutoff_v`; the check is enforced at save time on
+the patch's final state, so moving cutoff and warning together in one `PATCH /api/v1/config` is
+judged as a whole. The ordering is validated even while `cell_voltage_enabled` is false.
 
 #### Notify
 
@@ -652,9 +666,10 @@ finite number > 0`); `PATCH /api/v1/config` reports it per key and nothing is ap
 `solar.merge_strategy` must be `weighted_mean`, `median` or `max`.
 
 **Group names in the API** — `SETTINGS_META.group` is lowercase; `GET /api/v1/config` title-cases it
-(`general` → `General`), and moves exactly five keys into the `Safety` group regardless of their
+(`general` → `General`), and moves exactly ten keys into the `Safety` group regardless of their
 `SETTINGS_META` group: `optimizer.reserve_soc_pct`, `optimizer.max_grid_import_w`,
-`optimizer.max_grid_export_w`, `optimizer.allow_export`, `control.failsafe_on_error`.
+`optimizer.max_grid_export_w`, `optimizer.allow_export`, `control.failsafe_on_error`, and the five
+`protection.cell_voltage_*` keys.
 
 **Secrets are never echoed** — any settings key whose name contains `key`, `token`, `secret`,
 `password` or `passwd` is reported with type `password` and its value replaced by `***` when set (for
@@ -670,7 +685,7 @@ new value when the user types one.
 `price.fixed_day_price_eur_per_kwh`, `price.fixed_night_price_eur_per_kwh`, `grid.power_entity`,
 `solar.enabled`, `solar.source`, `solar.measured_entity`, `optimizer.horizon_hours`,
 `optimizer.allow_grid_charge`,
-`optimizer.min_spread_eur_per_kwh`, plus the five Safety keys. Everything else is `advanced: true`
+`optimizer.min_spread_eur_per_kwh`, plus the ten Safety keys. Everything else is `advanced: true`
 (this includes the advanced wear override `optimizer.cycle_cost_eur_per_kwh` and
 `solar.nasa_irradiance`).
 
@@ -1223,6 +1238,17 @@ result is then clipped by every limit inside `safety.check`.
 3. / 4. Batteries usable? Disabled, unavailable, missing or stale readings are excluded and named in
    `blocked_ids` (`battery_unavailable`, `stale_state`); HA disconnected blocks everything
    (`ha_disconnected`). No usable battery blocks (`battery_unavailable`).
+4b. **Cell-voltage guard** (`protection.cell_voltage_*`, off by default) — evaluated per battery
+   before the authority gate, so advisory/off and dry-run alert and log without writing. Below
+   `cell_voltage_cutoff_v` the battery latches an emergency charge at
+   `min(max_charge_w, emergency_charge_power_w or max_charge_w)` and may not discharge; between the
+   cutoff and `cell_voltage_resume_v` discharge is blocked and no charge is forced; at or above the
+   resume voltage the latch clears. A stale reading keeps the previous latch (fail-safe, noted); a
+   voltage never seen leaves the guard inactive. Reasons `cell_voltage_guard` /
+   `cell_voltage_emergency_charge` / `cell_voltage_stale`; the per-battery latch is persisted and
+   restored on boot. In a mixed fleet only the latched battery is blocked (the dispatcher passes
+   `block_discharge_ids` to `allocate_power`); when every usable battery is latched the aggregate
+   floor is raised to 0 W.
 5. **SoC clamp** — ceiling: `(E_max − e) / (dt * eta_chg)`; floor: `−(e − E_min) * eta_dis / dt`,
    where `E_min` uses `max(min_soc_pct, reserve_soc_pct)` per battery.
 6. **Power clamp** — aggregated limits `Σ max_charge_w` / `Σ max_discharge_w`.
@@ -1262,6 +1288,14 @@ discharge is an override, so it is still bounded by the battery's own floor/ceil
 
 Protocol: `id()`, `read_state()`, `apply(power_w, dry_run)`, `hold(dry_run)`, `capabilities()`.
 Writes go through the HA service API or state-setting where no service exists.
+
+Every driver also reads an optional mapped `cell_voltage_entity` into
+`BatteryState.extra["cell_voltage_v"]` — the lowest **per-cell** voltage in V, with the same freshness
+rules as every other measurement, never a pack total. That mapped entity is the primary cell-voltage
+source; `read_cell_voltage()` is the optional driver hook (`zendure_native` implements it from
+`packData[].minVol`) used only when no entity is mapped, and it is deliberately off the
+`BatteryDriver` protocol so other drivers ignore it. A missing/unreadable reading is None, never a
+guess.
 
 - **Idempotent within a slot**: no write when the device already reports the target within tolerance
   (the SolarFlow is BLE/cloud with a finite write budget). Result code `idempotent_skip`.
@@ -1488,7 +1522,7 @@ supplies it (which is why publishing a port would hand battery control to anyone
 | Method & route | Body / query | Returns |
 | --- | --- | --- |
 | `GET /api/v1/health` | — | `{status, version, uptime_s, commit}` |
-| `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]`, `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
+| `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]` (each with `cell_voltage_v`), `cell_voltage{enabled,cutoff_v,warning_v,resume_v,emergency_charge_power_w,latched[],batteries[{battery_id,voltage_v,fresh,seen,latched,block_discharge,force_charge_w,reason,note}]}` (additive, 0.16.0), `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
 | `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, slot_minutes, feasible, infeasible_reason, mode, dry_run, sources{}, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; `slot_minutes` is the plan's own resolution (the UI never assumes one); with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` and `slot_minutes: null` |
 | `GET /api/v1/plan/execution` | `hours` | additive (0.10.0): `{generated_at, slot_minutes, now, floors{reserve_soc_pct, min_soc_pct, floor_soc_pct}, batteries[{id, name, min_soc_pct, floor_soc_pct, capacity_kwh}], progress{…}, slots[{t, dispatch, actual}]}` — the same slot grid as `/plan`, joined with the persisted 5-minute actuals and the dispatch log. `dispatch` is the last attempt per battery in that slot (`requested_w`, `applied_w`, `ok`, `dry_run`, `clamped`, `code`, `reason`, `message`, `records`, `batteries[]`) and `actual` the measured aggregate (`samples`, `coverage_pct`, `pv_kw`, `load_kw`, `grid_kw`, `battery_kw`, `planned_kw`, `measured_kw`, `import_kwh`, `export_kwh`, `charged_kwh`, `discharged_kwh`, `soc_kwh_start`, `soc_kwh_end`). Both are `null` for a slot nothing was measured or dispatched in — never a fabricated zero |
 | `POST /api/v1/plan/recompute` | — | `{queued: true}` (async; poll status) |

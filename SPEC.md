@@ -236,6 +236,11 @@ control.grid_follow_max_ratio  0.5
 control.grid_follow_max_w      0     # 0 = derive the absolute grid-follow budget from capability x ratio (min 500 W)
 control.stale_state_seconds    180   # older measurement => hold power
 control.failsafe_on_error       true # write 0 W on unrecoverable error
+protection.cell_voltage_enabled false # 0.16.0: watch the lowest cell and charge it out of danger
+protection.cell_voltage_warning_v 3.10 # advisory per-cell threshold inside the cutoff..resume band
+protection.cell_voltage_cutoff_v  3.00 # below this: latch emergency charge, block discharge
+protection.cell_voltage_resume_v  3.18 # at/above this: clear the latch and plan normally
+protection.emergency_charge_power_w 0  # 0 = use the battery's own max_charge_w
 notify.enabled           true
 notify.persistent        true        # HA persistent notification
 notify.mobile_service    ""          # e.g. notify.example_mobile_app, empty = off
@@ -780,6 +785,13 @@ mismatch as a driver error (not a silent success). It must never write to `soc_s
 every tick — SoC floors are expressed as optimized power, with the device SoC limits configured
 separately and rarely.
 
+Every driver reads an optional mapped `cell_voltage_entity` (0.16.0) into
+`BatteryState.extra["cell_voltage_v"]` — the lowest per-cell voltage in V, with the same freshness
+rules as every other measurement, never a pack total and never a guess. That mapped entity is the
+primary cell-voltage source; `read_cell_voltage()` is the optional driver hook
+(`zendure_native` implements it) used only when no entity is mapped. The hook stays off the
+`BatteryDriver` protocol so drivers that cannot read a cell voltage simply ignore it.
+
 `native.py` (0.15.0) must: speak the device's local HTTP JSON API with `urllib`/`http.client`/`ssl`
 only (no third-party dependency), address the device by its required `sn`, read SoC / the measured
 AC pair / PV / the device's own limits / pack voltages, write charge and discharge as the property
@@ -803,6 +815,20 @@ clamped: bool, reasons: list[str], block: bool)` enforcing, in order:
 2. Kill switch / override active → block or return the override power.
 3. State older than `control.stale_state_seconds` → block (hold).
 4. HA disconnected or battery unavailable → block for that battery.
+4b. **Cell-voltage guard (0.16.0, `protection.cell_voltage_*`, off by default).** The lowest cell
+   voltage is read per battery from the mapped `cell_voltage_entity`, else the driver's optional
+   `read_cell_voltage()` hook. Below `cell_voltage_cutoff_v` the battery **latches** an emergency
+   charge: discharge is blocked and it is charged at
+   `min(max_charge_w, emergency_charge_power_w or max_charge_w)` regardless of price/plan, still
+   inside its own limits, max SoC and the ramp. Between the cutoff and `cell_voltage_resume_v`
+   discharge is blocked and no charge is forced; at or above the resume voltage the latch clears.
+   A stale or unreadable reading keeps the previous latch (fail-safe) and is noted; a voltage that
+   was never seen leaves the guard inactive. Reasons `cell_voltage_guard` /
+   `cell_voltage_emergency_charge` / `cell_voltage_stale`; the latch is persisted per battery and
+   restored on boot. The guard is a pure function evaluated before the authority gate, so
+   advisory/off and dry-run alert and log without writing, and a latched battery may not be
+   discharged until it recovers. `cell_voltage_warning_v` and `cell_voltage_resume_v` must sit
+   above the cutoff, validated at save time.
 5. SoC clamp: no charge above `E_max`, no discharge below `E_min + reserve`.
 6. Power clamp per battery limits (after allocation) and aggregated limits.
 7. Grid limits: predicted import/export with the requested power must stay inside
@@ -1141,8 +1167,9 @@ suffix - folding is the only signal.
 `control.*` split in two: the control-loop tuning knobs (`control.tick_seconds`,
 `control.replan_minutes`, `control.grid_follow*`, `control.stale_*`) moved out of the never-folding
 Safety group into a foldable `Control` group, while `control.failsafe_on_error` stays in `Safety`.
-The Safety group is now the five keys that can move hardware or change a hard limit, so "never folded"
-still means what it says.
+The Safety group is now the keys that can move hardware or change a hard limit — the five
+SoC/grid/fail-safe keys above plus the five `protection.cell_voltage_*` keys (0.16.0) — so "never
+folded" still means what it says.
 
 ### 13.4 UI tests
 
@@ -1507,6 +1534,25 @@ round, with the reason:
   an unreachable/mismatched-serial config at save time unless `allow_unreachable` is set. The local
   MQTT transport is documented as planned work (it needs a broker), never stubbed; the
   verified-vs-assumed split is in `docs/EXTERNAL_APIS.md` section 6.
+
+- **§3/§9.2/§9.3 (minimum cell-voltage protection; requested 2026-10-12, "protect the pack on low
+  cell voltage and charge it out of danger")** — a per-battery guard is added as clause 4b of the
+  ordered safety table and as the pure function `control.safety.cell_voltage_guard`. The settings
+  group `protection.cell_voltage_*` ships disabled (`enabled false`, warning 3.10 V, cutoff 3.00 V,
+  resume 3.18 V, `emergency_charge_power_w 0` = the battery's own `max_charge_w`) and is
+  cross-validated at save time (warning and resume must both sit above the cutoff). The lowest cell
+  voltage comes from a mapped `cell_voltage_entity` read with the same freshness rules as every
+  other measurement, falling back to the optional `read_cell_voltage()` driver hook only when no
+  entity is mapped; the hook stays off the `BatteryDriver` protocol so other drivers ignore it. Below
+  the cutoff the battery latches: discharge is blocked and it is charged at
+  `min(max_charge_w, emergency_charge_power_w or max_charge_w)` regardless of price/plan, still
+  inside its own limits, max SoC and the ramp; between cutoff and resume only discharge is blocked;
+  at or above resume the latch clears. A stale reading keeps the previous latch and is noted, a
+  never-seen voltage leaves the guard inactive, and the per-battery latch is persisted in the runtime
+  profile and restored on boot. The guard is evaluated before the authority gate so advisory/off and
+  dry-run alert and log with stable reasons (`cell_voltage_guard`, `cell_voltage_emergency_charge`,
+  `cell_voltage_stale`) without writing; `/status` gains a `cell_voltage` block and each battery a
+  `cell_voltage_v`, and the Batteries card states the voltage and marks a latched battery.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

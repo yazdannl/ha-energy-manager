@@ -62,7 +62,7 @@ class GenericDriver(BaseDriver):
                 problems.append("mapping: mode_select_entity must be a select entity")
             if not mapping.get("mode_manual_value"):
                 problems.append("mapping: mode_manual_value is required with mode_select_entity")
-        for key in ("soc_entity", "capacity_entity"):
+        for key in ("soc_entity", "capacity_entity", "cell_voltage_entity"):
             entity_id = mapping.get(key)
             if entity_id and not is_entity_id(entity_id):
                 problems.append(f"mapping: {key} is not an entity id")

@@ -126,6 +126,11 @@ class Reason:
     RAMP_LIMIT = "ramp_limit"
     DRIVER_ERROR = "driver_error"
     IDEMPOTENT_SKIP = "idempotent_skip"
+    # cell-voltage protection (0.16.0): a battery latched below its cutoff may not discharge and
+    # is charged out of danger; a stale reading keeps the previous latch.
+    CELL_VOLTAGE_GUARD = "cell_voltage_guard"
+    CELL_VOLTAGE_EMERGENCY_CHARGE = "cell_voltage_emergency_charge"
+    CELL_VOLTAGE_STALE = "cell_voltage_stale"
     #: The command is in force in Home Assistant, but the device has not followed it yet: an
     #: asynchronous control surface (the Zendure manager applies manual power on its next P1
     #: event) must not be mistaken for a broken one.  Not an error, and never a claim that the

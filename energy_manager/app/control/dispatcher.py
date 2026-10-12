@@ -69,6 +69,8 @@ class TickOutcome:
     measurements: dict[str, Any] = field(default_factory=dict)
     #: Set when the active plan was refused as stale (SPEC 9.1/Reason.STALE_INPUT).
     stale_input: str | None = None
+    #: The cell-voltage guard evaluation for this tick (SPEC 9.3 clause 4b), when enabled.
+    guard: Any = None
 
     @property
     def writes(self) -> int:
@@ -153,15 +155,41 @@ class Dispatcher:
     ) -> list[BatteryState]:
         """One live read per configured battery (SPEC 9.1 step 1).  Never raises."""
         states: list[BatteryState] = []
+        configs = {config.id: config for config in batteries}
         for driver in self._ordered_drivers(batteries):
             try:
-                states.append(driver.read_state())
+                state = driver.read_state()
             except Exception as exc:  # pragma: no cover - read_state must not raise
                 log.warning("driver %s read failed: %s", driver.id(), exc)
-                states.append(
-                    BatteryState(id=driver.id(), available=False, read_at=moment, stale=True)
-                )
+                state = BatteryState(id=driver.id(), available=False, read_at=moment, stale=True)
+            self._attach_cell_voltage(driver, configs.get(driver.id()), state)
+            states.append(state)
         return states
+
+    @staticmethod
+    def _attach_cell_voltage(driver: Any, config: BatteryConfig | None, state: BatteryState) -> None:
+        """Mapped min-cell-voltage entity first; the optional driver hook only as the fallback.
+
+        A driver that reads the voltage itself (``zendure_native``) fills ``extra`` in
+        ``read_state``; the hook is used only when no ``cell_voltage_entity`` is mapped.  A read
+        failure leaves the value None -- the guard then treats it as stale, never as a guess.
+        """
+        mapped = ""
+        mapping = getattr(config, "mapping", None)
+        if isinstance(mapping, Mapping):
+            mapped = str(mapping.get("cell_voltage_entity") or "").strip()
+        if state.extra.get("cell_voltage_v") is not None or mapped:
+            return
+        hook = getattr(driver, "read_cell_voltage", None)
+        if not callable(hook):
+            return
+        try:
+            value = hook()
+        except Exception as exc:  # pragma: no cover - a hook must never break a tick
+            log.debug("driver %s: read_cell_voltage failed: %s", driver.id(), exc)
+            value = None
+        if value is not None:
+            state.extra["cell_voltage_v"] = value
 
     def needs_replan(
         self,
@@ -206,6 +234,7 @@ class Dispatcher:
         batteries: Sequence[BatteryConfig],
         measurements: Mapping[str, Any] | None = None,
         battery_states: Sequence[BatteryState] | None = None,
+        cell_voltage_latch: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> TickOutcome:
         moment = now or self._clock()
         snapshot = dict(measurements or {})
@@ -251,15 +280,41 @@ class Dispatcher:
         outcome.target_w = target
 
         # 3. Guard rails.
-        decision = safety.check(target, slot, batteries, state, self._settings, moment)
+        decision = safety.check(
+            target,
+            slot,
+            batteries,
+            state,
+            self._settings,
+            moment,
+            cell_voltage_latch=cell_voltage_latch,
+        )
         outcome.allowed_w = decision.allowed_w
         outcome.block = decision.block
         outcome.reasons = list(decision.reasons)
+        outcome.guard = decision.guard
+        guard = decision.guard
+        forced: dict[str, float] = {}
+        blocked_discharge: set[str] = set()
+        if guard is not None and guard.enabled:
+            forced = {
+                item.battery_id: float(item.force_charge_w)
+                for item in guard.readings
+                if item.force_charge_w
+            }
+            blocked_discharge = {
+                item.battery_id for item in guard.readings if item.block_discharge
+            }
 
         if decision.block and str(state.mode) != Mode.AUTO.value:
             # Advisory/off: nothing is written, but the log still explains the decision for every
-            # configured battery.
+            # configured battery -- including a cell-voltage guard that would have acted.
             for config in sorted((c for c in batteries if c.enabled), key=lambda c: c.id):
+                reading = guard.reading(config.id) if guard is not None else None
+                code = (reading.reason if reading and reading.reason else None) or decision.reasons[0]
+                message = "; ".join(decision.reasons)
+                if reading is not None and reading.note:
+                    message = f"{message}; {reading.note}"
                 result = DispatchResult(
                     battery_id=config.id,
                     ts=moment,
@@ -267,8 +322,8 @@ class Dispatcher:
                     applied_w=0.0,
                     ok=True,
                     dry_run=bool(state.dry_run),
-                    code=decision.reasons[0],
-                    message="; ".join(decision.reasons),
+                    code=code,
+                    message=message,
                 )
                 outcome.results.append(result)
                 self._journal.dispatch(
@@ -344,10 +399,25 @@ class Dispatcher:
                 {b.id: b.energy_kwh for b in outcome.battery_states},
                 slot_hours=self.tick_interval_s() / 3600.0,
                 reserve_soc_pct=self._reserve_soc_pct(),
+                block_discharge_ids=blocked_discharge,
             )
 
         for config, power in entries:
             live = live_by_id.get(config.id)
+            # A latched battery is charged out of danger regardless of the plan, and may never
+            # discharge until it recovers (SPEC 9.3 clause 4b).  Both stay inside the battery's
+            # own limits, max SoC and the per-tick ramp.
+            if config.id in forced and not decision.block:
+                room = headroom_w(
+                    config,
+                    live.energy_kwh if live is not None else None,
+                    charging=True,
+                    slot_hours=self.tick_interval_s() / 3600.0,
+                    reserve_soc_pct=self._reserve_soc_pct(),
+                )
+                power = min(forced[config.id], room)
+            elif config.id in blocked_discharge:
+                power = max(power, 0.0)
             previous = float(live.power_w or 0.0) if live is not None else 0.0
             applied_target = clamp(power, previous - RAMP_LIMIT_W, previous + RAMP_LIMIT_W)
             applied_target = clamp(applied_target, -config.max_discharge_w, config.max_charge_w)
@@ -388,12 +458,16 @@ class Dispatcher:
                             )
                         )
             outcome.results.append(result)
+            reason = decision.reasons[0] if decision.reasons else result.code
+            specific = guard.reason_for(config.id) if guard is not None else None
+            if specific:
+                reason = specific
             self._journal.dispatch(
                 self._entry(
                     result,
                     mode=str(state.mode),
                     dry_run=bool(state.dry_run),
-                    reason=decision.reasons[0] if decision.reasons else result.code,
+                    reason=reason,
                     soc_pct=self._soc_of(config, live_by_id.get(config.id)),
                 )
             )

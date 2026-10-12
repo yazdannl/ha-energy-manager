@@ -76,7 +76,7 @@ class ApiError(Exception):
 #: page can hide them like any other advanced row.
 SAFETY_KEY_RE = re.compile(
     r"^(optimizer\.(reserve_soc_pct|max_grid_import_w|max_grid_export_w|allow_export)"
-    r"|control\.failsafe_on_error)$"
+    r"|control\.failsafe_on_error|protection\.cell_voltage_)"
 )
 UI_TYPES = {
     "choice": "str",
@@ -564,6 +564,7 @@ def status_dict(
     plan: Plan | None,
     pending_holds: Sequence[str] = (),
     mode_persisted: bool = True,
+    cell_voltage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     now = state.now or datetime.now(timezone.utc)
     override = None
@@ -618,6 +619,9 @@ def status_dict(
                 "timestamps_seen": bool((battery.extra or {}).get("timestamps_seen")),
                 "stalled_polls": int((battery.extra or {}).get("stalled_polls") or 0),
                 "frozen": bool((battery.extra or {}).get("frozen")),
+                # Additive (0.16.0): the lowest cell voltage this battery reported, when a mapped
+                # entity or the driver hook provides one.  None = never a guessed value.
+                "cell_voltage_v": (battery.extra or {}).get("cell_voltage_v"),
                 "last_error": battery.last_error,
             }
             for battery in state.batteries
@@ -656,6 +660,8 @@ def status_dict(
         if state.next_expensive_window
         else None,
         "override": override,
+        # Additive (0.16.0): the cell-voltage guard's thresholds, latch and per-battery readings.
+        "cell_voltage": dict(cell_voltage) if cell_voltage is not None else None,
         "alerts": [
             {
                 "ts": to_iso(alert.ts),
@@ -810,12 +816,14 @@ class ApiServer:
             state = engine.snapshot()
             pending = getattr(engine, "pending_holds", None)
             persisted = getattr(engine, "mode_persisted", None)
+            cell_voltage = getattr(engine, "cell_voltage_status", None)
             return self._json(
                 status_dict(
                     state,
                     engine.active_plan(),
                     pending() if callable(pending) else (),
                     persisted() if callable(persisted) else True,
+                    cell_voltage() if callable(cell_voltage) else None,
                 )
             )
 

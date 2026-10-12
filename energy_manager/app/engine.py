@@ -344,6 +344,11 @@ class Engine:
         self._floor_alerted: set[str] = set()
         self._alerted_codes: dict[str, datetime] = {}
         self._negative_price_hour: datetime | None = None
+        # Cell-voltage protection (SPEC 9.3 clause 4b): the per-battery latch survives a restart
+        # so a battery that was charging out of a low cell does not silently resume discharging.
+        self._cell_voltage_latch: dict[str, dict[str, Any]] = {}
+        self._cell_voltage_readings: dict[str, dict[str, Any]] = {}
+        self._cell_voltage_loaded = False
 
         # PV bias: sources.solar owns the learned profile (it applies it while fetching), so only
         # fall back to the in-engine EWMA when it is unavailable.  Learning is delegated in
@@ -666,6 +671,10 @@ class Engine:
             self.recover_live_writes()
         except Exception as exc:  # pragma: no cover - defensive, startup must not fail
             log.warning("live setpoint recovery failed: %s", exc)
+        try:
+            self._load_cell_voltage_latch()
+        except Exception as exc:  # pragma: no cover - defensive, startup must not fail
+            log.warning("cell-voltage latch recovery failed: %s", exc)
         self._stop.clear()
         for name, target in (
             ("sem-control", self._control_loop),
@@ -1650,7 +1659,38 @@ class Engine:
         errors: list[dict[str, str]] = []
         replan_keys = ("optimizer.", "price.", "solar.", "load.", "grid.")
         wants_replan = False
+        # The cell-voltage protection keys are cross-validated as a group, so a patch that moves
+        # cutoff and warning together is judged on its final state (SPEC 3/9.3).  Imported lazily
+        # to keep this module's boot free of an import-time dependency on config.py.
+        protection_errors: dict[str, str] = {}
+        protection_keys: set[str] = set()
+        try:
+            from .config import _PROTECTION_KEYS, protection_patch_errors
+
+            protection_keys = set(_PROTECTION_KEYS)
+            protection_errors = protection_patch_errors(
+                patch, {key: self._settings.get(key) for key in _PROTECTION_KEYS}
+            )
+        except Exception:  # pragma: no cover - config is always importable in a real run
+            protection_errors = {}
         for key in sorted(patch):
+            if key in protection_errors:
+                errors.append({"key": key, "message": protection_errors[key]})
+        # Persist the valid protection subset in one atomic update, so moving cutoff and warning
+        # together is never rejected by the half-applied state the per-key path would see.
+        protection_subset = {
+            key: value
+            for key, value in patch.items()
+            if key in protection_keys and key not in protection_errors
+        }
+        if protection_subset:
+            ok, failed = self._settings.update(protection_subset)
+            applied.extend(ok)
+            errors.extend(failed)
+            wants_replan = wants_replan or any(str(key).startswith(replan_keys) for key in ok)
+        for key in sorted(patch):
+            if key in protection_keys:
+                continue
             try:
                 self._settings.set(key, patch[key])
             except Exception as exc:
@@ -1665,6 +1705,7 @@ class Engine:
                     self._state.mode = str(self._settings.get("mode", self._state.mode))
                     self._state.dry_run = bool(self._settings.get("dry_run", self._state.dry_run))
                 self._handle_control_transition(previous_mode, previous_dry_run, "settings")
+        applied.sort()
         if applied:
             self._journal.event("info", "settings_changed", f"settings updated: {', '.join(applied)}")
         if wants_replan:
@@ -1691,6 +1732,7 @@ class Engine:
         moment = now or self._clock()
         self._sync_drivers()
         self._sync_mode()
+        self._load_cell_voltage_latch()
         measurements = self._sample(moment)
         batteries = self.effective_battery_configs()
         live: list[BatteryState] | None = None
@@ -1715,7 +1757,9 @@ class Engine:
             batteries=batteries,
             measurements=measurements,
             battery_states=live,
+            cell_voltage_latch=self._cell_voltage_latch,
         )
+        self._apply_cell_voltage(outcome.guard, moment)
         with self._lock:
             self._state.now = moment
             self._state.last_tick_at = moment
@@ -1821,6 +1865,30 @@ class Engine:
         with self._lock:
             return sorted(self._live_writes)
 
+    def cell_voltage_status(self) -> dict[str, Any]:
+        """The cell-voltage guard as the API/UI sees it (SPEC 10 /status, additive).
+
+        ``latched`` is the batteries currently protected; ``batteries`` carries each evaluated
+        reading.  Empty (``enabled: false``) when the guard is switched off, never fabricated.
+        """
+        with self._lock:
+            readings = [dict(item) for item in self._cell_voltage_readings.values()]
+        settings = self._settings
+        readings.sort(key=lambda row: str(row.get("battery_id") or ""))
+        return {
+            "enabled": bool(settings.get("protection.cell_voltage_enabled", False)),
+            "cutoff_v": settings.get("protection.cell_voltage_cutoff_v"),
+            "warning_v": settings.get("protection.cell_voltage_warning_v"),
+            "resume_v": settings.get("protection.cell_voltage_resume_v"),
+            "emergency_charge_power_w": settings.get("protection.emergency_charge_power_w"),
+            "latched": sorted(
+                str(row.get("battery_id"))
+                for row in readings
+                if row.get("block_discharge")
+            ),
+            "batteries": readings,
+        }
+
     def _hold_tolerance(self, battery_id: str) -> float:
         driver = self._drivers.get(battery_id)
         return float(getattr(driver, "tolerance_w", IDEMPOTENT_TOLERANCE_W) or 0.0)
@@ -1865,6 +1933,109 @@ class Engine:
                 {"batteries": sorted(restored)},
             )
         return self._live_write_ids()
+
+    # -- cell-voltage protection (SPEC 9.3 clause 4b) --------------------------------
+
+    def _load_cell_voltage_latch(self) -> dict[str, dict[str, Any]]:
+        """Restore the per-battery latch so a restart keeps protecting a low pack."""
+        if self._cell_voltage_loaded:
+            return self._cell_voltage_latch
+        self._cell_voltage_loaded = True
+        stored = self._store_call("profile_get", "control", "cell_voltage_latch")
+        payload = stored[1] if isinstance(stored, tuple) and len(stored) == 2 else stored
+        restored: dict[str, dict[str, Any]] = {}
+        if isinstance(payload, Mapping):
+            entries = payload.get("batteries")
+            if isinstance(entries, Mapping):
+                for battery_id, raw in entries.items():
+                    if not isinstance(raw, Mapping):
+                        continue
+                    restored[str(battery_id)] = {
+                        "latched": bool(raw.get("latched")),
+                        "force": bool(raw.get("force")),
+                        "seen": bool(raw.get("seen")),
+                    }
+        if restored:
+            with self._lock:
+                self._cell_voltage_latch = restored
+            latched = sorted(bid for bid, item in restored.items() if item.get("latched"))
+            if latched:
+                self._journal.event(
+                    "warning",
+                    "cell_voltage_recovered",
+                    "a previous run left a low-cell-voltage latch; protection resumes",
+                    {"batteries": latched},
+                )
+        return self._cell_voltage_latch
+
+    def _persist_cell_voltage_latch(self) -> None:
+        with self._lock:
+            snapshot = {key: dict(value) for key, value in self._cell_voltage_latch.items()}
+        self._store_call(
+            "profile_put",
+            "control",
+            "cell_voltage_latch",
+            {"batteries": snapshot, "updated_at": to_iso(self._clock())},
+        )
+
+    def _apply_cell_voltage(self, guard: Any, moment: datetime) -> None:
+        """Persist the latch and raise the (rate-limited) guard alerts for this tick."""
+        if guard is None:
+            return
+        readings = {
+            item.battery_id: {
+                "battery_id": item.battery_id,
+                "voltage_v": item.voltage_v,
+                "fresh": bool(item.fresh),
+                "seen": bool(item.seen),
+                "latched": bool(item.latched),
+                "block_discharge": bool(item.block_discharge),
+                "force_charge_w": item.force_charge_w,
+                "reason": item.reason,
+                "note": item.note,
+            }
+            for item in guard.readings
+        }
+        with self._lock:
+            self._cell_voltage_readings = readings
+        if not guard.enabled:
+            return
+        latch = guard.latch_state()
+        with self._lock:
+            changed = latch != self._cell_voltage_latch
+            self._cell_voltage_latch = latch
+        if changed:
+            self._persist_cell_voltage_latch()
+        emergency = [item for item in guard.readings if item.force_charge_w]
+        latched = [item for item in guard.readings if item.block_discharge and not item.force_charge_w]
+        stale = [item for item in guard.readings if item.reason == Reason.CELL_VOLTAGE_STALE]
+        if emergency:
+            self._alert_once(
+                Reason.CELL_VOLTAGE_EMERGENCY_CHARGE,
+                "Low cell voltage: emergency charging "
+                + ", ".join(item.battery_id for item in emergency),
+                {
+                    "batteries": [item.battery_id for item in emergency],
+                    "voltage_v": {item.battery_id: item.voltage_v for item in emergency},
+                },
+            )
+        if latched:
+            self._alert_once(
+                Reason.CELL_VOLTAGE_GUARD,
+                "Low cell voltage: discharge blocked for "
+                + ", ".join(item.battery_id for item in latched),
+                {
+                    "batteries": [item.battery_id for item in latched],
+                    "voltage_v": {item.battery_id: item.voltage_v for item in latched},
+                },
+            )
+        if stale:
+            self._alert_once(
+                Reason.CELL_VOLTAGE_STALE,
+                "Cell voltage is stale; keeping the previous protection state for "
+                + ", ".join(item.battery_id for item in stale),
+                {"batteries": [item.battery_id for item in stale]},
+            )
 
     def recover_live_writes(self) -> list[dict[str, Any]]:
         """Neutralise setpoints a previous run left behind, before taking control (audit 2).

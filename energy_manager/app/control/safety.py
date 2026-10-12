@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from ..models import (
     BatteryConfig,
@@ -49,9 +49,195 @@ class SafetyDecision:
     blocked_ids: list[str] = field(default_factory=list)
     usable_ids: list[str] = field(default_factory=list)
     dry_run: bool = False
+    #: The per-battery cell-voltage evaluation for this tick (SPEC 9.3 clause 4b), when the guard
+    #: is enabled.  Additive: callers that do not know about it are unaffected.
+    guard: "CellVoltageGuard | None" = None
 
     def __bool__(self) -> bool:  # a non-blocked, non-zero decision is "true"
         return not self.block
+
+
+# ---------------------------------------------------------------------------------------------
+# Cell-voltage protection (SPEC 9.3 clause 4b, 0.16.0)
+# ---------------------------------------------------------------------------------------------
+
+
+def _cell_voltage_of(state: BatteryState | None) -> float | None:
+    """The mapped/hook voltage a battery state carries, or None.  Never guessed, never 0 V."""
+    extra = getattr(state, "extra", None)
+    if not isinstance(extra, Mapping):
+        return None
+    raw = extra.get("cell_voltage_v")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw)
+    return value if value > 0.0 else None
+
+
+def _cell_voltage_fresh(state: BatteryState | None, now: datetime, stale_after: float) -> bool:
+    """The same freshness rules as every other measurement (SPEC 9.1 / 9.3 clause 3)."""
+    if state is None or not state.available or state.stale:
+        return False
+    age = state.age_seconds(now)
+    return age is not None and age <= stale_after
+
+
+@dataclass(frozen=True)
+class CellVoltageReading:
+    """One battery's cell-voltage evaluation for a tick."""
+
+    battery_id: str
+    voltage_v: float | None = None
+    fresh: bool = False
+    seen: bool = False
+    latched: bool = False
+    force: bool = False
+    block_discharge: bool = False
+    force_charge_w: float | None = None
+    reason: str | None = None
+    note: str | None = None
+
+
+@dataclass(frozen=True)
+class CellVoltageGuard:
+    """Per-battery low-cell-voltage state after one evaluation; the latch the engine persists."""
+
+    enabled: bool = False
+    cutoff_v: float | None = None
+    warning_v: float | None = None
+    resume_v: float | None = None
+    emergency_charge_power_w: float | None = None
+    readings: tuple[CellVoltageReading, ...] = ()
+
+    def reading(self, battery_id: str) -> CellVoltageReading | None:
+        for item in self.readings:
+            if item.battery_id == battery_id:
+                return item
+        return None
+
+    @property
+    def active(self) -> bool:
+        return any(item.block_discharge or item.force_charge_w for item in self.readings)
+
+    @property
+    def latched_ids(self) -> tuple[str, ...]:
+        return tuple(item.battery_id for item in self.readings if item.block_discharge)
+
+    def reason_for(self, battery_id: str) -> str | None:
+        item = self.reading(battery_id)
+        return item.reason if item is not None else None
+
+    def latch_state(self) -> dict[str, dict[str, Any]]:
+        """The latch to persist: one entry per evaluated (enabled) battery."""
+        return {
+            item.battery_id: {
+                "latched": bool(item.latched),
+                "force": bool(item.force),
+                "seen": bool(item.seen),
+            }
+            for item in self.readings
+        }
+
+
+def cell_voltage_guard(
+    batteries: Sequence[BatteryConfig],
+    states: Mapping[str, BatteryState],
+    settings: Any,
+    now: datetime | None = None,
+    latch: Mapping[str, Mapping[str, Any]] | None = None,
+) -> CellVoltageGuard:
+    """Pure per-battery low-cell-voltage guard (SPEC 9.3 clause 4b).
+
+    Below ``cutoff_v`` the battery latches into an emergency charge (``force``), is blocked from
+    discharging and is charged at ``min(max_charge_w, emergency_charge_power_w or max_charge_w)``.
+    Between cutoff and ``resume_v`` it is blocked from discharging only, and at or above
+    ``resume_v`` the latch clears.  A stale or missing reading keeps the previous latch (the
+    fail-safe direction) and is noted; a battery whose voltage was never seen stays inactive.
+    No I/O, no clock read, no mutation of the caller's objects.
+    """
+    if not bool(settings.get("protection.cell_voltage_enabled", False)):
+        return CellVoltageGuard(enabled=False)
+    moment = now or utcnow()
+    cutoff = float(settings.get("protection.cell_voltage_cutoff_v", 3.00) or 3.00)
+    warning = float(settings.get("protection.cell_voltage_warning_v", 3.10) or 3.10)
+    resume = float(settings.get("protection.cell_voltage_resume_v", 3.18) or 3.18)
+    emergency = float(settings.get("protection.emergency_charge_power_w", 0.0) or 0.0)
+    stale_after = float(settings.get("control.stale_state_seconds", 180) or 180)
+    previous = latch or {}
+    readings: list[CellVoltageReading] = []
+    for config in sorted((c for c in batteries if c.enabled), key=lambda c: c.id):
+        prev = previous.get(config.id) or {}
+        was_latched = bool(prev.get("latched"))
+        was_force = bool(prev.get("force"))
+        seen = bool(prev.get("seen"))
+        state = states.get(config.id)
+        voltage = _cell_voltage_of(state)
+        fresh = voltage is not None and _cell_voltage_fresh(state, moment, stale_after)
+        if fresh:
+            seen = True
+        max_charge = abs(float(config.max_charge_w or 0.0))
+        emergency_w = min(max_charge, emergency if emergency > 0 else max_charge)
+        if not fresh:
+            latched = was_latched
+            force = was_latched and was_force
+            if latched:
+                reason = Reason.CELL_VOLTAGE_STALE if seen else Reason.CELL_VOLTAGE_GUARD
+                note = (
+                    "cell voltage is stale; keeping the previous protection state"
+                    if seen
+                    else None
+                )
+                force_w = emergency_w if force else None
+            else:
+                reason = None
+                note = "cell voltage is stale" if seen else "no cell voltage reading yet"
+                force_w = None
+            readings.append(
+                CellVoltageReading(
+                    battery_id=config.id,
+                    voltage_v=voltage,
+                    fresh=False,
+                    seen=seen,
+                    latched=latched,
+                    force=force,
+                    block_discharge=latched,
+                    force_charge_w=force_w,
+                    reason=reason,
+                    note=note,
+                )
+            )
+            continue
+        assert voltage is not None  # fresh implies a positive reading
+        if voltage < cutoff:
+            latched, force, reason, force_w = True, True, Reason.CELL_VOLTAGE_EMERGENCY_CHARGE, emergency_w
+            note = None
+        elif voltage >= resume:
+            latched, force, reason, force_w, note = False, False, None, None, None
+        else:
+            latched, force, reason, force_w = True, False, Reason.CELL_VOLTAGE_GUARD, None
+            note = "cell voltage is below the warning threshold" if voltage < warning else None
+        readings.append(
+            CellVoltageReading(
+                battery_id=config.id,
+                voltage_v=voltage,
+                fresh=True,
+                seen=True,
+                latched=latched,
+                force=force,
+                block_discharge=latched,
+                force_charge_w=force_w,
+                reason=reason,
+                note=note,
+            )
+        )
+    return CellVoltageGuard(
+        enabled=True,
+        cutoff_v=cutoff,
+        warning_v=warning,
+        resume_v=resume,
+        emergency_charge_power_w=emergency,
+        readings=tuple(readings),
+    )
 
 
 def _energy_kwh(config: BatteryConfig, state: BatteryState | None) -> float | None:
@@ -91,10 +277,16 @@ def check(
     state: SystemState,
     settings: Any,
     now: datetime | None = None,
+    *,
+    cell_voltage_latch: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> SafetyDecision:
     """Apply SPEC 9.3 and return the write that is allowed (``block`` = nothing)."""
     moment = now or utcnow()
     get = settings.get
+    states = {s.id: s for s in getattr(state, "batteries", []) or []}
+    # Clause 4b is evaluated first, before the authority gate, so advisory/dry-run can still alert
+    # and log the guard without ever writing (SPEC 9.3).
+    guard = cell_voltage_guard(batteries, states, settings, moment, cell_voltage_latch)
 
     def decision(
         allowed_w: float,
@@ -116,6 +308,7 @@ def check(
             blocked_ids=list(blocked),
             usable_ids=list(usable),
             dry_run=bool(state.dry_run),
+            guard=guard,
         )
 
     def blocked(reasons: Sequence[str], blocked_ids: Sequence[str] = ()) -> SafetyDecision:
@@ -137,7 +330,6 @@ def check(
 
     # 3./4. Usable batteries: connected, available and fresh.
     enabled = sorted((c for c in batteries if c.enabled), key=lambda c: c.id)
-    states = {s.id: s for s in getattr(state, "batteries", []) or []}
     if not enabled:
         # The block is the same either way; reporting both causes keeps the more actionable one
         # (HA is down) visible even on an install with no batteries configured yet.
@@ -167,6 +359,24 @@ def check(
         return blocked(reasons, blocked_ids)
 
     usable_ids = [config.id for config, _ in usable]
+    usable_set = set(usable_ids)
+    # Clause 4b: a latched battery may not discharge, and one below the cutoff is charged out of
+    # danger regardless of price or plan.  In a mixed fleet the dispatcher enforces this per
+    # battery; when every usable battery is latched the aggregate itself must not discharge.
+    latched_usable = [
+        item for item in guard.readings if item.block_discharge and item.battery_id in usable_set
+    ]
+    forced_usable = {
+        item.battery_id: float(item.force_charge_w)
+        for item in guard.readings
+        if item.force_charge_w and item.battery_id in usable_set
+    }
+    cell_voltage_hold = bool(latched_usable) and len(latched_usable) == len(usable_ids)
+    if cell_voltage_hold:
+        reasons.append(Reason.CELL_VOLTAGE_GUARD)
+        if forced_usable:
+            target = max(target, sum(forced_usable.values()))
+            reasons.append(Reason.CELL_VOLTAGE_EMERGENCY_CHARGE)
     tick_seconds = float(get("control.tick_seconds", 30) or 30)
     dt_hours = max(tick_seconds, 1.0) / 3600.0
 
@@ -253,6 +463,9 @@ def check(
 
     lo = max(soc_lo, p_min, grid_lo, ramp_lo)
     hi = min(soc_hi, p_max, grid_hi, ramp_hi)
+    if cell_voltage_hold:
+        # Nothing usable is allowed to discharge: raise the aggregate floor to neutral.
+        lo = max(lo, 0.0)
     if lo > hi:
         # No power satisfies every clause: block and name each constraint that cannot be met.
         reasons = list(reasons)

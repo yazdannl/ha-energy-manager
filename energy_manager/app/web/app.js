@@ -1066,11 +1066,25 @@
       if (battery.available) badges.push(badge("available", "ok"));
       else badges.push(badge("unavailable", "err"));
       if (battery.stale) badges.push(badge("stale", "stale"));
+      var guard = status && status.cell_voltage && Array.isArray(status.cell_voltage.latched)
+        ? status.cell_voltage.latched.indexOf(battery.id) >= 0
+        : false;
+      var guardRow = null;
+      if (status && status.cell_voltage && Array.isArray(status.cell_voltage.batteries)) {
+        status.cell_voltage.batteries.forEach(function (row) {
+          if (row && row.battery_id === battery.id) guardRow = row;
+        });
+      }
+      if (guard) badges.push(badge("low cell voltage", "err"));
       grid.appendChild(el("div", { class: "card" + (battery.stale ? " card-stale" : "") }, [
         el("p", { class: "card-label", text: name }),
         el("p", { class: "card-value" }, withUnit(isNum(battery.soc_pct) ? battery.soc_pct.toFixed(1) : "--", "%")),
         el("p", { class: "card-sub" }, [fmtPower(battery.power_w) + " (" + direction + ")"]),
         el("p", { class: "card-sub" }, [fmtKwh(battery.energy_kwh) + " of " + fmtKwh(battery.capacity_kwh), isNum(battery.temperature_c) ? " · " + battery.temperature_c.toFixed(1) + " °C" : ""]),
+        el("p", { class: "card-sub" }, [
+          isNum(battery.cell_voltage_v) ? "cell " + Number(battery.cell_voltage_v).toFixed(3) + " V" : "cell voltage unknown",
+          guard ? (guardRow && guardRow.force_charge_w ? " · emergency charge active" : " · discharge blocked") : ""
+        ]),
         el("p", { class: "card-sub" }, ["read " + timeAgo(battery.read_at), " "].concat(badges)),
         battery.last_error ? el("p", { class: "field-error", text: battery.last_error }) : null
       ]));
@@ -2162,7 +2176,8 @@
       ["discharge_power_entity", "Discharge power entity"],
       ["mode_select_entity", "Mode select entity"],
       ["soc_entity", "State of charge sensor"],
-      ["capacity_entity", "Capacity sensor"]
+      ["capacity_entity", "Capacity sensor"],
+      ["cell_voltage_entity", "Lowest cell voltage sensor (per cell, V)"]
     ],
     zendure: [
       ["manual_mode_entity", "Manual mode select entity"],
@@ -2179,6 +2194,7 @@
       ["pv_power_entity", "PV power sensor"],
       ["output_power_entity", "Output power sensor"],
       ["grid_input_power_entity", "Grid input power sensor"],
+      ["cell_voltage_entity", "Lowest cell voltage sensor (per cell, V)"],
       ["smart_mode_entity", "Device smart mode switch"],
       ["ac_mode_entity", "AC mode entity"]
     ],
@@ -2195,6 +2211,7 @@
       ["output_power_entity", "Output power sensor (outputHomePower)"],
       ["grid_input_power_entity", "Grid input power sensor (gridInputPower)"],
       ["pv_power_entity", "PV input power sensor (solarInputPower)"],
+      ["cell_voltage_entity", "Lowest cell voltage sensor (per cell, V)"],
       ["smart_mode_entity", "Device smart mode (written with every command)"],
       ["operation_entity", "Zendure manager operation select (kept off, optional)"]
     ],
@@ -3009,6 +3026,18 @@
     var storedCost = storedKwhCostEur(buy, config, wear);
     var breakEven = breakEvenSellEur(buy, config, wear);
     var canTest = status.mode === "auto" && !status.dry_run;
+    var cellVoltage = st.extra && isNum(st.extra.cell_voltage_v) ? st.extra.cell_voltage_v : null;
+    var guardRow = null;
+    if (status && status.cell_voltage && Array.isArray(status.cell_voltage.batteries)) {
+      status.cell_voltage.batteries.forEach(function (row) {
+        if (row && row.battery_id === config.id) guardRow = row;
+      });
+    }
+    var guardText = !status || !status.cell_voltage || !status.cell_voltage.enabled
+      ? "off"
+      : guardRow
+        ? (guardRow.force_charge_w ? "emergency charge active" : "discharge blocked")
+        : "normal";
     // The disabled prerequisite is real text next to the action, never a hover-only title
     // (UI_REVIEW §3.4).
     var testBlockedReason = "Requires Auto and dry run off — currently mode is " + status.mode +
@@ -3107,6 +3136,7 @@
           config.enabled ? el("span", { class: "muted", text: "enabled" }) : badge("disabled", "warn"),
           " ",
           st.stale ? badge("stale state", "stale") : null,
+          guardRow && guardRow.block_discharge ? badge("low cell voltage", "err") : null,
           st.available ? null : badge("unavailable", "err")
         ]),
         actions
@@ -3117,6 +3147,8 @@
         el("li", null, [el("span", { class: "stat-label", text: "Charge level" }), el("span", { class: "stat-value", text: fmtPct(st.soc_pct) })]),
         el("li", null, [el("span", { class: "stat-label", text: "Energy" }), el("span", { class: "stat-value", text: fmtKwh(st.energy_kwh) + " of " + fmtKwh(st.capacity_kwh || config.capacity_kwh) })]),
         el("li", null, [el("span", { class: "stat-label", text: "Capacity" }), el("span", { class: "stat-value", text: fmtKwh(cap.effective) + (cap.source === "learned" ? " learned" : "") })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Cell voltage" }), el("span", { class: "stat-value", text: cellVoltage == null ? "not reported" : cellVoltage.toFixed(3) + " V" })]),
+        el("li", null, [el("span", { class: "stat-label", text: "Protection" }), el("span", { class: "stat-value", text: guardText })]),
         el("li", null, [el("span", { class: "stat-label", text: "Round trip" }), el("span", { class: "stat-value", text: eff ? fmtPct(eff.round_trip_pct) : "--" })]),
         el("li", null, [el("span", { class: "stat-label", text: "Cycles" }), el("span", { class: "stat-value", text: cycles == null ? "not reported" : cycles.toFixed(1) + " cycles" })]),
         el("li", null, [el("span", { class: "stat-label", text: "Limits" }), el("span", { class: "stat-value", text: fmtPower(config.max_charge_w) + " charge / " + fmtPower(config.max_discharge_w) + " discharge" })]),

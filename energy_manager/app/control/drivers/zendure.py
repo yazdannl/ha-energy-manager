@@ -100,6 +100,9 @@ TRANSLATION_TO_MAPPING: dict[str, str] = {
     "min_soc": "min_soc_entity",
     "ac_mode": "ac_mode_entity",
     "connection": "connection_entity",
+    # Lowest cell voltage (per cell, never a pack total).  Optional: without it the cell-voltage
+    # guard stays inactive on this driver (SPEC 9.2/9.3).
+    "cell_voltage": "cell_voltage_entity",
 }
 
 #: mapping keys this driver can resolve from the registry, for the mapping wizard.
@@ -268,6 +271,7 @@ class ZendureDriver(BaseDriver):
             "available_kwh_entity",
             "output_power_entity",
             "grid_input_power_entity",
+            "cell_voltage_entity",
         ):
             entity_id = mapping.get(key)
             if entity_id and not is_entity_id(entity_id):
@@ -511,6 +515,9 @@ class ZendureDriver(BaseDriver):
 
     def _read_pv_power(self) -> float | None:
         return self._number(self.effective_mapping().get("pv_power_entity"))
+
+    # The mapped min-cell voltage is read by the shared ``BaseDriver._mapped_cell_voltage`` (SPEC
+    # 9.2/9.3); this driver only declares the key in its mapping roles above.
 
     # -- writes -----------------------------------------------------------------------
 
@@ -858,6 +865,7 @@ class ZendureMqttDriver(ZendureDriver):
             "grid_input_power_entity",
             "pv_power_entity",
             "capacity_entity",
+            "cell_voltage_entity",
         ):
             entity_id = mapping.get(key)
             if entity_id and not is_entity_id(entity_id):
