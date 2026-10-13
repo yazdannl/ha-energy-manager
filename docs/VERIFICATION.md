@@ -1526,6 +1526,54 @@ is the gate.
 
 ---
 
+### 8.22 The ledger prices only the energy above the reserve (0.21.0)
+
+``optimizer.reserve_soc_pct`` is a per-battery floor *above* ``min_soc_pct`` that the plan never
+discharges below (SPEC 3), and ``optimize/allocate.py`` already measures the discharge room from
+``floor_energy_kwh = capacity_kwh * max(min_soc_pct, reserve_soc_pct) / 100``. The cost-basis ledger
+(SPEC 5) did not: it reset at ``min_soc_pct + 1`` and reconciled the held quantity with
+``E_phys = capacity_kwh * (soc - min_soc_pct) / 100 / eta_charge``. So the reserve band -- energy the
+plan can never sell -- was counted as held energy, weighted the per-battery basis and, through
+``fleet_sell_floor``'s energy weighting, the fleet floor the DP enforces. A stale or dear reserve
+could therefore refuse a sale of cheap energy held above it, which is the failure the request named
+("the price floor should always be calculated only for the portion above the charge limit").
+
+The fix keeps one level in the ledger:
+``floor_soc_pct = max(battery.min_soc_pct, optimizer.reserve_soc_pct)``, used by the reset
+(``soc <= floor_soc_pct + RESET_SOC_MARGIN_PCT`` clears ``basis``/``E``) and by the reconciliation
+(``E_phys = clamp(capacity_kwh * (soc - floor_soc_pct) / 100 / eta_charge, 0, max_energy)``).
+``Engine.update_cost_bases`` passes ``optimizer.reserve_soc_pct`` into ``update_basis`` (default
+``0.0``, so ``book_slices`` called directly -- and every existing test -- is the pre-0.21.0
+behaviour exactly). Slice boundaries, the measured energy integral, price attribution, the stall
+marker (0.20.3/0.20.5) and the reconciliation reset are untouched.
+
+Two tests pin it in ``tests/test_cost_basis.py``; on the frozen 0.20.6 tree (the same test file, the
+old source) the ledger test raises ``TypeError: book_slices() got an unexpected keyword argument
+'reserve_soc_pct'`` and the engine test fails with ``assert 1.8 == 0.8`` -- the reserve band is
+counted:
+
+| test | what it pins |
+|---|---|
+| `test_the_ledger_prices_only_the_energy_above_the_reserve` | a 5 kWh pack charging 0.8 kWh from 30 % to 46 % SoC with a carried 1.0 kWh at a 0.50 basis: no reserve blends it (basis 0.3667 over 1.8 kWh), a 30 % reserve clears the unsellable book and prices only the 0.8 kWh above it at 0.20 |
+| `test_engine_prices_the_ledger_above_the_configured_reserve` | the same store-driven window through `Engine.update_cost_bases` + `battery_cost_basis` + `fleet_sell_floor`: `energy_kwh` 1.8 with `optimizer.reserve_soc_pct = 0`, 0.8 with 30, basis 0.20 at the fleet floor either way |
+
+Documentation: SPEC §5 gains the 0.21.0 amendment, `docs/REFERENCE.md` spells the level into the
+ledger narrative and the ``E_phys`` line and extends the Reserve SoC settings row, and the Reserve
+SoC help text in `config.py` (mirrored in `mock.js`) states that the ledger and the sell floor price
+only the energy above it.
+
+Measured on this tree: `python3 -m pytest tests -q` -> **943 passed** (2 new; 941 before),
+`sh tools/audit.sh` -> **clean, 116 files scanned**, `node tools/ui_render_check.js` -> **127 passed,
+0 failed** (unchanged).
+
+What is *not* verified live: nothing was deployed and no live ledger was read by this record; the
+live installation's reserve is not observable from here (the 2026-10-12 settings capture carries no
+``optimizer.reserve_soc_pct``, i.e. the default 0), so on that install this release is a no-op until
+a reserve is configured. The live behaviour with a non-zero reserve is exercised offline through the
+same store/engine path the add-on uses.
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:

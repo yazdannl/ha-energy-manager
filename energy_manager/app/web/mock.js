@@ -607,7 +607,7 @@
     ["optimizer.cycle_cost_eur_per_kwh", "float", 0.0, "Wear override", "Advanced: a non-zero value replaces every battery's derived wear (price / (cycle life x usable kWh x discharge efficiency)) for planning and break-even. Leave 0 to use the derived per-fleet average wear.", "optimizer", null],
     ["optimizer.allow_grid_charge", "bool", true, "Allow grid charging", "", "optimizer", null],
     ["optimizer.allow_export", "bool", false, "Allow export", "Off until a feed-in tariff is configured; sell is then 0.00.", "optimizer", null],
-    ["optimizer.reserve_soc_pct", "float", 0.0, "Reserve SoC", "Extra floor above battery min_soc.", "optimizer", null],
+    ["optimizer.reserve_soc_pct", "float", 0.0, "Reserve SoC", "Extra floor above battery min_soc. The cost-basis ledger and the sell floor price only the energy above it.", "optimizer", null],
     ["optimizer.max_grid_import_w", "float", 0, "Max grid import W", "0 = unlimited.", "optimizer", null],
     ["optimizer.max_grid_export_w", "float", 0, "Max grid export W", "0 = unlimited.", "optimizer", null],
     ["optimizer.min_spread_eur_per_kwh", "float", 0.0, "Min spread", "Ignore arbitrage thinner than this.", "optimizer", null],

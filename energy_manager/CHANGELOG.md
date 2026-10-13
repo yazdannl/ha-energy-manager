@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.21.0
+
+- **The sell floor prices only the energy above the reserve.** `optimizer.reserve_soc_pct` is a
+per-battery floor above `min_soc_pct` that the plan never discharges below (SPEC 3), and the
+allocator already measures discharge room from `max(min_soc, reserve)`. The cost-basis ledger did
+not: it measured the held energy from `min_soc_pct` up, so the unsellable reserve band was weighted
+into the per-battery basis and into the energy-weighted fleet floor the DP enforces -- a stale or
+dear reserve could refuse sales of cheap energy held above it. The ledger's floor level is now
+`floor_soc_pct = max(battery.min_soc_pct, optimizer.reserve_soc_pct)`, used by both the reset
+(`basis = None, E = 0` when nothing sellable is held) and the SoC reconciliation
+(`E_phys = capacity_kwh x (soc - floor_soc_pct) / 100 / eta_charge`). With the default reserve of 0
+the level is `min_soc_pct` and the ledger is unchanged; a pack sitting at its reserve holds nothing
+sellable, so its basis is cleared and the floor is inactive until energy above the reserve is
+charged again.
+- Two tests pin it: a 30 % reserve prices the 0.8 kWh above it where the same measured window prices
+  1.8 kWh from `min_soc_pct`, and the reserve reaches the ledger through `Engine.update_cost_bases`.
+  `docs/REFERENCE.md` (ledger narrative and the Reserve SoC row), the Reserve SoC setting help and
+  SPEC §5 carry the rule.
+
 ## 0.20.6
 
 - **A live safety condition no longer strands the Dashboard.** The answer panel's **Safety state**

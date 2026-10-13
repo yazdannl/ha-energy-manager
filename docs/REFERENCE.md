@@ -601,7 +601,7 @@ dashboard's own roles beside it, and a `Use the Energy dashboard` button clears 
 | `optimizer.cycle_cost_eur_per_kwh` | float | `0.0` | 0…1 | **Wear override** *(advanced)* — non-zero = EUR per kWh delivered, replaces every battery's derived wear; 0 = derive it |
 | `optimizer.allow_grid_charge` | bool | `true` | — | **Allow grid charging** |
 | `optimizer.allow_export` | bool | `false` | — | **Allow export** — off = never export on purpose |
-| `optimizer.reserve_soc_pct` | float | `0.0` | 0…100 | **Reserve SoC** — extra floor above battery `min_soc` |
+| `optimizer.reserve_soc_pct` | float | `0.0` | 0…100 | **Reserve SoC** — extra floor above battery `min_soc`; the cost-basis ledger and the sell floor price only the energy above it (0.21.0) |
 | `optimizer.max_grid_import_w` | float | `0` | ≥ 0 | **Max grid import W** — 0 = unlimited |
 | `optimizer.max_grid_export_w` | float | `0` | ≥ 0 | **Max grid export W** — 0 = unlimited |
 | `optimizer.min_spread_eur_per_kwh` | float | `0.0` | 0…10 | **Min spread** — ignore arbitrage thinner than this |
@@ -1213,16 +1213,19 @@ E        -= discharged_ac / (eta_charge * eta_discharge)   # a discharge leaves 
 
 A missing `sell` falls back to `buy`; when neither resolves the sub-slice is skipped and counted,
 never priced by a guess. With no meter reading, the plan slot's own reason is the fallback
-attribution (`pv_surplus_charge` = PV, anything else = grid). At or below the SoC floor
-(`soc <= min_soc_pct + 1`) the ledger resets to `basis = None, E = 0`; `E` is clamped at
+attribution (`pv_surplus_charge` = PV, anything else = grid). The ledger prices only the energy
+above the level the plan never discharges below, `floor_soc_pct = max(min_soc_pct, reserve_soc_pct)`
+(0.21.0): at or below that level plus the 1-point margin (`soc <= floor_soc_pct + 1`) it resets to
+`basis = None, E = 0`; `E` is clamped at
 `capacity_kwh / eta_charge` and cleared with the basis when it reaches 0. A first run, or a gap
 longer than the 7-day lookback, starts clean instead of blending old energy in. The last 200 booked
 slices are kept as an audit journal, and `/status` exposes the last five per battery.
 
 After booking, the **quantity** is reconciled with the pack's own measured content (0.18.1):
-`E_phys = clamp(capacity_kwh * (soc - min_soc_pct) / 100 / eta_charge, 0, capacity_kwh / eta_charge)`
+`E_phys = clamp(capacity_kwh * (soc - floor_soc_pct) / 100 / eta_charge, 0, capacity_kwh / eta_charge)`
 from the last SoC sample at or before the booking end (a stale or missing sample skips the step and
-counts `skipped_no_soc`). The difference is applied to `E` and never to `basis`; the signed
+counts `skipped_no_soc`), with the same `floor_soc_pct = max(min_soc_pct, reserve_soc_pct)` so the
+reserve band is never counted into the basis or the fleet floor (0.21.0). The difference is applied to `E` and never to `basis`; the signed
 cumulative correction is `reconciled_kwh`, the last step `reconciled_last_kwh`, and a single
 correction beyond half the pack capacity resets the ledger (`basis = None, E = 0`) and counts
 `reconciled_resets`. All of these travel with the per-battery ledger into `/status`.

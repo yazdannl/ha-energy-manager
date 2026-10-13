@@ -34,9 +34,12 @@ timestamp, and nothing beyond the newest sample is booked: a ramp the next sampl
 swallowed by a flat extrapolation at an update boundary.
 
 After booking, the *quantity* is reconciled with the pack's own measured content (0.18.1):
-``E_phys = capacity_kwh * (soc - min_soc_pct) / 100 / eta_charge`` (clamped to ``[0, max_energy]``)
+``E_phys = capacity_kwh * (soc - floor_soc_pct) / 100 / eta_charge`` (clamped to ``[0, max_energy]``)
 from the last SoC sample at or before the booking end (a stale/missing one skips the step and is
-counted in ``skipped_no_soc``).  The difference is applied to the energy and never to the basis
+counted in ``skipped_no_soc``).  ``floor_soc_pct = max(battery.min_soc_pct,
+optimizer.reserve_soc_pct)`` is the level the plan never discharges below, so the ledger prices only
+the energy above it -- the reserve band is never sellable and its cost must not set the floor
+(0.21.0).  The difference is applied to the energy and never to the basis
 (the basis stays the tracked average price of the energy we priced), the signed cumulative
 correction is kept as ``reconciled_kwh`` plus ``reconciled_last_kwh``, and a single correction
 larger than half the pack capacity is treated as unattributable: the ledger resets and
@@ -125,7 +128,8 @@ MAX_GAP_MINUTES = SAMPLE_MINUTES * (1.0 + MAX_GAP_SAMPLES)
 STALL_TOLERANCE = timedelta(minutes=3 * SAMPLE_MINUTES)
 #: A command change smaller than this does not open a new slice (grid-follow micro corrections).
 APPLIED_CHANGE_TOLERANCE_W = 25.0
-#: At or below ``min_soc_pct + this`` the pack holds nothing usable: the ledger resets.
+#: At or below ``max(min_soc_pct, reserve_soc_pct) + this`` the pack holds nothing sellable: the
+#: ledger resets.
 RESET_SOC_MARGIN_PCT = 1.0
 #: A single SoC reconciliation correction beyond this fraction of the pack capacity means the
 #: ledger can no longer be attributed to the measured grid: it resets instead (0.18.1).
@@ -538,6 +542,7 @@ def book_slices(
     now: datetime,
     reset: bool = False,
     source: str = "measurements",
+    reserve_soc_pct: float = 0.0,
 ) -> dict[str, Any]:
     """Advance the ledger over the settled measured sample grid since ``state['last_ts']``.
 
@@ -585,7 +590,11 @@ def book_slices(
     max_energy = None
     if battery.capacity_kwh > 0 and battery.eta_charge > 0:
         max_energy = battery.capacity_kwh / battery.eta_charge
-    reset_soc = float(battery.min_soc_pct) + RESET_SOC_MARGIN_PCT
+    # The level the plan never discharges below: ``optimizer.reserve_soc_pct`` is a per-battery floor
+    # above ``min_soc_pct`` (SPEC 3).  The ledger prices only the energy above it, because the
+    # reserve band is never sellable and its cost must not set the floor (SPEC 5, 0.21.0).
+    floor_soc = max(float(battery.min_soc_pct), float(reserve_soc_pct or 0.0))
+    reset_soc = floor_soc + RESET_SOC_MARGIN_PCT
 
     # --- one boundary per applied change the add-on really made -------------------------------
     boundaries: list[tuple[datetime, float, str, str, Any]] = []
@@ -785,7 +794,7 @@ def book_slices(
         if soc_now is None:
             skipped_no_soc += 1
         else:
-            physical = battery.capacity_kwh * (soc_now - float(battery.min_soc_pct)) / 100.0
+            physical = battery.capacity_kwh * (soc_now - floor_soc) / 100.0
             physical = max(0.0, min(physical / float(battery.eta_charge), max_energy))
             correction = physical - energy
             if abs(correction) > battery.capacity_kwh * RECONCILE_RESET_FRACTION:
@@ -850,11 +859,16 @@ def update_basis(
     days: float = LOOKBACK_DAYS,
     timeline: PriceTimeline | None = None,
     fleet_enabled: int = 1,
+    reserve_soc_pct: float = 0.0,
 ) -> dict[str, Any] | None:
     """Advance one battery's ledger from its dispatch log, measurements and persisted plans.
 
     Returns the stored payload (or the previous one when nothing changed).  A missing store, missing
     rows or an unreadable profile is not an error, only "no change".
+
+    ``reserve_soc_pct`` is ``optimizer.reserve_soc_pct``: the per-battery level the plan never
+    discharges below.  The ledger prices only the energy above it (0.21.0), so the basis and the
+    fleet floor never include energy that can never be sold.
 
     When the measurement series holds no usable power point in the window, the fleet-aggregate
     ``actuals`` rows stand in for it -- but only with ``fleet_enabled == 1``, because with several
@@ -909,6 +923,7 @@ def update_basis(
         now=moment,
         reset=reset,
         source=source,
+        reserve_soc_pct=reserve_soc_pct,
     )
     previous = stored or {}
     grew = _count(booked.get("intervals")) > _count(previous.get("intervals"))

@@ -523,6 +523,24 @@ PV and charge from the grid in the cheapest hours). In ``slot_cost_eur``, for ``
 8.1), so no preference can invent a saving. ``allow_grid_charge=false`` keeps its PV-only bound and
 ``min_spread`` keeps charging only the grid part.
 
+**0.21.0 amendment (the ledger prices only the energy above the reserve).**
+``optimizer.reserve_soc_pct`` (SPEC 3) is a per-battery floor *above* ``min_soc_pct`` that the plan
+never discharges below, and the allocator already measures the discharge room from
+``floor_energy_kwh = capacity_kwh * max(min_soc_pct, reserve_soc_pct) / 100`` -- but the cost-basis
+ledger still measured the held energy from ``min_soc_pct`` up. The reserve band is therefore never
+sellable, yet its cost was weighted into the basis and into the fleet floor the DP enforces, so a
+stale or dear reserve could refuse sales of cheap energy held above it. The ledger's floor level is
+now
+``floor_soc_pct = max(battery.min_soc_pct, optimizer.reserve_soc_pct)``: both the reset (nothing
+sellable is held) and the SoC reconciliation
+``E_phys = clamp(capacity_kwh * (soc - floor_soc_pct) / 100 / eta_charge, 0, capacity_kwh / eta_charge)``
+use it, so the basis, ``energy_kwh`` and the energy-weighted fleet floor price only the energy above
+the level the plan keeps. With the default reserve of 0 the level is ``min_soc_pct`` and the ledger
+is exactly the 0.18.1--0.20.6 one; a pack sitting at its reserve holds nothing sellable, so its
+basis is cleared and the floor is inactive until energy above the reserve is charged again.
+Everything else -- slice boundaries, measured energy, price attribution, the stall marker and the
+reconciliation reset -- is unchanged.
+
 Runtime discovery is mandatory for `driver: zendure`: find candidate entities by asking HA for the
 entity registry entries whose `platform` is `zendure_ha` (or `unique_id` prefix `zendure_ha.`) and
 matching **translation keys** (`input_limit`, `output_limit`, `electric_level`,

@@ -1543,7 +1543,13 @@ class Engine:
         for config in configs:
             try:
                 payload = cost_basis_ledger.update_basis(
-                    self._store, config, moment, fleet_enabled=len(configs)
+                    self._store,
+                    config,
+                    moment,
+                    fleet_enabled=len(configs),
+                    reserve_soc_pct=float(
+                        self._settings.get("optimizer.reserve_soc_pct", 0.0) or 0.0
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 - the ledger must never break planning
                 log.warning("cost-basis update failed for %s: %s", config.id, exc)

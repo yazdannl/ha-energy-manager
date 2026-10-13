@@ -388,7 +388,7 @@ SETTINGS_META: dict[str, _Meta] = {
     "optimizer.cycle_cost_eur_per_kwh": _Meta("float", "optimizer", "Wear override", "Advanced: a non-zero value replaces every battery's derived wear (price / (cycle life x usable kWh x discharge efficiency)) for planning and break-even. Leave 0 to use the derived per-fleet average wear.", minimum=0.0, maximum=1.0, advanced=True),
     "optimizer.allow_grid_charge": _Meta("bool", "optimizer", "Allow grid charging", ""),
     "optimizer.allow_export": _Meta("bool", "optimizer", "Allow export", "Off = never export on purpose. The feed-in price comes from the Price card."),
-    "optimizer.reserve_soc_pct": _Meta("float", "optimizer", "Reserve SoC", "Extra floor above battery min_soc.", minimum=0.0, maximum=100.0),
+    "optimizer.reserve_soc_pct": _Meta("float", "optimizer", "Reserve SoC", "Extra floor above battery min_soc. The cost-basis ledger and the sell floor price only the energy above it.", minimum=0.0, maximum=100.0),
     "optimizer.max_grid_import_w": _Meta("float", "optimizer", "Max grid import W", "0 = unlimited.", minimum=0.0),
     "optimizer.max_grid_export_w": _Meta("float", "optimizer", "Max grid export W", "0 = unlimited.", minimum=0.0),
     "optimizer.min_spread_eur_per_kwh": _Meta("float", "optimizer", "Min spread", "Ignore arbitrage thinner than this.", minimum=0.0, maximum=10.0),

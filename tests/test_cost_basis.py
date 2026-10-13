@@ -110,7 +110,7 @@ def soc_for(energy_kwh: float, config: BatteryConfig) -> float:
     return config.min_soc_pct + energy_kwh * config.eta_charge * 100.0 / config.capacity_kwh
 
 
-def book(rows, series, timeline, battery_config, *, now, state=None, reset=False):
+def book(rows, series, timeline, battery_config, *, now, state=None, reset=False, reserve_soc_pct=0.0):
     return ledger.book_slices(
         state,
         battery=battery_config,
@@ -119,6 +119,7 @@ def book(rows, series, timeline, battery_config, *, now, state=None, reset=False
         dispatch_rows=rows,
         now=now,
         reset=reset,
+        reserve_soc_pct=reserve_soc_pct,
     )
 
 
@@ -313,6 +314,41 @@ def test_soc_floor_resets_the_ledger():
         state=state,
     )
     assert without_soc["basis_eur_per_kwh"] == pytest.approx((0.5 * 1.0 + 0.08) / 1.4)
+
+
+def test_the_ledger_prices_only_the_energy_above_the_reserve():
+    """0.21.0: the level the plan never discharges below must not be priced into the basis.
+
+    ``optimizer.reserve_soc_pct`` is a per-battery floor above ``min_soc_pct`` (SPEC 3).  The
+    measured window charges 0.8 kWh from 30 % to 46 % SoC on a 5 kWh pack while the ledger carries
+    1.0 kWh at a 0.50 basis.  With no reserve the whole 10..46 % band is the ledger and the stale
+    price blends in (0.3667 over 1.8 kWh); with a 30 % reserve the pack starts with nothing above
+    the reserve, so the old price is gone and only the 0.8 kWh above it is priced at 0.20.
+    """
+    config = battery(min_soc_pct=10.0)
+    timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05)])
+    power = points(T0, 13, 800.0)
+    ramp = tuple(
+        (T0 + timedelta(minutes=5 * index), 30.0 + (16.0 / 12.0) * index) for index in range(13)
+    )
+    series = ledger.Series(power=power, grid=power, soc=ramp)
+    state = {"basis_eur_per_kwh": 0.50, "energy_kwh": 1.0, "last_ts": to_iso(T0)}
+    plain = book(
+        [dispatch_row(1, T0, 800.0)], series, timeline, config, now=T0 + timedelta(hours=1), state=state
+    )
+    assert plain["basis_eur_per_kwh"] == pytest.approx((0.50 * 1.0 + 0.16) / 1.8)
+    assert plain["energy_kwh"] == pytest.approx(1.8, abs=1e-3)
+    reserved = book(
+        [dispatch_row(1, T0, 800.0)],
+        series,
+        timeline,
+        config,
+        now=T0 + timedelta(hours=1),
+        state=state,
+        reserve_soc_pct=30.0,
+    )
+    assert reserved["basis_eur_per_kwh"] == pytest.approx(0.20)
+    assert reserved["energy_kwh"] == pytest.approx(0.8, abs=1e-3)
 
 
 def test_price_slot_boundary_splits_the_energy():
@@ -1312,6 +1348,49 @@ def test_engine_update_cost_bases_advances_the_ledger_from_the_store(tmp_path):
     assert again["updated"] == [config.id]
     assert engine.battery_cost_basis(config.id)["intervals"] == status["intervals"]
     store.close()
+
+
+def test_engine_prices_the_ledger_above_the_configured_reserve(tmp_path):
+    """0.21.0: ``optimizer.reserve_soc_pct`` reaches the ledger, so the basis and the fleet floor
+    price only the energy above the level the plan never discharges below.
+
+    The same measured window (0.8 kWh charged from 30 % to 46 % SoC) yields the whole 10..46 % band
+    without a reserve and only the 0.8 kWh above 30 % with one.
+    """
+    config = battery(min_soc_pct=10.0)
+    power = points(T0, 13, 800.0)
+    ramp = tuple(
+        (T0 + timedelta(minutes=5 * index), 30.0 + (16.0 / 12.0) * index) for index in range(13)
+    )
+
+    def basis_energy(reserve: float) -> float:
+        store = Store(tmp_path / f"reserve-{int(reserve)}.db")
+        _seed_dispatch_and_plan(store, config, start=T0, hours=1)
+        store.add_measurements(
+            [
+                Measurement(ts=ts, role=f"battery_power:{config.id}", value=value, unit="W")
+                for ts, value in power
+            ]
+            + [
+                Measurement(ts=ts, role=f"battery_soc:{config.id}", value=value, unit="%")
+                for ts, value in ramp
+            ]
+            + [Measurement(ts=ts, role="grid_power", value=value, unit="W") for ts, value in power]
+        )
+        engine, _store, settings, clock = _build_engine(store=store, config=config)
+        settings["optimizer.reserve_soc_pct"] = reserve
+        clock.now = T0 + timedelta(hours=1, minutes=1)
+        engine.update_cost_bases(clock.now, force=True)
+        status = engine.battery_cost_basis(config.id)
+        assert status["cost_basis_eur_per_kwh"] == pytest.approx(0.20)
+        assert engine.fleet_sell_floor() == pytest.approx(
+            0.20 / (config.eta_charge * config.eta_discharge)
+        )
+        store.close()
+        return status["energy_kwh"]
+
+    assert basis_energy(0.0) == pytest.approx(1.8, abs=1e-3)
+    assert basis_energy(30.0) == pytest.approx(0.8, abs=1e-3)
 
 
 # ------------------------------------------- the sample grid and the pack reconciliation (0.18.1)
