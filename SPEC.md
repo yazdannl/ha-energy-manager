@@ -1772,6 +1772,24 @@ round, with the reason:
   the uniform schedule, and a sub-minute or past remainder floors at 1 minute so no `dt` is ever
   zero or negative.
 
+- **§8.2/§8.14 (a plan reason names the constraint that really bound the power; requested
+  2026-10-13 after the live 12:00Z slot)** — `_classify` must not read `power_bounds_kw`'s
+  `binding` flag as "the chosen power is on a grid bound". The interval computation is factored
+  into `soc_window_kw(e_kwh, agg, dt_hours)` (the hardware envelope narrowed by SoC reachability)
+  and `grid_window_kw(slot, agg, opts)` (import/export caps, the no-export rules and the cost-basis
+  sell floor); `power_bounds_kw` intersects them and keeps its public `(lo, hi, grid_binding)`
+  signature and `binding` semantics unchanged (any grid rule that tightens either side). The
+  classifier receives both windows per slot, and a slot is at a *grid* bound only when the power
+  sits on that grid bound and the bound is tighter than the SoC bound on the same side (charge: the
+  `hi` side, discharge: the `lo` side, hold: a zero bound on either side, still excluding the
+  floor's own `sell_floor` reason). A bound that coincides with the SoC bound counts as the SoC
+  bound. The 0.19.0 sell-floor rule (`grid_lo = max(grid_lo, -max(0, base))`, §8.14) is exactly
+  the case that made `binding` true in a PV-surplus slot while the charge filled the pack at its
+  ceiling, so the live 12:00 slot's +990.3 W is a PV-surplus charge, not a grid hold. No schedule
+  change: for the live-shaped case and a deterministic sweep of 40 horizons the powers, SoC
+  trajectory, energies and money are byte-identical to 0.20.1; only the action/reason labels move.
+  No new reason slug (the vocabulary stays additive).
+
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded
 in `docs/VERIFICATION.md`.

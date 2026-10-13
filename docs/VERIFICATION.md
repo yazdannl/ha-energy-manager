@@ -1264,9 +1264,45 @@ render check also asserts a partial first slot's window energy and cost. `tests/
 updates one assertion that encoded the uniform hour for a plan made at 12:20 (its first slot is now
 40 minutes).
 
+### 8.17 A plan reason names the constraint that really bound the power (0.20.2)
+
+The 0.19.0 sell floor (SPEC 8.14) sets `grid_lo = 0` in a PV-surplus slot, so `power_bounds_kw`
+reported `binding = True` there, and the pre-0.20.2 `_classify` credited any power sitting on *a*
+bound to the grid. The live plan made at 2026-10-13 11:04Z put the cheapest hour's charge on the
+pack's 100 % SoC ceiling and the label claimed a grid limit:
+
+| slot | power | SoC | 0.20.1 action/reason | 0.20.2 action/reason |
+| --- | --- | --- | --- | --- |
+| 12:00 | +990.3 W | 52.5 % -> 100.0 % | `charge / grid_limit_hold` | `pv_charge / pv_surplus_charge` |
+
+The slot's windows (1.92 kWh pack, 15 % floor, 1000 W / 800 W, eta 0.92, pv 2.02 kW, load 0.59 kW,
+e = 1.92 - 0.92 x 0.9903 kWh, sell floor 0.3997): `soc_hi = (e_max - e) / (1 h x eta) = 0.9903 kW`
+(the true constraint), `grid_hi = 1.0 kW` (the hardware charge ceiling), `grid_lo = 0` from the
+sell floor and `soc_lo = -0.7209 kW`. `binding` is genuinely true (the floor tightened the lower
+bound) while the power sits on `soc_hi`, so the grid reason was wrong.
+
+The fix splits the interval into `soc_window_kw` and `grid_window_kw` (both intersected by
+`power_bounds_kw`, whose `(lo, hi, binding)` signature and semantics are unchanged) and gives the
+classifier both windows per slot; a grid reason is used only where the grid bound is tighter than
+the SoC bound on that side. Two of the four new tests in `tests/test_cost_basis.py` fail at
+8143048: the live-shaped slot (its powers, SoC, energies and money are pinned to the pre-fix solve,
+including the `binding == True` window pair) and a discharge parked on the SoC floor in a
+sell-floor slot (0.20.1 `discharge/grid_limit_hold`, 0.20.2 `discharge/peak_discharge`). The
+strengthened 13:00 reason assertion in the existing F9 live test (`charge/grid_limit_hold` ->
+`pv_charge/pv_surplus_charge`, the same ceiling case) fails at 8143048 as well. The two
+preservation cases pass in both trees: an import-capped charge keeps `charge/grid_limit_hold` and
+an export cap holding the power at zero in a surplus slot keeps `hold/grid_limit_hold`.
+
+Powers/money unchanged, measured on the frozen 8143048 tree and the 0.20.2 working tree over the
+live-shaped fixtures and 40 deterministic random horizons: every field except the action/reason
+labels is byte-identical; 47 labels change, all of them away from the conflated `grid_limit_hold`
+and none into it.
+
 What is *not* verified live: the add-on was not deployed and nothing was written to the live
-instance, so the 0.20.1 plan has not been re-observed against a real dispatch; only the offline
+instance, so the 0.20.2 label has not been re-observed against a live plan; only the offline
 reproduction, the tests and the render check above are measured here.
+
+---
 
 ## 9. R1 scanner (`tools/audit.sh`)
 

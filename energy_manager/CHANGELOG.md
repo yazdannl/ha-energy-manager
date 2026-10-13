@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.20.2
+
+- **A plan reason now names the constraint that really bound the power.** The 0.19.0 sell floor
+  sets `grid_lo = 0` in a PV-surplus slot, so `power_bounds_kw` reported `binding = True` there and
+  `_classify` credited any power sitting on *a* bound to the grid: the live 12:00Z slot
+  (2026-10-13, the cheapest hour: +990.3 W filling the pack to its 100 % SoC ceiling) was labelled
+  `charge / grid_limit_hold` although the power sat on `soc_hi`, not on any grid limit. The window
+  computation is factored into `soc_window_kw` and `grid_window_kw`, which `power_bounds_kw` still
+  intersects with the same public `(lo, hi, binding)` result and the same `binding` semantics; the
+  classifier now sees both windows and uses a grid reason only on a side where the grid bound is
+  tighter than the SoC bound and the power really sits on it. The same conflation in the discharge
+  and hold branches goes away (a discharge parked on the SoC floor reports its discharge reason, a
+  hold on a zero grid bound that merely coincides with the SoC window reports the SoC reason), and
+  genuine grid cases (an import-capped charge, an export cap holding the power at zero) keep
+  `grid_limit_hold`. No reason slug is added. The schedule is untouched: the powers, SoC
+  trajectory, energies and money are byte-identical to 0.20.1; only the action/reason strings
+  change.
+
 ## 0.20.1
 
 - **The plan now models the current (partial) slot with the time it really has.** A plan made at

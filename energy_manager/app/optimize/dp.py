@@ -443,38 +443,39 @@ def exact_power_kw(
     return delta * agg.eta_discharge / dt_hours if dt_hours > 0 else 0.0
 
 
-def power_bounds_kw(
-    slot: SlotInput, e_kwh: float, agg: BatteryAggregate, opts: OptimizerOptions, dt_hours: float
-) -> tuple[float, float, bool]:
-    """Feasible ``[p_lo, p_hi]`` for a state, clipped by SoC reachability and grid limits.
+def soc_window_kw(e_kwh: float, agg: BatteryAggregate, dt_hours: float) -> tuple[float, float]:
+    """SoC-safe ``[lo, hi]`` for one state: the hardware envelope narrowed by reachability.
 
-    Returns ``(lo, hi, grid_binding)`` where ``grid_binding`` says the grid limits actually
-    tightened the SoC-safe window (not merely that limits are configured).  The interval is always
-    valid (``lo <= hi``): when the grid and SoC windows do not intersect, the value nearest the
-    grid window is held inside the SoC-safe envelope; such slots are reported as
-    ``grid_limits_infeasible`` by the caller.
+    One half of the interval :func:`power_bounds_kw` intersects; kept separate so a caller can
+    tell which window the chosen power really sits on (0.20.2).  ``lo <= hi`` always.
     """
-    phy_lo = -agg.p_discharge_kw
-    phy_hi = agg.p_charge_kw
-
-    soc_lo, soc_hi = phy_lo, phy_hi
+    lo, hi = -agg.p_discharge_kw, agg.p_charge_kw
     if dt_hours > 0 and agg.eta_charge > 0 and agg.eta_discharge > 0:
-        soc_hi = min(soc_hi, max(0.0, agg.e_max_kwh - e_kwh) / (dt_hours * agg.eta_charge))
-        soc_lo = max(soc_lo, -max(0.0, e_kwh - agg.e_min_kwh) * agg.eta_discharge / dt_hours)
-    soc_lo = min(soc_lo, soc_hi)
+        hi = min(hi, max(0.0, agg.e_max_kwh - e_kwh) / (dt_hours * agg.eta_charge))
+        lo = max(lo, -max(0.0, e_kwh - agg.e_min_kwh) * agg.eta_discharge / dt_hours)
+    return min(lo, hi), hi
 
+
+def grid_window_kw(
+    slot: SlotInput, agg: BatteryAggregate, opts: OptimizerOptions
+) -> tuple[float, float]:
+    """Grid-feasible ``[lo, hi]`` for one slot, from the limits alone (no SoC state).
+
+    Import/export caps, the no-export rules and the cost-basis sell floor.  The other half of
+    :func:`power_bounds_kw`'s interval.
+    """
     base = slot.load_kw - slot.pv_kw
-    grid_lo, grid_hi = phy_lo, phy_hi
+    lo, hi = -agg.p_discharge_kw, agg.p_charge_kw
     if opts.max_import_kw > 0:
-        grid_hi = min(grid_hi, opts.max_import_kw - base)  # import cap: base + p <= limit
+        hi = min(hi, opts.max_import_kw - base)  # import cap: base + p <= limit
     if opts.max_export_kw > 0:
-        grid_lo = max(grid_lo, -(opts.max_export_kw + base))  # export cap: -(base + p) <= limit
+        lo = max(lo, -(opts.max_export_kw + base))  # export cap: -(base + p) <= limit
     # Exporting at a zero (or unknown) sell price earns nothing and only spends energy, so it is
     # never planned -- independent of ``allow_export`` (audit minor).
     if not opts.allow_export or slot.sell is None or float(slot.sell) <= 0.0:
-        grid_lo = max(grid_lo, -base)
+        lo = max(lo, -base)
     if not opts.allow_grid_charge:
-        grid_hi = min(grid_hi, max(0.0, slot.pv_kw - slot.load_kw))
+        hi = min(hi, max(0.0, slot.pv_kw - slot.load_kw))
 
     # Cost-basis sell floor (SPEC 5, 0.18.0): a discharge/export whose *value leg* sits below the
     # break-even of what the energy in the pack actually cost is refused. The leg is the slot's
@@ -489,11 +490,26 @@ def power_bounds_kw(
             # surplus (``base < 0``) has no cost basis and keeps exporting freely, so the bound is
             # the house demand alone -- never ``-base``, which turned a surplus into a *positive*
             # lower bound and forced the pack to swallow it at any price (0.19.0 fix, SPEC 8.14).
-            grid_lo = max(grid_lo, -max(0.0, base))
+            lo = max(lo, -max(0.0, base))
         if base > 0.0 and float(slot.buy) < floor:
             # Even displacing import cannot pay for the held energy: hold instead of discharge.
-            grid_lo = max(grid_lo, 0.0)
+            lo = max(lo, 0.0)
+    return lo, hi
 
+
+def power_bounds_kw(
+    slot: SlotInput, e_kwh: float, agg: BatteryAggregate, opts: OptimizerOptions, dt_hours: float
+) -> tuple[float, float, bool]:
+    """Feasible ``[p_lo, p_hi]`` for a state, clipped by SoC reachability and grid limits.
+
+    Returns ``(lo, hi, grid_binding)`` where ``grid_binding`` says the grid limits actually
+    tightened the SoC-safe window (not merely that limits are configured).  The interval is always
+    valid (``lo <= hi``): when the grid and SoC windows do not intersect, the value nearest the
+    grid window is held inside the SoC-safe envelope; such slots are reported as
+    ``grid_limits_infeasible`` by the caller.
+    """
+    soc_lo, soc_hi = soc_window_kw(e_kwh, agg, dt_hours)
+    grid_lo, grid_hi = grid_window_kw(slot, agg, opts)
     lo = max(soc_lo, grid_lo)
     hi = min(soc_hi, grid_hi)
     if lo > hi:
@@ -676,17 +692,21 @@ def _solve_once(
 
     energies: list[float] = []
     powers: list[float] = []
-    bounds: list[tuple[float, float, bool]] = []
+    #: The two windows ``power_bounds_kw`` intersected, kept per slot so ``_classify`` can name
+    #: the constraint the chosen power really sits on (0.20.2).
+    windows: list[tuple[float, float, float, float]] = []
     cycle_cost = 0.0
     objective = 0.0
     e_now = clamp(start_kwh, agg.e_min_kwh, agg.e_max_kwh)
     for i, slot in enumerate(slots):
         dt_hours = minutes[i] / 60.0
-        lo, hi, binding = power_bounds_kw(slot, e_now, agg, opts, dt_hours)
+        lo, hi, _ = power_bounds_kw(slot, e_now, agg, opts, dt_hours)
         p = clamp(best_at(i, e_now), lo, hi)
         energies.append(e_now)
         powers.append(p)
-        bounds.append((lo, hi, binding))
+        soc_lo, soc_hi = soc_window_kw(e_now, agg, dt_hours)
+        grid_lo, grid_hi = grid_window_kw(slot, agg, opts)
+        windows.append((soc_lo, soc_hi, grid_lo, grid_hi))
         e_next = next_energy_kwh(e_now, p, dt_hours, agg)
         cycle_cost += wear_cost_eur(opts.wear_eur_per_kwh, agg.eta_discharge, e_now, e_next)
         objective += slot_cost_eur(p, slot, dt_hours, opts)
@@ -697,7 +717,7 @@ def _solve_once(
     terminal_error = abs(e_now - e_target) if e_target is not None else 0.0
     start_index = min(range(len(grid)), key=lambda k: abs(grid[k] - clamp(start_kwh, agg.e_min_kwh, agg.e_max_kwh)))
 
-    reasons = _classify(slots, agg, energies, powers, bounds, e_target, start_kwh, dt, step, opts)
+    reasons = _classify(slots, agg, energies, powers, windows, e_target, start_kwh, dt, step, opts)
     plan_slots = [
         PlanSlot(
             t=slot.t,
@@ -775,12 +795,28 @@ def _round_trip_blocks_arbitrage(
     return float(slot.sell) <= break_even
 
 
+def _at_grid_hi(p_kw: float, soc_hi: float, grid_hi: float) -> bool:
+    """True when ``p`` sits on a grid upper bound that is *tighter* than the SoC ceiling.
+
+    ``power_bounds_kw``'s ``binding`` flag only says some grid rule narrowed the interval, which is
+    not the same as the chosen power sitting on a grid bound: the 0.20.1 live plan put a charge on
+    the pack's 100 % ceiling while the sell-floor rule made the (unrelated) lower bound ``0``.  A
+    bound that merely coincides with the SoC bound is the SoC bound, never a grid one.
+    """
+    return abs(p_kw - grid_hi) <= EPS_KW and grid_hi < soc_hi - EPS_KW
+
+
+def _at_grid_lo(p_kw: float, soc_lo: float, grid_lo: float) -> bool:
+    """The discharge-side mirror of :func:`_at_grid_hi`."""
+    return abs(p_kw - grid_lo) <= EPS_KW and grid_lo > soc_lo + EPS_KW
+
+
 def _classify(
     slots: Sequence[SlotInput],
     agg: BatteryAggregate,
     energies: Sequence[float],
     powers: Sequence[float],
-    bounds: Sequence[tuple[float, float, bool]],
+    windows: Sequence[tuple[float, float, float, float]],
     e_target: float | None,
     start_kwh: float,
     dt: float,
@@ -806,15 +842,14 @@ def _classify(
     for i, slot in enumerate(slots):
         p = powers[i]
         e = energies[i]
-        lo, hi, binding = bounds[i]
+        soc_lo, soc_hi, grid_lo, grid_hi = windows[i]
         surplus = max(0.0, slot.pv_kw - slot.load_kw)
-        at_bound = (abs(p - hi) <= EPS_KW and hi > 0) or (abs(p - lo) <= EPS_KW and lo < 0)
         near_target = e_target is not None and i >= n - tail
         if p > 1e-4:
-            if binding and at_bound:
-                # A binding grid limit can leave a *non-zero* power: report the direction it is
-                # actually holding at, so ``sensor.sem_plan_action`` never says "hold" while the
-                # battery charges (audit minor).
+            if _at_grid_hi(p, soc_hi, grid_hi):
+                # A *grid* cap can leave a non-zero power: report the direction it holds, so
+                # ``sensor.sem_plan_action`` never says "hold" while the battery charges (audit
+                # minor).  A power on the SoC ceiling keeps its PV/arbitrage reason.
                 action, reason = Action.CHARGE, Reason.GRID_LIMIT_HOLD
             elif p <= surplus + 1e-4:
                 action, reason = Action.PV_CHARGE, Reason.PV_SURPLUS_CHARGE
@@ -824,7 +859,7 @@ def _classify(
                 action, reason = Action.CHARGE, Reason.ARBITRAGE_CHARGE
         elif p < -1e-4:
             exporting = grid_kw_at(slot, p) < -1e-4
-            if binding and at_bound:
+            if _at_grid_lo(p, soc_lo, grid_lo):
                 action, reason = Action.DISCHARGE, Reason.GRID_LIMIT_HOLD
             elif near_target and slot.buy <= median_buy:
                 action, reason = Action.DISCHARGE, Reason.TERMINAL_TARGET
@@ -836,10 +871,8 @@ def _classify(
                 reason = Reason.SELF_CONSUMPTION
         else:
             floor_blocks = _sell_floor_blocks(slot, opts)
-            if (
-                binding
-                and not floor_blocks
-                and (abs(lo) <= EPS_KW or abs(hi) <= EPS_KW)
+            if not floor_blocks and (
+                _at_grid_lo(0.0, soc_lo, grid_lo) or _at_grid_hi(0.0, soc_hi, grid_hi)
             ):
                 action, reason = Action.HOLD, Reason.GRID_LIMIT_HOLD
             elif e <= agg.e_min_kwh + half_step:

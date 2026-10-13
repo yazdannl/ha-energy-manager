@@ -1253,20 +1253,28 @@ keeps its PV-only bound and `min_spread` keeps charging only the grid part.
 
 | Condition | Action | Reason |
 | --- | --- | --- |
-| `p > 0`, binding grid limit at bound | charge | `grid_limit_hold` |
+| `p > 0`, on a grid upper bound tighter than the SoC ceiling | charge | `grid_limit_hold` |
 | `p > 0`, `p <= pv surplus` | pv_charge | `pv_surplus_charge` |
 | `p > 0`, in the terminal tail and `buy >= median` | charge | `terminal_target` |
 | `p > 0` otherwise | charge | `arbitrage_charge` |
-| `p < 0`, binding grid limit at bound | discharge | `grid_limit_hold` |
+| `p < 0`, on a grid lower bound tighter than the SoC floor | discharge | `grid_limit_hold` |
 | `p < 0`, in the terminal tail and `buy <= median` | discharge | `terminal_target` |
 | `p < 0`, `buy >= p75` | export / discharge | `peak_discharge` |
 | `p < 0` otherwise | export / discharge | `self_consumption` |
-| `p = 0`, grid limit binding at a zero bound | hold | `grid_limit_hold` |
+| `p = 0`, on a zero grid bound tighter than the SoC window | hold | `grid_limit_hold` |
 | `p = 0`, at `E_min` (within half a step) | hold | `reserve_hold` |
 | `p = 0`, at `E_max` | hold | `battery_full` |
 | `p = 0`, the cost-basis floor blocks every discharge | hold | `sell_floor` |
 | `p = 0`, round trip blocks the arbitrage | hold | `efficiency_loss` |
 | `p = 0` otherwise | hold | `spread_below_threshold` |
+
+**Which constraint bound the power (0.20.2).** `power_bounds_kw` still returns the intersected
+`(lo, hi, grid_binding)`, but `_classify` no longer reads `grid_binding` as "the power is on a grid
+bound": it receives the SoC-safe window (`soc_window_kw`) and the grid window (`grid_window_kw`)
+separately and uses a grid reason only on a side where the grid bound is tighter than the SoC bound
+and the power sits on it. The 0.19.0 sell floor setting `grid_lo = 0` in a PV-surplus slot is the
+case that exposed the old conflation: a charge filling the pack on its SoC ceiling stays
+`pv_surplus_charge`, and a discharge parked on the SoC floor stays `peak_discharge`.
 
 Action vocabulary: `hold`, `charge`, `discharge`, `pv_charge`, `export`, `self_consumption`,
 `reserve`.

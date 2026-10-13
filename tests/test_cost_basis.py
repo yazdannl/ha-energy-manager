@@ -781,6 +781,10 @@ def test_live_shaped_plan_keeps_the_pv_surplus_for_the_cheaper_hours():
     # 11:00-13:00 carry the 1879 Wh the pack needs to reach 100 %, exactly as the unfloored plan did.
     assert powers[11] > 0.0 and powers[12] > 0.0 and powers[13] > 0.0
     assert sum(powers[8:14]) / 1000.0 == pytest.approx(1.879, abs=0.002)
+    # The 13:00 slot's 617.4 W is exactly ``(e_max - e) / (1 * eta)``: the pack's ceiling, not the
+    # 1000 W grid ceiling the 0.20.1 label claimed (0.20.2, SPEC 8.17).
+    assert powers[11:14] == pytest.approx([565.217391304, 695.652173913, 617.391304348], abs=1e-6)
+    assert [slot.reason for slot in floored.slots[11:14]] == [Reason.PV_SURPLUS_CHARGE] * 3
     unfloored = _live_plan(None)
     # The unfloored plan was already price-driven (0.18.1: 0 early, 1879 Wh late), and the floor no
     # longer touches this window; the two plans may still differ later where the floor clamps a
@@ -794,6 +798,123 @@ def test_live_shaped_plan_keeps_the_pv_surplus_for_the_cheaper_hours():
     last = floored.slots[-1]
     final = dp.next_energy_kwh(last.soc_kwh, last.power_w / 1000.0, 1.0, aggregate)
     assert final == pytest.approx(1.92, abs=0.01)
+
+
+def test_live_shaped_ceiling_charge_is_a_pv_charge_not_a_grid_hold():
+    """0.20.1 mislabelled the live 12:00 slot ``charge / grid_limit_hold``: the sell floor sets
+    ``grid_lo = 0`` in a PV-surplus hour, so ``power_bounds_kw`` reported ``binding``, and a charge
+    that really sits on the pack's 100 % SoC ceiling was credited to the grid.  The reason must
+    name the window the power sits on; the schedule itself is the 0.20.1 one, byte for byte."""
+    config = battery(
+        capacity_kwh=1.92, min_soc_pct=15.0, max_charge_w=1000.0, max_discharge_w=800.0,
+        eta_charge=0.92, eta_discharge=0.92,
+    )
+    aggregate = dp.BatteryAggregate.from_configs([config], 0.0)
+    # The live plan (2026-10-13 11:04Z) reached 12:00 with e = 1.92 - 0.92 * 0.9903 kWh (52.5 %):
+    # filling to 100 % in the hour takes exactly (e_max - e) / (1 h * eta) = 990.3 W, not a limit.
+    e_start = 1.92 - 0.92 * 0.9903
+    slot = dp.SlotInput(t=T0, pv_kw=2.02, load_kw=0.59, buy=0.2620, sell=0.2620)
+    options = dp.OptimizerOptions(
+        slot_minutes=60, power_steps=24, allow_export=True, target_soc_pct_end=100.0
+    )
+    plan = dp.solve(
+        [slot], aggregate=aggregate, start_kwh=e_start, options=options, generated_at=T0,
+        sell_floor_eur_per_kwh=0.3997,
+    )
+    s = plan.slots[0]
+    # The schedule is the 0.20.1 one (pinned from the pre-fix solve): power, SoC and money unmoved.
+    assert s.power_w == pytest.approx(990.3, abs=1e-9)
+    assert s.soc_kwh == pytest.approx(e_start, abs=1e-12)
+    assert s.soc_pct == pytest.approx(52.55, abs=1e-9)
+    assert dp.next_energy_kwh(s.soc_kwh, s.power_w / 1000.0, 1.0, aggregate) == pytest.approx(
+        1.92, abs=1e-12
+    )
+    # The money, from the slot's own inputs (grid = load - pv + p).
+    expected_cost = -0.2620 * (2.02 - 0.59 - 0.9903)
+    assert plan.summary.cost_estimate_eur == pytest.approx(expected_cost, abs=1e-9)
+    assert plan.summary.baseline_cost_eur == pytest.approx(-0.2620 * (2.02 - 0.59), abs=1e-9)
+    assert plan.summary.charged_kwh == pytest.approx(0.9903, abs=1e-9)
+    assert plan.summary.pv_charge_kwh == pytest.approx(0.9903, abs=1e-9)
+    assert plan.summary.grid_charge_kwh == 0.0
+    assert plan.summary.objective_eur == pytest.approx(
+        expected_cost - 0.2620 * 0.92 * 1.92, abs=1e-9
+    )
+    # The floor tightened the *lower* bound while the power sits on the SoC ceiling: the grid
+    # windows and the binding flag are as before, but the label follows the window really hit.
+    floored = replace(options, sell_floor_eur_per_kwh=0.3997)
+    soc_lo, soc_hi = dp.soc_window_kw(e_start, aggregate, 1.0)
+    grid_lo, grid_hi = dp.grid_window_kw(slot, aggregate, floored)
+    assert (grid_lo, grid_hi) == (0.0, 1.0)
+    assert soc_hi == pytest.approx(0.9903, abs=1e-9)
+    assert soc_lo < grid_lo < soc_hi < grid_hi
+    assert dp.power_bounds_kw(slot, e_start, aggregate, floored, 1.0)[2] is True
+    assert s.action is Action.PV_CHARGE
+    assert s.reason == Reason.PV_SURPLUS_CHARGE
+
+
+def test_a_grid_capped_charge_still_names_the_grid_limit():
+    """Preservation (0.20.2, SPEC 8.17): a charge parked on a grid import cap that is tighter than
+    the SoC ceiling keeps ``charge / grid_limit_hold`` after the window split."""
+    config = battery(
+        capacity_kwh=2.0, min_soc_pct=0.0, max_charge_w=1000.0, max_discharge_w=1000.0,
+        eta_charge=1.0, eta_discharge=1.0,
+    )
+    aggregate = dp.BatteryAggregate.from_configs([config], 0.0)
+    slot = dp.SlotInput(t=T0, pv_kw=0.0, load_kw=0.55, buy=0.20, sell=0.05)
+    options = dp.OptimizerOptions(
+        slot_minutes=60, power_steps=24, allow_export=True, max_import_kw=1.05,
+        target_soc_pct_end=25.0,
+    )
+    plan = dp.solve([slot], aggregate=aggregate, start_kwh=0.0, options=options, generated_at=T0)
+    s = plan.slots[0]
+    assert s.power_w == pytest.approx(500.0, abs=1e-9)  # the import cap, not the 1000 W ceiling
+    assert plan.summary.cost_estimate_eur == pytest.approx(0.21, abs=1e-9)
+    assert s.action is Action.CHARGE
+    assert s.reason == Reason.GRID_LIMIT_HOLD
+
+
+def test_a_soc_floor_discharge_in_a_floor_slot_keeps_its_discharge_reason():
+    """0.20.1 called a discharge parked on the SoC floor ``grid_limit_hold`` whenever some grid
+    rule (the sell floor and the import cap here) made ``binding`` true.  The power sits on the
+    pack's own 10 % floor, so the discharge reason must stand (0.20.2, SPEC 8.17)."""
+    config = battery(
+        capacity_kwh=2.0, min_soc_pct=10.0, max_charge_w=1000.0, max_discharge_w=1000.0,
+        eta_charge=1.0, eta_discharge=1.0,
+    )
+    aggregate = dp.BatteryAggregate.from_configs([config], 0.0)
+    slot = dp.SlotInput(t=T0, pv_kw=0.0, load_kw=2.0, buy=0.55, sell=0.10)
+    options = dp.OptimizerOptions(
+        slot_minutes=60, power_steps=24, allow_export=True, max_import_kw=2.5
+    )
+    plan = dp.solve(
+        [slot], aggregate=aggregate, start_kwh=0.3, options=options, generated_at=T0,
+        sell_floor_eur_per_kwh=0.30,
+    )
+    s = plan.slots[0]
+    assert s.power_w == pytest.approx(-100.0, abs=1e-9)  # 0.3 -> 0.2 kWh = the 10 % floor
+    assert plan.summary.cost_estimate_eur == pytest.approx(1.045, abs=1e-9)
+    assert s.action is Action.DISCHARGE
+    assert s.reason == Reason.PEAK_DISCHARGE
+
+
+def test_a_grid_limited_hold_still_names_the_grid_limit():
+    """Preservation (0.20.2, SPEC 8.17): an export cap equal to the PV surplus pins the power at 0
+    on the grid side of the window -- a genuine grid hold, still ``hold / grid_limit_hold``."""
+    config = battery(
+        capacity_kwh=4.0, min_soc_pct=10.0, max_charge_w=1000.0, max_discharge_w=1000.0,
+        eta_charge=1.0, eta_discharge=1.0,
+    )
+    aggregate = dp.BatteryAggregate.from_configs([config], 0.0)
+    slot = dp.SlotInput(t=T0, pv_kw=1.5, load_kw=0.5, buy=0.50, sell=0.30)
+    options = dp.OptimizerOptions(
+        slot_minutes=60, power_steps=24, allow_export=True, max_export_kw=1.0,
+        salvage_multiplier=0.0,
+    )
+    plan = dp.solve([slot], aggregate=aggregate, start_kwh=2.0, options=options, generated_at=T0)
+    s = plan.slots[0]
+    assert s.power_w == 0.0
+    assert s.action is Action.HOLD
+    assert s.reason == Reason.GRID_LIMIT_HOLD
 
 
 def _preference_plan(preference: str, later_buy: float) -> Plan:
