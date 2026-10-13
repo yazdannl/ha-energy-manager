@@ -1474,6 +1474,48 @@ below the scanner's five-decimal threshold and keeps this section clean (`0.3001
 
 ---
 
+### 8.21 A live safety condition must not strand the Dashboard (0.20.6)
+
+`viewDashboard` paints its panels from one `/status` success handler, in order: answer, alerts,
+manual override, right now, price, supporting, batteries. `renderAutopilot` builds the answer through
+an append callback (`draw`), and every one of its blocks used that callback except the safety-state
+banner, which did `body.appendChild(box)` on its first argument. That argument is the callback, so
+whenever a safety line was live -- `/status.pending_holds` non-empty, or `mode_persisted: false` --
+the paint threw **`TypeError: body.appendChild is not a function`** immediately after the
+authority/measured/planned lines.
+
+Because the throw happened inside the `.then` success handler, the handler's remaining statements
+never ran: **Warnings and activity**, **Manual override**, **Right now**, **Battery energy price**,
+**Supporting measurements** and **Batteries** kept the initial `panelStatus(..., "Loading…")`, and
+the 15 s poll re-threw at the same place, so the tab never recovered. Two details in the reported
+screenshot follow directly: the `Now` panel stops after three lines (the trailing "Last plan …"
+legend note is appended *after* the safety banner, so it never ran), and the price card reads "the
+server did not report a cost-basis ledger" -- that text was painted by the earlier `/plan` handler,
+which ran `paintPrice` while `data.status` was still `null` (the `/status` paint of the same card, at
+the end of the aborted chain, never happened).
+
+The live shape is the one frozen in `backups/live-config-20261012-1156/final-status.json`
+(2026-10-12T12:24Z): `pending_holds: ["solarflow_800_plus"]` with `mode_persisted: true`. Remote
+`/status` could not be re-read from this host on 2026-10-13 (the add-on is ingress-only and has no
+LAN route), so the reproduction drives the render check with that frozen shape rather than a fresh
+fetch.
+
+The fix passes the callback through: `renderSafetyState(draw, status)` now ends in `draw(box)`.
+
+Three checks in `tools/ui_render_check.js` (section 1b1b) pin it, driven by a new mock hook
+`SEM_MOCK.setSafetyState(pending, persisted)`: the banner names the battery whose hold is still
+unconfirmed, no dashboard panel contains "Loading…" while it is live, and the panels painted after
+the answer (warnings/activity, `Grid power`, `PV power`, the battery card) all rendered. On the
+frozen 0.20.5 tree the same section aborts the render check with the identical `TypeError` (exit 1),
+so the gate fails before the fix and passes after it.
+
+Measured on this tree: `python3 -m pytest tests -q` -> **941 passed** (unchanged from 0.20.5; the new
+coverage lives in the render check), `sh tools/audit.sh` -> **clean, 116 files scanned** (the count is
+112 plus the untracked forecast tooling the scanner walks), `node tools/ui_render_check.js` ->
+**127 passed, 0 failed** (124 before).
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:

@@ -85,7 +85,9 @@ the settings form is dirty or a stop-result banner is on screen, so a failed sto
 dismissed (or the result is dismissed explicitly). One compact **Safety state**
 banner appears when `/status` reports a non-empty `pending_holds` (a battery whose last real setpoint
 is still live, so the add-on cannot claim it is idle) or `mode_persisted: false` (the running process
-has the new mode but a restart would come up in the old one). After a stop the panel re-fetches
+has the new mode but a restart would come up in the old one). The banner is appended through the
+answer's own `draw` callback like every other answer block (0.20.6), so a live safety state can never
+abort the rest of the dashboard paint. After a stop the panel re-fetches
 `/status` and appends both facts to the stop-result box, so a successful HTTP 200 that did not
 persist the mode is never presented as a clean stop.
 

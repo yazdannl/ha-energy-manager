@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.20.6
+
+- **A live safety condition no longer strands the Dashboard.** The answer panel's **Safety state**
+banner (`/status.pending_holds` non-empty, or `mode_persisted: false`) was built by
+`renderSafetyState`, which appended with `body.appendChild(box)` on the first argument it was given.
+That argument is `renderAutopilot`'s `draw` callback, not a DOM node, so as soon as a safety line was
+live the paint threw `TypeError: body.appendChild is not a function` right after the
+authority/measured/planned lines. The throw aborted the rest of the `/status` success handler: the
+answer stopped after its first three lines, and **Warnings and activity**, **Manual override**,
+**Right now**, **Battery energy price**, **Supporting measurements** and **Batteries** never painted
+and stayed on "Loading…" — the 15 s poll re-threw at the same place, so it never recovered. The
+price card looked wrong in a telling way: it still held the "the server did not report a cost-basis
+ledger" text painted by the earlier `/plan` handler while `data.status` was still null, so a healthy
+ledger read as missing. `renderSafetyState` now appends through the same callback as every other
+answer block. The render check renders the live shape (a pending hold for one battery) and asserts
+the banner shows *and* every later panel still painted; on the frozen 0.20.5 tree that section aborts
+with the identical `TypeError`.
+
 ## 0.20.5
 
 - **A stall now means stale measurements, not an empty booking window.** The 0.20.3 detector

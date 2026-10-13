@@ -862,7 +862,12 @@
     body.appendChild(box);
   }
 
-  function renderSafetyState(body, status) {
+  // Rendered through renderAutopilot's append callback like every other answer block, so it must
+  // take that callback (`draw`), never a DOM node: passing the callback to appendChild threw
+  // "body.appendChild is not a function" whenever a safety condition was live (a pending hold or an
+  // unpersisted mode), which aborted the rest of the /status paint and left five panels on
+  // "Loading…" for good (0.20.6).
+  function renderSafetyState(draw, status) {
     var lines = [];
     var pending = Array.isArray(status.pending_holds) ? status.pending_holds : [];
     if (pending.length) {
@@ -878,7 +883,7 @@
     var list = el("ul");
     lines.forEach(function (text) { list.appendChild(el("li", { text: text })); });
     box.appendChild(list);
-    body.appendChild(box);
+    draw(box);
   }
 
   // Who is in control, and whether the dispatcher writes (UI_REVIEW §3.1). The wording is the

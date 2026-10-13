@@ -1415,6 +1415,13 @@
     setCostBasisMode: function (mode) {
       db.costBasisMode = ["ok", "stale", "empty", "off"].indexOf(mode) >= 0 ? mode : "ok";
       return costBasisPayload();
+    },
+    // Render-check hook (0.20.6): /status.pending_holds (a setpoint written but not yet confirmed
+    // neutralised) feeds the answer's "Safety state" banner, and mode_persisted its second line.
+    setSafetyState: function (pending, persisted) {
+      db.pendingHolds = Array.isArray(pending) ? pending.slice() : [];
+      db.modePersisted = persisted !== false;
+      return statusPayload();
     }
   };
 })(typeof globalThis !== "undefined" ? globalThis : this);

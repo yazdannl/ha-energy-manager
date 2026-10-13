@@ -209,6 +209,27 @@ function classTokens(text) {
     && (byClass(view(), "answer-authority")[0] || {}).textContent === authorityBefore,
     "the authority line changed or vanished");
 
+  /* ---------- 1b1b. a live safety condition must not strand the dashboard (0.20.6) ---------- */
+  // /status.pending_holds drives the answer's "Safety state" banner through renderAutopilot's
+  // append callback. A mismatch there (the banner was handed the callback as if it were a DOM
+  // node) threw mid-paint, aborted the rest of the /status render, and left Warnings and activity,
+  // Right now, Supporting measurements and Batteries on "Loading…" for good. Render the live shape
+  // and assert the banner shows *and* every later panel still painted.
+  console.log("\n1b1b. a pending hold renders the safety banner without stranding the panels");
+  M.setSafetyState(["battery_1"], true);
+  await goto("/dashboard");
+  const safetyText = allText(view());
+  check("the safety banner names the battery whose hold is still unconfirmed",
+    /Safety state/.test(safetyText) && /A real setpoint may still be in force for: battery_1/.test(safetyText),
+    safetyText.slice(0, 200));
+  check("no dashboard panel is left on Loading… while a safety condition is live",
+    !/Loading/.test(safetyText), (safetyText.match(/\S*Loading\S*/) || [])[0] || "");
+  check("the panels painted after the answer still rendered (alerts, readings, batteries)",
+    /(No warnings or errors\.|Recent activity)/.test(safetyText) && /Grid power/.test(safetyText)
+      && /PV power/.test(safetyText) && /Example Battery 1/.test(safetyText),
+    safetyText.slice(0, 240));
+  M.setSafetyState([], true);
+
   /* ---------- 1b2. the manual override panel (0.20.0, SPEC 5/9.3/10) ---------- */
   // The panel is asserted in both documented states: nothing set, then an active override with a
   // per-battery limit — the mock serves /status manual_limits plus cap_charge_w/cap_discharge_w.
