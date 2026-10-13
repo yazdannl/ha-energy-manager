@@ -1227,16 +1227,23 @@ cumulative correction is `reconciled_kwh`, the last step `reconciled_last_kwh`, 
 correction beyond half the pack capacity resets the ledger (`basis = None, E = 0`) and counts
 `reconciled_resets`. All of these travel with the per-battery ledger into `/status`.
 
-A ledger that cannot advance must say so (0.20.3). With no usable power samples in the window,
-`book_slices` leaves the basis and the energy exactly as they were, increments the
-`skipped_no_samples` counter, sets the persisted `no_samples_since` marker (`stale` in the payload
-and the API) and logs one warning per stall naming the battery; the next successful booking clears
-the marker. Both fields survive a restart and are exposed per battery in `/status.cost_basis` and
-the HA sensor attributes, so a frozen sell floor is visible instead of silent. When the per-battery
-measurement rows hold no usable power point in the window **and exactly one battery is enabled**,
-`update_basis` falls back to the fleet-aggregate 5-minute `actuals` rows
-(`battery_kw`/`grid_kw`/`soc_kwh`, capped at the newest row) and books measured energy that was
-never booked, under unchanged basis semantics (the payload's `sample_source` then says `actuals`).
+A ledger that cannot follow the pack must say so (0.20.3; the freshness rule is 0.20.5). A *stall*
+is stale measurements, never an empty booking window: `book_slices` leaves the basis and the energy
+exactly as they were, increments the `skipped_no_samples` counter, sets the persisted
+`no_samples_since` marker (`stale` in the payload and the API) and logs one warning per stall naming
+the battery when no usable power sample exists at all or the newest one is older than
+`STALL_TOLERANCE` (15 min = three 5-minute buckets, one whole bucket above the 10-minute
+`MAX_GAP_MINUTES` booking gap tolerance, so a healthy sampler -- or one that merely dropped a single
+bucket -- can never trip it); the next successful booking with a fresh sample clears the marker.  A
+ledger already settled up to the newest sample (an update inside the current sample bin) books
+nothing and is **healthy**: it never sets the marker, steps the counter, logs the warning or falls
+back to `actuals`.  Both fields survive a restart and are exposed per battery in
+`/status.cost_basis` and the HA sensor attributes, so a frozen sell floor is visible instead of
+silent. When the per-battery measurement rows hold no usable power point in the window **and
+exactly one battery is enabled**, `update_basis` falls back to the fleet-aggregate 5-minute
+`actuals` rows (`battery_kw`/`grid_kw`/`soc_kwh`, capped at the newest row) and books measured
+energy that was never booked, under unchanged basis semantics (the payload's `sample_source` then
+says `actuals`).
 With two or more enabled batteries the aggregate cannot be split without guessing, so the fallback
 is refused and the stall is reported instead.
 

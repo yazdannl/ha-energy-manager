@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.20.5
+
+- **A stall now means stale measurements, not an empty booking window.** The 0.20.3 detector
+derived `stalled` from the coverage of `(last_ts, newest sample)`, which is empty by construction
+whenever the ledger is already settled up to the newest sample: every update landing inside the
+current 5-minute bin wrote `stale: true` / `no_samples_since` and stepped `skipped_no_samples` on a
+perfectly healthy ledger (live on 2026-10-13T12:23:02Z it advanced 368 -> 371 intervals and
+reported stalled *in the same update*, and at 12:28:11Z the same ledger read healthy again), which
+the 0.20.4 Dashboard card rendered as "Stale reading".  A stall is now a freshness failure: the
+newest usable power sample must be older than `STALL_TOLERANCE` (15 min = three sampling buckets,
+one whole bucket above the 10-minute booking-gap tolerance) or missing entirely.  The 0.20.3
+counter, marker, single warning and `sample_source` semantics are unchanged, and the single-battery
+`actuals` fallback still fires only when the window holds no usable power point at all -- a healthy
+ledger updating twice inside one sample bin books nothing extra and keeps `sample_source:
+measurements`.
+- Documentation: SPEC 5 amendment, `docs/REFERENCE.md` (`stale` / `no_samples_since` /
+  `skipped_no_samples` semantics), `docs/VERIFICATION.md` §8.20 and the `docs/UI.md` card note.
+
 ## 0.20.4
 
 - **The Dashboard shows what the energy in the pack cost and what a sale has to earn.** Both

@@ -1833,6 +1833,25 @@ round, with the reason:
   fetch beyond ``/status`` and the already-fetched plan, and changes no optimiser, ledger,
   dispatcher or sampler behaviour.
 
+- **§5/§10 (a stall is a freshness failure, not an empty booking window; requested 2026-10-13
+  after the live 0.20.4 false positive at 12:23:02Z)** — the 0.20.3 stall marker must report
+  *measurements that stopped arriving*, never a booking window that happens to be empty.  A ledger
+  already settled up to the newest sample finds the covered ranges of ``(last_ts, newest sample)``
+  empty by construction, so ``book_slices`` must not derive ``stalled`` from that coverage (live:
+  the healthy ledger advanced 368 -> 371 intervals and wrote ``stale: true`` in the same update,
+  then read healthy five minutes later).  ``stalled`` is true only when no usable power sample
+  exists at all or the newest one is older than ``STALL_TOLERANCE = 3 * SAMPLE_MINUTES`` (15 min:
+  ``MAX_GAP_MINUTES``, the 10-min booking gap tolerance, plus one whole sample bucket, so a healthy
+  sampler -- or one that merely dropped a single bucket -- can never trip it).  Everything else from
+  0.20.3 is unchanged: ``skipped_no_samples`` steps once per stalling update, the persisted
+  ``no_samples_since`` marker (and the ``stale`` boolean) is set once per stall and cleared when a
+  fresh sample resumes the booking, one warning per stall, and the ``sample_source`` field.  The
+  single-battery ``actuals`` fallback stays exactly as it was: it fires only when the per-battery
+  series holds no usable power point at or after the window start, which the empty-window case never
+  is (its newest sample *is* the window start), so a healthy ledger updating twice inside one sample
+  bin books nothing extra and never switches ``sample_source`` to ``actuals``.  No optimiser,
+  dispatcher, sampler or ledger-economics change.
+
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded
 in `docs/VERIFICATION.md`.

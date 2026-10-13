@@ -56,13 +56,16 @@ The ledger is derived data in the ``learning_profiles`` store (``kind = PROFILE_
 settings.  Nothing here may crash or block: no store, no rows, an unknown battery or a missing price
 degrades to ``basis=None`` (the floor is then inactive) and the control loop carries on.
 
-A ledger that cannot advance must never do so *silently* (0.20.3): with no usable power samples in
-the window ``book_slices`` counts ``skipped_no_samples``, sets ``no_samples_since``/``stale`` in the
-stored payload (visible in ``/status.cost_basis`` and the HA sensors) and logs one warning per
-stall, cleared when booking resumes.  To recover measured energy that was never booked, an update
-whose window has no usable measurement power point falls back to the fleet-aggregate ``actuals``
-rows -- but only when exactly one battery is enabled, because the aggregate cannot be split across
-a fleet without guessing; with several batteries the stall is reported instead.
+A ledger that cannot advance must never do so *silently* (0.20.3): when the newest usable power
+sample is older than :data:`STALL_TOLERANCE`, ``book_slices`` counts ``skipped_no_samples``, sets
+``no_samples_since``/``stale`` in the stored payload (visible in ``/status.cost_basis`` and the HA
+sensors) and logs one warning per stall, cleared when booking resumes.  A stall is a *freshness*
+failure, never an empty booking window (0.20.5): an update that lands inside the current sample bin
+finds the ledger already settled up to the newest sample, and an empty booking window there is
+healthy, not a stall.  To recover measured energy that was never booked, an update whose window
+has no usable measurement power point falls back to the fleet-aggregate ``actuals`` rows -- but only
+when exactly one battery is enabled, because the aggregate cannot be split across a fleet without
+guessing; with several batteries the stall is reported instead.
 """
 
 from __future__ import annotations
@@ -90,6 +93,7 @@ __all__ = [
     "RECONCILE_RESET_FRACTION",
     "RESET_SOC_MARGIN_PCT",
     "SAMPLE_MINUTES",
+    "STALL_TOLERANCE",
     "STATE_VERSION",
     "PriceSlot",
     "PriceTimeline",
@@ -112,6 +116,13 @@ SAMPLE_MINUTES = 5.0
 #: A whole sample may be missing before a measurement gap is treated as unknown.
 MAX_GAP_SAMPLES = 1.0
 MAX_GAP_MINUTES = SAMPLE_MINUTES * (1.0 + MAX_GAP_SAMPLES)
+#: A *stall* is a freshness failure: the ledger cannot follow the pack when the newest usable
+#: sample is older than this.  ``MAX_GAP_MINUTES`` is the booking gap tolerance (how wide a hole
+#: the integral may bridge); the stall tolerance sits one whole sample bucket above it -- 15 min =
+#: the 10-min gap bound + one missing 5-min bucket -- so a healthy sampler, or one that merely
+#: dropped a single bucket and is due its next sample, can never trip it, while a real outage is
+#: caught well inside one extra bucket.
+STALL_TOLERANCE = timedelta(minutes=3 * SAMPLE_MINUTES)
 #: A command change smaller than this does not open a new slice (grid-follow micro corrections).
 APPLIED_CHANGE_TOLERANCE_W = 25.0
 #: At or below ``min_soc_pct + this`` the pack holds nothing usable: the ledger resets.
@@ -641,9 +652,12 @@ def book_slices(
             for a, b in power.covered_ranges(window_from, now)
             if min(b, settled_end) > a
         ]
-    # No usable power sample covers any part of the window: the ledger cannot advance (0.20.3).
-    # Recorded with a counter and a marker below instead of silently returning the same payload.
-    stalled = bool(slices) and not coverage
+    # A stall is a *freshness* failure, never an empty booking window (0.20.5).  An update that
+    # lands inside the current sample bin finds the ledger already settled up to the newest sample,
+    # so `coverage` above is empty by construction there and says nothing about the sampler; the
+    # 0.20.3 counter, marker and warning below are kept, but what they report is the age of the
+    # newest usable sample against the sample grid instead of the emptiness of the window.
+    stalled = bool(slices) and (settled_end is None or (now - settled_end) > STALL_TOLERANCE)
     for start, end, applied, dispatch_reason, mode, dispatch_id in slices:
         if settled_end is None or start >= settled_end:
             # Not bounded by samples on both sides yet: leave it for the next update.
@@ -752,9 +766,12 @@ def book_slices(
             # One warning per stall, not one per tick: the stored marker (which survives a
             # restart) is what says the stall was already reported.
             log.warning(
-                "cost-basis ledger for %s stalled: no usable battery power samples in the window "
-                "since %s; the stored basis and sell floor no longer follow the pack",
+                "cost-basis ledger for %s stalled: the newest usable battery power sample is %s, "
+                "older than the %s stall tolerance (window since %s); the stored basis and sell "
+                "floor no longer follow the pack",
                 battery.id,
+                to_iso(settled_end) if settled_end is not None else "missing",
+                STALL_TOLERANCE,
                 to_iso(window_from or now),
             )
         if no_samples_since is None:

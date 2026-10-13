@@ -77,7 +77,8 @@ expensive window) and the `Next 24 hours` mini-chart (price line + SoC line). Th
 price** card shows the cost-basis ledger's two money figures — the average charged price and the
 break-even sell price (basis ÷ round trip + wear + margin) — with the stored energy, its value and
 the ledger's `updated_at`; several enabled batteries add one row each, and a stalled ledger
-(0.20.3's stall marker) is a visible warning beside the numbers instead of a quietly frozen floor.
+(0.20.3's stall marker: no usable power sample for 15 minutes, 0.20.5) is a visible warning beside
+the numbers instead of a quietly frozen floor.
 
 Polls itself every 15 s while the tab is visible; paused while a dialog is open, a write is pending,
 the settings form is dirty or a stop-result banner is on screen, so a failed stop stays visible until

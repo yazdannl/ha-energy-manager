@@ -1406,6 +1406,74 @@ request (the floor) without extra parsing.
 
 ---
 
+### 8.20 A stall is stale measurements, not an empty booking window (0.20.5)
+
+0.20.3's stall detector asked the wrong question. It set `stalled = bool(slices) and not coverage`,
+where `coverage` was the covered ranges of `(window_from, settled_end)` clipped to the newest
+sample. Whenever the ledger is already settled up to the newest sample, `window_from == settled_end`
+and that coverage is empty *by construction*: an update landing inside the current 5-minute sample
+bin, with nothing left to book, therefore read as a stall even though the measurements were
+perfectly fresh. `bool(slices)` does not discriminate either, because the open command interval
+`(cursor, now)` is almost always present.
+
+Live on the 0.20.4 add-on (one battery, healthy measurements), the update at **2026-10-13T12:23:02Z**
+advanced the ledger correctly -- `intervals 368 -> 371`, three 5-minute journal slices
+`12:05->12:10`, `12:10->12:15`, `12:15->12:20`, each `charge_kwh 0.0832` at 999 W, its basis moving
+from 0.3001 to 0.2913 EUR/kWh (four decimals; the payload carries six), `sample_source:
+measurements` -- and *in the same update* wrote `stale: true`, `no_samples_since:
+2026-10-13T12:20:00` and `skipped_no_samples: 2`. Five minutes later (**12:28:11Z**) the same ledger
+reported `stale: false` with `no_samples_since: null` and the counter unchanged. The 0.20.4
+Dashboard card renders the marker as "Stale reading", so a healthy ledger showed a false alarm.
+
+The fix defines a stall as a **freshness failure**, tested against `now` and the sample grid:
+
+* before: `stalled = bool(slices) and not coverage`, where `coverage` was the covered ranges of
+  `(last_ts, newest sample)` clipped to the newest sample;
+* after: `stalled = bool(slices) and (settled_end is None or (now - settled_end) >
+  STALL_TOLERANCE)`, with `settled_end = power.last_time` (clipped to `now`).
+
+`STALL_TOLERANCE = 3 * SAMPLE_MINUTES` = **15 min**. `MAX_GAP_MINUTES` is the booking gap tolerance
+(10 min: one sample bucket plus one missing bucket, the widest hole the integral may bridge); the
+stall tolerance sits one whole bucket above it, so a healthy sampler -- and even one that dropped a
+single bucket and is due its next sample -- can never trip it, while a genuine outage (three missing
+buckets) is caught within one bucket. Everything else from 0.20.3 is unchanged: the
+`skipped_no_samples` step per stalling update, the persisted `no_samples_since`/`stale` marker set
+once per stall and cleared on resume, the single `log.warning` per stall (its message now names the
+newest sample and the tolerance) and `sample_source`. The single-battery `actuals` fallback is
+unchanged and cannot fire on the empty-window case: it requires no usable power point at or after
+the window start, while there the newest sample *is* the window start.
+
+Six tests in `tests/test_cost_basis.py` pin it (all six pass on this tree; the "on e1c4418" column is
+the same test file run against the frozen 0.20.4 source):
+
+| test | on e1c4418 | what it pins |
+|---|---|---|
+| `test_an_update_inside_the_current_sample_bin_is_not_a_stall` | **fails**: `assert True is False` (`stale` true on a settled ledger) | two updates inside one bin: the second is `stale` false with no marker, the counter unchanged, nothing extra booked, `sample_source == "measurements"` and no warning |
+| `test_a_twenty_minute_old_sample_is_a_stall_and_counts_once_per_update` | **fails**: `assert False is True` (coverage hides the stale tail) | newest sample 20 min old: stale, marker set, exactly one warning, counter +1 per update |
+| `test_no_power_samples_at_all_is_still_a_stall` | passes (preservation) | the original 0.20.3 incident shape stays stale: no power rows, frozen 0.3197 basis, 282 intervals, counter +1, one warning |
+| `test_the_stall_tolerance_boundary_separates_fresh_from_stale` | **fails**: `assert True is False` (14 min behind read as stalled) | 14 min behind is fresh; 16 min is stale with the marker at the newest sample; the tolerance is `3 * SAMPLE_MINUTES` and above `MAX_GAP_MINUTES` |
+| `test_a_fresh_sample_clears_the_stall_and_the_next_stall_warns_again` | **fails**: `assert False is True` (no stall detected at all) | resume clears the marker and keeps the counter; a later outage warns a second time |
+| `test_an_eighteen_hour_old_feed_is_stale_and_still_recovered_from_actuals` | **fails**: `assert False is True` | the 18 h incident shape: the fallback books the recoverable window from `actuals` (intervals 282 -> 283, `last_ts` at the newest row) while the 18 h old newest sample still reports stale |
+
+`test_no_power_samples_at_all_is_still_a_stall` is the preservation guard: the 0.20.3 detector
+already handled that shape, so it passes on both trees, exactly as the 0.20.3 report noted for its
+own preservation tests.
+
+Measured on this tree: `python3 -m pytest tests -q` -> **941 passed** (6 new tests; 935 before),
+`sh tools/audit.sh` -> **clean, 112 files scanned**, `node tools/ui_render_check.js` -> **124 passed,
+0 failed**.
+
+What is *not* verified live: nothing was deployed and no live endpoint was read, so the corrected
+marker has not been re-observed against the running add-on; the reproduction is offline, built from
+the shape and values of the frozen live payload quoted above. One scanner observation, deliberately
+not changed here: the
+documented line-level `audit-allow:` opt-out in `tools/audit.sh` filters the `grep -o` match text
+instead of the source line, so the marker does not currently exempt a matching line (verified with a
+throwaway probe file); the live prices above are therefore quoted to four decimals, which stays
+below the scanner's five-decimal threshold and keeps this section clean (`0.3001`/`0.2913`).
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:

@@ -1609,6 +1609,259 @@ def test_basis_status_exposes_the_stall_marker():
     assert empty["skipped_no_samples"] == 0
 
 
+# --------------------------------- a stall is the age of the newest sample, not an empty window
+# (0.20.5)
+#
+# Live false positive on 2026-10-13T12:23:02Z: the ledger advanced correctly (intervals 368 ->
+# 371, three 5-minute slices of 0.0832 kWh at 999 W, its basis moving down with them) and in the
+# same update wrote stale=true / no_samples_since=12:20:00 / skipped_no_samples=2; five minutes
+# later the same ledger reported stale=false with no gap.  The old detector -- `not coverage` of
+# (last_ts, newest sample) -- is empty by construction whenever the ledger is already settled up
+# to the newest sample, so every update inside the current 5-minute bin flickered stale.
+
+
+def _charge_samples(
+    start: datetime, count: int, config: BatteryConfig, *, charged_before_minutes: int = 0
+) -> list[Measurement]:
+    """``count`` samples of 800 W battery power every 5 min from ``start``, with the SoC they
+    imply.
+
+    The newest sample is therefore ``start + 5 * (count - 1)`` minutes.  ``charged_before_minutes``
+    lets a later block continue the same charge instead of restarting the SoC at the floor (which
+    would reset the ledger).
+    """
+    rows = []
+    for index in range(count):
+        moment = start + timedelta(minutes=5 * index)
+        charged = 0.8 * (charged_before_minutes + 5 * index) / 60.0
+        rows.append(
+            Measurement(ts=moment, role=f"battery_power:{config.id}", value=800.0, unit="W")
+        )
+        rows.append(
+            Measurement(
+                ts=moment, role=f"battery_soc:{config.id}", value=soc_for(charged, config), unit="%"
+            )
+        )
+    return rows
+
+
+def test_an_update_inside_the_current_sample_bin_is_not_a_stall(tmp_path, caplog):
+    """The live false positive: a ledger settled up to the newest sample flickered stale."""
+    config = battery()
+    store = Store(tmp_path / "settled.db")
+    _seed_dispatch_and_plan(store, config, start=T0)
+    store.add_measurements(_charge_samples(T0, 5, config))
+    # The fleet-aggregate actuals exist and disagree with the per-battery measurements: an empty
+    # window must not fall back to them (`sample_source` below pins that it does not).
+    for index in range(5):
+        store.upsert_actuals(
+            T0 + timedelta(minutes=5 * index), battery_kw=0.4, grid_kw=0.4, soc_kwh=1.5
+        )
+    timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05, minutes=120)])
+    with caplog.at_level("WARNING", logger="app.cost_basis"):
+        first = ledger.update_basis(store, config, T0 + timedelta(minutes=22), timeline=timeline)
+        second = ledger.update_basis(store, config, T0 + timedelta(minutes=24), timeline=timeline)
+    assert first is not None and second is not None
+    # The first update settles the ledger on the newest sample (T0 + 20 min).
+    assert first["intervals"] == 1
+    assert first["last_ts"] == to_iso(T0 + timedelta(minutes=20))
+    assert first["stale"] is False and first["skipped_no_samples"] == 0
+    # The second lands two minutes later, inside the next sample bin: there is nothing left to
+    # book, but an empty booking window is not a missing measurement.
+    assert second["stale"] is False
+    assert second["no_samples_since"] is None
+    assert second["skipped_no_samples"] == 0
+    assert second["intervals"] == first["intervals"]
+    assert second["last_ts"] == first["last_ts"]
+    assert second["basis_eur_per_kwh"] == pytest.approx(first["basis_eur_per_kwh"])
+    assert second["energy_kwh"] == pytest.approx(first["energy_kwh"])
+    # The actuals fallback must not fire either: the newest sample is fresh (0.20.5 review).
+    assert second["sample_source"] == "measurements"
+    assert [record for record in caplog.records if "stalled" in record.getMessage()] == []
+    store.close()
+
+
+def test_a_twenty_minute_old_sample_is_a_stall_and_counts_once_per_update(tmp_path, caplog):
+    """Freshness: coverage inside the window is not the same as a fresh newest sample."""
+    config = battery()
+    store = Store(tmp_path / "old-sample.db")
+    _seed_dispatch_and_plan(store, config, start=T0)
+    store.add_measurements(_charge_samples(T0, 9, config))
+    timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05, minutes=120)])
+    now = T0 + timedelta(hours=1)
+    with caplog.at_level("WARNING", logger="app.cost_basis"):
+        first = ledger.update_basis(store, config, now, timeline=timeline)
+        second = ledger.update_basis(store, config, now, timeline=timeline)
+    assert first is not None and second is not None
+    # The ledger advances over everything the samples cover...
+    assert first["intervals"] == 1
+    assert first["last_ts"] == to_iso(T0 + timedelta(minutes=40))
+    assert first["basis_eur_per_kwh"] == pytest.approx(0.20)
+    # ...and still reports the stall: the newest usable sample is 20 min old (> 15 min).
+    for payload in (first, second):
+        assert payload["stale"] is True
+        assert payload["no_samples_since"] == to_iso(T0)
+    assert first["skipped_no_samples"] == 1
+    assert second["skipped_no_samples"] == 2  # one step per update while the stall lasts
+    assert second["sample_source"] == "measurements"  # the window has power: no fallback
+    warnings = [record for record in caplog.records if "stalled" in record.getMessage()]
+    assert len(warnings) == 1  # one warning per stall, not one per tick
+    store.close()
+
+
+def test_no_power_samples_at_all_is_still_a_stall(tmp_path, caplog):
+    """The original 0.20.3 incident shape: the freshness rule must not silence a real stall."""
+    config = battery()
+    store = Store(tmp_path / "incident.db")
+    _seed_dispatch_and_plan(store, config, start=T0)
+    seeded_soc = soc_for(0.8, config)
+    store.add_measurements(
+        [
+            Measurement(
+                ts=T0 + timedelta(minutes=5 * index),
+                role=f"battery_soc:{config.id}",
+                value=seeded_soc,
+                unit="%",
+            )
+            for index in range(13)
+        ]
+    )
+    # The frozen live ledger: 282 intervals, basis 0.3197, last booked 18 h before the incident.
+    store.profile_put(
+        ledger.PROFILE_KIND,
+        config.id,
+        {"basis_eur_per_kwh": 0.3197, "energy_kwh": 1.0, "last_ts": to_iso(T0), "intervals": 282},
+        T0,
+    )
+    timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05, minutes=120)])
+    now = T0 + timedelta(hours=1)
+    with caplog.at_level("WARNING", logger="app.cost_basis"):
+        first = ledger.update_basis(store, config, now, timeline=timeline)
+        second = ledger.update_basis(store, config, now, timeline=timeline)
+    assert first is not None and second is not None
+    for payload in (first, second):
+        assert payload["stale"] is True
+        assert payload["no_samples_since"] == to_iso(T0)
+        assert payload["basis_eur_per_kwh"] == pytest.approx(0.3197)  # frozen, never re-guessed
+        assert payload["intervals"] == 282
+    assert first["skipped_no_samples"] == 1
+    assert second["skipped_no_samples"] == 2
+    warnings = [record for record in caplog.records if "stalled" in record.getMessage()]
+    assert len(warnings) == 1
+    store.close()
+
+
+def test_the_stall_tolerance_boundary_separates_fresh_from_stale(tmp_path):
+    """Just under the grid-derived tolerance is fresh; past it is a stall."""
+    config = battery()
+    store = Store(tmp_path / "boundary.db")
+    _seed_dispatch_and_plan(store, config, start=T0)
+    store.add_measurements(_charge_samples(T0, 10, config))  # newest sample at T0 + 45 min
+    timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05, minutes=120)])
+    # The first update settles the ledger on the newest sample (T0 + 45 min)...
+    first = ledger.update_basis(store, config, T0 + timedelta(minutes=58), timeline=timeline)
+    assert first is not None
+    assert first["last_ts"] == to_iso(T0 + timedelta(minutes=45))
+    assert first["stale"] is False
+    # ...and a second update 14 min behind it is still fresh: the tolerance is exclusive.
+    fresh = ledger.update_basis(store, config, T0 + timedelta(minutes=59), timeline=timeline)
+    assert fresh is not None
+    assert fresh["last_ts"] == to_iso(T0 + timedelta(minutes=45))  # nothing left to book
+    assert fresh["stale"] is False
+    assert fresh["no_samples_since"] is None
+    assert fresh["skipped_no_samples"] == 0
+    assert fresh["sample_source"] == "measurements"
+    # 16 min behind: past the tolerance, a stall.
+    stale = ledger.update_basis(store, config, T0 + timedelta(minutes=61), timeline=timeline)
+    assert stale is not None
+    assert stale["stale"] is True
+    assert stale["no_samples_since"] == to_iso(T0 + timedelta(minutes=45))
+    assert stale["skipped_no_samples"] == 1
+    # The tolerance is derived from the sample grid and sits above the booking gap tolerance.
+    assert ledger.STALL_TOLERANCE == timedelta(minutes=3 * ledger.SAMPLE_MINUTES)
+    assert ledger.STALL_TOLERANCE == timedelta(minutes=15)
+    assert ledger.STALL_TOLERANCE > timedelta(minutes=ledger.MAX_GAP_MINUTES)
+    store.close()
+
+
+def test_a_fresh_sample_clears_the_stall_and_the_next_stall_warns_again(tmp_path, caplog):
+    """Resume: the marker clears, and a later outage is reported as a new stall."""
+    config = battery()
+    store = Store(tmp_path / "resume.db")
+    _seed_dispatch_and_plan(store, config, start=T0)
+    store.add_measurements(_charge_samples(T0, 9, config))
+    timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05, minutes=180)])
+    now = T0 + timedelta(hours=1)
+    with caplog.at_level("WARNING", logger="app.cost_basis"):
+        stalled = ledger.update_basis(store, config, now, timeline=timeline)
+        assert stalled is not None
+        assert stalled["stale"] is True and stalled["skipped_no_samples"] == 1
+        assert len([r for r in caplog.records if "stalled" in r.getMessage()]) == 1
+        # Fresh samples ending one bucket before `now` resume the ledger and clear the marker:
+        # measurement rows are read with `ts < now`, so a healthy feed always stops one bucket
+        # short of the update moment.
+        store.add_measurements(
+            _charge_samples(T0 + timedelta(minutes=45), 3, config, charged_before_minutes=45)
+        )
+        resumed = ledger.update_basis(store, config, now, timeline=timeline)
+        assert resumed is not None
+        assert resumed["stale"] is False
+        assert resumed["no_samples_since"] is None
+        assert resumed["skipped_no_samples"] == 1  # cumulative, never cleared
+        assert resumed["last_ts"] == to_iso(T0 + timedelta(minutes=55))
+        assert resumed["intervals"] == stalled["intervals"] + 1
+        # The feed dies again: the marker comes back and the stall warns a second time.
+        later = ledger.update_basis(store, config, now + timedelta(minutes=20), timeline=timeline)
+        assert later is not None
+        assert later["stale"] is True
+        assert later["no_samples_since"] == to_iso(T0 + timedelta(minutes=55))
+        assert later["skipped_no_samples"] == 2
+        assert len([r for r in caplog.records if "stalled" in r.getMessage()]) == 2
+    store.close()
+
+
+def test_an_eighteen_hour_old_feed_is_stale_and_still_recovered_from_actuals(tmp_path):
+    """The 18 h incident shape: the fallback books from actuals, and the stall still shows."""
+    config = battery()
+    store = Store(tmp_path / "eighteen-hours.db")
+    _seed_dispatch_and_plan(store, config, start=T0, hours=20)
+    store.profile_put(
+        ledger.PROFILE_KIND,
+        config.id,
+        {"basis_eur_per_kwh": 0.3197, "energy_kwh": 1.0, "last_ts": to_iso(T0), "intervals": 282},
+        T0,
+    )
+    # The measurement roles persisted no power rows at all (the 0.20.3 defect), so the only usable
+    # power samples are the fleet-aggregate actuals -- and those stop 18 h before `now`.
+    end = T0 + timedelta(hours=18)
+    charge_from = 18 * 12 - 12  # the last hour is a real 800 W charge
+    for index in range(18 * 12 + 1):
+        charging = index >= charge_from
+        store.upsert_actuals(
+            T0 + timedelta(minutes=5 * index),
+            battery_kw=0.8 if charging else 0.0,
+            grid_kw=0.8 if charging else 0.0,
+            soc_kwh=1.0 + (0.8 * (index - charge_from) / 12.0 if charging else 0.0),
+        )
+    payload = ledger.update_basis(store, config, T0 + timedelta(hours=36))
+    assert payload is not None
+    # The fallback books what the actuals really measured, under unchanged basis economics: the
+    # 5-min ramp into the charging hour (0.4 kW average) plus one flat 800 W hour, priced at the
+    # plan's 0.20 and averaged into the frozen 0.3197 basis.
+    charged = 0.4 * 5 / 60 + 0.8
+    expected_basis = (0.3197 * 1.0 + charged * 0.20) / (1.0 + charged)
+    assert payload["sample_source"] == "actuals"
+    assert payload["intervals"] == 283
+    assert payload["last_ts"] == to_iso(end)
+    assert payload["journal"][-1]["charge_kwh"] == pytest.approx(charged, abs=1e-4)
+    assert payload["basis_eur_per_kwh"] == pytest.approx(expected_basis, abs=1e-6)
+    # ...and the newest sample being 18 h old is still a stall, not a healthy recovery.
+    assert payload["stale"] is True
+    assert payload["no_samples_since"] == to_iso(T0)
+    assert payload["skipped_no_samples"] == 1
+    store.close()
+
+
 # ------------------------------------------- recovering unbooked measured energy (0.20.3)
 
 
