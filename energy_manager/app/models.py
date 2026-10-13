@@ -427,6 +427,14 @@ class PlanSlot:
     soc_pct: float | None = None  # capacity-weighted mean SoC, percent; shown in the UI/API
     pv_source: str = ""  # provider that supplied pv_kw for this slot
     price_source: str = ""  # provider that supplied buy/sell for this slot
+    #: Additive (0.20.1, SPEC 8.16): the duration the solver actually modelled for this slot, in
+    #: minutes.  Full ``plan.slot_minutes`` for every slot except a first slot that began before
+    #: the plan was made, whose value is the remaining part of that clock slot (>= 1.0).  The
+    #: slot's timestamp stays clock-aligned; only this duration changes, so the schedule, its
+    #: energy and its money all match the time the dispatcher really has.  ``0.0`` (the default)
+    #: means "unknown -- fall back to ``plan.slot_minutes``", e.g. a plan reloaded from an older
+    #: store.
+    minutes: float = 0.0
 
     def grid_kw(self) -> float:
         # p > 0 charges (consumes from AC), so a charge *raises* grid import.

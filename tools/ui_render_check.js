@@ -329,6 +329,21 @@ function classTokens(text) {
     /Battery/.test(labels) && /1\.60 kWh out/.test(facts[2].value)
     && /SoC/.test(labels) && /50 % → 40 %/.test(facts[3].value) && /floor 20 %/.test(facts[3].value),
     `${facts[2].value} / ${facts[3].value}`);
+  // 0.20.1 (SPEC 8.16): a partial first slot carries its own modelled duration, so its energy and
+  // cost use the window the solver did; the timestamp grid (and the window end) stays clock-aligned.
+  const partialPlan = {
+    slot_minutes: 60,
+    summary: {},
+    slots: [slotAt(0, { minutes: 44.0 }), slotAt(1, { minutes: 60.0 })],
+  };
+  const partialWindows = A.planActionWindows(partialPlan, { slots: [] });
+  check("a partial first slot's energy and cost use its modelled minutes",
+    partialWindows.length === 1
+    && Math.abs(partialWindows[0].minutes - 104) < 1e-9
+    && Math.abs(partialWindows[0].discharged_kwh - 0.8 * 104 / 60) < 1e-9
+    && Math.abs(partialWindows[0].cost_eur - (-0.5 * 0.3 * 104 / 60)) < 1e-9
+    && partialWindows[0].endMs === partialWindows[0].startMs + 2 * HOUR,
+    `${partialWindows.length} windows, ${partialWindows[0] && partialWindows[0].minutes} min`);
   check("a window states its grid flow and what it earns",
     /Grid cost/.test(labels) && /exports 1\.00 kWh/.test(facts[4].value) && /earns/.test(facts[4].value), facts[4] ? facts[4].value : "no grid fact");
   check("the join lands the dispatch and the measurement on the right window",

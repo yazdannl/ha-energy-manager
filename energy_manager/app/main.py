@@ -38,7 +38,7 @@ from .notify import Notifier
 
 log = logging.getLogger("app.main")
 
-APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.20.0"
+APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.20.1"
 COMMIT = os.environ.get("SEM_COMMIT") or os.environ.get("GITHUB_SHA") or ""
 DEFAULT_PORT = 8099
 DEFAULT_OPTIONS = "/data/options.json"
@@ -841,10 +841,15 @@ def _selfcheck_http(api: ApiServer, engine: Any) -> list[tuple[str, bool, str]]:
         slots = (plan or {}).get("slots") or []
         results.append(
             (
-                "plan slots carry soc_pct/pv_source/price_source",
+                "plan slots carry soc_pct/pv_source/price_source/minutes",
                 bool(slots)
                 and all(slot.get("price_source") for slot in slots)
-                and all(slot.get("soc_pct") is not None for slot in slots),
+                and all(slot.get("soc_pct") is not None for slot in slots)
+                # Additive 0.20.1 (SPEC 8.16): the modelled duration of every slot.
+                and all(
+                    isinstance(slot.get("minutes"), (int, float)) and slot["minutes"] > 0
+                    for slot in slots
+                ),
                 f"{len(slots)} slots",
             )
         )

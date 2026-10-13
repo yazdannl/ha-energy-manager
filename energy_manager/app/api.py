@@ -350,6 +350,11 @@ def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dic
                 "price_stale": slot.price_stale,
                 "pv_source": slot.pv_source or plan.sources.get("solar", "unknown"),
                 "price_source": slot.price_source or plan.sources.get("price", "unknown"),
+                # Additive (0.20.1, SPEC 8.16): the duration the solver modelled for this slot.
+                # Full ``slot_minutes`` for every slot but a first one that began before the plan
+                # was made, whose value is the remaining part of that clock slot.  The timestamp
+                # above stays clock-aligned; clients size energy/cost windows from this field.
+                "minutes": float(slot.minutes or plan.slot_minutes),
             }
             for slot in slots
         ],
@@ -390,6 +395,9 @@ def plan_execution_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
     slots = [
         {
             "t": entry.get("t"),
+            # Additive (0.20.1, SPEC 8.16): the modelled duration, so a client that turns planned
+            # power into energy uses the same window the solver did (grid step when absent).
+            "minutes": _round(entry.get("minutes") or payload.get("slot_minutes")),
             "dispatch": _rounded_dispatch(entry.get("dispatch")),
             "actual": _rounded_actual(entry.get("actual")),
         }
@@ -677,6 +685,8 @@ def status_dict(
                 "action": current.action.value,
                 "reason": current.reason,
                 "soc_kwh": current.soc_kwh,
+                # Additive (0.20.1, SPEC 8.16): the modelled duration of the current slot.
+                "minutes": float(current.minutes or plan.slot_minutes),
             },
         },
         "last_plan_at": to_iso(state.last_plan_at),

@@ -1751,6 +1751,27 @@ round, with the reason:
   `POST /override {power_w, minutes, battery_id}` with a signed power (charge `+`, discharge `-`,
   hold `0`) and `DELETE /override` -- and the Dashboard panel is its only new client.
 
+- **§6/§8.1/§8.2/§10 (the current partial slot is modelled with the time it really has; requested
+  2026-10-13 after the live 05:16Z plan undersold the 05:00 slot and the pack stopped at 37 %)** —
+  `solve_from_forecasts` floors the horizon start to the slot grid, so the first slot can begin up
+  to a full slot before `now`, while the pre-0.20.1 `solve` applied one uniform
+  `dt = slot_minutes / 60` to every slot: the modelled 05:00 hour really covered only 05:16-06:00,
+  its end-of-slot SoC was unattainable in the clock, and every later slot's price was applied to a
+  window shifted by the same elapsed part. `PlanSlot` gains the additive field `minutes` (the
+  duration the solver actually modelled): full `slot_minutes` for every slot after the first, the
+  remaining part of the current clock slot for the first, `0.0` meaning "unknown -- fall back to
+  `plan.slot_minutes`" for an older stored plan. `solve` gains the keyword `now` (`None` keeps the
+  old uniform model, so an existing caller is bit-for-bit unchanged) and computes the first slot's
+  duration as `clamp((slots[0].t + slot_delta - now).total_seconds() / 60, 1.0, slot_minutes)`; the
+  DP transitions, `power_bounds_kw`, the slot cost, the SoC trajectory, the summary money
+  (`cost_estimate_eur`, `baseline_cost_eur`, `saved_eur`) and every other consumer of plan-slot
+  energy (the execution view's intended side, `/plan` and `/plan/execution` slots, `/status`'s
+  current slot, the per-battery allocation, the web window energy/cost) use `minutes / 60`. The
+  timestamps stay clock-aligned and the grid is unchanged, so the API and the UI labels do not
+  move; only the durations, the energies and the money do. A `now` exactly on the grid reproduces
+  the uniform schedule, and a sub-minute or past remainder floors at 1 minute so no `dt` is ever
+  zero or negative.
+
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded
 in `docs/VERIFICATION.md`.

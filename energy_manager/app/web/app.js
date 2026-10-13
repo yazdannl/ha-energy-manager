@@ -1756,7 +1756,6 @@
     var slots = Array.isArray(plan && plan.slots) ? plan.slots : [];
     var minutes = planSlotMinutes(plan);
     var stepMs = minutes * 60000;
-    var hours = minutes / 60;
     var byTime = {};
     ((execution && execution.slots) || []).forEach(function (entry) {
       if (entry && entry.t) byTime[entry.t] = entry;
@@ -1766,18 +1765,24 @@
     function add(win, slot) {
       var exec = byTime[slot.t] || {};
       var power = isNum(slot.power_w) ? slot.power_w : 0;
+      // The slot's own modelled duration (0.20.1, SPEC 8.16): a partial first slot is not a full
+      // clock hour, so its energy and cost use the window the solver did.  The timestamp grid (and
+      // therefore the window end below) stays clock-aligned.
+      var slotMinutes = isNum(slot.minutes) && slot.minutes > 0 ? slot.minutes : minutes;
+      var slotHours = slotMinutes / 60;
+      win.windowMinutes += slotMinutes;
       win.last = slot;
       win.buySum += isNum(slot.buy) ? slot.buy : 0;
       win.sellSum += isNum(slot.sell) ? slot.sell : 0;
       win.pvSum += isNum(slot.pv_kw) ? slot.pv_kw : 0;
       win.loadSum += isNum(slot.load_kw) ? slot.load_kw : 0;
-      win.charged_kwh += Math.max(0, power) / 1000 * hours;
-      win.discharged_kwh += Math.max(0, -power) / 1000 * hours;
+      win.charged_kwh += Math.max(0, power) / 1000 * slotHours;
+      win.discharged_kwh += Math.max(0, -power) / 1000 * slotHours;
       // The plan's own grid model (models.PlanSlot.grid_kw): positive = importing.
       var grid = (isNum(slot.load_kw) ? slot.load_kw : 0) - (isNum(slot.pv_kw) ? slot.pv_kw : 0) + power / 1000;
-      win.grid_import_kwh += Math.max(0, grid) * hours;
-      win.grid_export_kwh += Math.max(0, -grid) * hours;
-      win.cost_eur += (grid >= 0 ? grid * (slot.buy || 0) : grid * (slot.sell || 0)) * hours;
+      win.grid_import_kwh += Math.max(0, grid) * slotHours;
+      win.grid_export_kwh += Math.max(0, -grid) * slotHours;
+      win.cost_eur += (grid >= 0 ? grid * (slot.buy || 0) : grid * (slot.sell || 0)) * slotHours;
       if (isNum(slot.load_p10)) win.bandLow = win.bandLow == null ? slot.load_p10 : Math.min(win.bandLow, slot.load_p10);
       if (isNum(slot.load_p90)) win.bandHigh = win.bandHigh == null ? slot.load_p90 : Math.max(win.bandHigh, slot.load_p90);
       if (isNum(slot.soc_pct)) {
@@ -1850,6 +1855,7 @@
         actualSlots: 0,
         actualSamples: 0,
         actualMinutes: 0,
+        windowMinutes: 0,
         measured_charged_kwh: 0,
         measured_discharged_kwh: 0,
         measured_import_kwh: 0,
@@ -1865,7 +1871,7 @@
       win.pv_kw = win.pvSum / win.slots;
       win.load_kw = win.loadSum / win.slots;
       win.spread = win.sell - win.buy;
-      win.minutes = win.slots * minutes;
+      win.minutes = win.windowMinutes;
       win.hours = win.minutes / 60;
     });
     return windows;

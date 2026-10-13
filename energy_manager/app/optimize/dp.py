@@ -585,8 +585,17 @@ def _solve_once(
     target_penalty: float,
     e_target: float | None,
     salvage: float,
+    minutes_of: Sequence[float] | None = None,
 ) -> _DpResult:
-    dt = opts.slot_minutes / 60.0
+    # Per-slot modelled duration in minutes (0.20.1, SPEC 8.16): the caller passes a shorter first
+    # slot when the plan is made mid-slot; ``None`` keeps the uniform pre-0.20.1 model so existing
+    # callers stay bit-for-bit unchanged.
+    minutes = (
+        [float(value) for value in minutes_of]
+        if minutes_of is not None
+        else [float(opts.slot_minutes)] * len(slots)
+    )
+    dt = opts.slot_minutes / 60.0  # uniform reference, used only by _classify's tail heuristic
     anchors = [clamp(start_kwh, agg.e_min_kwh, agg.e_max_kwh)]
     if e_target is not None:
         anchors.append(e_target)
@@ -617,21 +626,22 @@ def _solve_once(
     argmin: list[list[float]] = [[0.0] * len(grid) for _ in range(n)]
     for i in range(n - 1, -1, -1):
         slot = slots[i]
+        dt_hours = minutes[i] / 60.0
         next_value = value[i + 1]
         row = value[i]
         choices = argmin[i]
         for k, e in enumerate(grid):
-            lo, hi, _ = power_bounds_kw(slot, e, agg, opts, dt)
+            lo, hi, _ = power_bounds_kw(slot, e, agg, opts, dt_hours)
             extra = (
-                exact_power_kw(e, e_target, dt, agg)
+                exact_power_kw(e, e_target, dt_hours, agg)
                 if (i == n - 1 and e_target is not None)
                 else None
             )
             best = float("inf")
             best_p = clamp(0.0, lo, hi)
             for p in _actions(lo, hi, opts.power_steps, extra):
-                e_next = next_energy_kwh(e, p, dt, agg)
-                cost = slot_cost_eur(p, slot, dt, opts)
+                e_next = next_energy_kwh(e, p, dt_hours, agg)
+                cost = slot_cost_eur(p, slot, dt_hours, opts)
                 cost += wear_cost_eur(opts.wear_eur_per_kwh, agg.eta_discharge, e, e_next)
                 cost += _interp(next_value, grid, e_next)
                 iterations += 1
@@ -642,20 +652,21 @@ def _solve_once(
             choices[k] = best_p
 
     def best_at(i: int, e: float) -> float:
+        dt_hours = minutes[i] / 60.0
         for index, point in enumerate(grid):
             if abs(point - e) <= 1e-9:
                 return argmin[i][index]
-        lo, hi, _ = power_bounds_kw(slots[i], e, agg, opts, dt)
+        lo, hi, _ = power_bounds_kw(slots[i], e, agg, opts, dt_hours)
         extra = (
-            exact_power_kw(e, e_target, dt, agg)
+            exact_power_kw(e, e_target, dt_hours, agg)
             if (i == n - 1 and e_target is not None)
             else None
         )
         best = float("inf")
         best_p = clamp(0.0, lo, hi)
         for p in _actions(lo, hi, opts.power_steps, extra):
-            e_next = next_energy_kwh(e, p, dt, agg)
-            cost = slot_cost_eur(p, slots[i], dt, opts)
+            e_next = next_energy_kwh(e, p, dt_hours, agg)
+            cost = slot_cost_eur(p, slots[i], dt_hours, opts)
             cost += wear_cost_eur(opts.wear_eur_per_kwh, agg.eta_discharge, e, e_next)
             cost += _interp(value[i + 1], grid, e_next)
             if cost < best:
@@ -670,14 +681,15 @@ def _solve_once(
     objective = 0.0
     e_now = clamp(start_kwh, agg.e_min_kwh, agg.e_max_kwh)
     for i, slot in enumerate(slots):
-        lo, hi, binding = power_bounds_kw(slot, e_now, agg, opts, dt)
+        dt_hours = minutes[i] / 60.0
+        lo, hi, binding = power_bounds_kw(slot, e_now, agg, opts, dt_hours)
         p = clamp(best_at(i, e_now), lo, hi)
         energies.append(e_now)
         powers.append(p)
         bounds.append((lo, hi, binding))
-        e_next = next_energy_kwh(e_now, p, dt, agg)
+        e_next = next_energy_kwh(e_now, p, dt_hours, agg)
         cycle_cost += wear_cost_eur(opts.wear_eur_per_kwh, agg.eta_discharge, e_now, e_next)
-        objective += slot_cost_eur(p, slot, dt, opts)
+        objective += slot_cost_eur(p, slot, dt_hours, opts)
         e_now = clamp(e_next, agg.e_min_kwh, agg.e_max_kwh)
     objective += cycle_cost - salvage * e_now
     if e_target is not None:
@@ -703,6 +715,7 @@ def _solve_once(
             soc_pct=agg.soc_pct_for(energies[i]),
             pv_source=slot.pv_source,
             price_source=slot.price_source,
+            minutes=minutes[i],
         )
         for i, slot in enumerate(slots)
     ]
@@ -866,22 +879,28 @@ def _summary(
     maintenance: Mapping[str, Any] | None = None,
     sell_floor_eur_per_kwh: float | None = None,
 ) -> PlanSummary:
+    def hours_of(slot: PlanSlot) -> float:
+        # The duration the slot was actually modelled with (0.20.1, SPEC 8.16); ``dt`` is only the
+        # fallback for a slot that carries none (an older stored plan or a hand-built fixture).
+        return slot.minutes / 60.0 if slot.minutes > 0 else dt
+
     cost = 0.0
     for s in plan_slots:
         # The frozen PlanSlot helper is the source of truth for a slot's cost (SPEC 8.1).
-        cost += s.cost_eur(dt)
+        cost += s.cost_eur(hours_of(s))
     baseline = sum(
-        dt
+        hours_of(s)
         * (
             s.buy * max(s.load_kw - s.pv_kw, 0.0)
             - float(s.sell or 0.0) * max(s.pv_kw - s.load_kw, 0.0)
         )
         for s in plan_slots
     )
-    charged = sum(max(0.0, s.power_w) / 1000.0 * dt for s in plan_slots)
-    discharged = sum(max(0.0, -s.power_w) / 1000.0 * dt for s in plan_slots)
+    charged = sum(max(0.0, s.power_w) / 1000.0 * hours_of(s) for s in plan_slots)
+    discharged = sum(max(0.0, -s.power_w) / 1000.0 * hours_of(s) for s in plan_slots)
     pv_charge = sum(
-        min(max(0.0, s.power_w) / 1000.0, max(0.0, s.pv_kw - s.load_kw)) * dt for s in plan_slots
+        min(max(0.0, s.power_w) / 1000.0, max(0.0, s.pv_kw - s.load_kw)) * hours_of(s)
+        for s in plan_slots
     )
     grid_charge = max(0.0, charged - pv_charge)
     summary = PlanSummary(
@@ -944,6 +963,7 @@ def solve(
     dry_run: bool = True,
     maintenance: Mapping[str, Any] | None = None,
     sell_floor_eur_per_kwh: float | None = None,
+    now: datetime | None = None,
 ) -> Plan:
     """Solve the horizon and return a ``Plan`` (SPEC 8.2).  Deterministic.
 
@@ -956,8 +976,14 @@ def solve(
     ``sell_floor_eur_per_kwh`` is the engine's cost-basis floor (SPEC 5, 0.18.0): when set, no
     discharge/export transition may carry a value leg below it. ``None`` keeps the schedule
     bit-for-bit as before.
+
+    ``now`` is the moment the plan is made (0.20.1, SPEC 8.16): when it falls inside the first
+    slot, that slot is modelled with only the minutes left in its clock window (a 1-minute floor
+    guards a sub-minute or negative remainder), so the schedule, its energy and its money all
+    match the time the dispatcher really has.  ``None`` keeps the uniform full-slot model, so an
+    older caller (or a recompute for a plan already on the grid) is bit-for-bit unchanged.
     """
-    now = generated_at or utcnow()
+    moment = generated_at or utcnow()
     sources = dict(source_names or {})
     if sell_floor_eur_per_kwh is not None:
         options = replace(options, sell_floor_eur_per_kwh=float(sell_floor_eur_per_kwh))
@@ -976,7 +1002,7 @@ def solve(
             target_soc_pct_end = configured if current is None else max(current, configured)
             active_maintenance["effective_target_soc_pct"] = target_soc_pct_end
         options = replace(options, target_soc_pct_end=target_soc_pct_end)
-    horizon_start = slots[0].t if slots else quarter_floor(now, options.slot_minutes)
+    horizon_start = slots[0].t if slots else quarter_floor(moment, options.slot_minutes)
     horizon_end = (
         slots[-1].t + timedelta(minutes=options.slot_minutes)
         if slots
@@ -985,7 +1011,7 @@ def solve(
 
     def make_plan(slots_out, summary, feasible=True, reason=None) -> Plan:
         return Plan(
-            generated_at=now,
+            generated_at=moment,
             horizon_start=horizon_start,
             horizon_end=horizon_end,
             slot_minutes=options.slot_minutes,
@@ -1001,6 +1027,14 @@ def solve(
 
     if not slots:
         return make_plan([], PlanSummary(), feasible=False, reason=Reason.NO_SLOTS)
+    # Per-slot modelled duration (0.20.1, SPEC 8.16).  The grid and the timestamps do not move;
+    # only a first slot that began before ``now`` is shortened to the time it really has left.
+    minutes_of = [float(options.slot_minutes)] * len(slots)
+    if now is not None:
+        slot_end = slots[0].t + timedelta(minutes=options.slot_minutes)
+        minutes_of[0] = clamp(
+            (slot_end - now).total_seconds() / 60.0, 1.0, float(options.slot_minutes)
+        )
     if aggregate.batteries == 0 or aggregate.e_max_kwh <= 0:
         # No controllable battery: publish the do-nothing schedule so the timeline still renders.
         dt = options.slot_minutes / 60.0
@@ -1021,8 +1055,9 @@ def solve(
                 soc_pct=aggregate.soc_pct_for(0.0),
                 pv_source=s.pv_source,
                 price_source=s.price_source,
+                minutes=minutes_of[i],
             )
-            for s in slots
+            for i, s in enumerate(slots)
         ]
         return make_plan(
             plan_slots,
@@ -1052,7 +1087,8 @@ def solve(
         )
 
     result = _solve_once(
-        slots, aggregate, start_kwh, options, TARGET_HARD_PENALTY, e_target, salvage
+        slots, aggregate, start_kwh, options, TARGET_HARD_PENALTY, e_target, salvage,
+        minutes_of=minutes_of,
     )
     infeasible: str | None = None
     if e_target is not None:
@@ -1061,7 +1097,8 @@ def solve(
             # Documented downgrade: an unreachable terminal target becomes a soft penalty plus a
             # reason, never an exception (SPEC 8.1).
             result = _solve_once(
-                slots, aggregate, start_kwh, options, TARGET_SOFT_PENALTY, e_target, salvage
+                slots, aggregate, start_kwh, options, TARGET_SOFT_PENALTY, e_target, salvage,
+                minutes_of=minutes_of,
             )
             infeasible = "terminal_target_unreachable"
 
@@ -1135,4 +1172,8 @@ def solve_from_forecasts(
         dry_run=dry_run,
         maintenance=maintenance,
         sell_floor_eur_per_kwh=sell_floor_eur_per_kwh,
+        # The horizon start stays floored to the slot grid, so the first slot can begin before
+        # ``moment``; passing it lets the solver model that slot with only its remaining minutes
+        # (0.20.1, SPEC 8.16).
+        now=moment,
     )

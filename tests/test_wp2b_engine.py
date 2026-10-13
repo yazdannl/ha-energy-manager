@@ -626,11 +626,20 @@ def test_plan_execution_progress_counts_only_elapsed_slots():
     assert abs(progress["measured_export_kwh"] - 2.0 * 5 / 60) < 1e-9
     assert abs(progress["measured_discharged_kwh"] - 0.5 * 5 / 60) < 1e-9
     assert progress["measured_import_kwh"] == 0.0
+    # The plan was made at 12:20, so its first slot models only the 40 minutes left in the 12:00
+    # clock slot (0.20.1, SPEC 8.16): the intended energy and cost use that duration, not the
+    # full grid step.
+    assert elapsed[0].minutes == 40.0
     expected_planned = sum(
-        max(0.0, float(item.power_w)) / 1000.0 * (plan.slot_minutes / 60.0) for item in elapsed
+        max(0.0, float(item.power_w))
+        / 1000.0
+        * (float(item.minutes or plan.slot_minutes) / 60.0)
+        for item in elapsed
     )
     assert abs(progress["planned_charged_kwh"] - expected_planned) < 1e-9
-    expected_cost = sum(item.cost_eur(plan.slot_minutes / 60.0) for item in elapsed)
+    expected_cost = sum(
+        item.cost_eur(float(item.minutes or plan.slot_minutes) / 60.0) for item in elapsed
+    )
     assert abs(progress["planned_cost_eur"] - expected_cost) < 1e-9
     # The measured cost is the slot's own tariff: export earns the sell price.
     assert abs(progress["measured_cost_eur"] - (-(2.0 * 5 / 60) * slot.sell)) < 1e-9

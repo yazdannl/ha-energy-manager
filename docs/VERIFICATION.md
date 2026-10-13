@@ -1214,6 +1214,60 @@ selfcheck horizon, not a captured forecast. Independent review: not run for this
 
 ---
 
+### 8.16 The current (partial) slot uses the time it really has (0.20.1)
+
+A plan made mid-slot floors its horizon to the slot grid, so the first slot can begin before `now`.
+The pre-0.20.1 solver then applied one uniform `dt = slot_minutes / 60` to every slot, so the
+first slot was modelled as a full hour measured from `now`, and every later slot's price covered a
+window shifted by the same elapsed part.
+
+Live evidence (plan generated 2026-10-13 05:16:25Z, SolarFlow 800 Plus, 1.92 kWh / 15 % floor /
+1000 W charge / 800 W discharge / eta 0.92, SoC 85 %, sell floor 0.3997; reproduced offline by the
+slot-shaped case in `tests/test_partial_slot.py`):
+
+| slot | 0.20.0 power | 0.20.0 SoC | 0.20.1 power | 0.20.1 SoC | modelled minutes (0.20.1) |
+| --- | --- | --- | --- | --- | --- |
+| 05:00 (44 min left) | −461.2 W | 85.0 % | −640.0 W | 85.0 % | 44 |
+| 06:00 | −775.2 W | 58.9 % | −767.2 W | 58.4 % | 60 |
+| 07:00 | 0 W | 15.0 % (phantom) | 0 W | 15.0 % | 60 |
+
+The 05:00 slot's real window is 05:16–06:00, so the old plan's 0.461 kWh AC collapsed to
+0.338 kWh AC for that slot (0.775 kWh AC still fit in the 06:00 hour): 1.113 kWh AC of the
+1.236 kWh AC above the floor could actually move — 0.123 kWh AC of the plan's own intent was
+unattainable in the clock. Home Assistant's SoC history shows the failure: 05:03Z 91 %,
+06:00Z 71 %, 06:58Z 37 %, then flat at 37 %; when the peak window closed the pack still held
+0.710 kWh — 0.634 kWh stored (0.583 kWh AC) above the floor the plan had scheduled it down to.
+The elapsed 16 minutes also shifted every later slot's price away from its clock window.
+
+The 0.20.1 solver builds the identical plan in the identical input case but models the first slot
+with its 44 remaining minutes (`clamp((slot.t + slot_minutes − now), 1, slot_minutes)`) and passes
+`PlanSlot.minutes / 60` to the transitions, power bounds, slot cost and SoC trajectory. The two
+peak slots move 0.469 + 0.767 = 1.236 kWh AC, exactly the energy above the floor, and the pack
+lands at 15.0 % at the 07:00 clock boundary instead of the phantom “15 % at 07:00” while the clock
+stopped at 37 %. The summary money, the execution view's intended side, `/plan`,
+`/plan/execution`, `/status` and the web action windows use the same field, so no reported energy
+or money can drift from the schedule; a `now` exactly on the grid reproduces the pre-0.20.1
+schedule bit for bit, and a sub-minute remainder floors at one minute instead of producing a zero
+`dt`.
+
+Tests (`tests/test_partial_slot.py`, 9 new; all fail on 6fbf4a2): the live case's first slot is
+44 minutes and later slots 60 with the timestamps unmoved; the scheduled AC energy over the real
+windows equals what the floor allows (one SoC step of slack) and the recomputed SoC trajectory
+matches the plan and ends on the floor; the summary money equals the schedule's grid cost over the
+modelled minutes and differs from the full-hour reading; a one-slot no-battery horizon books
+`cost_estimate_eur` over the remaining minutes against a hand-computed value (and not the doubled
+full-hour one); `now` exactly on the grid equals the `now=None` schedule; a sub-minute/past
+remainder yields a 1-minute window with finite powers inside the battery limits; the execution
+view's intended energy and cost use the modelled minutes; and the `/plan` and `/plan/execution`
+serialisers carry `minutes` (with the `slot_minutes` fallback for an older plan). The headless
+render check also asserts a partial first slot's window energy and cost. `tests/test_wp2b_engine.py`
+updates one assertion that encoded the uniform hour for a plan made at 12:20 (its first slot is now
+40 minutes).
+
+What is *not* verified live: the add-on was not deployed and nothing was written to the live
+instance, so the 0.20.1 plan has not been re-observed against a real dispatch; only the offline
+reproduction, the tests and the render check above are measured here.
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:

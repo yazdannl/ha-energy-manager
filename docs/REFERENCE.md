@@ -824,6 +824,18 @@ cost_i  = dt * ( buy * max(grid, 0) − sell * max(−grid, 0) )
 `models.PlanSlot.grid_kw()` and `PlanSlot.cost_eur(dt)` are the frozen helpers; the optimizer's
 `_summary` calls them so a reported plan cost can never diverge from the shipped helper.
 
+**Partial first slot (0.20.1, SPEC 8.16)** — a plan made mid-slot (the engine plans through
+`solve_from_forecasts`, whose horizon start is `quarter_floor(now, slot_minutes)`) keeps the
+clock-aligned timestamps but models the first slot with only the minutes left in it:
+`PlanSlot.minutes = clamp((slot.t + slot_minutes − now) in minutes, 1.0, slot_minutes)`, and every
+later slot the full `slot_minutes`. `solve(..., now=now)` sets it; `now=None` keeps the uniform
+pre-0.20.1 model, and `now` exactly on the grid reproduces the uniform schedule. The DP
+transitions, `power_bounds_kw`, the slot cost, the SoC trajectory, the summary money, the execution
+view's intended side and the UI action windows all use `PlanSlot.minutes / 60`, so no reported
+energy or money can drift from the schedule. A sub-minute or past remainder floors at 1 minute; a
+slot that carries no duration (`minutes = 0.0`, e.g. an older stored plan) falls back to
+`plan.slot_minutes`.
+
 ### 4.2 Price formulas
 
 **Unit normalisation** — `models.eur_per_kwh_from_raw(value, unit, scale_divisor, vat_pct, adder)`:
@@ -1099,16 +1111,18 @@ Disabled batteries are excluded everywhere. Zero enabled batteries still yield a
 
 ### 4.7 Optimizer (dynamic program)
 
-**Model** — discrete slots `dt = optimizer.slot_minutes / 60` over `optimizer.horizon_hours`
-(clamped 12…48 h). Per slot: `pv_i` kW, `load_i` kW, `buy_i` EUR/kWh, `sell_i` EUR/kWh.
+**Model** — discrete slots over `optimizer.horizon_hours` (clamped 12…48 h), each with its own
+modelled duration `dt_i = PlanSlot.minutes / 60` (`optimizer.slot_minutes / 60` for every slot but
+a partial first one, 0.20.1/SPEC 8.16). Per slot: `pv_i` kW, `load_i` kW, `buy_i` EUR/kWh,
+`sell_i` EUR/kWh.
 
 **Objective**:
 
 ```
 minimise  Σ cost_i  +  wear * Σ delivered_kwh_i  −  salvage * e_N
 delivered_kwh_i = max(0, e_i − e_{i+1}) * eta_dis     # wear on the discharge leg only
-cost_i  = dt * ( buy * max(grid,0) − sell * max(−grid,0) )
-          [+ min_spread * max(0, p_i − pv_surplus) * dt   when min_spread > 0 and p_i > 0]
+cost_i  = dt_i * ( buy * max(grid,0) − sell * max(−grid,0) )
+          [+ min_spread * max(0, p_i − pv_surplus) * dt_i   when min_spread > 0 and p_i > 0]
 grid_i  = load_i − pv_i + p_i
 salvage = optimizer.salvage_multiplier * median(buy over horizon) * eta_dis
 ```
@@ -1127,8 +1141,8 @@ E_min <= e_i <= E_max
 grid_i <= max_grid_import_w/1000             (when set)
 −grid_i <= max_grid_export_w/1000            (when set)
 export only when allow_export and sell > 0   (exporting at an unknown/zero sell price is never planned)
-energy transition:  e_{i+1} = e_i + dt*p_i*eta_chg     (p_i >= 0)
-                    e_{i+1} = e_i + dt*p_i/eta_dis     (p_i < 0)   # exact at p = 0
+energy transition:  e_{i+1} = e_i + dt_i*p_i*eta_chg     (p_i >= 0)
+                    e_{i+1} = e_i + dt_i*p_i/eta_dis     (p_i < 0)   # exact at p = 0
 optimizer.target_soc_pct_end : hard terminal constraint when set
 maintenance target        : while a tracked battery is due, the higher of
                             maintenance.full_charge_target_soc_pct and optimizer.target_soc_pct_end
@@ -1260,12 +1274,12 @@ Action vocabulary: `hold`, `charge`, `discharge`, `pv_charge`, `export`, `self_c
 **Summary formulas** (`_summary`, all over the returned schedule):
 
 ```
-cost            = Σ PlanSlot.cost_eur(dt)
-baseline        = Σ dt * ( buy*max(load−pv,0) − sell*max(pv−load,0) )
+cost            = Σ PlanSlot.cost_eur(minutes_i / 60)
+baseline        = Σ (minutes_i / 60) * ( buy*max(load−pv,0) − sell*max(pv−load,0) )
 saved           = baseline − cost
-charged         = Σ max(0, power_w)/1000 * dt
-discharged      = Σ max(0, −power_w)/1000 * dt
-pv_charge       = Σ min(max(0,power_w)/1000, max(0, pv−load)) * dt
+charged         = Σ max(0, power_w)/1000 * minutes_i / 60
+discharged      = Σ max(0, −power_w)/1000 * minutes_i / 60
+pv_charge       = Σ min(max(0,power_w)/1000, max(0, pv−load)) * minutes_i / 60
 grid_charge     = max(0, charged − pv_charge)
 cycles          = discharged / usable_kwh
 arbitrage_kwh   = min(grid_charge, discharged)
@@ -1663,8 +1677,8 @@ supplies it (which is why publishing a port would hand battery control to anyone
 | --- | --- | --- |
 | `GET /api/v1/health` | — | `{status, version, uptime_s, commit}` |
 | `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]` (each with `cell_voltage_v`, additive 0.18.0 `cost_basis_eur_per_kwh`/`stored_value_eur`, and additive 0.20.0 `max_charge_w`/`max_discharge_w` plus `cap_charge_w`/`cap_discharge_w`, `null` = unlimited), `cell_voltage{enabled,cutoff_v,warning_v,resume_v,emergency_charge_power_w,latched[],batteries[{battery_id,voltage_v,fresh,seen,latched,block_discharge,force_charge_w,reason,note}]}` (additive, 0.16.0), `full_charge{enabled,interval_days,target_soc_pct,overdue_grace_hours,active,due,overdue,batteries[],plan{…}}` (additive, 0.17.0), `cost_basis{enabled,margin_eur_per_kwh,sell_floor_eur_per_kwh,fleet_basis_eur_per_kwh,batteries[{id,name,cost_basis_eur_per_kwh,energy_kwh,stored_value_eur,sell_floor_eur_per_kwh,intervals,skipped_no_price,skipped_no_power,skipped_no_grid,skipped_no_soc,reconciled_kwh,reconciled_last_kwh,reconciled_resets,window_start,updated_at,journal_entries,journal[]}]}` (additive, 0.18.0; the `skipped_no_soc`/`reconciled_*` counters additive 0.18.1), `manual_limits{}` (additive, 0.20.0: the raw per-direction mapping), `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
-| `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, slot_minutes, feasible, infeasible_reason, mode, dry_run, sources{}, maintenance, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh, maintenance{enabled,active,due,overdue,target_soc_pct,effective_target_soc_pct,interval_days,overdue_grace_hours,batteries[],due_batteries[],overdue_batteries[]} (additive, 0.17.0), sell_floor_eur_per_kwh (additive, 0.18.0)}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; `slot_minutes` is the plan's own resolution (the UI never assumes one); with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` and `slot_minutes: null` |
-| `GET /api/v1/plan/execution` | `hours` | additive (0.10.0): `{generated_at, slot_minutes, now, floors{reserve_soc_pct, min_soc_pct, floor_soc_pct}, batteries[{id, name, min_soc_pct, floor_soc_pct, capacity_kwh}], progress{…}, slots[{t, dispatch, actual}]}` — the same slot grid as `/plan`, joined with the persisted 5-minute actuals and the dispatch log. `dispatch` is the last attempt per battery in that slot (`requested_w`, `applied_w`, `ok`, `dry_run`, `clamped`, `code`, `reason`, `message`, `records`, `batteries[]`) and `actual` the measured aggregate (`samples`, `coverage_pct`, `pv_kw`, `load_kw`, `grid_kw`, `battery_kw`, `planned_kw`, `measured_kw`, `import_kwh`, `export_kwh`, `charged_kwh`, `discharged_kwh`, `soc_kwh_start`, `soc_kwh_end`). Both are `null` for a slot nothing was measured or dispatched in — never a fabricated zero |
+| `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, slot_minutes, feasible, infeasible_reason, mode, dry_run, sources{}, maintenance, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh, maintenance{enabled,active,due,overdue,target_soc_pct,effective_target_soc_pct,interval_days,overdue_grace_hours,batteries[],due_batteries[],overdue_batteries[]} (additive, 0.17.0), sell_floor_eur_per_kwh (additive, 0.18.0)}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, minutes (additive 0.20.1), action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; `slot_minutes` is the plan's own resolution (the UI never assumes one) and `minutes` is the duration the solver modelled for each slot (the full step, or the remaining part of the current clock slot; 0.20.1); with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` and `slot_minutes: null` |
+| `GET /api/v1/plan/execution` | `hours` | additive (0.10.0): `{generated_at, slot_minutes, now, floors{reserve_soc_pct, min_soc_pct, floor_soc_pct}, batteries[{id, name, min_soc_pct, floor_soc_pct, capacity_kwh}], progress{…}, slots[{t, minutes (additive 0.20.1), dispatch, actual}]}` — the same slot grid as `/plan`, joined with the persisted 5-minute actuals and the dispatch log. `dispatch` is the last attempt per battery in that slot (`requested_w`, `applied_w`, `ok`, `dry_run`, `clamped`, `code`, `reason`, `message`, `records`, `batteries[]`) and `actual` the measured aggregate (`samples`, `coverage_pct`, `pv_kw`, `load_kw`, `grid_kw`, `battery_kw`, `planned_kw`, `measured_kw`, `import_kwh`, `export_kwh`, `charged_kwh`, `discharged_kwh`, `soc_kwh_start`, `soc_kwh_end`). Both are `null` for a slot nothing was measured or dispatched in — never a fabricated zero |
 | `POST /api/v1/plan/recompute` | — | `{queued: true}` (async; poll status) |
 | `GET /api/v1/forecast` | `kind=price\|solar\|load`, `hours` | `{kind, generated_at, source, stale, slots, provider, contract, notes[], reason, hint}` |
 | `GET /api/v1/batteries` | — | `{batteries: [{config, state, capabilities, mapping_resolved, discovery[], capacity_source, capacity_kwh, capacity_learned_kwh, capacity_samples, capacity_updated_at, effective_capacity_kwh, capacity_reason, capacity{source,configured_kwh,learned_kwh,samples,updated_at,effective_kwh,reason,stale,confident,applied}, maintenance{id,watching,state,due,overdue,at_target,due_at,due_in_days,last_completed,first_seen,target_soc_pct,interval_days,soc_pct} (additive, 0.17.0)}]}` (the capacity fields are additive, SPEC 5) |

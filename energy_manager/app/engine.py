@@ -3144,7 +3144,9 @@ class Engine:
                 slot.power_w if slot is not None else 0.0,
                 configs,
                 energies,
-                slot_hours=max(1, plan.slot_minutes) / 60.0,
+                slot_hours=max(
+                    1.0, float(getattr(slot, "minutes", 0.0) or plan.slot_minutes)
+                ) / 60.0,
                 reserve_soc_pct=float(self._settings.get("optimizer.reserve_soc_pct", 0.0) or 0.0),
             )
         }
@@ -3449,6 +3451,9 @@ class Engine:
             "slots": [
                 {
                     "t": to_iso(slot.t),
+                    # Additive (0.20.1, SPEC 8.16): the duration the plan modelled for this slot;
+                    # the clock grid step for every slot but a partial first one.
+                    "minutes": float(slot.minutes or minutes),
                     "dispatch": _dispatch_in_window(dispatches, slot.t, minutes),
                     "actual": measured[index],
                 }
@@ -3793,7 +3798,11 @@ class Engine:
                 )
                 last = plan.slots[-1]
                 final_kwh = dp.next_energy_kwh(
-                    last.soc_kwh, last.power_w / 1000.0, plan.slot_minutes / 60.0, aggregate
+                    last.soc_kwh,
+                    last.power_w / 1000.0,
+                    # The last slot's own modelled duration (0.20.1, SPEC 8.16).
+                    float(last.minutes or plan.slot_minutes) / 60.0,
+                    aggregate,
                 )
                 soc_target_pct = round(final_kwh / capacity * 100.0, 1)
         pv_today, pv_tomorrow, peak_w, peak_at = self._pv_summary(now)
@@ -4106,11 +4115,12 @@ def _execution_progress(
 
     A fully elapsed slot counts whole; the slot in progress counts by the share actually measured
     (``coverage_pct``), so both sides cover the same span and the comparison stays apples to apples.
-    Measured totals stay ``None`` until something was really measured, so a fresh install never
-    reports a measured zero it did not observe.
+    The intended side uses each slot's own modelled duration (``PlanSlot.minutes``, 0.20.1/SPEC
+    8.16), so a partial first slot is never credited with a full clock hour.  Measured totals stay
+    ``None`` until something was really measured, so a fresh install never reports a measured zero
+    it did not observe.
     """
     step = timedelta(minutes=minutes)
-    hours = minutes / 60.0
     elapsed = 0
     reached = 0
     samples = 0
@@ -4118,8 +4128,12 @@ def _execution_progress(
     planned_charged = planned_discharged = planned_cost = 0.0
     measured_charged = measured_discharged = imported = exported = measured_cost = 0.0
     for slot, entry in zip(slots, measured):
-        if minutes <= 0:
+        # The duration the plan modelled for this slot: the grid step for every slot but a partial
+        # first one; an older plan without the field falls back to the grid step.
+        slot_minutes = float(slot.minutes or minutes)
+        if slot_minutes <= 0:
             continue
+        hours = slot_minutes / 60.0
         complete = slot.t + step <= moment
         coverage = float(entry.get("coverage_pct") or 0.0) if entry else 0.0
         share = 1.0 if complete else coverage / 100.0
@@ -4127,7 +4141,7 @@ def _execution_progress(
             continue
         if complete:
             elapsed += 1
-        span_minutes += minutes * share
+        span_minutes += slot_minutes * share
         planned_charged += max(0.0, float(slot.power_w)) / 1000.0 * hours * share
         planned_discharged += max(0.0, -float(slot.power_w)) / 1000.0 * hours * share
         planned_cost += slot.cost_eur(hours) * share

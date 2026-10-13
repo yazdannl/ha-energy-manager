@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.20.1
+
+- **The plan now models the current (partial) slot with the time it really has.** A plan made at
+  05:16Z floors its horizon to the 05:00 slot, but the solver used a full hour for every slot, so
+  the 05:00 hour really covered only 05:16–06:00: the live plan sold 461.2 W in it, the dispatcher
+  abandoned the slot at the clock boundary, and the pack stopped at 37 % at 06:58Z instead of
+  reaching the planned 15 % at 07:00 — energy above the floor was left unsold at peak, and every
+  later slot's price was applied to a window shifted by the elapsed part. `PlanSlot` now carries an
+  additive `minutes` (full slot length for every slot but the first, which is the remaining part of
+  the current clock slot, minimum 1 minute), and the DP transitions, power bounds, slot cost, SoC
+  trajectory and summary money all use it. `solve` takes an optional `now` (absent = the previous
+  uniform model, unchanged), and the execution view, `/plan`, `/plan/execution`, `/status` and the
+  web action windows read the same field, so the schedule, its energy and its money can no longer
+  drift from the clock. Slot timestamps and the API grid are unchanged.
+
 ## 0.20.0
 
 - **The "Today" tab is now "Dashboard".** The primary nav, the HA-connection tooltip and the

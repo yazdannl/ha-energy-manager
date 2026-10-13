@@ -18,6 +18,10 @@ no MQTT, no cloud account, and no YAML to install by hand.
   it causes (see [Battery round trip](#battery-round-trip-efficiency)).
 - **PV surplus first.** When the solar forecast says power is coming, charging is scheduled against
   that surplus instead of buying it.
+- **Uses the time the clock really has.** A plan made mid-slot models the current slot with only
+  the minutes left in it, and every later slot with its full length. The schedule, its energy and
+  its money all use those real durations, so the plan only promises energy the dispatcher can move
+  before the clock boundary; the slot timestamps stay on the normal grid.
 - **Learns your house.** The load forecast is a median weekday/weekend hourly profile over the last
   8 weeks from Home Assistant long-term statistics, level-scaled to the last 7 days, with an EWMA
   bias correction and an optional outdoor-temperature term.
