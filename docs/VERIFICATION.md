@@ -1514,6 +1514,16 @@ coverage lives in the render check), `sh tools/audit.sh` -> **clean, 116 files s
 112 plus the untracked forecast tooling the scanner walks), `node tools/ui_render_check.js` ->
 **127 passed, 0 failed** (124 before).
 
+Deployed and observed live (2026-10-13T21:15Z): `supervisor/api /store/reload` then
+`/addons/f20c2e09_energy_manager/update` moved the add-on to **0.20.6** with `state: started`, and
+the add-on's `sensor.sem_*` publisher is live again after the restart (`sensor.sem_battery_soc_avg`
+16.0 %, `sensor.sem_price_now` 0.3083 EUR/kWh, `sensor.sem_plan_action` `hold`). A stale HA-side
+`update.smart_energy_manager_update` entity still read `0.20.5 -> 0.20.6` at 21:16Z (Core's copy of
+the add-on update info lags the Supervisor, which is authoritative). What is *not* verified live: the
+browser rendering itself -- the add-on is ingress-only and had no LAN route from this host on
+2026-10-13, so the fixed Dashboard still needs the owner's browser to confirm; the render check above
+is the gate.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
