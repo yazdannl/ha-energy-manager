@@ -41,7 +41,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import replace
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from ...models import DispatchResult, Reason
 from .base import (
@@ -303,6 +303,24 @@ class ZendureDriver(BaseDriver):
     def effective_mapping(self) -> dict[str, str]:
         """The mapping in use.  The engine merges registry-resolved roles in before construction."""
         return {key: value for key, value in self.config.mapping.items() if value}
+
+    @classmethod
+    def measured_roles(cls, mapping: Mapping[str, Any]) -> dict[str, str]:
+        """Zendure measures the AC pair natively: ``grid_input_power`` charges, ``output_home``
+        discharges (``_measured_pair``, appendix A).  A mapping that also carries the generic
+        ``charge_power_entity``/``discharge_power_entity`` keeps those: the generic keys win when
+        both vocabularies are present, matching the save-time validation.
+
+        Both native keys are required, exactly like ``_power_is_measured``: mapping one side alone
+        is not a measurement (an idle battery would otherwise read as a one-sided flow).
+        """
+        roles = super().measured_roles(mapping)
+        drawn = mapping.get("grid_input_power_entity")
+        output = mapping.get("output_power_entity")
+        if drawn and output:
+            roles.setdefault("battery_charge", str(drawn))
+            roles.setdefault("battery_discharge", str(output))
+        return roles
 
     def capabilities(self) -> dict[str, Any]:
         caps = super().capabilities()

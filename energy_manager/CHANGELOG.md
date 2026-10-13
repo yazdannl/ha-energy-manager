@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.20.3
+
+- **The measurement sampler now reads the driver's own role vocabulary.** The sampler built its
+  per-battery role map from a private list of mapping keys, so a Zendure battery whose stored
+  mapping names the native measured pair (`grid_input_power_entity` / `output_power_entity`) and
+  `pv_power_entity` / `soc_entity` persisted no `battery_charge` / `battery_discharge` /
+  `battery_power` rows at all: the cost-basis ledger integrates that series, so it silently froze
+  (18 h, 282 intervals, an unchanged 0.3197 basis and sell floor while the pack charged 0.2 kWh AC
+  at 0.266), and the capacity learner lost its samples too. The measured-role table now lives on
+  the driver classes (`drivers.measured_roles`, generic keys by default, overridden by the Zendure
+  driver with its native pair and requiring both sides like `_power_is_measured`), and
+  `sources/measure.role_entities` resolves it through the driver registry. The generic keys win
+  when both vocabularies are present, the registry-resolved mapping the engine passes in counts
+  (so a role the runtime resolver filled in is sampled), and an unmapped battery resolves nothing.
+  `power_setpoint_entity` keeps its meaning: a signed setpoint is a command, never a measured
+  energy row.
+- **A stalled ledger is visible instead of silently frozen.** With no usable power samples in the
+  window, `book_slices` now counts `skipped_no_samples`, sets `no_samples_since` and `stale` in the
+  stored payload (they survive a restart), and logs one warning per stall; booking again clears the
+  marker. `/status.cost_basis` exposes the counter, the marker and the `sample_source`, and
+  `sensor.sem_battery_cost_basis` carries the per-battery `stale` / `no_samples_since` plus a fleet
+  `stale` flag.
+- **Measured energy that was never booked is recovered (single-battery installs).** When the
+  per-battery measurement series holds no usable power point in the window and exactly one battery
+  is enabled, `update_basis` falls back to the 5-minute fleet-aggregate `actuals` rows
+  (`battery_kw`/`grid_kw`/`soc_kwh`, capped at the newest row); with one battery that aggregate is
+  the same physical measurement, so the frozen window books with the same measured integral, price
+  attribution and SoC reconciliation. With two or more enabled batteries the aggregate cannot be
+  split without guessing, so no fallback happens and the stall is reported instead.
+
 ## 0.20.2
 
 - **A plan reason now names the constraint that really bound the power.** The 0.19.0 sell floor

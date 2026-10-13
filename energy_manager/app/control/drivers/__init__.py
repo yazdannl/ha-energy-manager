@@ -11,7 +11,7 @@ mapping keys (``ROLE_TO_MAPPING``) instead of duplicating the ranking logic.
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from ...models import BatteryConfig
 from .base import (
@@ -107,6 +107,18 @@ def resolve_mapping_for(driver_name: str) -> Any | None:
     return MAPPING_RESOLVERS.get(driver_name)
 
 
+def measured_roles_for(driver_name: str, mapping: Mapping[str, Any] | None) -> dict[str, str]:
+    """The sampler's measured roles for one battery, resolved by the driver that owns them.
+
+    ``app.sources.measure`` calls this so no driver-specific entity key list lives in the source
+    layer (SPEC 7.3, 0.20.3).  An unknown driver resolves nothing, never a guessed role.
+    """
+    cls = DRIVERS.get(str(driver_name))
+    if cls is None:
+        return {}
+    return dict(cls.measured_roles(dict(mapping or {})))
+
+
 def validate_config(config: BatteryConfig) -> list[str]:
     """All problems that make this battery unusable, empty when it is fine."""
     problems = list(config.validate())
@@ -179,6 +191,7 @@ __all__ = [
     "ZendureNativeDriver",
     "create",
     "driver_class",
+    "measured_roles_for",
     "names",
     "parse_energy_kwh",
     "parse_number",

@@ -13,7 +13,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 from ...models import (
     BatteryConfig,
@@ -224,6 +224,30 @@ class BaseDriver:
 
     def mapping_resolved(self) -> bool:
         return not self.validate_mapping(self.config.mapping)
+
+    @classmethod
+    def measured_roles(cls, mapping: Mapping[str, Any]) -> dict[str, str]:
+        """The measured sampling roles this driver's own reads use, by unsuffixed role name.
+
+        The measurement sampler (``app.sources.measure``) builds its per-battery role map from
+        this table, so the ledger and the capacity learner read exactly what the driver reads
+        instead of a private copy of the mapping keys that can drift (SPEC 7.3, 0.20.3).  The
+        default is the generic vocabulary: the measured AC pair ``charge_power_entity`` /
+        ``discharge_power_entity`` plus ``pv_power_entity``, ``output_power_entity`` and
+        ``soc_entity``.  A driver whose reads use different keys overrides this.
+
+        ``battery_power`` is deliberately absent: it is the signed ``power_setpoint_entity``, a
+        command rather than a confirmed measurement, and keeps its own meaning.  Only mapped
+        roles are returned; an unmapped role is never guessed.
+        """
+        candidates: dict[str, Any] = {
+            "battery_charge": mapping.get("charge_power_entity"),
+            "battery_discharge": mapping.get("discharge_power_entity"),
+            "battery_pv": mapping.get("pv_power_entity"),
+            "battery_output": mapping.get("output_power_entity"),
+            "battery_soc": mapping.get("soc_entity"),
+        }
+        return {role: str(entity) for role, entity in candidates.items() if entity}
 
     # -- reading ----------------------------------------------------------------------
 

@@ -42,7 +42,10 @@ no MQTT, no cloud account, and no YAML to install by hand.
   energy at a loss. The floor only ever restricts a discharge: in a PV-surplus hour the pack holds
   while the PV exports, so a cheaper later hour still wins. The ledger resets when the pack reaches
   its floor, survives restarts, and is exposed per battery in `/status` plus
-  `sensor.sem_battery_cost_basis` and `sensor.sem_battery_value`.
+  `sensor.sem_battery_cost_basis` and `sensor.sem_battery_value`. A ledger that cannot advance says
+  so (`stale`/`no_samples_since` in `/status` plus one log warning) instead of freezing silently,
+  and on a single-battery install it recovers the measured energy from the 5-minute `actuals` rows
+  while the measurement rows are missing.
 - **Explains itself.** Every planning decision and every blocked dispatch carries a stable reason
   slug, visible in the log, so "why didn't it charge?" always has an answer.
 - **Shows the money.** Savings are accounted against a do-nothing baseline (defined below) and

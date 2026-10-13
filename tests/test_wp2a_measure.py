@@ -195,3 +195,118 @@ def test_collect_reads_only_mapped_entities_and_upserts_five_minute_buckets(stor
     rows = store.measurements_range(NOW - timedelta(minutes=10), NOW + timedelta(minutes=10))
     assert len(rows) == 1 and rows[0]["value"] == pytest.approx(600.0)
     assert rows[0]["ts"] == "2026-01-05T12:00:00+00:00"
+
+
+# ------------------------------------------- driver-resolved measured roles (0.20.3)
+
+
+def test_measured_roles_resolve_through_the_driver():
+    """The sampler reads the driver's own vocabulary, never a private key list (0.20.3).
+
+    The live incident: a Zendure mapping with only the native pair persisted no battery power at
+    all, so the cost-basis ledger and the capacity learner silently had no samples.
+    """
+    settings = Settings(None, options={})
+    native = BatteryConfig(
+        id="battery_1", name="Example", driver="zendure", capacity_kwh=5.0,
+        mapping={
+            "power_setpoint_entity": "number.example_battery_set",
+            "grid_input_power_entity": "sensor.example_battery_grid_input",
+            "output_power_entity": "sensor.example_battery_output_home",
+            "pv_power_entity": "sensor.example_battery_pv",
+            "soc_entity": "sensor.example_battery_soc",
+        },
+    )
+    mapping = role_entities(settings, [native])
+    assert mapping["battery_charge:battery_1"] == "sensor.example_battery_grid_input"
+    assert mapping["battery_discharge:battery_1"] == "sensor.example_battery_output_home"
+    assert mapping["battery_power:battery_1"] == "number.example_battery_set"
+    assert mapping["battery_pv:battery_1"] == "sensor.example_battery_pv"
+    assert mapping["battery_output:battery_1"] == "sensor.example_battery_output_home"
+    assert mapping["battery_soc:battery_1"] == "sensor.example_battery_soc"
+
+    generic = BatteryConfig(
+        id="battery_2", name="Example", driver="generic", capacity_kwh=5.0,
+        mapping={
+            "charge_power_entity": "sensor.example_generic_charge",
+            "discharge_power_entity": "sensor.example_generic_discharge",
+            "soc_entity": "sensor.example_generic_soc",
+        },
+    )
+    generic_roles = role_entities(settings, [generic])
+    assert generic_roles["battery_charge:battery_2"] == "sensor.example_generic_charge"
+    assert generic_roles["battery_discharge:battery_2"] == "sensor.example_generic_discharge"
+    assert generic_roles["battery_soc:battery_2"] == "sensor.example_generic_soc"
+    assert "battery_output:battery_2" not in generic_roles
+    assert "battery_pv:battery_2" not in generic_roles
+
+
+def test_generic_charge_keys_win_over_the_native_pair():
+    """Both vocabularies present: the generic keys win, matching the save-time validation."""
+    settings = Settings(None, options={})
+    both = BatteryConfig(
+        id="battery_1", name="Example", driver="zendure", capacity_kwh=5.0,
+        mapping={
+            "charge_power_entity": "sensor.example_generic_charge",
+            "discharge_power_entity": "sensor.example_generic_discharge",
+            "grid_input_power_entity": "sensor.example_battery_grid_input",
+            "output_power_entity": "sensor.example_battery_output_home",
+            "soc_entity": "sensor.example_battery_soc",
+        },
+    )
+    mapping = role_entities(settings, [both])
+    assert mapping["battery_charge:battery_1"] == "sensor.example_generic_charge"
+    assert mapping["battery_discharge:battery_1"] == "sensor.example_generic_discharge"
+    # Roles only the native mapping has still resolve.
+    assert mapping["battery_output:battery_1"] == "sensor.example_battery_output_home"
+
+
+def test_measured_roles_need_the_complete_native_pair_and_never_guess():
+    """One native side is not a measurement; an unmapped battery resolves nothing at all."""
+    settings = Settings(None, options={})
+    incomplete = BatteryConfig(
+        id="battery_1", name="Example", driver="zendure", capacity_kwh=5.0,
+        mapping={
+            "grid_input_power_entity": "sensor.example_battery_grid_input",
+            "soc_entity": "sensor.example_battery_soc",
+        },
+    )
+    mapping = role_entities(settings, [incomplete])
+    assert "battery_charge:battery_1" not in mapping
+    assert "battery_discharge:battery_1" not in mapping
+    assert mapping["battery_soc:battery_1"] == "sensor.example_battery_soc"
+
+    blank = BatteryConfig(
+        id="battery_9", name="Example", driver="zendure", capacity_kwh=5.0,
+        mapping={"manual_power_entity": "number.example_manual_power"},
+    )
+    assert role_entities(settings, [blank]) == {}
+
+
+def test_collect_reads_registry_resolved_roles_through_the_mapping_override():
+    """A registry-filled role counts for the sampler exactly like a user-confirmed one."""
+    settings = Settings(None, options={})
+    stored = BatteryConfig(
+        id="battery_1", name="Example", driver="zendure", capacity_kwh=5.0,
+        mapping={"manual_power_entity": "number.example_manual_power"},
+    )
+    resolved = {
+        "battery_1": {
+            "grid_input_power_entity": "sensor.example_battery_grid_input",
+            "output_power_entity": "sensor.example_battery_output_home",
+            "soc_entity": "sensor.example_battery_soc",
+        }
+    }
+    states = [
+        state("sensor.example_battery_grid_input", 500, "W"),
+        state("sensor.example_battery_output_home", 200, "W"),
+        state("sensor.example_battery_soc", 40, "%"),
+    ]
+    measurements, actuals = collect(
+        FakeClient(states), settings, [stored], mappings=resolved, now=NOW
+    )
+    roles = {item.role for item in measurements}
+    assert {"battery_charge:battery_1", "battery_discharge:battery_1", "battery_soc:battery_1"} <= roles
+    assert "battery_power:battery_1" not in roles  # the stored mapping has no signed setpoint
+    assert actuals["battery_kw"] == pytest.approx(0.3)  # 500 W in - 200 W out
+    assert actuals["soc_kwh"] == pytest.approx(2.0)

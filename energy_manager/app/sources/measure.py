@@ -15,7 +15,14 @@ Role names in ``measurements`` follow :class:`app.models.Measurement`; per-batte
 (``battery_power:<battery id>``, ``battery_soc:<battery id>``, ``battery_pv:<battery id>``,
 ``battery_output:<battery id>``) so several batteries stay distinguishable.
 
-Single reference for the settings-key -> role mapping resolved by :func:`role_entities`:
+The measured battery roles come from the **driver** that reads the battery
+(``drivers.measured_roles``, resolved by :func:`role_entities` through the driver registry), so the
+ledger and the capacity learner read the same entities the driver does — a Zendure mapping names
+them ``grid_input_power_entity``/``output_power_entity``, the generic one
+``charge_power_entity``/``discharge_power_entity``.  The engine also passes the registry-resolved
+mapping per battery (``Engine.resolved_mappings``): a role the runtime resolver filled in counts
+for the sampler exactly like one the user confirmed.  ``battery_power:<id>`` is only the signed
+``power_setpoint_entity`` — a command, never a confirmed measurement.
 
 ============================  ========================
 setting key                   sampling role
@@ -26,9 +33,10 @@ setting key                   sampling role
 ``grid.power_entity``         ``grid_power``
 ``grid.import_entity``        ``grid_import``
 ``grid.export_entity``        ``grid_export``
-battery ``mapping``           ``battery_power:<id>``, ``battery_charge:<id>``,
-                              ``battery_discharge:<id>``, ``battery_pv:<id>``,
-                              ``battery_output:<id>``, ``battery_soc:<id>``
+battery ``mapping``           ``battery_power:<id>``, plus the measured
+                              ``battery_charge`` / ``battery_discharge`` /
+                              ``battery_pv`` / ``battery_output`` / ``battery_soc``
+                              roles declared by the battery's driver
 ============================  ========================
 
 A role passed through ``entities=`` (the engine's user-confirmed mapping) always wins over the
@@ -101,6 +109,8 @@ def role_entities(
     settings: Any,
     batteries: Iterable[BatteryConfig] = (),
     extra: Mapping[str, str] | None = None,
+    *,
+    mappings: Mapping[str, Mapping[str, str]] | None = None,
 ) -> dict[str, str]:
     """Resolve the sampling role -> entity id map from settings, batteries and engine overrides.
 
@@ -108,6 +118,14 @@ def role_entities(
     ``grid_export``, ``pv_power``, ``load_power`` and the derived-load roles used by
     :mod:`app.sources.load`. Grid roles otherwise come from ``grid.power_entity`` /
     ``grid.import_entity`` / ``grid.export_entity``.
+
+    Per battery, ``mappings`` optionally carries the driver-resolved mapping for that battery id
+    (``Engine.resolved_mappings``): registry-filled roles count for the sampler exactly like the
+    user's confirmed ones, and the stored keys win over a resolved duplicate. The measured roles
+    themselves are declared by the driver (``drivers.measured_roles``), so this module holds no
+    driver-specific entity key list and the sampler cannot drift from what the driver reads.
+    ``battery_power:<id>`` keeps its meaning: the signed ``power_setpoint_entity``, a command,
+    never a confirmed measurement.
     """
     mapping: dict[str, str] = dict(extra or {})
     keys = (
@@ -121,19 +139,29 @@ def role_entities(
     for role, key in keys:
         entity = str(settings.get(key, "") or "")
         mapping.setdefault(role, entity)
-    for battery in batteries:
-        battery_mapping = battery.mapping or {}
-        candidates = {
-            f"battery_power:{battery.id}": battery_mapping.get("power_setpoint_entity"),
-            f"battery_charge:{battery.id}": battery_mapping.get("charge_power_entity"),
-            f"battery_discharge:{battery.id}": battery_mapping.get("discharge_power_entity"),
-            f"battery_pv:{battery.id}": battery_mapping.get("pv_power_entity"),
-            f"battery_output:{battery.id}": battery_mapping.get("output_power_entity"),
-            f"battery_soc:{battery.id}": battery_mapping.get("soc_entity"),
-        }
-        for role, entity in candidates.items():
-            if entity:
-                mapping.setdefault(role, str(entity))
+    resolved = mappings or {}
+    if batteries:
+        # Imported lazily: the driver registry is the single owner of the measured-role table, and
+        # the source layer only consumes it here, on the sampler's own path.
+        from ..control import drivers as driver_registry
+
+        for battery in batteries:
+            # Resolved defaults first, stored keys second: a registry-filled role is used only when
+            # the user's mapping does not have it (the same merge ``Engine._resolved_mapping`` uses).
+            battery_mapping = {
+                **dict(resolved.get(battery.id) or {}),
+                **dict(battery.mapping or {}),
+            }
+            candidates: dict[str, Any] = {
+                f"battery_power:{battery.id}": battery_mapping.get("power_setpoint_entity"),
+            }
+            for role, entity in driver_registry.measured_roles_for(
+                battery.driver, battery_mapping
+            ).items():
+                candidates[f"{role}:{battery.id}"] = entity
+            for role, entity in candidates.items():
+                if entity:
+                    mapping.setdefault(role, str(entity))
     return {role: entity for role, entity in mapping.items() if entity}
 
 
@@ -186,19 +214,21 @@ def collect(
     batteries: Iterable[BatteryConfig] = (),
     *,
     entities: Mapping[str, str] | None = None,
+    mappings: Mapping[str, Mapping[str, str]] | None = None,
     states: Any = None,
     now: datetime | None = None,
 ) -> tuple[list[Measurement], dict[str, Any]]:
     """Sample the configured roles and bucket them at :data:`MEASUREMENT_MINUTES`.
 
     Without an explicit ``states`` snapshot only the mapped entities are read, one targeted call
-    each. Returns ``(measurements, actuals)``; the engine is the single writer of both tables
+    each. ``mappings`` is the per-battery driver-resolved mapping (see :func:`role_entities`).
+    Returns ``(measurements, actuals)``; the engine is the single writer of both tables
     (``actuals`` here is the live tick value, not a row to persist).
     """
     moment = now or utcnow()
     bucket = quarter_floor(moment, MEASUREMENT_MINUTES)
     battery_list = [battery for battery in batteries if battery.enabled]
-    role_map = role_entities(settings, battery_list, entities)
+    role_map = role_entities(settings, battery_list, entities, mappings=mappings)
     if states is not None:
         state_map = _state_map(states)
     elif client is not None:

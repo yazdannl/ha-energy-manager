@@ -38,7 +38,7 @@ from .notify import Notifier
 
 log = logging.getLogger("app.main")
 
-APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.20.2"
+APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.20.3"
 COMMIT = os.environ.get("SEM_COMMIT") or os.environ.get("GITHUB_SHA") or ""
 DEFAULT_PORT = 8099
 DEFAULT_OPTIONS = "/data/options.json"
@@ -154,9 +154,19 @@ def resolve_location(settings: Any, ha: Any) -> tuple[Any, str]:
 
 
 def build_sources(
-    settings: Any, store: Any, ha: Any, *, location: tuple[float, float, str] | None = None
+    settings: Any,
+    store: Any,
+    ha: Any,
+    *,
+    location: tuple[float, float, str] | None = None,
+    sampler_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Forecast providers (SPEC 4/7), the measurement sampler and the discovery sources."""
+    """Forecast providers (SPEC 4/7), the measurement sampler and the discovery sources.
+
+    ``sampler_state`` is filled by the caller with the engine after construction
+    (``sampler_state["engine"]``); the sampler then reads the driver-resolved per-battery mapping
+    from it, so it sees the same roles the drivers read (SPEC 7.3, 0.20.3).
+    """
     price_module = _import("sources.price")
     solar_module = _import("sources.solar")
     load_module = _import("sources.load")
@@ -207,8 +217,10 @@ def build_sources(
     if measure_collect is not None and ha is not None:
         def sampler(now: datetime) -> dict[str, Any]:
             entities = grid_mapping.power_roles() if grid_mapping is not None else grid_roles
+            engine = (sampler_state or {}).get("engine")
+            mappings = engine.resolved_mappings() if engine is not None else None
             measurements, actuals = measure_collect(
-                ha, settings, settings.battery_list(), entities=entities, now=now
+                ha, settings, settings.battery_list(), entities=entities, mappings=mappings, now=now
             )
             if store is not None and measurements:
                 # 5-minute measurement rows; the actuals row is written by the engine, which is
@@ -345,7 +357,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     ha = build_ha()
     location, label = resolve_location(settings, ha)
-    sources = build_sources(settings, store, ha, location=location)
+    sampler_state: dict[str, Any] = {}
+    sources = build_sources(settings, store, ha, location=location, sampler_state=sampler_state)
     maintenance = build_maintenance(
         settings,
         store,
@@ -364,6 +377,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         commit=COMMIT,
         **sources,
     )
+    # The sampler reads the driver-resolved mapping (registry roles included) through this handle;
+    # it is bound before the control thread starts (SPEC 7.3, 0.20.3).
+    sampler_state["engine"] = engine
     engine.start()
     _install_exit_holds(engine)
     api = ApiServer(engine, host=args.host, port=args.port, version=APP_VERSION)

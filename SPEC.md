@@ -1790,6 +1790,30 @@ round, with the reason:
   trajectory, energies and money are byte-identical to 0.20.1; only the action/reason labels move.
   No new reason slug (the vocabulary stays additive).
 
+- **§5/§7.3 (the sampler reads the driver's measured roles; a stalled ledger is visible and its
+  unbooked energy recoverable; requested 2026-10-13 after the live ledger froze for 18 h)** — the
+  measurement sampler must not keep a private copy of the battery mapping keys. A driver declares
+  the roles its own reads use with the classmethod `measured_roles(mapping)` (generic
+  `charge_power_entity` / `discharge_power_entity` / `pv_power_entity` / `output_power_entity` /
+  `soc_entity` by default; the Zendure driver overrides it with the native pair
+  `grid_input_power_entity` = charge and `output_power_entity` = discharge, requires both sides
+  like `_power_is_measured`, and lets the generic keys win when both vocabularies are present).
+  `sources/measure.role_entities` resolves that table through the driver registry and accepts the
+  engine's driver-resolved mapping per battery (`Engine.resolved_mappings`) as an override, so a
+  role the runtime registry resolver filled in is sampled exactly like a user-confirmed one, while
+  an unmapped battery resolves nothing. `battery_power:<id>` keeps its meaning: the signed
+  `power_setpoint_entity`, a command, never measured energy. `book_slices` must record a stall
+  instead of returning the previous payload unchanged: a `skipped_no_samples` counter, a persisted
+  `no_samples_since` marker (with a `stale` boolean) that survives restarts, one journal warning
+  per stall cleared when booking resumes, all visible in `/status.cost_basis` (per battery) and in
+  the `sensor.sem_battery_cost_basis` attributes. When the per-battery measurement series holds no
+  usable power point in the window and exactly one battery is enabled, `update_basis` may fall
+  back to the fleet-aggregate 5-minute `actuals` rows (`battery_kw`/`grid_kw`/`soc_kwh`) to recover
+  measured energy that was never booked; with several enabled batteries the aggregate is never
+  split by guesswork and the stall is reported instead. Every basis semantic is unchanged: the
+  measured integral, the plan/price attribution, the quantity reconciliation, no invented price
+  and no extrapolation beyond the newest row.
+
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded
 in `docs/VERIFICATION.md`.

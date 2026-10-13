@@ -55,10 +55,19 @@ means grid).  A bounded audit journal keeps the last :data:`MAX_JOURNAL` booked 
 The ledger is derived data in the ``learning_profiles`` store (``kind = PROFILE_KIND``), never user
 settings.  Nothing here may crash or block: no store, no rows, an unknown battery or a missing price
 degrades to ``basis=None`` (the floor is then inactive) and the control loop carries on.
+
+A ledger that cannot advance must never do so *silently* (0.20.3): with no usable power samples in
+the window ``book_slices`` counts ``skipped_no_samples``, sets ``no_samples_since``/``stale`` in the
+stored payload (visible in ``/status.cost_basis`` and the HA sensors) and logs one warning per
+stall, cleared when booking resumes.  To recover measured energy that was never booked, an update
+whose window has no usable measurement power point falls back to the fleet-aggregate ``actuals``
+rows -- but only when exactly one battery is enabled, because the aggregate cannot be split across
+a fleet without guessing; with several batteries the stall is reported instead.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
@@ -66,6 +75,8 @@ from datetime import datetime, timedelta
 from typing import Any, Iterable, Mapping, Sequence
 
 from .models import BatteryConfig, Mode, Reason, from_iso, to_iso, utcnow
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "APPLIED_CHANGE_TOLERANCE_W",
@@ -210,6 +221,54 @@ def measurement_series(rows: Iterable[Mapping[str, Any]], battery_id: str) -> Se
             grid.append((moment, grid_w))
         if _SOC_ROLE in values:
             soc.append((moment, values[_SOC_ROLE]))
+    return Series(tuple(power), tuple(grid), tuple(soc))
+
+
+def _has_window_power(series: Series, start: datetime) -> bool:
+    """True when the battery series holds a usable power point at or after ``start``.
+
+    ``measurement_series`` returns its points ascending, so the newest point answers it: a series
+    whose last battery sample predates the window has nothing to integrate there.
+    """
+    if not series.power:
+        return False
+    return max(t for t, _ in series.power) >= start
+
+
+def _actuals_series(store: Any, battery: BatteryConfig, start: datetime, end: datetime) -> Series:
+    """The single-battery fallback series from the fleet-aggregate ``actuals`` rows (0.20.3).
+
+    ``actuals`` carries one aggregated row per :data:`SAMPLE_MINUTES` bucket: ``battery_kw`` the sum
+    of the confirmed per-battery flows, ``soc_kwh`` the sum of their stored energy and ``grid_kw``
+    the meter.  With exactly one enabled battery that aggregate *is* that battery's measurement, so
+    it can stand in for missing ``measurements`` rows without inventing a split; the caller may not
+    use it with several batteries.  SoC is reconstructed as a percentage from ``capacity_kwh``.
+    A row without a finite value is skipped, and the series never extends beyond its newest row.
+    """
+    reader = getattr(store, "actuals_range", None)
+    if not callable(reader):
+        return Series()
+    try:
+        rows = reader(start - timedelta(hours=1), end) or []
+    except Exception:  # noqa: BLE001 - no history is not an error
+        return Series()
+    capacity = float(battery.capacity_kwh or 0.0)
+    power: list[tuple[datetime, float]] = []
+    grid: list[tuple[datetime, float]] = []
+    soc: list[tuple[datetime, float]] = []
+    for row in rows:
+        moment = _parse(row.get("ts"))
+        if moment is None:
+            continue
+        battery_kw = _finite(row.get("battery_kw"))
+        if battery_kw is not None:
+            power.append((moment, battery_kw * 1000.0))
+        grid_kw = _finite(row.get("grid_kw"))
+        if grid_kw is not None:
+            grid.append((moment, grid_kw * 1000.0))
+        soc_kwh = _finite(row.get("soc_kwh"))
+        if soc_kwh is not None and capacity > 0.0:
+            soc.append((moment, max(0.0, soc_kwh) / capacity * 100.0))
     return Series(tuple(power), tuple(grid), tuple(soc))
 
 
@@ -467,6 +526,7 @@ def book_slices(
     dispatch_rows: Sequence[Mapping[str, Any]] = (),
     now: datetime,
     reset: bool = False,
+    source: str = "measurements",
 ) -> dict[str, Any]:
     """Advance the ledger over the settled measured sample grid since ``state['last_ts']``.
 
@@ -504,6 +564,8 @@ def book_slices(
     reconciled_last = _finite(stored.get("reconciled_last_kwh"))
     reconciled_resets = _count(stored.get("reconciled_resets"))
     skipped_no_soc = _count(stored.get("skipped_no_soc"))
+    skipped_no_samples = _count(stored.get("skipped_no_samples"))
+    no_samples_since = _parse(stored.get("no_samples_since"))
     if reset or (last_ts is not None and last_ts > now):
         basis, energy, last_ts, window_start = None, 0.0, None, None
         reconciled, reconciled_last = 0.0, None
@@ -579,6 +641,9 @@ def book_slices(
             for a, b in power.covered_ranges(window_from, now)
             if min(b, settled_end) > a
         ]
+    # No usable power sample covers any part of the window: the ledger cannot advance (0.20.3).
+    # Recorded with a counter and a marker below instead of silently returning the same payload.
+    stalled = bool(slices) and not coverage
     for start, end, applied, dispatch_reason, mode, dispatch_id in slices:
         if settled_end is None or start >= settled_end:
             # Not bounded by samples on both sides yet: leave it for the next update.
@@ -681,6 +746,21 @@ def book_slices(
             )
     if booked:
         last_ts = processed_end
+    if stalled:
+        skipped_no_samples += 1
+        if stored.get("no_samples_since") is None:
+            # One warning per stall, not one per tick: the stored marker (which survives a
+            # restart) is what says the stall was already reported.
+            log.warning(
+                "cost-basis ledger for %s stalled: no usable battery power samples in the window "
+                "since %s; the stored basis and sell floor no longer follow the pack",
+                battery.id,
+                to_iso(window_from or now),
+            )
+        if no_samples_since is None:
+            no_samples_since = window_from or now
+    else:
+        no_samples_since = None
 
     # --- reconcile the quantity with the pack's measured content (0.18.1) ----------------------
     if booked and basis is not None and max_energy is not None and last_ts is not None:
@@ -706,6 +786,7 @@ def book_slices(
 
     return {
         "version": STATE_VERSION,
+        "sample_source": source,
         "basis_eur_per_kwh": None if basis is None else round(basis, 6),
         "energy_kwh": round(energy, 4),
         "last_ts": to_iso(last_ts),
@@ -714,6 +795,9 @@ def book_slices(
         "last_reason": command[1],
         "last_mode": command[2],
         "intervals": intervals,
+        "skipped_no_samples": skipped_no_samples,
+        "no_samples_since": to_iso(no_samples_since),
+        "stale": no_samples_since is not None,
         "skipped_no_price": skipped_no_price,
         "skipped_no_power": skipped_no_power,
         "skipped_no_grid": skipped_no_grid,
@@ -748,11 +832,18 @@ def update_basis(
     *,
     days: float = LOOKBACK_DAYS,
     timeline: PriceTimeline | None = None,
+    fleet_enabled: int = 1,
 ) -> dict[str, Any] | None:
     """Advance one battery's ledger from its dispatch log, measurements and persisted plans.
 
-    Returns the stored payload (or the previous one when nothing new was booked).  A missing store,
-    missing rows or an unreadable profile is not an error, only "no change".
+    Returns the stored payload (or the previous one when nothing changed).  A missing store, missing
+    rows or an unreadable profile is not an error, only "no change".
+
+    When the measurement series holds no usable power point in the window, the fleet-aggregate
+    ``actuals`` rows stand in for it -- but only with ``fleet_enabled == 1``, because with several
+    batteries the aggregate cannot be split without guessing (0.20.3).  A stall is persisted (the
+    ``skipped_no_samples`` counter and the ``no_samples_since`` marker) instead of being dropped, so
+    it survives a restart and shows up in ``/status``.
     """
     moment = now or utcnow()
     if not callable(getattr(store, "measurements_range", None)) or not callable(
@@ -783,17 +874,35 @@ def update_basis(
         dispatch_rows = []
     if timeline is None:
         timeline = PriceTimeline.from_store(store, start, moment)
+    series = measurement_series(rows, battery.id)
+    source = "measurements"
+    if _count(fleet_enabled) == 1 and not _has_window_power(series, start):
+        # The persisted measurement rows do not cover the window: the actuals row is the same
+        # physical measurement aggregated once per bucket, and with a single enabled battery it
+        # belongs to that battery.  Recovering it books energy that was measured but never booked.
+        actuals = _actuals_series(store, battery, start, moment)
+        if actuals.power:
+            series, source = actuals, "actuals"
     booked = book_slices(
         stored,
         battery=battery,
-        series=measurement_series(rows, battery.id),
+        series=series,
         timeline=timeline,
         dispatch_rows=dispatch_rows,
         now=moment,
         reset=reset,
+        source=source,
     )
-    grew = _count(booked.get("intervals")) > _count((stored or {}).get("intervals"))
-    if not grew:
+    previous = stored or {}
+    grew = _count(booked.get("intervals")) > _count(previous.get("intervals"))
+    # A stall must be persisted even though it books nothing: the counter and the marker are the
+    # only trace until booking resumes, and clearing the marker is itself a change to store.
+    stall_changed = (
+        _count(booked.get("skipped_no_samples"))
+        != _count(previous.get("skipped_no_samples"))
+        or booked.get("no_samples_since") != previous.get("no_samples_since")
+    )
+    if not grew and not stall_changed:
         return stored
     writer = getattr(store, "profile_put", None)
     if callable(writer):
@@ -840,6 +949,11 @@ def basis_status(
         "skipped_no_price": _count((payload or {}).get("skipped_no_price")),
         "skipped_no_power": _count((payload or {}).get("skipped_no_power")),
         "skipped_no_grid": _count((payload or {}).get("skipped_no_grid")),
+        "skipped_no_samples": _count((payload or {}).get("skipped_no_samples")),
+        # Additive (0.20.3): a stalled ledger says so instead of just freezing (SPEC 5).
+        "stale": bool((payload or {}).get("no_samples_since")),
+        "no_samples_since": (payload or {}).get("no_samples_since"),
+        "sample_source": (payload or {}).get("sample_source"),
         # Additive (0.18.1): how far the quantity was pulled onto the pack's own measured SoC
         # content, and how often a correction was too large to attribute (a reset).
         "skipped_no_soc": _count((payload or {}).get("skipped_no_soc")),

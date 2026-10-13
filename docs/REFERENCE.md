@@ -1079,6 +1079,17 @@ Roles: `pv_power`, `load_power`, `price`, `grid_power`, `grid_import`, `grid_exp
 `battery_power:<id>`, `battery_charge:<id>`, `battery_discharge:<id>`, `battery_pv:<id>`,
 `battery_output:<id>`, `battery_soc:<id>`.
 
+The per-battery **measured** roles are declared by the battery's driver
+(`drivers.measured_roles(mapping)`): by default the generic `charge_power_entity` /
+`discharge_power_entity` pair plus `pv_power_entity` / `output_power_entity` / `soc_entity`, and on
+the Zendure drivers the native `grid_input_power_entity` (charge) / `output_power_entity`
+(discharge) pair — both sides required, exactly like `_power_is_measured`, with the generic keys
+winning when both vocabularies are present (0.20.3). `role_entities` resolves that table through
+the driver registry and also accepts the engine's driver-resolved mapping per battery
+(`Engine.resolved_mappings`), so a role the registry resolver filled in is sampled exactly like a
+user-confirmed one and an unmapped battery resolves nothing. `battery_power:<id>` is only the
+signed `power_setpoint_entity`: a command, never measured energy.
+
 Unit handling: power → W (`W`, `kW`, `MW`), SoC → %, price → EUR/kWh. The tick's `actuals` row is:
 
 ```
@@ -1215,6 +1226,19 @@ counts `skipped_no_soc`). The difference is applied to `E` and never to `basis`;
 cumulative correction is `reconciled_kwh`, the last step `reconciled_last_kwh`, and a single
 correction beyond half the pack capacity resets the ledger (`basis = None, E = 0`) and counts
 `reconciled_resets`. All of these travel with the per-battery ledger into `/status`.
+
+A ledger that cannot advance must say so (0.20.3). With no usable power samples in the window,
+`book_slices` leaves the basis and the energy exactly as they were, increments the
+`skipped_no_samples` counter, sets the persisted `no_samples_since` marker (`stale` in the payload
+and the API) and logs one warning per stall naming the battery; the next successful booking clears
+the marker. Both fields survive a restart and are exposed per battery in `/status.cost_basis` and
+the HA sensor attributes, so a frozen sell floor is visible instead of silent. When the per-battery
+measurement rows hold no usable power point in the window **and exactly one battery is enabled**,
+`update_basis` falls back to the fleet-aggregate 5-minute `actuals` rows
+(`battery_kw`/`grid_kw`/`soc_kwh`, capped at the newest row) and books measured energy that was
+never booked, under unchanged basis semantics (the payload's `sample_source` then says `actuals`).
+With two or more enabled batteries the aggregate cannot be split without guessing, so the fallback
+is refused and the stall is reported instead.
 
 The floor per battery is `break_even_sell_eur_per_kwh(basis, wear) + margin` (the frozen helper, the
 battery's own etas, the advanced wear override when set), and the fleet floor the plan enforces is
@@ -1663,7 +1687,7 @@ blocks the control loop. Unchanged state and attributes are not rewritten.
 | `sensor.sem_load_forecast_now` | kW | `today_kwh`, `confidence` |
 | `sensor.sem_savings_today` | EUR | `month_eur`, `year_eur`, `baseline_kwh` |
 | `sensor.sem_battery_soc_avg` | % | — |
-| `sensor.sem_battery_cost_basis` | EUR/kWh | `stored_value_eur`, `energy_kwh`, per-battery basis; state `unknown` without a ledger |
+| `sensor.sem_battery_cost_basis` | EUR/kWh | `stored_value_eur`, `energy_kwh`, per-battery basis plus `stale`/`no_samples_since` (additive 0.20.3); state `unknown` without a ledger |
 | `sensor.sem_battery_value` | EUR | `cost_basis_eur_per_kwh`, `sell_floor_eur_per_kwh`; state `unknown` without a ledger |
 | `sensor.sem_forecast_accuracy` | % | `pv_mape`, `load_mape`, `price_mae` |
 | `binary_sensor.sem_autopilot_active` | on/off | — |
@@ -1684,7 +1708,8 @@ supplies it (which is why publishing a port would hand battery control to anyone
 | Method & route | Body / query | Returns |
 | --- | --- | --- |
 | `GET /api/v1/health` | — | `{status, version, uptime_s, commit}` |
-| `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]` (each with `cell_voltage_v`, additive 0.18.0 `cost_basis_eur_per_kwh`/`stored_value_eur`, and additive 0.20.0 `max_charge_w`/`max_discharge_w` plus `cap_charge_w`/`cap_discharge_w`, `null` = unlimited), `cell_voltage{enabled,cutoff_v,warning_v,resume_v,emergency_charge_power_w,latched[],batteries[{battery_id,voltage_v,fresh,seen,latched,block_discharge,force_charge_w,reason,note}]}` (additive, 0.16.0), `full_charge{enabled,interval_days,target_soc_pct,overdue_grace_hours,active,due,overdue,batteries[],plan{…}}` (additive, 0.17.0), `cost_basis{enabled,margin_eur_per_kwh,sell_floor_eur_per_kwh,fleet_basis_eur_per_kwh,batteries[{id,name,cost_basis_eur_per_kwh,energy_kwh,stored_value_eur,sell_floor_eur_per_kwh,intervals,skipped_no_price,skipped_no_power,skipped_no_grid,skipped_no_soc,reconciled_kwh,reconciled_last_kwh,reconciled_resets,window_start,updated_at,journal_entries,journal[]}]}` (additive, 0.18.0; the `skipped_no_soc`/`reconciled_*` counters additive 0.18.1), `manual_limits{}` (additive, 0.20.0: the raw per-direction mapping), `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
+| `GET /api/v1/status` | — | serialised `SystemState`: `version`, `commit`, `uptime_s`, `mode`, `dry_run`, `pending_holds[]`, `mode_persisted`, `ha_connected`, `ha_last_error`, `location`, `now`, `price_now`, `price_rank_pct`, `pv_now_w`, `load_now_w`, `grid_now_w`, `batteries[]` (each with `cell_voltage_v`, additive 0.18.0 `cost_basis_eur_per_kwh`/`stored_value_eur`, and additive 0.20.0 `max_charge_w`/`max_discharge_w` plus `cap_charge_w`/`cap_discharge_w`, `null` = unlimited), `cell_voltage{enabled,cutoff_v,warning_v,resume_v,emergency_charge_power_w,latched[],batteries[{battery_id,voltage_v,fresh,seen,latched,block_discharge,force_charge_w,reason,note}]}` (additive, 0.16.0), `full_charge{enabled,interval_days,target_soc_pct,overdue_grace_hours,active,due,overdue,batteries[],plan{…}}` (additive, 0.17.0), `cost_basis{enabled,margin_eur_per_kwh,sell_floor_eur_per_kwh,fleet_basis_eur_per_kwh,batteries[{id,name,cost_basis_eur_per_kwh,energy_kwh,stored_value_eur,sell_floor_eur_per_kwh,intervals,skipped_no_price,skipped_no_power,skipped_no_grid,skipped_no_soc,skipped_no_samples,reconciled_kwh,reconciled_last_kwh,reconciled_resets,window_start,updated_at,journal_entries,journal[]}]}` (additive, 0.18.0; the `skipped_no_soc`/`reconciled_*` counters additive 0.18.1; `skipped_no_samples`/`stale`/`no_samples_since`/`sample_source`
+additive 0.20.3), `manual_limits{}` (additive, 0.20.0: the raw per-direction mapping), `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
 | `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, slot_minutes, feasible, infeasible_reason, mode, dry_run, sources{}, maintenance, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh, maintenance{enabled,active,due,overdue,target_soc_pct,effective_target_soc_pct,interval_days,overdue_grace_hours,batteries[],due_batteries[],overdue_batteries[]} (additive, 0.17.0), sell_floor_eur_per_kwh (additive, 0.18.0)}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, minutes (additive 0.20.1), action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; `slot_minutes` is the plan's own resolution (the UI never assumes one) and `minutes` is the duration the solver modelled for each slot (the full step, or the remaining part of the current clock slot; 0.20.1); with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` and `slot_minutes: null` |
 | `GET /api/v1/plan/execution` | `hours` | additive (0.10.0): `{generated_at, slot_minutes, now, floors{reserve_soc_pct, min_soc_pct, floor_soc_pct}, batteries[{id, name, min_soc_pct, floor_soc_pct, capacity_kwh}], progress{…}, slots[{t, minutes (additive 0.20.1), dispatch, actual}]}` — the same slot grid as `/plan`, joined with the persisted 5-minute actuals and the dispatch log. `dispatch` is the last attempt per battery in that slot (`requested_w`, `applied_w`, `ok`, `dry_run`, `clamped`, `code`, `reason`, `message`, `records`, `batteries[]`) and `actual` the measured aggregate (`samples`, `coverage_pct`, `pv_kw`, `load_kw`, `grid_kw`, `battery_kw`, `planned_kw`, `measured_kw`, `import_kwh`, `export_kwh`, `charged_kwh`, `discharged_kwh`, `soc_kwh_start`, `soc_kwh_end`). Both are `null` for a slot nothing was measured or dispatched in — never a fabricated zero |
 | `POST /api/v1/plan/recompute` | — | `{queued: true}` (async; poll status) |

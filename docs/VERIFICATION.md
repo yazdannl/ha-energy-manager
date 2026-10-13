@@ -1302,6 +1302,59 @@ What is *not* verified live: the add-on was not deployed and nothing was written
 instance, so the 0.20.2 label has not been re-observed against a live plan; only the offline
 reproduction, the tests and the render check above are measured here.
 
+### 8.18 The sampler reads the driver's measured roles; a stalled ledger is visible and recovered (0.20.3)
+
+The live battery's stored mapping names the **native** Zendure keys (`grid_input_power_entity`,
+`output_power_entity`, `pv_power_entity`, `soc_entity`, ...), while the pre-0.20.3
+`sources/measure.role_entities` built the per-battery role map from a private list of *generic*
+keys (`charge_power_entity`, `discharge_power_entity`, `power_setpoint_entity`). Reproduced
+offline by calling `role_entities` with the live-shaped mapping: only `battery_output`,
+`battery_pv` and `battery_soc` resolved — all three AC power roles were missing, so the sampler
+never persisted `battery_charge` / `battery_discharge` / `battery_power` rows.
+
+The consequence was a silently frozen ledger: `cost_basis.book_slices` integrates that power
+series, `settled_end = power.last_time` was `None`, its slice loop broke on the first iteration and
+`update_basis` returned the previous payload. Live on 2026-10-13: `intervals` stuck at 282,
+`updated_at` frozen at 2026-10-12T17:13:02Z (18 h), basis at 0.3197 and the sell floor at 0.3997
+while the pack charged ~0.2 kWh AC at 0.266 EUR/kWh; no counter moved, no warning was journaled,
+and the published sensors stopped changing. `app/capacity.py` reads the same roles, so the learner
+had no samples either (`capacity_learned_rejected ... keeping the seed capacity 1.920 kWh`).
+
+The 0.20.3 fix and what the tests pin:
+
+* `BaseDriver.measured_roles(mapping)` owns the table: by default the generic pair plus
+  `pv_power_entity` / `output_power_entity` / `soc_entity`; `ZendureDriver` overrides it with the
+  native `grid_input_power_entity` (charge) / `output_power_entity` (discharge) pair, requiring
+  both sides like `_power_is_measured` and letting the generic keys win when both vocabularies are
+  present. `role_entities` resolves that table through the driver registry and accepts the
+  engine's `Engine.resolved_mappings()` (the registry-resolved mapping per battery, bound into the
+  sampler in `main.build_sources`) as an override. Native-only, generic-only and both-keys
+  mappings each resolve the power roles plus SoC; an incomplete native pair and an unmapped battery
+  resolve none.
+* A stall is recorded, not swallowed: `skipped_no_samples` steps exactly once per update,
+  `no_samples_since` + `stale` persist in the profile (and survive a restart) with one
+  `log.warning` per stall, and the next successful booking clears the marker;
+  `/status.cost_basis` and `sensor.sem_battery_cost_basis` expose them.
+* A window with no usable measurement power point and exactly one enabled battery falls back to
+  `store.actuals_range(start - 1 h, now)` (`battery_kw`/`grid_kw`/`soc_kwh`; the newest actuals row
+  caps the booking). The recovered booking equals the measurement-role booking in basis, energy,
+  journal cost and sell floor; with two enabled batteries the fleet aggregate is not split and the
+  stall is reported instead. Live this recovers 2026-10-12T17:13:02Z -> the newest actuals row at
+  the first update after deployment (the whole ~18 h window as of 2026-10-13T11:2xZ), subject to
+  the 400-day `actuals` retention.
+
+Measured on the 0.20.3 tree: `python3 -m pytest tests -q` -> **935 passed** (10 new tests; 8 of them
+fail on 0245a7f, and the two role-precedence / no-guess tests pass before and after because the fix
+must not change them), `sh tools/audit.sh` -> **clean, 112 files scanned**, `node
+tools/ui_render_check.js` -> **110 passed, 0 failed**. The offline reproduction on 0245a7f with the
+live-shaped native mapping yields no `battery_charge`/`battery_discharge` roles while
+`battery_output`/`pv`/`soc` still resolve.
+
+What is *not* verified live: the add-on was not deployed and nothing was written to the live
+instance, so the recovered window has not been re-observed against the live store; the sizes above
+are computed from the frozen ledger payload (last_ts 2026-10-12T17:13:02Z, 282 intervals) and the
+newest `actuals` row available to the add-on.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)

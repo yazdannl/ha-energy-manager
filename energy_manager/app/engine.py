@@ -1349,6 +1349,25 @@ class Engine:
             return config
         return replace(config, mapping={**mapping, **merged})
 
+    def resolved_mappings(self) -> dict[str, dict[str, str]]:
+        """Every enabled battery's driver-resolved mapping, for the measurement sampler (SPEC 7.3).
+
+        The sampler reads entities by role; handing it this mapping keeps it on exactly what the
+        drivers read, including roles the registry resolver filled in, while the stored mapping
+        still wins over a resolved duplicate.  The registry read behind it is cached, so one call
+        per control tick is cheap.  A battery is skipped rather than guessed when it cannot be
+        resolved.
+        """
+        mappings: dict[str, dict[str, str]] = {}
+        for config in self.battery_configs():
+            if not config.enabled:
+                continue
+            try:
+                mappings[config.id] = dict(self._resolved_mapping(config).mapping)
+            except Exception as exc:  # pragma: no cover - defensive, like the resolver itself
+                log.debug("resolved mapping for %s failed: %s", config.id, exc)
+        return mappings
+
     # ------------------------------------------------------------------ learned capacity
 
     def capacity_status(self, battery_id: str) -> dict[str, Any]:
@@ -1523,7 +1542,9 @@ class Engine:
         updated: list[str] = []
         for config in configs:
             try:
-                payload = cost_basis_ledger.update_basis(self._store, config, moment)
+                payload = cost_basis_ledger.update_basis(
+                    self._store, config, moment, fleet_enabled=len(configs)
+                )
             except Exception as exc:  # noqa: BLE001 - the ledger must never break planning
                 log.warning("cost-basis update failed for %s: %s", config.id, exc)
                 continue
@@ -3898,9 +3919,13 @@ class Engine:
                             "id": row.get("id"),
                             "cost_basis_eur_per_kwh": row.get("cost_basis_eur_per_kwh"),
                             "energy_kwh": row.get("energy_kwh"),
+                            # Additive (0.20.3): a frozen ledger is visible here too.
+                            "stale": bool(row.get("stale")),
+                            "no_samples_since": row.get("no_samples_since"),
                         }
                         for row in basis_rows
                     ],
+                    "stale": any(bool(row.get("stale")) for row in basis_rows),
                 },
             ),
             SEM_BATTERY_VALUE: (

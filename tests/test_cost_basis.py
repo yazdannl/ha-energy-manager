@@ -46,6 +46,7 @@ from app.models import (  # noqa: E402
     to_iso,
 )
 from app.optimize import dp  # noqa: E402
+from app.sources.measure import role_entities  # noqa: E402
 from app.store import Store  # noqa: E402
 
 T0 = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
@@ -473,6 +474,13 @@ def _seed_store(store: Store, config: BatteryConfig, *, start: datetime, hours: 
             for index in range(hours * 12 + 1)
         ]
     )
+    _seed_dispatch_and_plan(store, config, start=start, hours=hours)
+
+
+def _seed_dispatch_and_plan(
+    store: Store, config: BatteryConfig, *, start: datetime, hours: int = 1
+) -> None:
+    """The applied charge and its plan, with no measurement or actuals rows (0.20.3 tests)."""
     store.add_dispatch(
         ts=start,
         battery_id=config.id,
@@ -1512,3 +1520,246 @@ def test_basis_status_carries_the_reconciliation_counters():
     assert empty["reconciled_last_kwh"] is None
     assert empty["reconciled_resets"] == 0
     assert empty["skipped_no_soc"] == 0
+
+
+# ------------------------------------------- a stalled ledger is never silent (0.20.3)
+
+
+def test_stalled_ledger_counts_marks_and_warns_once_then_recovers(tmp_path, caplog):
+    """The live 0.20.2 defect: no power rows froze the ledger with no trace at all."""
+    store = Store(tmp_path / "stall.db")
+    config = battery()
+    _seed_dispatch_and_plan(store, config, start=T0)
+    seeded_soc = soc_for(0.8, config)
+    store.add_measurements(
+        [
+            Measurement(
+                ts=T0 + timedelta(minutes=5 * index),
+                role=f"battery_soc:{config.id}",
+                value=seeded_soc,
+                unit="%",
+            )
+            for index in range(13)
+        ]
+    )
+    # The frozen live ledger: 282 intervals, basis 0.3197, last booked 18 h before the incident.
+    store.profile_put(
+        ledger.PROFILE_KIND,
+        config.id,
+        {
+            "basis_eur_per_kwh": 0.3197,
+            "energy_kwh": 1.0,
+            "last_ts": to_iso(T0),
+            "intervals": 282,
+        },
+        T0,
+    )
+    timeline = ledger.PriceTimeline([slot(T0, 0.20, 0.05, minutes=120)])
+    now = T0 + timedelta(hours=1)
+    with caplog.at_level("WARNING", logger="app.cost_basis"):
+        first = ledger.update_basis(store, config, now, timeline=timeline)
+        second = ledger.update_basis(store, config, now, timeline=timeline)
+    assert first is not None and second is not None
+    # Freezing: the basis is left exactly as it was, never re-guessed from nothing.
+    assert second["basis_eur_per_kwh"] == pytest.approx(0.3197)
+    assert second["energy_kwh"] == pytest.approx(1.0)
+    assert second["intervals"] == 282
+    # Visible: one counter step per update, a persisted marker and exactly one warning.
+    assert second["skipped_no_samples"] == 2
+    assert second["stale"] is True
+    assert second["no_samples_since"] == to_iso(T0)
+    warnings = [record for record in caplog.records if "stalled" in record.getMessage()]
+    assert len(warnings) == 1
+    stored = ledger.load_basis(store, config.id)
+    assert stored is not None and stored["stale"] is True
+    assert stored["skipped_no_samples"] == 2
+
+    # The next successful booking clears the marker.
+    store.add_measurements(
+        [
+            Measurement(
+                ts=T0 + timedelta(minutes=5 * index),
+                role=f"battery_power:{config.id}",
+                value=800.0,
+                unit="W",
+            )
+            for index in range(13)
+        ]
+    )
+    third = ledger.update_basis(store, config, now, timeline=timeline)
+    assert third is not None
+    assert third["stale"] is False
+    assert third["no_samples_since"] is None
+    assert third["intervals"] == 283
+    assert third["skipped_no_samples"] == 2  # the counter is cumulative
+    store.close()
+
+
+def test_basis_status_exposes_the_stall_marker():
+    status = ledger.basis_status(
+        {"basis_eur_per_kwh": 0.3197, "energy_kwh": 1.0, "no_samples_since": to_iso(T0),
+         "skipped_no_samples": 9}
+    )
+    assert status["stale"] is True
+    assert status["no_samples_since"] == to_iso(T0)
+    assert status["skipped_no_samples"] == 9
+    assert status["sample_source"] is None
+    empty = ledger.basis_status(None)
+    assert empty["stale"] is False and empty["no_samples_since"] is None
+    assert empty["skipped_no_samples"] == 0
+
+
+# ------------------------------------------- recovering unbooked measured energy (0.20.3)
+
+
+def test_single_battery_actuals_fallback_recovers_the_unbooked_window(tmp_path):
+    """With one battery the actuals row is the same measurement, so it can recover the window."""
+    config = battery()
+    now = T0 + timedelta(hours=1)
+    measured_store = Store(tmp_path / "measured.db")
+    _seed_store(measured_store, config, start=T0)
+    measured = ledger.update_basis(measured_store, config, now)
+
+    fallback_store = Store(tmp_path / "fallback.db")
+    _seed_dispatch_and_plan(fallback_store, config, start=T0)
+    seeded_soc = soc_for(0.8, config)
+    for index in range(13):
+        fallback_store.upsert_actuals(
+            T0 + timedelta(minutes=5 * index),
+            battery_kw=0.8,
+            grid_kw=0.8,
+            soc_kwh=seeded_soc / 100.0 * config.capacity_kwh,
+        )
+    recovered = ledger.update_basis(fallback_store, config, now)
+
+    assert measured["sample_source"] == "measurements"
+    assert recovered["sample_source"] == "actuals"
+    assert recovered["stale"] is False
+    # The recovered booking is the same arithmetic as the measurement-role booking: the measured
+    # integral, the plan's buy/sell attribution, and the pack reconciliation.
+    assert recovered["basis_eur_per_kwh"] == pytest.approx(measured["basis_eur_per_kwh"])
+    assert recovered["energy_kwh"] == pytest.approx(measured["energy_kwh"])
+    assert recovered["intervals"] == measured["intervals"]
+    assert recovered["journal"][-1]["cost_eur"] == pytest.approx(
+        measured["journal"][-1]["cost_eur"]
+    )
+    assert recovered["journal"][-1]["grid_kwh"] > 0.0  # attributed through the measured meter
+    assert ledger.basis_status(recovered, config)["sell_floor_eur_per_kwh"] == pytest.approx(
+        ledger.basis_status(measured, config)["sell_floor_eur_per_kwh"]
+    )
+    measured_store.close()
+    fallback_store.close()
+
+
+def test_actuals_fallback_never_splits_the_fleet_aggregate(tmp_path):
+    """Two enabled batteries: the aggregate cannot be split, so the stall is reported instead."""
+    config = battery()
+    store = Store(tmp_path / "two-batteries.db")
+    _seed_dispatch_and_plan(store, config, start=T0)
+    seeded_soc = soc_for(0.8, config)
+    for index in range(13):
+        store.upsert_actuals(
+            T0 + timedelta(minutes=5 * index),
+            battery_kw=1.6,  # both packs charging: the fleet aggregate, not one battery
+            grid_kw=1.6,
+            soc_kwh=2.0 * seeded_soc / 100.0 * config.capacity_kwh,
+        )
+    payload = ledger.update_basis(store, config, T0 + timedelta(hours=1), fleet_enabled=2)
+    assert payload is not None
+    assert payload["sample_source"] == "measurements"
+    assert payload["stale"] is True
+    assert payload["skipped_no_samples"] == 1
+    assert payload["no_samples_since"] == to_iso(T0)
+    assert payload["basis_eur_per_kwh"] is None  # never a guessed split
+    assert payload["intervals"] == 0
+    store.close()
+
+
+def test_engine_recovers_the_ledger_and_reports_a_stall_without_a_guessed_split(tmp_path):
+    """The engine passes the enabled-fleet size, so the fallback stays single-battery only."""
+    config = battery()
+    single = Store(tmp_path / "engine-single.db")
+    engine, _store, _settings, clock = _build_engine(store=single, config=config)
+    _seed_dispatch_and_plan(single, config, start=T0)
+    seeded_soc = soc_for(0.8, config)
+    for index in range(13):
+        single.upsert_actuals(
+            T0 + timedelta(minutes=5 * index),
+            battery_kw=0.8,
+            grid_kw=0.8,
+            soc_kwh=seeded_soc / 100.0 * config.capacity_kwh,
+        )
+    clock.now = T0 + timedelta(hours=1)
+    engine.update_cost_bases(clock.now, force=True)
+    row = engine.battery_cost_basis(config.id)
+    assert row["sample_source"] == "actuals" and row["stale"] is False
+    assert row["skipped_no_samples"] == 0
+    assert engine.fleet_sell_floor() is not None
+    single.close()
+
+    fleet = Store(tmp_path / "engine-fleet.db")
+    engine2, _store2, settings2, clock2 = _build_engine(store=fleet, config=config)
+    settings2.add_battery(battery(id="example_battery_2", name="Example Battery 2"))
+    _seed_dispatch_and_plan(fleet, config, start=T0)
+    for index in range(13):
+        fleet.upsert_actuals(
+            T0 + timedelta(minutes=5 * index),
+            battery_kw=1.6,
+            grid_kw=1.6,
+            soc_kwh=2.0 * seeded_soc / 100.0 * config.capacity_kwh,
+        )
+    clock2.now = T0 + timedelta(hours=1)
+    engine2.update_cost_bases(clock2.now, force=True)
+    row2 = engine2.battery_cost_basis(config.id)
+    assert row2["stale"] is True and row2["skipped_no_samples"] == 1
+    assert row2["cost_basis_eur_per_kwh"] is None
+    assert row2["intervals"] == 0
+    fleet.close()
+
+
+def test_engine_resolved_mappings_carry_registry_roles_for_the_sampler():
+    """The sampler's mapping override is the driver-resolved one, registry roles included."""
+    config = BatteryConfig(
+        id="example_battery_1",
+        name="Example Battery 1",
+        driver="zendure",
+        capacity_kwh=5.0,
+        mapping={
+            "manual_power_entity": "number.example_manual_power",
+            "operation_entity": "select.example_operation",
+        },
+    )
+    settings = _selfcheck_settings()
+    settings["control.grid_follow"] = False
+    settings.add_battery(config)
+    entries = [
+        {
+            "platform": "zendure_ha",
+            "translation_key": key,
+            "entity_id": entity,
+            "device_id": "example_device",
+        }
+        for key, entity in (
+            ("output_home_power", "sensor.example_output_home_power"),
+            ("grid_input_power", "sensor.example_grid_input_power"),
+            ("electric_level", "sensor.example_electric_level"),
+        )
+    ]
+    engine = Engine(
+        settings,
+        store=_FakeStore(),
+        ha=_FakeHA(),
+        notifier=_FakeNotifier(),
+        clock=_Clock(),
+        **{**_selfcheck_sources(), "registry_source": lambda: entries},
+    )
+    mappings = engine.resolved_mappings()
+    resolved = mappings[config.id]
+    assert resolved["output_power_entity"] == "sensor.example_output_home_power"
+    assert resolved["grid_input_power_entity"] == "sensor.example_grid_input_power"
+    assert resolved["soc_entity"] == "sensor.example_electric_level"
+    # ...and the sampler reads those roles even though the stored mapping never names them.
+    roles = role_entities(settings, [config], mappings=mappings)
+    assert roles["battery_charge:example_battery_1"] == "sensor.example_grid_input_power"
+    assert roles["battery_discharge:example_battery_1"] == "sensor.example_output_home_power"
+    assert roles["battery_soc:example_battery_1"] == "sensor.example_electric_level"
