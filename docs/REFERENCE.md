@@ -1240,6 +1240,19 @@ never booked, under unchanged basis semantics (the payload's `sample_source` the
 With two or more enabled batteries the aggregate cannot be split without guessing, so the fallback
 is refused and the stall is reported instead.
 
+**Where the Dashboard reads it (0.20.4).** The Dashboard's **Battery energy price** card is
+read-only and shows exactly the ledger the optimiser acts on: `cost_basis.fleet_basis_eur_per_kwh`
+(the average charged price, EUR/kWh, three decimals) and `cost_basis.sell_floor_eur_per_kwh` (the
+break-even sell price), broken down as `basis ÷ round trip + wear + margin` from the plan summary's
+`round_trip_efficiency` and `wear_eur_per_kwh` plus `cost_basis.margin_eur_per_kwh` (a term the
+payload does not carry is omitted, never shown as a zero). The context line sums the enabled rows'
+`energy_kwh` and `stored_value_eur` (only when every enabled battery reports them) and shows the
+oldest `updated_at`; each enabled battery of a multi-battery fleet also gets its own row. The
+per-battery `stale` / `no_samples_since` marker turns both readings into a marked stale card and a
+warning naming the battery and the moment the samples stopped; a ledger with no basis yet, an empty
+pack and `optimizer.sell_floor_enabled = false` each render `--` with the reason. No other endpoint
+is fetched for the card.
+
 The floor per battery is `break_even_sell_eur_per_kwh(basis, wear) + margin` (the frozen helper, the
 battery's own etas, the advanced wear override when set), and the fleet floor the plan enforces is
 the **energy-weighted mean** of those per-battery floors. In the DP a discharge/export transition

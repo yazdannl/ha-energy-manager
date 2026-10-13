@@ -1814,6 +1814,25 @@ round, with the reason:
   measured integral, the plan/price attribution, the quantity reconciliation, no invented price
   and no extrapolation beyond the newest row.
 
+- **§10/§13 (the Dashboard shows the ledger's average charged price and its break-even sell price;
+  requested 2026-10-13, "can we show the current price floor as well in the dashboard")** — the
+  Dashboard gains one compact **Battery energy price** card, display-only. It reads
+  ``GET /status.cost_basis`` (the ledger the optimiser acts on, not the forward break-even alone)
+  and renders the energy-weighted ``fleet_basis_eur_per_kwh`` (the average charged price) and
+  ``sell_floor_eur_per_kwh`` in EUR/kWh with three decimals, the floor's own breakdown ``basis ÷
+  round trip + wear + margin`` (round trip and wear from the plan summary's
+  ``round_trip_efficiency`` / ``wear_eur_per_kwh``, the margin from
+  ``cost_basis.margin_eur_per_kwh``; a term the payload does not carry is omitted, never printed
+  as a fake zero), the stored energy ``energy_kwh`` and its value ``stored_value_eur``, and the
+  ledger's ``updated_at`` in local time. With more than one enabled battery the fleet figures are
+  joined by one row per battery (both prices, energy, value, freshness). 0.20.3's stall marker
+  (``stale`` / ``no_samples_since``, per battery) must stay visible: the card marks both readings
+  as stale and shows a warning naming the battery and the moment its samples stopped. A ledger
+  with no basis yet (or an empty pack) and ``optimizer.sell_floor_enabled = false`` each render
+  ``--`` with the reason, and a missing field is never rendered as a number. The card adds no
+  fetch beyond ``/status`` and the already-fetched plan, and changes no optimiser, ledger,
+  dispatcher or sampler behaviour.
+
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded
 in `docs/VERIFICATION.md`.

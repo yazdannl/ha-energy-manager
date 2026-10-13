@@ -134,9 +134,9 @@
     return kw.toFixed(digits === undefined ? 2 : digits) + " kW";
   }
 
-  function fmtPrice(value) {
+  function fmtPrice(value, digits) {
     if (!isNum(value)) return "--";
-    return value.toFixed(4) + " " + UNIT_EUR + "/kWh";
+    return value.toFixed(digits === undefined ? 4 : digits) + " " + UNIT_EUR + "/kWh";
   }
 
   function fmtEur(value, digits) {
@@ -1050,6 +1050,140 @@
     ]));
   }
 
+  // ------------------------------------------------------------------ battery energy price (0.20.4)
+
+  // The cost-basis ledger's two money figures (SPEC 5/10, additive 0.20.4): the average price paid
+  // for the AC energy in the pack and the break-even sell price the optimiser acts on.  The values
+  // come from /status.cost_basis -- the ledger the optimizer reads -- with the round trip and wear
+  // the plan assumed; a missing field is null (rendered "--"), never a guessed zero.  Pure data,
+  // no DOM, so the offline render check can assert every state directly.
+  function costBasisView(status, plan) {
+    var block = status && status.cost_basis && typeof status.cost_basis === "object" ? status.cost_basis : null;
+    var summary = (plan && plan.summary) || (status && status.active_plan && status.active_plan.summary) || {};
+    var rows = block && Array.isArray(block.batteries) ? block.batteries : [];
+    var roundTrip = isNum(summary.round_trip_efficiency) && summary.round_trip_efficiency > 0 ? summary.round_trip_efficiency : null;
+    var batteries = rows.map(function (row) {
+      row = row || {};
+      return {
+        id: row.id || null,
+        name: row.name || row.id || "battery",
+        enabled: row.enabled !== false,
+        basis: isNum(row.cost_basis_eur_per_kwh) ? row.cost_basis_eur_per_kwh : null,
+        floor: isNum(row.sell_floor_eur_per_kwh) ? row.sell_floor_eur_per_kwh : null,
+        energyKwh: isNum(row.energy_kwh) ? row.energy_kwh : null,
+        valueEur: isNum(row.stored_value_eur) ? row.stored_value_eur : null,
+        updatedAt: row.updated_at || null,
+        stale: row.stale === true,
+        stalledSince: row.no_samples_since || null,
+        bookings: isNum(row.intervals) ? row.intervals : 0
+      };
+    });
+    var enabledRows = batteries.filter(function (row) { return row.enabled; });
+    var stalled = enabledRows.filter(function (row) { return row.stale; });
+    // Only a complete sum is a fleet total: one battery without the field would make the sum read
+    // as a smaller number rather than as unknown ("never a fabricated figure").
+    var energy = enabledRows.length && enabledRows.every(function (row) { return row.energyKwh !== null; })
+      ? enabledRows.reduce(function (sum, row) { return sum + row.energyKwh; }, 0) : null;
+    var value = enabledRows.length && enabledRows.every(function (row) { return row.valueEur !== null; })
+      ? enabledRows.reduce(function (sum, row) { return sum + row.valueEur; }, 0) : null;
+    var stamps = enabledRows.map(function (row) { return row.updatedAt; }).filter(Boolean).sort();
+    return {
+      present: block !== null,
+      enabled: !!(block && block.enabled),
+      basis: block && isNum(block.fleet_basis_eur_per_kwh) ? block.fleet_basis_eur_per_kwh : null,
+      floor: block && isNum(block.sell_floor_eur_per_kwh) ? block.sell_floor_eur_per_kwh : null,
+      roundTrip: roundTrip,
+      wear: isNum(summary.wear_eur_per_kwh) ? summary.wear_eur_per_kwh : null,
+      margin: block && isNum(block.margin_eur_per_kwh) ? block.margin_eur_per_kwh : null,
+      batteries: batteries,
+      enabledBatteries: enabledRows,
+      stale: stalled.length > 0,
+      stalledSince: stalled.length ? stalled[0].stalledSince : null,
+      stalledNames: stalled.map(function (row) { return row.name; }),
+      // The oldest update is the fleet's freshness: it is what a stalled battery freezes.
+      updatedAt: stamps.length ? stamps[0] : null,
+      energyKwh: energy,
+      storedValueEur: value,
+      bookings: enabledRows.reduce(function (sum, row) { return sum + row.bookings; }, 0),
+      // "Empty" is a ledger with nothing priced: a fresh install, a pack emptied to its floor, or
+      // every battery's ledger reset.  It is never the same state as a stale figure.
+      empty: enabledRows.length > 0 && enabledRows.every(function (row) { return row.basis === null; })
+    };
+  }
+
+  // "basis ÷ round trip + wear + margin" with only the terms the payload really carries, so a
+  // missing round trip, wear or margin is omitted instead of printed as a fake zero (SPEC 5).
+  function costBasisBreakdown(model) {
+    var parts = [];
+    if (isNum(model.basis) && isNum(model.roundTrip) && model.roundTrip > 0) {
+      parts.push(fmtPrice(model.basis / model.roundTrip, 3) + " from basis " + fmtPrice(model.basis, 3) +
+        " ÷ " + fmtPct(model.roundTrip * 100, 1) + " round trip");
+    }
+    if (isNum(model.wear)) parts.push(fmtPrice(model.wear, 3) + " wear");
+    if (isNum(model.margin)) parts.push(fmtPrice(model.margin, 3) + " margin");
+    return parts.join(" + ");
+  }
+
+  function costBasisContextText(model) {
+    var stored = isNum(model.energyKwh) && isNum(model.storedValueEur)
+      ? "Stored " + fmtKwh(model.energyKwh) + " worth " + fmtEur(model.storedValueEur)
+      : isNum(model.energyKwh) ? "Stored " + fmtKwh(model.energyKwh)
+      : isNum(model.storedValueEur) ? "Stored value " + fmtEur(model.storedValueEur)
+      : "Stored energy not reported";
+    var updated = model.updatedAt
+      ? "ledger updated " + fmtDateTime(model.updatedAt) + " (" + timeAgo(model.updatedAt) + ")"
+      : "ledger update time not reported";
+    return stored + " · " + updated + ".";
+  }
+
+  // One per-battery row: both values, the stored energy, its value and this battery's freshness.
+  function batteryPriceRowText(row) {
+    var parts = ["average " + fmtPrice(row.basis, 3), "break-even " + fmtPrice(row.floor, 3)];
+    if (isNum(row.energyKwh)) parts.push(fmtKwh(row.energyKwh));
+    if (isNum(row.valueEur)) parts.push(fmtEur(row.valueEur));
+    parts.push(row.updatedAt ? "updated " + timeAgo(row.updatedAt) : "never updated");
+    return parts.join(" · ");
+  }
+
+  // One compact "Battery energy price" card (0.20.4): both ledger figures, the stored energy and
+  // its value, the ledger's freshness, and a visible warning when 0.20.3's stall marker is set --
+  // a frozen floor must not look healthy.  A value the ledger cannot report renders "--".
+  function renderBatteryEnergyPrice(draw, data) {
+    var model = costBasisView(data.status, data.plan);
+    if (!model.present) {
+      draw(el("p", { class: "muted", text: "The server did not report a cost-basis ledger, so the average charged price and the break-even sell price are unknown." }));
+      return;
+    }
+    var state = model.stale ? "stale" : null;
+    draw(el("div", { class: "cards" }, [
+      statCard("Average charged price", fmtPrice(model.basis, 3), "weighted average paid for the energy in the pack", isNum(model.basis) ? state : (state || "unknown")),
+      statCard("Break-even sell price", fmtPrice(model.floor, 3), isNum(model.basis) ? (costBasisBreakdown(model) || "the plan did not report the round trip and wear") : "no basis yet", isNum(model.floor) ? state : (state || "unknown"))
+    ]));
+    if (!model.enabled) {
+      draw(el("p", { class: "field-help", text: "The sell floor is switched off (optimizer.sell_floor_enabled = false), so no break-even price is derived; the average charged price is still the ledger's." }));
+    } else if (!model.enabledBatteries.length) {
+      draw(el("p", { class: "muted", text: "No enabled battery has a cost-basis ledger yet." }));
+    } else if (model.empty) {
+      draw(el("p", { class: "muted", text: model.bookings > 0 ? "The pack is empty: the ledger holds no priced energy, so there is no break-even price yet." : "No ledger yet: no charging interval has been booked, so there is no break-even price yet." }));
+    }
+    draw(el("p", { class: "legend-note", text: costBasisContextText(model) }));
+    if (model.stale) {
+      draw(el("div", { class: "banner banner-warn" }, [
+        el("p", { class: "banner-title", text: "The ledger is stalled" }),
+        el("p", { text: "No usable battery power samples since " + fmtDateTime(model.stalledSince) + " (" + timeAgo(model.stalledSince) + ") for " + model.stalledNames.join(", ") + ": the average charged price and the break-even sell price still show the last booked value and no longer follow the pack." })
+      ]));
+    }
+    if (model.enabledBatteries.length > 1) {
+      draw(el("ul", { class: "stat-row" }, model.enabledBatteries.map(function (row) {
+        return el("li", null, [
+          el("span", { class: "stat-label", text: row.name }),
+          el("span", { class: "stat-value", text: batteryPriceRowText(row) }),
+          row.stale ? el("span", null, [" ", badge("stale", "stale")]) : null
+        ]);
+      })));
+    }
+  }
+
   function renderBatteryCards(body, status) {
     var batteries = Array.isArray(status.batteries) ? status.batteries : [];
     if (!batteries.length) {
@@ -1363,10 +1497,12 @@
     overrideBody.appendChild(overrideDynamic);
     overrideBody.appendChild(overrideNotes);
     var nowBody = dashboardPanel(host, "Right now");
+    // Battery energy price (0.20.4): the ledger's two money figures sit with the live readings.
+    var priceBody = dashboardPanel(host, "Battery energy price");
     var supportBody = dashboardPanel(host, "Supporting measurements", "panel-quiet");
     var chartBody = dashboardPanel(host, "Next 24 hours");
     var batteryBody = dashboardPanel(host, "Batteries");
-    [alertsBody, nowBody, supportBody, chartBody, batteryBody].forEach(function (body) {
+    [alertsBody, nowBody, priceBody, supportBody, chartBody, batteryBody].forEach(function (body) {
       panelStatus(body, "loading", "Loading…");
     });
 
@@ -1501,6 +1637,9 @@
     function paintNow() {
       renderInto(nowBody, function (target) { clear(target); renderNow(target, data); });
     }
+    function paintPrice() {
+      renderInto(priceBody, function (target) { renderBatteryEnergyPrice(function (node) { target.appendChild(node); }, data); });
+    }
     function paintSupporting() {
       renderInto(supportBody, function (target) { clear(target); renderSupporting(target, data); });
     }
@@ -1546,6 +1685,7 @@
         paintAlerts();
         paintManualOverride();
         paintNow();
+        paintPrice();
         paintSupporting();
         paintBatteries();
         setConfirmed(status);
@@ -1556,6 +1696,7 @@
         data.plan = plan;
         paintAnswer();
         paintChart();
+        paintPrice();
       }, function () { /* the chart panel keeps its own retry; live readings still update */ });
     }
 
@@ -1567,6 +1708,7 @@
       paintAlerts();
       paintManualOverride();
       paintNow();
+      paintPrice();
       paintSupporting();
       paintBatteries();
       syncModeButtons(status);
@@ -1579,6 +1721,7 @@
       data.plan = plan;
       paintAnswer();
       paintChart();
+      paintPrice();
     }, function (err) {
       panelStatus(chartBody, "error", "Could not load the 24-hour plan: " + (err && err.message ? err.message : err), function () { refresh(); });
     });
@@ -5617,6 +5760,10 @@
     windowPriceText: windowPriceText,
     windowSummary: windowSummary,
     planWindowContext: planWindowContext,
+    costBasisView: costBasisView,
+    costBasisBreakdown: costBasisBreakdown,
+    batteryPriceRowText: batteryPriceRowText,
+    renderBatteryEnergyPrice: renderBatteryEnergyPrice,
     priceRank: priceRank,
     fmtCt: fmtCt,
     cycleCostFromConfig: cycleCostFromConfig,

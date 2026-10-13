@@ -30,7 +30,7 @@ Unknown routes fall back to `#/dashboard`. Query options: `#/plan?hours=12|24|36
 
 ## Navigation and reading hierarchy
 
-`index.html` renders **four primary destinations** (Today, Plan, Savings, Manage) as a row that fits
+`index.html` renders **four primary destinations** (Dashboard, Plan, Savings, Manage) as a row that fits
 360 px, plus one contextual sub-row that `setNav()` shows only for the current area (Plan →
 Plan/Forecasts; Manage → Batteries/Settings/Log). All seven hash routes stay real links, so every
 view is reachable and deep-linkable; `#nav a[aria-current="page"]` marks the active entry and the
@@ -38,7 +38,7 @@ primary item stays marked while its sub-row is open. Keyboard users get ≥44 px
 
 Each view answers in the same three levels:
 
-1. **Answer** — Today: the control authority, what was measured and what is planned. Plan: the
+1. **Answer** — Dashboard: the control authority, what was measured and what is planned. Plan: the
    saving/loss versus the baseline. Forecasts: measured error and freshness. Batteries: fleet
    readiness. Savings: the comparable saving/loss and its baseline coverage. Settings: the safety
    summary. Log: the latest dispatch outcome.
@@ -66,14 +66,18 @@ rejected cache slot, so a Retry always makes a fresh request.
 
 ## Panels and interactions
 
-**Dashboard (Today)** — the `Autopilot` panel leads with the answer: the control-authority sentence,
+**Dashboard** — the `Autopilot` panel leads with the answer: the control-authority sentence,
 what was **measured** and what is **planned**, then the mode Off/Advisory/Auto buttons with
 `aria-pressed`, the dry-run checkbox and `Stop now`. The mode buttons are built once outside the
 re-rendered area, so the first click applies (an earlier re-render could swallow it) and a refused or
 cancelled dry-run change restores the server's confirmed state. Warnings and errors follow first;
 informational activity is demoted behind a `Recent activity` disclosure. Then the three primary
 cards (battery charge, grid power, price now), the quiet supporting row (PV, load, cheapest/next
-expensive window) and the `Next 24 hours` mini-chart (price line + SoC line).
+expensive window) and the `Next 24 hours` mini-chart (price line + SoC line). The **Battery energy
+price** card shows the cost-basis ledger's two money figures — the average charged price and the
+break-even sell price (basis ÷ round trip + wear + margin) — with the stored energy, its value and
+the ledger's `updated_at`; several enabled batteries add one row each, and a stalled ledger
+(0.20.3's stall marker) is a visible warning beside the numbers instead of a quietly frozen floor.
 
 Polls itself every 15 s while the tab is visible; paused while a dialog is open, a write is pending,
 the settings form is dirty or a stop-result banner is on screen, so a failed stop stays visible until
@@ -173,8 +177,8 @@ chart series skip nulls instead of plotting them as 0, and the legend says so.
 
 **Settings** — an always-visible toolbar holds the search field and the `Show all advanced` switch,
 and an always-visible **Safety summary** states the authority in force (mode · dry run) with links to
-the Safety group and to Today's `Stop now`. Below that the page opens on four dependency-complete
-setup cards, each carrying every input the selected option needs: **Price** (`price.provider`, the
+the Safety group and to the Dashboard's `Stop now`. Below that the page opens on four
+dependency-complete setup cards, each carrying every input the selected option needs: **Price** (`price.provider`, the
 provider-specific fields — including the fixed day/night start hours and the day-ahead VAT, energy-tax
 and import-fee adders — the feed-in cost and the energy-tax refund toggle), **Meter**
 (`grid.power_entity`, a searchable picker), **Solar** (`solar.source` plus a measured-PV picker unless

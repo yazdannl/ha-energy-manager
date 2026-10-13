@@ -270,6 +270,96 @@ function classTokens(text) {
   M.routes["DELETE /api/v1/limits"]({ params: {} });
   M.routes["POST /api/v1/mode"]({ body: { mode: "advisory", dry_run: true }, params: {} });
 
+  /* ---------- 1b3. battery energy price: both ledger figures (0.20.4, SPEC 5/10) ---------- */
+  // The card is display-only: it reads /status.cost_basis (the ledger the optimiser acts on) plus
+  // the plan summary's round trip and wear, and must distinguish a healthy ledger from a stalled
+  // one (0.20.3's marker) and from a ledger with nothing booked.
+  console.log("\n1b3. battery energy price card");
+  const pricePanel = () => [...view().querySelectorAll(".panel")].find((p) => {
+    const h2 = p.querySelector("h2");
+    return h2 && h2.textContent === "Battery energy price";
+  }) || null;
+  const priceText = () => (pricePanel() ? pricePanel().textContent : "");
+
+  const costStatus = await M.handle("GET", "/api/v1/status");
+  const ledger = costStatus.cost_basis;
+  const expectedBasis = A.fmtPrice(ledger.fleet_basis_eur_per_kwh, 3);
+  const expectedFloor = A.fmtPrice(ledger.sell_floor_eur_per_kwh, 3);
+  await goto("/dashboard");
+  check("the dashboard has one Battery energy price panel", !!pricePanel()
+    && byClass(view(), "panel").filter((p) => (p.querySelector("h2") || {}).textContent === "Battery energy price").length === 1);
+  check("the card states the average charged price in EUR/kWh (3 decimals)",
+    /Average charged price/.test(priceText()) && priceText().includes(expectedBasis)
+    && /^\d+\.\d{3} EUR\/kWh$/.test(expectedBasis), `${expectedBasis} :: ${priceText().slice(0, 160)}`);
+  check("the card states the break-even sell price in EUR/kWh (3 decimals)",
+    /Break-even sell price/.test(priceText()) && priceText().includes(expectedFloor)
+    && /^\d+\.\d{3} EUR\/kWh$/.test(expectedFloor), `${expectedFloor} :: ${priceText().slice(0, 200)}`);
+  check("the break-even line breaks into basis, round trip, wear and margin",
+    /from basis \d+\.\d{3} EUR\/kWh ÷ 90\.0 % round trip/.test(priceText())
+    && /\d+\.\d{3} EUR\/kWh wear/.test(priceText()) && /\d+\.\d{3} EUR\/kWh margin/.test(priceText()),
+    priceText().slice(0, 260));
+  check("the card states the stored energy, its value and the ledger's freshness",
+    /Stored 5\.40 kWh worth 1\.33 EUR/.test(priceText())
+    && /ledger updated .+ \(\d+ min( \d+ s)? ago\)/.test(priceText()),
+    priceText().slice(-260));
+  check("a healthy ledger adds no stale warning",
+    !/stalled/i.test(priceText()) && !/Stale reading/.test(priceText()));
+
+  // 0.20.3's stall marker: a frozen floor must not look healthy.
+  M.setCostBasisMode("stale");
+  await goto("/dashboard");
+  check("a stalled ledger shows a visible warning next to the numbers",
+    /The ledger is stalled/.test(priceText()) && /No usable battery power samples since/.test(priceText())
+    && /still show the last booked value and no longer follow the pack/.test(priceText()),
+    priceText().slice(0, 300));
+  check("the stalled reading is marked, not left looking healthy",
+    /Stale reading/.test(priceText()) && pricePanel().querySelectorAll(".card-stale").length === 2,
+    `${pricePanel() ? pricePanel().querySelectorAll(".card-stale").length : 0} marked cards`);
+
+  // An empty ledger says so: a missing price is a dash, never a fake number.
+  M.setCostBasisMode("empty");
+  await goto("/dashboard");
+  check("an empty ledger says so instead of showing a stale figure",
+    /No ledger yet/.test(priceText()) && !/ledger is stalled/.test(priceText()), priceText().slice(0, 240));
+  check("a missing price renders as a dash, never a fake number",
+    /Average charged price--/.test(priceText()) && /Break-even sell price--/.test(priceText())
+    && !/\d+\.\d{3} EUR\/kWh/.test(priceText()), priceText().slice(0, 240));
+
+  // A disabled sell floor derives no floor but the average charged price is still the ledger's.
+  M.setCostBasisMode("off");
+  await goto("/dashboard");
+  check("a disabled sell floor says so and derives no break-even price",
+    /sell floor is switched off/.test(priceText()) && /Break-even sell price--/.test(priceText())
+    && priceText().includes(expectedBasis), priceText().slice(0, 300));
+
+  // Several enabled batteries: the fleet figures plus one row per battery.
+  M.setCostBasisMode("ok");
+  const fleetStatus = await M.handle("GET", "/api/v1/status");
+  fleetStatus.cost_basis.batteries.push(Object.assign({}, fleetStatus.cost_basis.batteries[0], {
+    id: "battery_2", name: "Second battery", cost_basis_eur_per_kwh: 0.3, sell_floor_eur_per_kwh: 0.39,
+    energy_kwh: 2.0, stored_value_eur: 0.6,
+  }));
+  const fleetRows = fleetStatus.cost_basis.batteries;
+  const fleetEnergy = fleetRows.reduce((sum, row) => sum + row.energy_kwh, 0);
+  const fleetBasis = fleetRows.reduce((sum, row) => sum + row.cost_basis_eur_per_kwh * row.energy_kwh, 0) / fleetEnergy;
+  fleetStatus.cost_basis.fleet_basis_eur_per_kwh = fleetBasis;
+  const fleetHost = document.createElement("div");
+  A.renderBatteryEnergyPrice((node) => fleetHost.appendChild(node), { status: fleetStatus, plan: null });
+  check("several enabled batteries render a per-battery row",
+    fleetHost.querySelectorAll(".stat-row li").length === 2
+    && /Second battery/.test(fleetHost.textContent)
+    && /average 0\.300 EUR\/kWh · break-even 0\.390 EUR\/kWh/.test(fleetHost.textContent),
+    `${fleetHost.querySelectorAll(".stat-row li").length} rows: ${fleetHost.textContent.slice(0, 200)}`);
+  check("the fleet figures stay the ledger's energy-weighted mean, not one battery's",
+    fleetHost.textContent.includes(A.fmtPrice(fleetBasis, 3))
+    && Math.abs(A.costBasisView(fleetStatus, null).energyKwh - fleetEnergy) < 1e-9,
+    A.fmtPrice(fleetBasis, 3));
+  const stalledView = A.costBasisView({
+    cost_basis: { enabled: true, batteries: [{ id: "b", name: "B", cost_basis_eur_per_kwh: 0.2, energy_kwh: 1.0, stale: true, no_samples_since: "2026-01-01T00:00:00Z" }] },
+  }, null);
+  check("the view marks the stalled battery and names it",
+    stalledView.stale === true && stalledView.stalledNames.join(",") === "B");
+
   /* ---------- 1c. next actions: the data behind each time slot (SPEC 10) ---------- */
   // The window rows are the phone-first reading of the plan, so they are checked as data first
   // (pure helpers, deterministic synthetic slots) and then as rendered structure.

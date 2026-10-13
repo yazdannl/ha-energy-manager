@@ -1357,6 +1357,55 @@ newest `actuals` row available to the add-on.
 
 ---
 
+### 8.19 The Dashboard shows the average charged price and the break-even sell price (0.20.4)
+
+Both figures already existed in `GET /api/v1/status.cost_basis` — the ledger's energy-weighted
+`fleet_basis_eur_per_kwh` (the average price paid for the AC energy in the pack) and its
+`sell_floor_eur_per_kwh` (the break-even price the optimiser acts on, `basis / round trip + wear +
+margin`) — but no view rendered them, so the numbers the sell floor is enforced with were invisible.
+0.20.4 adds one display-only **Battery energy price** card to the Dashboard; no optimiser, ledger,
+dispatcher or sampler code changed (the Python diff is the version string in `app/main.py`).
+
+The card reads exactly:
+
+* `cost_basis.enabled`, `.fleet_basis_eur_per_kwh`, `.sell_floor_eur_per_kwh`,
+  `.margin_eur_per_kwh`, and per battery `.id`, `.name`, `.enabled`, `.cost_basis_eur_per_kwh`,
+  `.sell_floor_eur_per_kwh`, `.energy_kwh`, `.stored_value_eur`, `.updated_at`, `.intervals`,
+  `.stale` and `.no_samples_since`;
+* the plan summary's `round_trip_efficiency` and `wear_eur_per_kwh` for the floor's breakdown
+  (`/status.active_plan.summary` is the fallback when the plan fetch has not landed).
+
+Both prices render in EUR/kWh with three decimals; a term the payload does not carry is omitted
+instead of printed as a zero, and a missing price renders `--` (the app-wide unknown token
+documented in `docs/UI.md`), never a number. The context line sums the enabled batteries'
+`energy_kwh` and `stored_value_eur` (only when every enabled battery reports them) and shows the
+oldest `updated_at` in local time; several enabled batteries add one row each with both prices,
+energy, value and freshness. 0.20.3's stall marker is load-bearing here: a `stale` battery marks
+both readings as stale and shows a warning naming the battery and the moment its samples stopped; a
+ledger with no basis yet, an empty pack and `optimizer.sell_floor_enabled = false` each say so
+explicitly instead of showing a frozen figure.
+
+The render check grew from 110 to 124 assertions: it now pins both labels and values (3 decimals),
+the breakdown, the stored energy/value/freshness line, the absence of a stale warning on a healthy
+ledger, the stalled warning and the two marked cards, the empty-ledger dash state, the disabled
+floor, and one per-battery row per enabled battery of a multi-battery fleet. `mock.js` serves the
+ledger with generic numbers only (`?mock=1`: a basis in the mid-0.2 range, a floor near 0.3 EUR/kWh
+and about 5.4 kWh stored) and `SEM_MOCK.setCostBasisMode("ok"|"stale"|"empty"|"off")` switches those
+states.
+
+Measured on this tree: `python3 -m pytest tests -q` -> **935 passed** (the count is unchanged from
+0.20.3; the new coverage lives in the render check), `sh tools/audit.sh` -> **clean, 112 files
+scanned**, `node tools/ui_render_check.js` -> **124 passed, 0 failed**.
+
+What is *not* verified: nothing was deployed and no live endpoint was read, so the card has not
+been observed against the running add-on (the live ledger values are deliberately absent from the
+repo and from the mock); the browser rendering at 360 px is covered structurally by the DOM shim
+only, not visually. The optional "current sell price beside the floor" hint from the request was
+left out: it needs the current slot's `sell` from `/plan`, and the card as shipped answers the
+request (the floor) without extra parsing.
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:

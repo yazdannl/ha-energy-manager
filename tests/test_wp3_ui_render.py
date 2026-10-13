@@ -89,5 +89,16 @@ def test_ui_renders_and_settings_ia_holds():
         "the plan view marks a maintenance plan from its payload",
         "a non-active maintenance block adds no banner",
         "the native driver's connection settings are validated in the wizard",
+        # SPEC 5/10 cost-basis ledger (0.20.4): the Dashboard must render the average charged price
+        # and the break-even sell price, mark a stalled ledger and never fake a missing one.
+        "the dashboard has one Battery energy price panel",
+        "the card states the average charged price in EUR/kWh (3 decimals)",
+        "the card states the break-even sell price in EUR/kWh (3 decimals)",
+        "the break-even line breaks into basis, round trip, wear and margin",
+        "the card states the stored energy, its value and the ledger's freshness",
+        "a stalled ledger shows a visible warning next to the numbers",
+        "an empty ledger says so instead of showing a stale figure",
+        "a missing price renders as a dash, never a fake number",
+        "several enabled batteries render a per-battery row",
     ):
         assert needle in proc.stdout, f"the render check no longer reports {needle!r}:\n{proc.stdout}"

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.20.4
+
+- **The Dashboard shows what the energy in the pack cost and what a sale has to earn.** Both
+  figures already existed in `GET /api/v1/status.cost_basis` — the ledger's energy-weighted
+  `fleet_basis_eur_per_kwh` (the average charged price) and its `sell_floor_eur_per_kwh` (the
+  break-even price the optimiser acts on) — but no view rendered them. One compact **Battery energy
+  price** card now shows both in EUR/kWh, breaks the floor down into `basis ÷ round trip + wear +
+  margin` (the plan's own round trip and wear, the configured margin; a term the payload does not
+  carry is omitted rather than printed as a fake zero), and adds the stored energy (`energy_kwh`),
+  its value (`stored_value_eur`) and the ledger's `updated_at`. Several enabled batteries add one
+  row each, with the same figures and freshness. Display-only: no optimizer, ledger, dispatcher or
+  sampler behaviour changes.
+- **A stalled ledger is visible on the card; an empty one says so.** When 0.20.3's stall marker is
+  set (`stale` / `no_samples_since`) the card marks both readings and shows a warning naming the
+  battery and the moment its samples stopped, so a frozen floor cannot look healthy. A ledger with
+  no basis yet, a pack that is empty, or `optimizer.sell_floor_enabled = false` each render `--`
+  with the reason instead of a stale figure. The card reads `/status` and the already-fetched plan
+  only; it never adds a fetch.
+- Documentation: `docs/UI.md` and `docs/UI_REVIEW.md` now call the tab **Dashboard** (its label
+  since 0.20.0; both still said "Today"), and `energy_manager/DOCS.md` documents the 0.20.0 manual
+  override / limits panel plus the new price card.
+
 ## 0.20.3
 
 - **The measurement sampler now reads the driver's own role vocabulary.** The sampler built its

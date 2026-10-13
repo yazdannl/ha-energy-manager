@@ -678,7 +678,9 @@
     modePersisted: true,
     // 0.20.0 manual limits: {"*": {...}, "<battery_id>": {...}} with charge_w/discharge_w.
     // Empty by default so ?mock=1 starts unlimited; a render-check scenario sets one.
-    limits: {}
+    limits: {},
+    // 0.20.4 cost-basis ledger state: "ok", "stale", "empty" or "off".
+    costBasisMode: "ok"
   };
 
   function limitsCopy() {
@@ -1005,6 +1007,67 @@
   // Routes
   // -----------------------------------------------------------------------------------
 
+  // 0.20.4: the cost-basis ledger /status carries (SPEC 5/10): the average price paid for the AC
+  // energy in the pack, the break-even sell price, the stored energy and its value, per battery.
+  // Generic numbers only, never a live instance's.  db.costBasisMode selects the states the UI
+  // must render distinctly: "ok" (a healthy ledger), "stale" (0.20.3's stall marker: the floor no
+  // longer follows the pack), "empty" (nothing booked yet) and "off" (the sell floor is disabled).
+  var MOCK_BASIS = 0.2456;
+  var MOCK_BASIS_ENERGY = 5.4;
+  var MOCK_BASIS_MARGIN = 0.002;
+  var MOCK_BASIS_AGE_MS = 5 * 60000;
+  var MOCK_BASIS_STALL_MS = 6 * 3600000;
+
+  function costBasisRow(mode, now) {
+    var stale = mode === "stale";
+    var empty = mode === "empty";
+    var roundTrip = round(MOCK_ETA * MOCK_ETA, 6);
+    var basis = empty ? null : MOCK_BASIS;
+    var energy = empty ? 0.0 : MOCK_BASIS_ENERGY;
+    return {
+      id: "battery_1",
+      name: "Example Battery 1",
+      enabled: true,
+      cost_basis_eur_per_kwh: basis,
+      // Floor = basis / round trip + wear + margin (models.BatteryConfig plus the configured margin).
+      sell_floor_eur_per_kwh: (basis === null || mode === "off")
+        ? null
+        : round(basis / roundTrip + MOCK_WEAR + MOCK_BASIS_MARGIN, 6),
+      energy_kwh: energy,
+      stored_value_eur: basis === null ? null : round(basis * energy, 4),
+      updated_at: empty ? null : iso(now - (stale ? MOCK_BASIS_STALL_MS : MOCK_BASIS_AGE_MS)),
+      window_start: empty ? null : iso(now - 24 * 3600000),
+      intervals: empty ? 0 : 42,
+      skipped_no_price: 0,
+      skipped_no_power: empty ? 0 : 1,
+      skipped_no_grid: 0,
+      skipped_no_soc: 0,
+      skipped_no_samples: stale ? 5 : 0,
+      stale: stale,
+      no_samples_since: stale ? iso(now - MOCK_BASIS_STALL_MS) : null,
+      sample_source: "measurements",
+      reconciled_kwh: 0.0,
+      reconciled_last_kwh: null,
+      reconciled_resets: 0,
+      journal_entries: empty ? 0 : 42,
+      journal: []
+    };
+  }
+
+  function costBasisPayload() {
+    var mode = db.costBasisMode || "ok";
+    var rows = [costBasisRow(mode, Date.now())];
+    var row = rows[0];
+    return {
+      enabled: mode !== "off",
+      margin_eur_per_kwh: MOCK_BASIS_MARGIN,
+      // The fleet values are the energy-weighted means of the priced rows (engine.cost_basis_block).
+      sell_floor_eur_per_kwh: mode === "off" ? null : row.sell_floor_eur_per_kwh,
+      fleet_basis_eur_per_kwh: row.cost_basis_eur_per_kwh,
+      batteries: rows
+    };
+  }
+
   function statusPayload() {
     var providers = providersPayload();
     return {
@@ -1030,6 +1093,7 @@
       next_expensive_window: [iso(Date.now() + 6 * 3600000), iso(Date.now() + 7 * 3600000)],
       override: db.override,
       manual_limits: limitsCopy(),
+      cost_basis: costBasisPayload(),
       cell_voltage: {
         enabled: true,
         cutoff_v: 3.0,
@@ -1345,6 +1409,12 @@
     routes: routes,
     handle: handle,
     fixtures: fixtures,
-    note: MOCK_NOTE
+    note: MOCK_NOTE,
+    // Render-check hook (0.20.4): switch the /status cost-basis fixture between the states the UI
+    // must distinguish (ok/stale/empty/off).  Generic numbers only.
+    setCostBasisMode: function (mode) {
+      db.costBasisMode = ["ok", "stale", "empty", "off"].indexOf(mode) >= 0 ? mode : "ok";
+      return costBasisPayload();
+    }
   };
 })(typeof globalThis !== "undefined" ? globalThis : this);

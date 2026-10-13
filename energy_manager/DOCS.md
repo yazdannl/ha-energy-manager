@@ -71,6 +71,24 @@ Where to look: the battery card shows the round trip, the derived wear and the b
 that follows from it; the Plan view shows the assumed round trip and wear and draws the break-even
 line against the sell prices.
 
+## Manual override, limits and the price floor
+
+The Dashboard's **Manual override** panel can force a battery (or the whole fleet) to charge,
+discharge or hold for 1 to 240 minutes. The force is bounded by everything that protects the
+device — the cell-voltage guard, the SoC floor, the grid and ramp limits, and the configured power
+maxima — it expires on its own, and `Clear override` ends it immediately. Under **Limits** the same
+panel sets a per-battery (or fleet-wide) ceiling on charge and/or discharge power that caps both the
+automatic plan and a manual override and can never raise a battery's configured maximum; an empty
+field clears that direction and 0 W blocks it. In `advisory`/`off` and in dry run an override is
+accepted and logged but never written to the hardware.
+
+The Dashboard's **Battery energy price** card shows the cost-basis ledger: the **average charged
+price** of the energy in the pack and the **break-even sell price** (basis ÷ round trip + wear +
+margin), with the stored energy, its value and when the ledger last advanced. Several enabled
+batteries add a row each. When the ledger stops receiving measured power samples the card says so
+beside the numbers instead of showing a frozen floor, and with no ledger yet or the sell floor
+switched off the prices render `--`.
+
 ## Safety and privacy in one paragraph
 
 Nothing leaves your system except the forecast requests (Forecast.Solar, NASA POWER irradiance for
