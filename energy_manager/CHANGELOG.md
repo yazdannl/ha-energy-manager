@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.23.0
+
+- **The learned PV model is now fitted on the irradiance chain it is actually served, and it is given
+the weather.** This began as a question — are cloud cover, temperature and rain being taken into
+account? — and the audit found something worse than a missing feature.
+- **The defect: a train/serve mismatch.** Training drove the physics with *satellite-observed*
+horizontal irradiance; at runtime the add-on reconstructs irradiance as clear-sky Haurwitz attenuated
+by a forecast cloud percentage. Those are different estimators of the same quantity, so the learned
+residual was spending itself correcting an irradiance model that is never used in service. Scored on
+the chain it would actually see, the 0.22.0 artifact falls from 115.8 W to 150.5 W and picks up an
+~8 % energy bias — meaning the accuracy validated offline was not the accuracy in service.
+- **The fix.** The training corpus is now built from the serving chain, and the model is handed the
+ingredients of that chain rather than only its result: cloud cover, the Kasten attenuation, clear-sky
+potential, wind, humidity and rain (22 → 28 features). Wind matters physically because the NOCT module
+model had no convective cooling term at all; cloud now reaches the model as a number it can learn a
+mapping from, instead of being pre-mixed by a hand-tuned formula it could never correct. Every added
+feature is a field a Home Assistant weather forecast publishes — a feature the add-on cannot observe
+at serving time would quietly make the forecast worse.
+- **Result.** Held-out *systems* 5.102 % → **4.742 %** of nameplate; held-out *years* 5.548 % →
+**5.620 %** (a tie within the difference between corpora, and it now holds on both splits); energy bias
++9.5 % for the physics prior → **+0.09 %**; aggregate specific-yield gate −0.59 %. Parity against
+scikit-learn stays exact at 0.000e+00.
+- **What was verified rather than assumed** about the inputs that were already right: cloud cover, air
+and module temperature, panel tilt/azimuth/capacity and the inverter limit were all genuinely in the
+model, and PVGIS `G(i)` really is horizontal for this corpus — its clearness index never exceeds 0.80,
+where plane-of-array data misread as horizontal would exceed 1.0. Corpus timestamps were checked by lag
+correlation (lag 0 wins at r = 0.879) instead of trusted. The three factors that are still *not*
+modelled — snow, soiling and horizon shading — are named in SPEC §7.1.4 rather than implied away.
+- **Three real bugs were caught by the golden-vector cross-check, not by a metric.** It found the
+clear-sky and irradiance features being built per-system on one path and at the corpus centroid on the
+other (4.3 and 4.0 W/m²) — the same defect in miniature, and the kind that ships as "the forecast is a
+bit off". It also caught the training pipeline still reading a stale `ghi` series for one feature after
+that change. Its tolerance is now a documented 1e-4: four orders below the smallest error it has
+caught, four orders above float32 round-trip noise on a float32-stored corpus.
+- **Unit safety.** Wind and precipitation are converted from the weather entity's own units; a km/h
+value read as m/s is a 3.6x error that still looks like a plausible number. An unrecognised unit
+returns "unknown" rather than the raw value.
+- The weather series must be supplied to `ingest.py` (`--weather`) and is required rather than optional,
+because omitting it would silently restore the mismatch this release exists to remove.
+
 ## 0.22.1
 
 - **The Savings view works on an install with no load or PV sensor.** The baseline was only ever
@@ -12,8 +52,9 @@
 - **Empty periods are no longer counted as covered.** `savings_from_daily` left buckets with no
   stored rows at their default `baseline_cost_eur = 0`, so a month with 4 days of history claimed
   "Baseline available for 25 of 30 periods" and compared 0.00 EUR with 0.00 EUR. Such buckets now
-  report `null` baseline/savings plus an additive `has_data` flag, a bucket mixing a known and an
-  unknown baseline is unknown as a whole, and totals add `measured_periods`/`baseline_periods`. The
+  report `null` baseline/savings plus an additive `has_data` flag, a bucket that mixes known and
+  unknown rows keeps only the known rows (summed per row), and totals add
+  `measured_periods`/`baseline_periods`. The
   UI counts coverage from `has_data` and shows `--` (not `0.00`) for periods with no activity.
 - **`sensor.sem_savings_today` no longer fabricates a zero.** A null saving published `0.0` EUR and
   `month_eur`/`year_eur` did the same; it now publishes `unknown` (and `null` attributes). Its

@@ -827,6 +827,14 @@ cloud map; a field the entity does not publish is passed as zero **and stated as
 its unit is converted from the entity's own (`_WIND_TO_MS`, `_RAIN_TO_MM`) because a km/h value read
 as m/s is a 3.6x error that still looks like a plausible number.
 
+**What is still not modelled, stated rather than implied.** Snow cover, soiling and horizon shading are
+absent. The corpus is Dutch and its *targets* contain all three, so the model partly absorbs them as
+average weather rather than responding to them: a snow-covered array will be over-forecast, and a
+shaded one will be over-forecast at low sun. Rain is a feature, but instantaneous rain is a weak proxy
+for the multi-week soiling it would really stand for, and no rolling accumulation is used because the
+add-on has no stored precipitation history to compute one from. These are named here so a wrong
+forecast in those conditions can be recognised as a known limitation rather than debugged as a bug.
+
 **Air temperature** comes from the weather entity's hourly forecast when there is one, else the
 current reading of `load.temperature_entity` held flat, else a stated constant
 (`DEFAULT_AIR_TEMPERATURE_C = 15`). The module-temperature term moves power about 4 % per 10 °C, so
