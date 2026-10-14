@@ -4411,7 +4411,8 @@
     "solar.source": {
       forecast_solar: "Forecast.Solar (per plane)",
       capacity: "Array capacity (watt peak)",
-      derived: "Learn from the meter"
+      derived: "Learn from the meter",
+      learned: "Learned model (trained on other arrays)"
     },
     mode: { off: "Off", advisory: "Advisory", auto: "Auto" },
     log_level: { debug: "Debug", info: "Info", warning: "Warning", error: "Error" }
@@ -4419,7 +4420,11 @@
 
   function choiceText(key, value) {
     var map = CHOICE_LABELS[key];
-    return map && Object.prototype.hasOwnProperty.call(map[value]) ? map[value] : String(value);
+    // Ownership is asked of the *map*, not of ``map[value]``. Calling hasOwnProperty with an
+    // absent key's value passes ``undefined`` as the receiver and throws, which takes down the whole
+    // settings view the moment the backend gains a choice value this table has not heard of yet.
+    // A missing label is a cosmetic gap; a blank settings page is not.
+    return map && Object.prototype.hasOwnProperty.call(map, value) ? map[value] : String(value);
   }
 
   // The API returns settings sorted by key, which interleaves groups; present them in a stable
@@ -4598,13 +4603,22 @@
     "solar.capacity_wp", "solar.tilt_deg", "solar.azimuth_deg", "solar.performance_ratio",
     "solar.weather_entity", "solar.nasa_irradiance"
   ];
+  // learned (SPEC §7.1.4): the same array geometry and weather inputs as the capacity estimate, plus
+  // the inverter's AC limit so the model can clip. solar.performance_ratio is deliberately absent —
+  // the artifact carries its own inverter, module-temperature and clipping terms, so a ratio applied
+  // on top of it would count those losses twice.
+  var SOLAR_FIELDS_LEARNED = [
+    "solar.capacity_wp", "solar.ac_capacity_wp", "solar.tilt_deg", "solar.azimuth_deg",
+    "solar.weather_entity", "solar.nasa_irradiance"
+  ];
   // The one-line note under the source select, so a user who later reads an explained forecast
   // knows which model produced it. Capacity states its assumptions because they are stated (not
   // silent) in the forecast notes too (SPEC §7.1.1).
   var SOLAR_SOURCE_NOTES = {
     forecast_solar: "Per-plane geometry (kWp, tilt, azimuth): the Forecast.Solar API is asked per plane, so each plane is modelled on its own tilt and direction.",
     capacity: "Estimate from the array's total watt peak: enter the Wp and the add-on models production from the sun's position, optionally attenuated by a weather entity's cloud cover; leave tilt/azimuth unset and it assumes south-facing at 35 degrees and says so in the forecast notes.",
-    derived: "Estimate from the meter: at every moment the meter exports, the array is producing at least the exported power plus whatever the battery is charging (pv = export + battery charge). The add-on learns the array's watt peak from those moments and then models it like the capacity source. Nothing to enter — it needs the Meter card and a battery whose charge/discharge power is mapped. The house load at those moments is not subtracted, so the learned size is a conservative lower bound."
+    derived: "Estimate from the meter: at every moment the meter exports, the array is producing at least the exported power plus whatever the battery is charging (pv = export + battery charge). The add-on learns the array's watt peak from those moments and then models it like the capacity source. Nothing to enter — it needs the Meter card and a battery whose charge/discharge power is mapped. The house load at those moments is not subtracted, so the learned size is a conservative lower bound.",
+    learned: "A model trained on 174 other Dutch rooftop arrays, applied to yours. It predicts the ratio between what physics says an array of your size should make and what an array actually makes, so one model can serve a roof it has never seen — and it needs only the array's watt peak to start, before this house has any history of its own. Set the inverter's AC limit when it is smaller than the array: past that limit the DC curve flattens and the model has to be told, or it will keep forecasting output the inverter cannot deliver. The performance ratio is not used here — the model carries its own inverter, module-temperature and soiling terms."
   };
 
   /** Visible solar.* keys for a source, plus the note to show.
@@ -4613,9 +4627,10 @@
     var s = String(source || "forecast_solar");
     // derived runs the capacity model on a watt peak learned from the meter, so the geometry,
     // performance ratio and weather fields apply there too (an explicit solar.capacity_wp wins).
-    var keys = SOLAR_FIELDS_ALWAYS.concat(
-      s === "forecast_solar" ? SOLAR_FIELDS_FORECAST_SOLAR : SOLAR_FIELDS_CAPACITY
-    );
+    var specific = s === "forecast_solar"
+      ? SOLAR_FIELDS_FORECAST_SOLAR
+      : (s === "learned" ? SOLAR_FIELDS_LEARNED : SOLAR_FIELDS_CAPACITY);
+    var keys = SOLAR_FIELDS_ALWAYS.concat(specific);
     // An unknown source keeps the forecast_solar fields (never an empty group), the same fallback
     // the price table uses, so a newer backend value cannot hide every field.
     var note = SOLAR_SOURCE_NOTES[s] != null ? SOLAR_SOURCE_NOTES[s] : null;
@@ -4659,6 +4674,9 @@
       keys.push("price.vat_pct", "price.energy_tax_eur_per_kwh", "price.import_fee_eur_per_kwh");
     }
     if (source === "capacity") keys.push("solar.capacity_wp");
+    // The learned source is unusable without a watt peak, and the inverter limit is the one number
+    // that decides whether an afternoon clip shows up in the forecast at all, so both are on the card.
+    if (source === "learned") keys.push("solar.capacity_wp", "solar.ac_capacity_wp");
     if (source === "forecast_solar") keys.push("solar.planes");
     if (source !== "derived") keys.push("solar.measured_entity");
     // The merge list and its strategy are part of the Solar card whatever the single source is.
@@ -5179,12 +5197,13 @@
     // The merge list and its strategy (SPEC §7.1.3). The All-settings JSON row for solar.sources
     // remains the fallback path; this editor is the normal add/remove/reorder surface and commits
     // through the same dirty/Save flow.
-    var SOLAR_SOURCE_KINDS = ["forecast_solar", "ha_energy", "capacity", "derived"];
+    var SOLAR_SOURCE_KINDS = ["forecast_solar", "ha_energy", "capacity", "derived", "learned"];
     var SOLAR_SOURCE_KIND_LABELS = {
       forecast_solar: "Forecast.Solar (API)",
       ha_energy: "Home Assistant Energy dashboard",
       capacity: "Array capacity (watt peak)",
-      derived: "Learn from the meter"
+      derived: "Learn from the meter",
+      learned: "Learned model (SPEC 7.1.4)"
     };
 
     function solarSourceSelect(value, onChange) {

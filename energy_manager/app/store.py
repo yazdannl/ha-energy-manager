@@ -39,7 +39,7 @@ from .models import (
 
 __all__ = ["DEFAULT_RETENTION", "SCHEMA_VERSION", "Store"]
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Forward-only. Append new (version, statements) entries; never edit a released entry.
 MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
@@ -190,8 +190,28 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
             "ALTER TABLE actuals ADD COLUMN price_sell REAL",
         ),
     ),
+    (
+        3,
+        (
+            # 0.22.0 forecast archive (SPEC.md 7.4): what each provider predicted for each slot, so
+            # forecast skill becomes a measurement rather than an impression, and a change to the
+            # learned correction can be accepted or rejected on evidence.
+            """
+            CREATE TABLE IF NOT EXISTS forecast_archive (
+                kind TEXT,
+                source TEXT,
+                target_ts TEXT,
+                issued_at TEXT,
+                value REAL,
+                uncertainty_pct REAL,
+                PRIMARY KEY (kind, source, target_ts)
+            ) WITHOUT ROWID
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_forecast_archive_target ON forecast_archive(target_ts)",
+            "CREATE INDEX IF NOT EXISTS idx_forecast_archive_issued ON forecast_archive(issued_at)",
+        ),
+    ),
 ]
-
 #: Retention policy used by :meth:`Store.trim` (SPEC.md section 11).
 DEFAULT_RETENTION = {
     "measurements_days": 400,
@@ -199,6 +219,10 @@ DEFAULT_RETENTION = {
     "dispatch_rows": 20_000,
     "events_rows": 5_000,
     "plans_rows": 200,  # ~2 days at the default 15-minute replan cadence
+    # Archived forecasts live only as long as the actuals they are scored against: once the measured
+    # series is trimmed, an archived prediction has nothing left to be compared with, and it is the
+    # comparison that is worth keeping, not the prediction.
+    "forecast_archive_days": 400,
 }
 
 _ACTUAL_COLUMNS = (
@@ -212,6 +236,14 @@ _ACTUAL_COLUMNS = (
     "plan_power_w",
     "dispatch_power_w",
 )
+
+#: Which measured ``actuals`` column scores each archived forecast kind. A kind absent here is a
+#: programming error, not an empty result: reporting "no error" for a series nothing measured would
+#: be the most flattering possible bug.
+_ARCHIVE_ACTUAL_COLUMN = {
+    "solar": "pv_kw",
+    "load": "load_kw",
+}
 
 _SAVINGS_COLUMNS = (
     "import_kwh",
@@ -601,6 +633,94 @@ class Store:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    # ------------------------------------------------------------------ forecast archive (SPEC 7.4)
+    def archive_forecast(self, rows: Iterable[tuple[str, str, str, str, float, float | None]]) -> int:
+        """Record ``(kind, source, target_ts, issued_at, value, uncertainty_pct)`` forecasts.
+
+        Upsert rather than append, keeping the newest issue per ``(kind, source, slot)``. A provider
+        refreshes every thirty minutes over a ~48 hour horizon, so appending would store thousands of
+        rows a day for the one number per slot that actually matters: the most recent forecast made
+        *before* the slot, which is the one the planner acted on. The ``WHERE`` clause on the conflict
+        keeps an already-elapsed slot from being rewritten by a later issue that is only now
+        catching up to it.
+
+        Returns the number of rows offered; a row whose slot already has a newer issue is left alone.
+        """
+        payload = [
+            (str(kind), str(source), _to_ts(target), _to_ts(issued), float(value), uncertainty)
+            for kind, source, target, issued, value, uncertainty in rows
+            if target is not None and issued is not None
+        ]
+        if not payload:
+            return 0
+        with _transaction(self.connection) as conn:
+            conn.executemany(
+                "INSERT INTO forecast_archive"
+                "(kind, source, target_ts, issued_at, value, uncertainty_pct) VALUES(?,?,?,?,?,?)"
+                " ON CONFLICT(kind, source, target_ts) DO UPDATE SET"
+                " issued_at = excluded.issued_at, value = excluded.value,"
+                " uncertainty_pct = excluded.uncertainty_pct"
+                " WHERE excluded.issued_at >= forecast_archive.issued_at",
+                payload,
+            )
+        return len(payload)
+
+    def forecast_archive_range(
+        self, start: datetime, end: datetime, kind: str | None = None
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM forecast_archive WHERE target_ts >= ? AND target_ts < ?"
+        params: list[Any] = [to_iso(start), to_iso(end)]
+        if kind is not None:
+            sql += " AND kind = ?"
+            params.append(str(kind))
+        rows = self.connection.execute(sql + " ORDER BY target_ts", params).fetchall()
+        return [dict(row) for row in rows]
+
+    def forecast_accuracy(
+        self, start: datetime, end: datetime, kind: str
+    ) -> list[dict[str, Any]]:
+        """Per-source error of archived forecasts against the measured series, by local hour.
+
+        Compared on hourly means of both sides rather than slot by slot, because the archive holds
+        15-minute slots while ``actuals`` holds whatever the sampler wrote; joining those on an exact
+        timestamp would silently match almost nothing and report a flattering empty result. An
+        unmeasured series (a NULL column, which is the normal case for PV on an install with no
+        inverter sensor) yields no rows, and the caller is expected to say so rather than report a
+        perfect score.
+        """
+        column = _ARCHIVE_ACTUAL_COLUMN.get(str(kind))
+        if column is None:
+            raise ValueError(f"no measured series to score {kind!r} forecasts against")
+        rows = self.connection.execute(
+            "WITH f AS ("
+            "  SELECT source AS source, substr(target_ts, 1, 13) AS hour,"
+            "         AVG(value) AS forecast_kw, COUNT(*) AS slots"
+            "  FROM forecast_archive WHERE kind = ? AND target_ts >= ? AND target_ts < ?"
+            "  GROUP BY source, hour"
+            "), m AS ("
+            f"  SELECT substr(ts, 1, 13) AS hour, AVG({column}) AS measured_kw"
+            f"  FROM actuals WHERE ts >= ? AND ts < ? AND {column} IS NOT NULL"
+            "  GROUP BY hour"
+            ")"
+            " SELECT f.source AS source, COUNT(*) AS hours,"
+            "        AVG(ABS(f.forecast_kw - m.measured_kw)) AS mae_kw,"
+            "        AVG(f.forecast_kw - m.measured_kw) AS bias_kw,"
+            "        AVG(m.measured_kw) AS measured_mean_kw,"
+            "        AVG(f.forecast_kw) AS forecast_mean_kw"
+            " FROM f JOIN m ON m.hour = f.hour"
+            " GROUP BY f.source ORDER BY f.source",
+            (str(kind), to_iso(start), to_iso(end), to_iso(start), to_iso(end)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def trim_forecast_archive(self, before: datetime) -> int:
+        """Drop archived forecasts whose slot is older than ``before``; returns rows deleted."""
+        with _transaction(self.connection) as conn:
+            cursor = conn.execute(
+                "DELETE FROM forecast_archive WHERE target_ts < ?", (to_iso(before),)
+            )
+            return int(cursor.rowcount or 0)
+
     # ------------------------------------------------------------------ forecast cache / profiles
     def cache_get(self, kind: str, key: str) -> tuple[datetime, Any] | None:
         row = self.connection.execute(
@@ -749,6 +869,7 @@ class Store:
         dispatch_rows: int = DEFAULT_RETENTION["dispatch_rows"],
         events_rows: int = DEFAULT_RETENTION["events_rows"],
         plans_rows: int = DEFAULT_RETENTION["plans_rows"],
+        forecast_archive_days: int = DEFAULT_RETENTION["forecast_archive_days"],
     ) -> dict[str, int]:
         """Apply SPEC.md section 11 retention. Returns per-table deleted row counts.
 
@@ -760,6 +881,7 @@ class Store:
         pairs = (
             ("measurements", "ts", moment - timedelta(days=measurements_days)),
             ("actuals", "ts", moment - timedelta(days=actuals_days)),
+            ("forecast_archive", "target_ts", moment - timedelta(days=forecast_archive_days)),
         )
         removed: dict[str, int] = {}
         with _transaction(self.connection) as conn:

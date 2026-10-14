@@ -574,20 +574,21 @@
     ["price.feed_in_energy_tax_refund", "bool", true, "Energy tax refunded", "On = feed-in pays the same consumer price you buy at, minus the feed-in cost. Off = the energy-tax component is not paid back and is subtracted too.", "price", null],
 
     ["solar.enabled", "bool", true, "Solar forecast", "Enable the PV forecast.", "solar", null],
-    ["solar.source", "str", "forecast_solar", "Solar source", "forecast_solar = the Forecast.Solar API (needs planes); capacity = estimate from the array's watt peak; derived = learn the array from the meter's export moments minus what the battery was charging, no numbers to enter.", "solar", ["forecast_solar", "capacity", "derived"]],
+    ["solar.source", "str", "forecast_solar", "Solar source", "forecast_solar = the Forecast.Solar API (needs planes); capacity = estimate from the array's watt peak; derived = learn the array from the meter's export moments minus what the battery was charging, no numbers to enter; learned = a model trained on 174 other Dutch arrays that corrects its own physics for this array (needs solar.capacity_wp).", "solar", ["forecast_solar", "capacity", "derived", "learned"]],
     ["solar.planes", "json", [], "PV planes", "forecast_solar only. List of {kwp, tilt_deg, azimuth_deg (compass: 0=north), damping}.", "solar", null],
     ["solar.api_key", "password", "", "Forecast.Solar key", "forecast_solar only. Optional personal key; keyless is single-plane hourly.", "solar", null],
     ["solar.bias_correction", "bool", true, "Bias correction", "Learn a multiplicative correction from measured PV.", "solar", null],
     ["solar.measured_entity", "str", "", "Measured PV entity", "Runtime-picked PV generation sensor. Use the inverter's AC output; a meter's export register under-reports because self-consumed energy never reaches the meter.", "solar", null],
     // capacity only (SPEC 7.1.1): the array's watt peak plus the geometry the model assumes while
     // it is unset, the performance ratio and the optional weather entity for cloud attenuation.
-    ["solar.capacity_wp", "float", null, "Array watt peak", "capacity only. Total Wp of the array (all panels added). Unset = no capacity estimate, never a guess from history.", "solar", null],
+    ["solar.capacity_wp", "float", null, "Array watt peak", "capacity/learned. Total Wp of the array (all panels added). Unset = no capacity estimate, never a guess from history.", "solar", null],
+    ["solar.ac_capacity_wp", "float", null, "Inverter AC limit", "learned only. The inverter's maximum AC output in watts; when the array's DC watt peak is higher, the model clips past this. Unset = assumed equal to the watt peak (no clipping).", "solar", null],
     ["solar.tilt_deg", "float", null, "Tilt", "capacity only. Panel tilt from horizontal. Unset = assume 35 degrees, stated in the forecast notes.", "solar", null],
     ["solar.azimuth_deg", "float", null, "Azimuth", "capacity only. Compass direction the panels face: 0 = north, 90 = east, 180 = south, 270 = west. Unset = assume south.", "solar", null],
     ["solar.performance_ratio", "float", 0.85, "Performance ratio", "capacity only. Inverter, temperature and soiling losses applied to the clear-sky estimate.", "solar", null],
     ["solar.weather_entity", "str", "", "Weather entity", "capacity only. HA weather entity whose hourly cloud coverage attenuates the estimate. Unset = clear-sky, refined by the measured-PV correction.", "solar", null],
     ["solar.nasa_irradiance", "bool", true, "NASA irradiance", "capacity/derived only. NASA POWER's observed hourly irradiance (keyless, 2-3 day latency) adds a per-hour clearness factor where the weather entity has no cloud data, and refines the meter-derived array fit.", "solar", null],
-    ["solar.sources", "json", [], "Forecast sources", "Merge several PV forecasts into one: an ordered list of {source, weight, ...}. source is forecast_solar, ha_energy (any solar-forecast provider the HA Energy dashboard already has), capacity or derived; weight is a finite number > 0. Empty = use solar.source alone.", "solar", null],
+    ["solar.sources", "json", [], "Forecast sources", "Merge several PV forecasts into one: an ordered list of {source, weight, ...}. source is forecast_solar, ha_energy (any solar-forecast provider the HA Energy dashboard already has), capacity, derived or learned; weight is a finite number > 0. Empty = use solar.source alone.", "solar", null],
     ["solar.merge_strategy", "str", "weighted_mean", "Merge strategy", "How several sources become one value per slot: weighted_mean = the weighted average (default), median = the middle value, max = the most optimistic source.", "solar", ["weighted_mean", "median", "max"]],
 
     ["load.mode", "str", "auto", "Load source", "auto uses the load entity if mapped, else derived.", "load", ["auto", "entity", "derived"]],
@@ -760,7 +761,7 @@
     "price.fixed_day_start_hour", "price.fixed_night_price_entity",
     "price.fixed_night_start_hour", "price.fixed_price_entity", "price.import_fee_eur_per_kwh",
     "price.scale_divisor", "price.source", "price.static_schedule", "price.unit",
-    "price.vat_pct", "solar.api_key", "solar.azimuth_deg", "solar.bias_correction",
+    "price.vat_pct", "solar.api_key", "solar.ac_capacity_wp", "solar.azimuth_deg", "solar.bias_correction",
     "solar.capacity_wp", "solar.nasa_irradiance", "solar.performance_ratio", "solar.planes", "solar.tilt_deg",
     "solar.sources", "solar.merge_strategy",
     "solar.weather_entity", "timezone"

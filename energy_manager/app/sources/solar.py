@@ -26,6 +26,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from ..forecast import local_head
+from ..forecast import pv as pv_learned
 from ..models import (
     ConfigError,
     ProviderStatus,
@@ -39,6 +41,7 @@ from ..models import (
     utcnow,
 )
 from . import ProviderError, RateLimited, horizon_hours, http_get_json
+from .load import temperature_to_c
 
 log = logging.getLogger(__name__)
 
@@ -406,9 +409,12 @@ ASSUMED_GEOMETRY_NOTE = (
 )
 NO_FORECAST_NOTE = "{entity} does not support weather.get_forecasts; current cloud cover held flat"
 CLOUD_FALLBACK_NOTE = "weather.get_forecasts failed for {entity}; current cloud cover held flat"
-NO_CLOUD_DATA_NOTE = ("{entity} publishes no cloud_coverage; estimate is clear-sky (uncertainty 35%)")
+# The two clear-sky notes name the cause but not a number. The band is not always 35 percent: when
+# the NASA POWER clearness profile applies it is 30, and putting a stale figure in prose while
+# ``uncertainty_pct`` carries the real one is how a forecast ends up contradicting itself.
+NO_CLOUD_DATA_NOTE = "{entity} publishes no cloud_coverage; estimate is clear-sky"
 NO_CLIENT_NOTE = "{entity}: no Home Assistant client to query; estimate is clear-sky"
-NO_WEATHER_NOTE = "no solar.weather_entity set; estimate is clear-sky (uncertainty 35%)"
+NO_WEATHER_NOTE = "no solar.weather_entity set; estimate is clear-sky"
 CLOUD_APPLIED_NOTE = "cloud attenuation applied from {entity} (hourly cloud coverage)"
 MEASURED_NOTE = (
     "a measured PV entity refines this curve with a learned per-hour correction"
@@ -443,6 +449,92 @@ DERIVED_NO_HISTORY_ERROR = (
 DERIVED_KIND = "solar_derived"
 DERIVED_PROFILE_KEY = "capacity"
 DERIVED_REFIT_HOURS = 24.0
+
+
+# --------------------------------------------------------------------------------------------
+# Learned residual source (SPEC.md section 7.1.4)
+# --------------------------------------------------------------------------------------------
+#
+# The committed artifact predicts a *multiplier on a physical estimate*, and that estimate is the
+# model's own: an Erbs diffuse split, a NOCT module temperature, an inverter efficiency and hard AC
+# clipping. It is not the ``capacity`` tier's estimate. The two differ by tens of percent at low sun
+# and high cell temperature, so applying a residual fitted against one of them to the other would be
+# wrong rather than merely imprecise. That is why ``solar.performance_ratio`` is not applied here:
+# the model already carries the inverter, temperature and soiling terms the ratio would stand in for.
+
+LEARNED_SOURCE = "learned"
+#: Assumed air temperature when neither a weather forecast nor a mapped sensor supplies one. The
+#: module temperature model moves power about four percent per ten degrees, so this is stated in the
+#: notes rather than silently applied.
+DEFAULT_AIR_TEMPERATURE_C = 15.0
+LEARNED_CAPACITY_NOTE = "learned model: {capacity_wp:g} Wp DC from {origin}"
+LEARNED_AC_NOTE = "inverter limit {ac_capacity_wp:g} W AC from solar.ac_capacity_wp"
+LEARNED_ASSUMED_AC_NOTE = (
+    "inverter limit assumed equal to the array's watt peak; set solar.ac_capacity_wp if the "
+    "inverter is smaller (a DC/AC ratio above one clips, and the model needs to know)"
+)
+LEARNED_NO_RATIO_NOTE = (
+    "solar.performance_ratio is not applied: the learned model carries its own inverter, module "
+    "temperature and clipping terms"
+)
+LEARNED_IRRADIANCE_NOTE = (
+    "irradiance is estimated, not measured: the model is driven by a clearness index"
+)
+LEARNED_TEMPERATURE_WEATHER_NOTE = "air temperature from the {entity} forecast"
+LEARNED_TEMPERATURE_HELD_NOTE = "air temperature held flat from {entity}"
+LEARNED_ASSUMED_TEMPERATURE_NOTE = (
+    "no weather or temperature entity: air temperature assumed {value:g} C"
+)
+LEARNED_UNAVAILABLE_ERROR = "learned PV model unavailable ({error})"
+
+
+# --------------------------------------------------------------------------------------------
+# Fine-tune head (SPEC.md section 7.5)
+# --------------------------------------------------------------------------------------------
+#
+# Fitted from the archived forecast-versus-measured record, adopted only when it beats what it would
+# replace, and revertible. It supplies the per-hour correction *instead of* the shipped EWMA rather
+# than on top of it: stacking two multiplicative corrections fitted to the same signal would count
+# the same systematic error twice, and the failure would look like an ordinary cloudy week.
+
+#: The ``learning_profiles`` key the head is stored under; the forecast kind it corrects.
+HEAD_KIND = "solar"
+
+
+def _head_factors(
+    store: Any,
+    zone: timezone | ZoneInfo,
+    moment: datetime,
+    incumbent: Sequence[float],
+    kind: str = HEAD_KIND,
+) -> list[float] | None:
+    """Refit at most once a day, then report the promoted head's factors (``None`` if none).
+
+    Both halves are best-effort. A fitting failure leaves whatever was promoted before in place, and
+    an empty archive simply means there is nothing to learn from yet, which is the state every
+    install starts in.
+    """
+    if store is None:
+        return None
+    try:
+        local_head.update(store, kind=kind, zone=zone, incumbent=incumbent, now=moment)
+    except Exception as err:  # noqa: BLE001 - a failed fit must never fail the forecast
+        log.warning("fine-tune head refit failed for %s: %s", kind, err)
+    return local_head.active_factors(store, kind)
+
+
+def _head_status(store: Any, kind: str = HEAD_KIND) -> dict[str, Any] | None:
+    """The head's last decision, for the provider status. Names the reason either way."""
+    payload = local_head.read_profile(store, kind)
+    if not payload:
+        return None
+    return {
+        key: payload.get(key)
+        for key in (
+            "status", "promoted", "samples", "fit_samples", "holdout_samples",
+            "candidate_mae_kw", "incumbent_mae_kw", "reason", "fitted_at",
+        )
+    }
 
 
 def _declination_rad(day_of_year: int) -> float:
@@ -604,6 +696,30 @@ def _hourly_cloud_map(rows: Sequence[Mapping[str, Any]], zone: timezone | ZoneIn
     return out
 
 
+def _hourly_temperature_map(
+    rows: Sequence[Mapping[str, Any]], zone: timezone | ZoneInfo
+) -> dict[datetime, float]:
+    """``{local hour start: air temperature}`` for the forecast rows that carry one, degrees C.
+
+    ``temperature`` is a required field of a ``weather.get_forecasts`` hourly row, so this usually
+    has a value wherever the cloud map does; the unit is Kelvin for some integrations, hence the
+    conversion rather than a bare ``float()``.
+    """
+    out: dict[datetime, float] = {}
+    for row in rows:
+        if row.get("temperature") is None:
+            continue
+        moment = from_iso(row.get("datetime"))
+        if moment is None:
+            continue
+        unit = row.get("temperature_unit") or "\u00b0C"
+        value = temperature_to_c(row.get("temperature"), unit)
+        if value is None:
+            continue
+        out[moment.astimezone(zone).replace(minute=0, second=0, microsecond=0)] = value
+    return out
+
+
 def _current_cloud_coverage(client: Any, entity_id: str) -> float | None:
     """The entity's current ``cloud_coverage`` attribute, if it publishes one."""
     try:
@@ -627,17 +743,19 @@ def _slot_cloud_map(
     entity_id: str,
     zone: timezone | ZoneInfo,
     grid: Sequence[datetime],
-) -> tuple[dict[datetime, float] | None, str]:
-    """Cloud coverage per slot from the weather entity, with two documented fallbacks.
+) -> tuple[dict[datetime, float] | None, str, dict[datetime, float]]:
+    """Cloud coverage, note and hourly air temperature from the weather entity, with fallbacks.
 
-    Returns ``(mapping, note)``. A ``None`` mapping means the estimate stays clear-sky. Weather is
-    optional: no path here raises or fails the forecast (SPEC 7.1.1 step 3).
+    Returns ``(mapping, note, temperatures)``. A ``None`` mapping means the estimate stays clear-sky.
+    Weather is optional: no path here raises or fails the forecast (SPEC 7.1.1 step 3). The
+    temperature map comes from the same service call because the learned source needs an air
+    temperature too, and issuing a second identical request would be a wasted round trip.
     """
     hour_keys = {slot.astimezone(zone).replace(minute=0, second=0, microsecond=0) for slot in grid}
     if not entity_id:
-        return None, NO_WEATHER_NOTE
+        return None, NO_WEATHER_NOTE, {}
     if client is None or not callable(getattr(client, "call_service", None)):
-        return None, NO_CLIENT_NOTE.format(entity=entity_id)
+        return None, NO_CLIENT_NOTE.format(entity=entity_id), {}
     unsupported = False
     try:
         response = client.call_service(
@@ -654,7 +772,9 @@ def _slot_cloud_map(
         if not unsupported:
             log.warning("weather.get_forecasts failed for %s: %s", entity_id, err)
     else:
-        hourly = _hourly_cloud_map(_forecast_cloud_rows(response, entity_id), zone)
+        rows = _forecast_cloud_rows(response, entity_id)
+        temperatures = _hourly_temperature_map(rows, zone)
+        hourly = _hourly_cloud_map(rows, zone)
         if hourly:
             mapping = {
                 slot: hourly[key]
@@ -666,13 +786,15 @@ def _slot_cloud_map(
                 note = CLOUD_APPLIED_NOTE.format(entity=entity_id)
                 if covered < len(hour_keys):
                     note += f" (covers {covered} of {len(hour_keys)} hours)"
-                return mapping, note
+                return mapping, note, temperatures
+        if temperatures:
+            return None, NO_CLOUD_DATA_NOTE.format(entity=entity_id), temperatures
     # Both documented fallbacks: the entity's current cloud cover held flat, then clear-sky.
     held = _current_cloud_coverage(client, entity_id)
     if held is not None:
         note = NO_FORECAST_NOTE if unsupported else CLOUD_FALLBACK_NOTE
-        return {slot: held for slot in grid}, note.format(entity=entity_id)
-    return None, NO_CLOUD_DATA_NOTE.format(entity=entity_id)
+        return {slot: held for slot in grid}, note.format(entity=entity_id), {}
+    return None, NO_CLOUD_DATA_NOTE.format(entity=entity_id), {}
 
 
 # --------------------------------------------------------------------------------------------
@@ -1063,7 +1185,7 @@ def _capacity_forecast(
     except (TypeError, ValueError):
         performance_ratio = 0.85
     weather_entity = str(settings.get("solar.weather_entity", "") or "").strip()
-    cloud_map, cloud_note = _slot_cloud_map(client, weather_entity, zone, grid)
+    cloud_map, cloud_note, _weather_temperatures = _slot_cloud_map(client, weather_entity, zone, grid)
     # NASA POWER is an addition, not a replacement: it is only consulted when the weather
     # forecast does not already cover every hour of the horizon, and it never overrides cloud
     # coverage. One keyless request per location per day (daily-cached).
@@ -1181,6 +1303,282 @@ def _capacity_forecast(
             "weather_entity": weather_entity or None,
             "bias_correction": bias_enabled,
             "correction_applied": round(forecast.correction_applied, 4),
+        }
+    )
+    return forecast, status
+
+
+def _current_temperature_c(client: Any, entity_id: str) -> float | None:
+    """The mapped temperature sensor's current reading in degrees C, or ``None``."""
+    try:
+        state = client.get_state(entity_id)
+    except Exception:  # noqa: BLE001 - a state read failure is a missing temperature, nothing more
+        return None
+    if not isinstance(state, Mapping):
+        return None
+    attributes = state.get("attributes") or {}
+    unit = attributes.get("unit_of_measurement") if isinstance(attributes, Mapping) else None
+    return temperature_to_c(state.get("state"), unit)
+
+
+def _learned_temperatures(
+    client: Any,
+    settings: Any,
+    zone: timezone | ZoneInfo,
+    grid: Sequence[datetime],
+    weather_temperatures: Mapping[datetime, float],
+) -> tuple[dict[datetime, float], str]:
+    """Air temperature per slot for the learned model, and a note naming where it came from.
+
+    Preference is the weather entity's own hourly forecast, because it is the only source that
+    actually varies across the horizon; a mapped sensor is held flat, which is the same
+    simplification the cloud fallback already makes. The last resort is a stated constant: the
+    module temperature term moves power about four percent per ten degrees, so this is worth being
+    honest about rather than quietly assuming a pleasant afternoon.
+    """
+    if weather_temperatures:
+        hours = sorted(weather_temperatures)
+        last = weather_temperatures[hours[0]]
+        held: dict[datetime, float] = {}
+        for slot in grid:
+            key = slot.astimezone(zone).replace(minute=0, second=0, microsecond=0)
+            value = weather_temperatures.get(key)
+            if value is not None:
+                last = value
+            held[slot] = last
+        entity = str(settings.get("solar.weather_entity", "") or "").strip()
+        return held, LEARNED_TEMPERATURE_WEATHER_NOTE.format(entity=entity)
+    sensor = str(settings.get("load.temperature_entity", "") or "").strip()
+    if sensor and client is not None:
+        reading = _current_temperature_c(client, sensor)
+        if reading is not None:
+            return (
+                {slot: reading for slot in grid},
+                LEARNED_TEMPERATURE_HELD_NOTE.format(entity=sensor),
+            )
+    return (
+        {slot: DEFAULT_AIR_TEMPERATURE_C for slot in grid},
+        LEARNED_ASSUMED_TEMPERATURE_NOTE.format(value=DEFAULT_AIR_TEMPERATURE_C),
+    )
+
+
+def _learned_forecast(
+    settings: Any,
+    store: Any,
+    client: Any,
+    *,
+    status: ProviderStatus,
+    forecast: SolarForecast,
+    moment: datetime,
+    location: tuple[float, float, str] | None,
+    origin: str = "solar.capacity_wp",
+    http: Callable[..., Any] | None = None,
+) -> tuple[SolarForecast, ProviderStatus]:
+    """Learned residual model over the array's own physics (SPEC.md section 7.1.4).
+
+    The base model is trained on other people's arrays, so it exists to answer the question a fresh
+    install cannot answer from its own history: what will this array produce. It is deliberately a
+    multiplier on physics rather than a direct power regression, which is what lets one artifact
+    serve a site it has never seen.
+
+    Never raises. A missing artifact, a missing capacity or a broken model file is a status naming
+    the cause, because solar is optional and a forecast that cannot be made must say so rather than
+    quietly return zero (SPEC.md section 3).
+    """
+    try:
+        model = pv_learned.load_model()
+    except (OSError, ValueError, KeyError, TypeError) as err:  # noqa: BLE001 - a bad artifact is a status
+        status.ok = False
+        status.last_error = LEARNED_UNAVAILABLE_ERROR.format(error=err)
+        status.detail["reason"] = "model unavailable"
+        forecast.notes.append(status.last_error)
+        return forecast, status
+
+    try:
+        capacity_wp = float(settings.get("solar.capacity_wp") or 0.0)
+    except (TypeError, ValueError):
+        capacity_wp = 0.0
+    if capacity_wp <= 0.0:
+        status.ok = False
+        status.detail["reason"] = "no capacity configured"
+        status.last_error = MISSING_CAPACITY_ERROR
+        forecast.notes.append(status.last_error)
+        return forecast, status
+
+    if location is None:
+        location = _location_or_error(settings, client, status=status, forecast=forecast)
+        if location is None:
+            return forecast, status
+    latitude, longitude, timezone_name = location
+    zone = _zone(timezone_name)
+    horizon = horizon_hours(settings)
+    start = quarter_floor(moment, SLOT_MINUTES)
+    grid = slot_range(start, start + timedelta(hours=horizon), SLOT_MINUTES)
+
+    tilt_deg, azimuth_deg, tilt_assumed, azimuth_assumed = _capacity_geometry(settings)
+    try:
+        ac_capacity_wp = float(settings.get("solar.ac_capacity_wp") or 0.0)
+    except (TypeError, ValueError):
+        ac_capacity_wp = 0.0
+    ac_assumed = ac_capacity_wp <= 0.0
+    if ac_assumed:
+        ac_capacity_wp = capacity_wp
+
+    weather_entity = str(settings.get("solar.weather_entity", "") or "").strip()
+    cloud_map, cloud_note, weather_temperatures = _slot_cloud_map(client, weather_entity, zone, grid)
+    temperatures, temperature_note = _learned_temperatures(
+        client, settings, zone, grid, weather_temperatures
+    )
+    covered_hours = (
+        {slot.astimezone(zone).replace(minute=0, second=0, microsecond=0) for slot in cloud_map}
+        if cloud_map
+        else set()
+    )
+    grid_hours = {slot.astimezone(zone).replace(minute=0, second=0, microsecond=0) for slot in grid}
+    nasa_factors: list[float] | None = None
+    nasa_status = "not needed"
+    nasa_note: str | None = None
+    if grid_hours - covered_hours:
+        nasa_factors, nasa_status, nasa_hours, nasa_samples = _nasa_profile(
+            settings,
+            store,
+            moment,
+            latitude=latitude,
+            longitude=longitude,
+            zone=zone,
+            http=http,
+        )
+        if nasa_factors is not None:
+            nasa_note = NASA_APPLIED_NOTE.format(
+                hours=nasa_hours, samples=nasa_samples, days=NASA_WINDOW_DAYS
+            )
+        elif nasa_status == "failed":
+            nasa_note = NASA_ERROR_NOTE.format(error="the request failed")
+        elif nasa_status == "no daylight samples":
+            nasa_note = NASA_NO_DATA_NOTE
+
+    forecast.notes.append(LEARNED_CAPACITY_NOTE.format(capacity_wp=capacity_wp, origin=origin))
+    forecast.notes.append(
+        LEARNED_ASSUMED_AC_NOTE if ac_assumed else LEARNED_AC_NOTE.format(ac_capacity_wp=ac_capacity_wp)
+    )
+    if tilt_assumed and azimuth_assumed:
+        forecast.notes.append(ASSUMED_GEOMETRY_NOTE)
+    elif tilt_assumed:
+        forecast.notes.append(ASSUMED_TILT_NOTE)
+    elif azimuth_assumed:
+        forecast.notes.append(ASSUMED_AZIMUTH_NOTE)
+    forecast.notes.append(LEARNED_NO_RATIO_NOTE)
+    forecast.notes.append(LEARNED_IRRADIANCE_NOTE)
+    forecast.notes.append(temperature_note)
+    if cloud_note:
+        forecast.notes.append(cloud_note)
+    if nasa_note:
+        forecast.notes.append(nasa_note)
+    measured_entity = str(settings.get("solar.measured_entity", "") or "").strip()
+    forecast.notes.append(MEASURED_NOTE if measured_entity else MISSING_MEASURED_NOTE)
+
+    bias_enabled = bool(settings.get("solar.bias_correction", True))
+    bias_payload = _bias_payload(store) if (store is not None and bias_enabled) else _empty_bias_payload()
+    ewma_factors = (
+        _decay_factors(bias_payload["factors"], bias_payload.get("updated_at"), moment)
+        if bias_enabled
+        else [1.0] * 24
+    )
+    # The learned source is the one that personalises, so it is the one that consults the head. The
+    # head replaces the EWMA for this provider only: a promoted head has been shown to beat those
+    # factors on data it was not fitted on, and using both would apply one correction twice.
+    factors = ewma_factors
+    correction_source = "hourly EWMA" if bias_enabled else "disabled"
+    if bias_enabled and store is not None:
+        head = _head_factors(store, zone, moment, ewma_factors)
+        if head is not None:
+            factors = head
+            correction_source = "fine-tune head"
+    if cloud_map:
+        uncertainty = CAPACITY_UNCERTAINTY_CLOUD_PCT
+    elif nasa_factors is not None:
+        uncertainty = CAPACITY_UNCERTAINTY_NASA_PCT
+    else:
+        uncertainty = CAPACITY_UNCERTAINTY_CLEAR_PCT
+    applied: list[float] = []
+    ratios: list[float] = []
+    slots: list[SolarSlot] = []
+    for slot_time in grid:
+        hour_key = slot_time.astimezone(zone).replace(minute=0, second=0, microsecond=0)
+        coverage = cloud_map.get(hour_key) if cloud_map else None
+        if coverage is not None:
+            attenuation = _cloud_factor(coverage)
+        elif nasa_factors is not None:
+            attenuation = nasa_factors[slot_time.astimezone(zone).hour]
+        else:
+            attenuation = 1.0
+        # The model is driven by an *estimated* horizontal global irradiance, exactly as the corpus
+        # was driven by a measured one: clear-sky Haurwitz attenuated by whatever the provider knows
+        # about cloud. The clearness index that follows is normalised by extraterrestrial
+        # irradiance, so it lands in the range the model was trained on rather than outside it.
+        geometry = pv_learned.solar_geometry(latitude, longitude, slot_time, tilt_deg, azimuth_deg)
+        estimate = pv_learned.estimate_slot(
+            model,
+            moment=slot_time,
+            latitude=latitude,
+            longitude=longitude,
+            tilt_deg=tilt_deg,
+            azimuth_deg=azimuth_deg,
+            dc_capacity_wp=capacity_wp,
+            ac_capacity_wp=ac_capacity_wp,
+            # ``clear_sky_ghi_wm2`` is already zero below the horizon, so this stays zero at night
+            # however large the attenuation is.
+            ghi_wm2=geometry.clear_sky_ghi_wm2 * attenuation,
+            t_ambient_c=temperatures[slot_time],
+        )
+        factor = factors[slot_time.astimezone(zone).hour] if bias_enabled else 1.0
+        applied.append(factor)
+        if estimate.elevation_deg > 0.0:
+            ratios.append(estimate.ratio)
+        slots.append(
+            SolarSlot(
+                t=slot_time,
+                pv_kw=max(0.0, estimate.pv_kw * factor),
+                uncertainty_pct=uncertainty,
+            )
+        )
+
+    forecast.slots = slots
+    forecast.planes = [
+        {
+            "capacity_wp": capacity_wp,
+            "ac_capacity_wp": ac_capacity_wp,
+            "tilt_deg": tilt_deg,
+            "azimuth_deg": azimuth_deg,
+        }
+    ]
+    forecast.correction_applied = sum(applied) / len(applied) if applied else 1.0
+    status.ok = True
+    status.last_success = moment
+    status.stale = False
+    status.detail.update(
+        {
+            "capacity_wp": capacity_wp,
+            "capacity_source": origin,
+            "ac_capacity_wp": ac_capacity_wp,
+            "assumed_ac_capacity": ac_assumed,
+            "tilt_deg": tilt_deg,
+            "azimuth_deg": azimuth_deg,
+            "assumed_tilt": tilt_assumed,
+            "assumed_azimuth": azimuth_assumed,
+            "performance_ratio_applied": False,
+            "cloud_attenuation": bool(cloud_map),
+            "nasa_irradiance": bool(nasa_factors),
+            "nasa_status": nasa_status,
+            "weather_entity": weather_entity or None,
+            "bias_correction": bias_enabled,
+            "correction_applied": round(forecast.correction_applied, 4),
+            # The artifact's own provenance, so a forecast can always be traced to a model and a
+            # corpus rather than to "the learned thing".
+            "model": model.metadata,
+            "mean_residual_ratio": round(sum(ratios) / len(ratios), 4) if ratios else None,
+            "correction_source": correction_source,
+            "fine_tune_head": _head_status(store),
         }
     )
     return forecast, status
@@ -1475,7 +1873,7 @@ def _load_single_source_forecast(
     """Today's single-source path (``solar.source``); the merge path only falls back here."""
     moment = now or utcnow()
     source = str(settings.get("solar.source", "forecast_solar") or "forecast_solar")
-    if source in ("capacity", "derived"):
+    if source in ("capacity", "derived", LEARNED_SOURCE):
         status = ProviderStatus(kind="solar", name=source, active=True)
         forecast = SolarForecast(generated_at=moment, source=source)
         if not bool(settings.get("solar.enabled", True)):
@@ -1496,6 +1894,17 @@ def _load_single_source_forecast(
                 http=http,
                 grid_roles=grid_roles,
                 ws_factory=ws_factory,
+            )
+        if source == LEARNED_SOURCE:
+            return _learned_forecast(
+                settings,
+                store,
+                client,
+                status=status,
+                forecast=forecast,
+                moment=moment,
+                location=location,
+                http=http,
             )
         return _capacity_forecast(
             settings,
@@ -1900,7 +2309,7 @@ def _ha_energy_forecast(
 
 #: The merge strategies ``solar.merge_strategy`` accepts (config.py validates the setting).
 MERGE_STRATEGIES = ("weighted_mean", "median", "max")
-MERGE_SOURCE_TYPES = ("forecast_solar", "ha_energy", "capacity", "derived")
+MERGE_SOURCE_TYPES = ("forecast_solar", "ha_energy", "capacity", "derived", "learned")
 #: Provider-specific merge keys that override the matching ``solar.*`` setting for that source only.
 _SOURCE_SETTING_KEYS = (
     "planes",
@@ -2103,6 +2512,11 @@ def _dispatch_merge_source(
         return _derived_forecast(
             settings, store, client, status=status, forecast=forecast, moment=moment,
             location=location, http=http, grid_roles=grid_roles, ws_factory=ws_factory,
+        )
+    if source == "learned":
+        return _learned_forecast(
+            settings, store, client, status=status, forecast=forecast, moment=moment,
+            location=location, http=http,
         )
     if source == "ha_energy":
         return _ha_energy_forecast(

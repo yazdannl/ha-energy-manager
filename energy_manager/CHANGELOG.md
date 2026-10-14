@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.22.0
+
+- **A learned PV model, trained offline and served from the committed artifact** (`solar.source =
+  learned`, SPEC §7.1.4). It was fitted on the Utrecht 175 corpus — 174 residential arrays, four
+  years, 1.86 M hourly daylight rows — and predicts a *ratio* against its own physical reference
+  rather than a power in watts, which is what lets one artifact serve a roof it has never seen. That
+  is the cold-start prior a fresh install otherwise has no way to build: the existing sources each
+  need either an API key, a watt peak the user measured, or weeks of the meter's export moments.
+- Validated on held-out **systems** (5.102 % of nameplate MAE, 5 folds) and on held-out **years**
+  (5.548 %, trained on 2014 and scored on 2015-2017) — the second being the one that matters for a
+  base model, because a system split cannot tell a model that generalises from one that memorised a
+  year of weather. An aggregate specific-yield gate agrees to +0.15 %, and the model reproduces the
+  spread across arrays, not just the median. Both error figures travel in the artifact and are
+  reported in the provider status, so the number shown is the out-of-sample one.
+- The reference physics is deliberately **not** the capacity tier's: Erbs diffuse split, a NOCT module
+  temperature and explicit AC clipping instead of a constant 25 % diffuse fraction and one
+  `performance_ratio`. The residual was fitted against that reference, so multiplying an estimate
+  derived from the other would be wrong by the difference — which is why `solar.performance_ratio` is
+  not applied when this source is active, and the forecast says so. New setting `solar.ac_capacity_wp`
+  (the inverter's AC limit; unset = assumed equal to the watt peak, stated as an assumption).
+- **Served by standard-library arithmetic only** (R3), with the port pinned by a golden-vector test
+  emitted from the training pipeline itself whose `--cross-check` proves those vectors are the
+  arithmetic that fitted the model. A transcription error would otherwise be invisible: the forecast
+  would simply be a little worse. Weights are stored as IEEE-754 bit patterns in integers, because a
+  decimal round-trip flips comparisons on split thresholds and dense decimal arrays are what R1's
+  audit correctly reads as coordinates.
+- **A forecast archive** (SPEC §7.4): what each provider predicted for each future slot, upserted per
+  `(kind, source, slot)` keeping the newest issue made *before* the slot. Appending would store
+  thousands of rows a day for one number per slot that matters, and rewriting an elapsed slot from a
+  later issue would let a provider quietly improve its own record. Skill is compared on hourly means
+  of both sides, and a kind with no measured series raises rather than reporting a perfect score.
+- **A nightly fine-tune head** (SPEC §7.5): per-hour-of-day factors from this house's own
+  forecast-versus-measured record, in closed form (`m = (Σf·a + λ)/(Σf² + λ)` — ridge against a prior
+  of exactly 1.0, so no data means the base model rather than a division by zero, and a nightly refit
+  still fits inside R3). A fit is only a candidate: it is adopted only when it beats whatever is in
+  force on the newest 3 days by more than 2 % of that error, and the previous profile is kept so
+  `revert` undoes it in one write. It **replaces** the hourly EWMA rather than stacking on it — two
+  corrections fitted to the same signal would count one systematic error twice, and it would look
+  like an ordinary cloudy week. Fewer than 36 scored slots across 10 hours of the day is refused with
+  a reason, which is the state every install starts in.
+- **Two bugs fixed rather than shipped.** The training pipeline's day-of-year was
+  `days_since_epoch % 365 + 1`: offset by 11-13 days and drifting a day per year as leap days
+  accumulated, so the seasonal feature meant something different in every training year. Fixing it
+  improved everything, including the physics prior (176.1 → 163.4 W); retraining was cheaper than
+  cementing it into an artifact. And the settings view called `hasOwnProperty` with an absent choice's
+  value as the receiver, so any backend choice value the UI's label table had not yet heard of blanked
+  the whole settings page — now a cosmetic fallback to the raw value.
+- The clear-sky forecast notes no longer claim a hard-coded "uncertainty 35 %". The real band is 30 %
+  wherever the NASA POWER clearness profile applies, and prose that contradicts the `uncertainty_pct`
+  field beside it is worse than prose that omits it. `SCHEMA_VERSION` 2 → 3.
+
 ## 0.21.1
 
 - **A hold can no longer be "confirmed" by a 0 W flow while the inverter is still armed.** On a

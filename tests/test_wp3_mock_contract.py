@@ -560,9 +560,10 @@ def test_config_payload_exposes_every_frozen_setting(fixtures):
         assert by_key[key]["default"] == default, key
     assert by_key["price.provider"]["choices"] == ["entity", "zonneplan", "day_ahead", "fixed"]
     assert by_key["price.contract"]["choices"] == ["dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night"]
-    # solar.source is a choice too (SPEC §7.1.1): the Forecast.Solar API, the capacity estimate or
-    # the meter-derived array, with the capacity-only keys shipped at their frozen defaults.
-    assert by_key["solar.source"]["choices"] == ["forecast_solar", "capacity", "derived"]
+    # solar.source is a choice too (SPEC §7.1.1): the Forecast.Solar API, the capacity estimate, the
+    # meter-derived array, or the learned residual model (SPEC §7.1.4), with the capacity-only keys
+    # shipped at their frozen defaults.
+    assert by_key["solar.source"]["choices"] == ["forecast_solar", "capacity", "derived", "learned"]
     for key, kind, default in [
         ("solar.capacity_wp", "float", None),
         ("solar.tilt_deg", "float", None),

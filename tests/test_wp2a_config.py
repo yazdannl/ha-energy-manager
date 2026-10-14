@@ -572,6 +572,7 @@ ADVANCED_KEYS = {
     "price.feed_in_tax_inclusive",
     "solar.bias_correction",
     "solar.capacity_wp",
+    "solar.ac_capacity_wp",
     "solar.tilt_deg",
     "solar.azimuth_deg",
     "solar.performance_ratio",

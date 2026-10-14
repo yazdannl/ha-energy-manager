@@ -3216,9 +3216,54 @@ class Engine:
                 and bool(self._settings.get("solar.bias_correction", True))
             ):
                 self._solar = analytics.apply_pv_bias(solar, self._pv_factors, now)
+            self._archive_forecast("solar", self._solar, now)
         if self._load_source is not None:
             self._fetch("load", "load", now, self._load_source)
+            self._archive_forecast("load", self._load, now)
         self._sync_provider_status()
+
+    def _archive_forecast(self, kind: str, forecast: Any, now: datetime) -> None:
+        """Record what was just forecast for each future slot (SPEC.md section 7.4).
+
+        Archived after the learned correction, because the correction is what the planner acted on
+        and scoring the uncorrected curve would grade a forecast nobody used.
+
+        Never fatal: a forecast that cannot be archived is still a forecast, and a full disk or a
+        locked database must not take the control loop down with it.
+        """
+        slots = getattr(forecast, "slots", None)
+        if not slots:
+            return
+        source = str(getattr(forecast, "source", "") or kind)
+        issued = to_iso(now)
+        rows = []
+        for slot in slots:
+            moment = getattr(slot, "t", None)
+            # Solar slots carry ``pv_kw``; load slots carry ``p50``-equivalent ``load_kw``. Reading the
+            # wrong attribute would archive NULLs and quietly score as a perfect forecast.
+            value = getattr(slot, "load_kw", None) if kind == "load" else getattr(slot, "pv_kw", None)
+            if moment is None or value is None:
+                continue
+            if moment <= now:
+                # Only the future is a forecast. A slot that has already elapsed is history, and
+                # rewriting it from a later issue would let a provider quietly improve its own record.
+                continue
+            rows.append(
+                (
+                    kind,
+                    source,
+                    to_iso(moment),
+                    issued,
+                    float(value),
+                    getattr(slot, "uncertainty_pct", None),
+                )
+            )
+        if not rows:
+            return
+        try:
+            self._store.archive_forecast(rows)
+        except Exception as exc:  # noqa: BLE001 - archiving must never break the control loop
+            log.warning("archiving the %s forecast failed: %s", kind, exc)
 
     def _fetch(self, kind: str, attribute: str, now: datetime, source: Callable) -> Any:
         try:

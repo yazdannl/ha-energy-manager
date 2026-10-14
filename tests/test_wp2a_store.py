@@ -38,6 +38,8 @@ EXPECTED_TABLES = {
     "events",
     "settings",
     "meta",
+    # 0.22.0: what each provider predicted per slot, so forecast skill is measurable (SPEC 7.4).
+    "forecast_archive",
 }
 
 
@@ -239,7 +241,7 @@ def test_schema_v2_migrates_a_v1_database_and_keeps_its_rows(tmp_path):
         store.upsert_savings_daily("2026-01-02", charged_kwh=1.5, battery_measured=1)
         assert store.savings_daily_range("2026-01-02", "2026-01-02")[0]["charged_kwh"] == 1.5
         version = store.connection.execute("SELECT version FROM schema_version").fetchone()[0]
-        assert version == SCHEMA_VERSION == 2
+        assert version == SCHEMA_VERSION == 3
     finally:
         store.close()
 

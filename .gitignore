@@ -15,6 +15,12 @@ local/
 !tests/*.json
 !tests/**/*.json
 
+# Trained model artefacts are the second exception: they are fitted offline by tools/forecast_ml and
+# committed on purpose so a model change is reviewable in a diff. Scoped to those two directories
+# alone — the one under the add-on is what actually ships and is what the parity test pins.
+!tools/forecast_ml/models/*.json
+!energy_manager/app/forecast/models/*.json
+
 # Local environment
 .venv/
 venv/

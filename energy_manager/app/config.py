@@ -134,6 +134,7 @@ DEFAULTS: dict[str, Any] = {
     # astronomy plus, when available, cloud cover. Unset tilt/azimuth = the documented assumption
     # (south-facing, 35 degrees) and the forecast says so.
     "solar.capacity_wp": None,
+    "solar.ac_capacity_wp": None,
     "solar.tilt_deg": None,
     "solar.azimuth_deg": None,
     "solar.performance_ratio": 0.85,
@@ -248,10 +249,11 @@ _PRICE_SOURCE_CHOICES = ("zonneplan_entity", "energy_charts", "entity_forecast",
 _PRICE_PROVIDER_CHOICES = ("entity", "zonneplan", "day_ahead", "fixed")
 _PRICE_CONTRACT_CHOICES = ("dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night")
 _PRICE_UNIT_CHOICES = ("auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh")
-_SOLAR_SOURCE_CHOICES = ("forecast_solar", "capacity", "derived")
+_SOLAR_SOURCE_CHOICES = ("forecast_solar", "capacity", "derived", "learned")
 #: Source types a ``solar.sources`` merge entry may name (0.12.0). ``ha_energy`` reads whatever
-#: solar-forecast providers the Home Assistant Energy dashboard already has configured.
-_SOLAR_MERGE_SOURCE_CHOICES = ("forecast_solar", "ha_energy", "capacity", "derived")
+#: solar-forecast providers the Home Assistant Energy dashboard already has configured. ``learned``
+#: (0.22.0) is the trained residual model in SPEC.md section 7.1.4.
+_SOLAR_MERGE_SOURCE_CHOICES = ("forecast_solar", "ha_energy", "capacity", "derived", "learned")
 #: How several per-source series become one (0.12.0).
 _SOLAR_MERGE_STRATEGIES = ("weighted_mean", "median", "max")
 #: Provider-specific keys a merge entry may carry, per source type. The key is the setting suffix
@@ -272,6 +274,17 @@ _SOLAR_SOURCE_KEYS: dict[str, tuple[str, ...]] = {
         "tilt_deg",
         "azimuth_deg",
         "performance_ratio",
+        "weather_entity",
+        "nasa_irradiance",
+    ),
+    # The learned source takes no performance_ratio: the artifact carries its own inverter,
+    # temperature and clipping terms, so accepting the key here would let a user ask for a number to
+    # be applied that deliberately is not.
+    "learned": (
+        "capacity_wp",
+        "ac_capacity_wp",
+        "tilt_deg",
+        "azimuth_deg",
         "weather_entity",
         "nasa_irradiance",
     ),
@@ -350,12 +363,13 @@ SETTINGS_META: dict[str, _Meta] = {
     "price.feed_in_tax_inclusive": _Meta("bool", "price", "Feed-in incl. VAT", "For the flat tariff/entity only: off = add price.vat_pct to the value.", advanced=True),
     "price.feed_in_energy_tax_refund": _Meta("bool", "price", "Energy tax refunded", "On = feed-in pays the same consumer price you buy at, minus the feed-in cost. Off = the energy-tax component is not paid back and is subtracted too."),
     "solar.enabled": _Meta("bool", "solar", "Solar forecast", "Enable the PV forecast."),
-    "solar.source": _Meta("choice", "solar", "Solar source", "forecast_solar = the Forecast.Solar API (needs planes); capacity = estimate from the array's watt peak; derived = learn the array from the meter's export moments minus what the battery was charging, no numbers to enter.", _SOLAR_SOURCE_CHOICES),
+    "solar.source": _Meta("choice", "solar", "Solar source", "forecast_solar = the Forecast.Solar API (needs planes); capacity = estimate from the array's watt peak; derived = learn the array from the meter's export moments minus what the battery was charging, no numbers to enter; learned = a model trained on 174 other Dutch arrays that corrects its own physics for this array (needs solar.capacity_wp).", _SOLAR_SOURCE_CHOICES),
     "solar.planes": _Meta("json", "solar", "PV planes", "forecast_solar only. List of {kwp, tilt_deg, azimuth_deg (compass: 0=north), damping}.", advanced=True),
     "solar.api_key": _Meta("str", "solar", "Forecast.Solar key", "Optional personal key; keyless is single-plane hourly.", nullable=True, advanced=True),
     "solar.bias_correction": _Meta("bool", "solar", "Bias correction", "Learn a multiplicative correction from measured PV.", advanced=True),
     "solar.measured_entity": _Meta("str", "solar", "Measured PV entity", "Runtime-picked PV generation sensor. Use the inverter's AC output; a meter's export register under-reports because self-consumed energy never reaches the meter. The derived source reads the meter instead."),
     "solar.capacity_wp": _Meta("float", "solar", "Array watt peak", "Total Wp of the array (all panels added). Used by the capacity source; the derived source learns it. Unset = no capacity estimate.", minimum=0.0, maximum=200000.0, nullable=True, advanced=True),
+    "solar.ac_capacity_wp": _Meta("float", "solar", "Inverter AC limit", "The learned source only. The inverter's maximum AC output in watts; when the array's DC watt peak is higher, the model clips past this. Unset = assumed equal to the watt peak (no clipping).", minimum=0.0, maximum=200000.0, nullable=True, advanced=True),
     "solar.tilt_deg": _Meta("float", "solar", "Tilt", "Panel tilt from horizontal. Unset = assume 35 degrees (stated in the forecast notes).", minimum=0.0, maximum=90.0, nullable=True, advanced=True),
     "solar.azimuth_deg": _Meta("float", "solar", "Azimuth", "Compass direction the panels face: 0 = north, 90 = east, 180 = south, 270 = west. Unset = assume south.", minimum=0.0, maximum=360.0, nullable=True, advanced=True),
     "solar.performance_ratio": _Meta("float", "solar", "Performance ratio", "Inverter, temperature and soiling losses applied to the clear-sky estimate.", minimum=0.5, maximum=1.1, advanced=True),

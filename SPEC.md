@@ -199,12 +199,15 @@ price.unit               auto|eur_per_kwh|eur_per_mwh|micro_eur_per_kwh
 price.scale_divisor      1.0   # fixed-point divisor for providers publishing integers (per source)
 price.bzn                NL    # bidding zone for the energy_charts day-ahead source
 solar.enabled            true
-solar.source             forecast_solar|capacity|derived   # derived = learn the array from the meter (§7.1.2)
+solar.source             forecast_solar|capacity|derived|learned   # derived = learn the array from the meter (§7.1.2); learned = the trained residual model (§7.1.4)
 solar.planes             []   # [{kwp, tilt_deg, azimuth_deg, damping}]
 solar.api_key            ""   # optional forecast.solar personal key (raises rate limits, enables multi-plane)
-solar.bias_correction    true # learn multiplicative correction from measured PV
+solar.bias_correction    true # learn multiplicative correction from measured PV; the master switch for both the hourly EWMA and the fine-tune head (§7.5)
 solar.measured_entity    ""   # runtime-picked PV power sensor for bias learning
-solar.nasa_irradiance    true # capacity/derived only: observed NASA POWER clearness per hour-of-day
+solar.nasa_irradiance    true # capacity/derived/learned: observed NASA POWER clearness per hour-of-day
+solar.capacity_wp        null # capacity/learned: total DC watt peak; the learned source requires it
+solar.ac_capacity_wp     null # learned only: the inverter's AC limit; null = assumed equal to the watt peak (§7.1.4)
+learning head            -    # §7.5 fits per-hour factors into learning_profiles and applies them only when promoted
 solar.sources            []   # merge several sources into one: [{source, weight, ...}] (§7.1.3)
 solar.merge_strategy     weighted_mean|median|max   # how several sources become one value per slot
 load.mode                auto|entity|derived   # auto uses load entity if mapped else derived
@@ -761,6 +764,68 @@ parameters and answers `{config_entry_id: {"wh_hours": {<ISO timestamp>: <Wh>}}}
 are summed point by point, and one `entry_id` selects a single provider. A missing command, an empty
 dashboard or an unavailable provider is a note, never a failed forecast.
 
+#### 7.1.4 Learned residual model (`solar.source = learned`, 0.22.0)
+
+A model trained offline on 174 other Dutch rooftop arrays, shipped as a committed artifact and served
+by `app/forecast/pv.py` with the standard library only (R3). It answers the one question a fresh
+install cannot answer from its own history: what will *this* array produce, before there is any local
+history to learn from.
+
+**What is predicted, and why it is a ratio.** The artifact outputs a dimensionless multiplier on a
+physical estimate, never a power in watts. Capacity, location and orientation enter as *features*, so
+one model serves an array it has never seen; a direct power regression would have to be refitted for
+every install, which is the opposite of a cold-start prior.
+
+**The reference physics is not the capacity tier's.** This is the part that must not be got wrong,
+because the two differ by tens of percent at low sun and high cell temperature:
+
+| | §7.1.4 (this model's reference) | §7.1.1 capacity estimate |
+| --- | --- | --- |
+| diffuse split | Erbs, from the clearness index | constant 25 % |
+| module temperature | NOCT model from air temperature | not modelled |
+| inverter | `eta = 0.96` plus hard AC clipping | folded into one `performance_ratio` |
+
+So the residual multiplies *this* reference, and **`solar.performance_ratio` is not applied** when
+the learned source is active: the artifact already carries the inverter, module-temperature and
+soiling terms that ratio stands in for. The forecast notes say so. Multiplying a residual fitted
+against one reference by an estimate derived from the other would be wrong by the difference between
+them.
+
+**Irradiance is estimated, and the forecast says so.** The training corpus carried *measured*
+horizontal global irradiance; at runtime the source is handed clear-sky Haurwitz attenuated by
+forecast cloud cover (§7.1.1 step 3) or by the NASA POWER clearness profile (§7.1.1 step 3b). The
+clearness index is normalised by extraterrestrial irradiance, so an estimated value lands inside the
+range the model was trained on rather than outside it — which is the property that makes serving it
+viable at all. It does not make the estimate measured, so the uncertainty band stays the §7.1.1 one
+(35 % clear-sky, 30 % with NASA clearness, 25 % with cloud coverage) rather than the artifact's own
+held-out accuracy, and a note states that the model is driven by a clearness index.
+
+**Air temperature** comes from the weather entity's hourly forecast when there is one, else the
+current reading of `load.temperature_entity` held flat, else a stated constant
+(`DEFAULT_AIR_TEMPERATURE_C = 15`). The module-temperature term moves power about 4 % per 10 °C, so
+which of the three applied is stated in the notes rather than left implicit.
+
+**Settings.** `solar.capacity_wp` (DC watt peak, required — a missing one is a failure naming the
+setting, never a guess from history) and the optional `solar.ac_capacity_wp` (the inverter's AC
+limit). When the AC limit is unset it is assumed equal to the watt peak, which is a stated assumption:
+a DC/AC ratio above one clips, and a model that is not told about the inverter limit will keep
+forecasting output the inverter cannot deliver. `solar.tilt_deg`, `solar.azimuth_deg`,
+`solar.weather_entity`, `solar.nasa_irradiance` and `solar.bias_correction` apply as in §7.1.1,
+including the assumed-geometry notes.
+
+**Status and provenance.** The provider status carries the artifact's own provenance — the training
+corpus, its licence, when it was fitted, how many arrays, and the held-out error on both a
+held-out-system and a held-out-year split — so a forecast can always be traced to a model rather than
+referred to as "the learned thing".
+
+**Precision.** Weights are stored as IEEE-754 bit patterns held in integers. Two reasons, both
+load-bearing: a decimal round-trip changes comparisons for rows sitting exactly on a split threshold,
+and dense arrays of four-to-five-decimal values are the shape R1's audit correctly treats as
+coordinates. `tests/test_forecast_pv.py` pins the port against golden vectors emitted by the training
+pipeline, whose own `--cross-check` proves those vectors come from the arithmetic that fitted the
+model. A transcription error in the port would otherwise be invisible: it would merely look like a
+slightly worse forecast.
+
 ### 7.2 Load (`sources/load.py`)
 Sources in priority order, all producing 15-minute `LoadForecast` slots with `p10/p50/p90`:
 
@@ -786,6 +851,56 @@ Every `control.tick_seconds`, sample grid power, PV power, load power, per-batte
 accounting, so sampling must never be skipped because a write failed.
 
 ---
+
+### 7.4 Forecast archive and forecast skill (0.22.0)
+
+The `forecast_archive` table records what each provider predicted for each future slot, so forecast
+skill is a measurement rather than an impression, and a change to a learned correction can be
+accepted or rejected on evidence.
+
+Rows are **upserted, keeping the newest issue per `(kind, source, slot)`**, and only future slots are
+written. Appending would store thousands of rows a day for one number per slot that matters — the
+most recent forecast made *before* the slot, which is the one the planner acted on — and rewriting an
+elapsed slot from a later issue would let a provider quietly improve its own record. The forecast is
+archived after the learned correction, because the correction is what the planner used and scoring
+the uncorrected curve would grade a forecast nobody acted on.
+
+`Store.forecast_accuracy` reports per-source error against the measured series, compared on **hourly
+means of both sides**: the archive holds 15-minute slots while the sampler writes at its own cadence,
+and joining those on an exact timestamp would match almost nothing and report a flattering empty
+result. A kind with no measured series is a `ValueError`, never an empty score — reporting "no error"
+for a series nothing measured would be the most flattering possible bug. Archived forecasts are
+trimmed with the actuals they are scored against (§11): it is the comparison that is worth keeping,
+not the prediction.
+
+### 7.5 Nightly fine-tune head (0.22.0)
+
+`app/forecast/local_head.py` fits a per-hour-of-day multiplier from this house's own archived
+forecast-versus-measured record, so the base model's systematic error for *this* array is corrected
+without a rebuild.
+
+**Closed form.** `m_h = (Σ f·a + λ) / (Σ f² + λ)` — ridge regression against a prior of exactly 1.0.
+With no data the estimate *is* 1.0 rather than a division by zero; with little data it barely moves;
+with enough it becomes the least-squares fit. `λ = 25` (about three hours of a 3 kW array), chosen
+over-strength so that one afternoon cannot rewrite an hour of the day. Buckets are **local** hours,
+matching the §7.1 EWMA, and an hour with no scored slots keeps exactly 1.0 rather than borrowing a
+neighbour's. Factors are clamped to the §7.1 bounds `[0.3, 1.8]`.
+
+**The gate is part of the feature.** A fit is only a candidate. It is adopted only when it beats the
+incumbent — whatever correction is in force, the shipped EWMA factors or an already-promoted head — on
+a holdout of the newest 3 days by more than `PROMOTION_MARGIN = 2 %` of that error. Fewer than 36
+scored slots across 10 hours of the day is refused with a reason. The previous profile is kept, so
+`revert` undoes a promotion in one write: a head that looked better on the holdout and turns out worse
+in service must be removable without a rebuild.
+
+**It replaces, it does not stack.** When a head is promoted, the learned source uses its factors
+*instead of* the §7.1 EWMA factors. Two multiplicative corrections fitted to the same signal would
+count the same systematic error twice, and the failure would look like an ordinary cloudy week.
+`solar.bias_correction` remains the master switch for both.
+
+Refits happen at most once every 20 hours, from inside the provider, in the same shape as the
+derived-capacity refit (§7.1.2). Every failure mode is a non-event: a fit that cannot be computed is
+not promoted, a profile that cannot be stored is not adopted, and neither can fail a forecast.
 
 ## 8. Optimizer
 
@@ -1474,6 +1589,36 @@ than by weakening `tools/audit.sh`.
 ---
 
 ## 16. Amendment log (why the spec changed)
+
+**0.22.0 learned PV residual model, forecast archive and fine-tune head (user request: finish the
+forecasting work and deploy it).** Three additions, and the reasoning matters more than the shape:
+
+- **§7.1.4 `solar.source = learned`.** A model trained offline on the Utrecht 175 corpus (CC-BY-4.0)
+  and served from the committed artifact by standard-library arithmetic only (R3). It predicts a
+  *ratio* on its own physical reference rather than a power, so one artifact serves an array it has
+  never seen — the cold-start prior a fresh install has no way to build for itself. Validated on
+  held-out *systems* (5.102 % of nameplate) and on held-out *years* (5.548 %, 2014 → 2015-2017), with
+  an aggregate specific-yield gate at +0.15 %; against a physics prior whose own bias is +14.4 %.
+  Both numbers travel in the artifact so the UI reports the honest one.
+- **§7.4 forecast archive.** Upserted per `(kind, source, slot)`, keeping the newest pre-event issue.
+  Without it, "the forecast improved" is an opinion; with it, the §7.5 gate has ground truth and the
+  user can read their own error.
+- **§7.5 nightly fine-tune head.** Closed-form ridge per local hour, shrunk toward 1.0, adopted only
+  by beating the incumbent on a holdout by 2 %, revertible in one write. It **replaces** the §7.1
+  hourly EWMA rather than stacking on it; two corrections fitted to one signal would double-count the
+  same error, and the failure would look like an ordinary cloudy week.
+
+Also amended: `solar.ac_capacity_wp` (§3), and the clear-sky notes no longer state a hard-coded
+"uncertainty 35 %" — the real band is 30 % wherever the NASA POWER clearness profile applies, and
+prose that contradicts the `uncertainty_pct` field beside it is worse than prose that omits it.
+
+Two bugs were found and fixed rather than embodied in the shipped artifact. The training pipeline's
+day-of-year was `days_since_epoch % 365 + 1`, offset by 11-13 days *and* drifting by a day per year as
+leap days accumulated, so the seasonal feature meant something different in every training year; the
+add-on's skill breakdown was also exercised on both horizons after the fix, which improved every
+number including the physics prior (176.1 → 163.4 W). And the settings view called
+`hasOwnProperty` with an absent choice's value as the receiver, so adding a backend choice value the
+UI's label table had not heard of blanked the entire page; that is now a cosmetic fallback.
 
 **0.5.0 UI redesign (user request: "cluttered and not modern at all", "modern minimalist ui with more
 options available if the user wants to change them", "use either bootstrap or tailwindcss").** §13.1

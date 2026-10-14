@@ -92,10 +92,15 @@ switched off the prices render `--`.
 ## Safety and privacy in one paragraph
 
 Nothing leaves your system except the forecast requests (Forecast.Solar, NASA POWER irradiance for
-the capacity/derived solar sources, and — if used — the energy-charts day-ahead price API), and no
-location or entity mapping is stored in this
+the capacity/derived/learned solar sources, and — if used — the energy-charts day-ahead price API),
+and no location or entity mapping is stored in this
 repository or in its logs. Hard SoC, power, grid and ramp limits are enforced in front of every
 write, every rejection is logged with its reason, and `mode: off` is the kill switch.
+
+The learned solar source sends nothing at all. Its model is a file committed inside the add-on, and
+the fine-tune head is fitted from your own forecast-versus-measured record in the add-on's own
+`/data` database — that record never leaves the machine, and the held-out error printed beside the
+forecast is the *offline* one from other arrays, not a promise about your roof.
 
 ## Zendure SolarFlow: read this before you uninstall
 
