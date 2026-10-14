@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.23.1
+
+- **`year` and `all` savings no longer stay `--`.** 0.22.1 treated a bucket that mixed rows with and
+  without a baseline as wholly unknown, which left the year/all ranges permanently unknown: their
+  month buckets always contain the pre-fix NULL rows. A bucket now sums only the rows that could be
+  re-priced, per row, so an unknown row's cost is never subtracted from a known baseline, and the
+  UI's comparable actual net cost is `baseline − savings` so it stays exact for those buckets.
+
 ## 0.23.0
 
 - **The learned PV model is now fitted on the irradiance chain it is actually served, and it is given

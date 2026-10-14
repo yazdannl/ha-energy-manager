@@ -1599,8 +1599,9 @@ totals: import_kwh, export_kwh, pv_kwh, cost_eur, revenue_eur, baseline_cost_eur
 ```
 
 A bucket with no stored row reports `has_data: false` and a `None` baseline/savings: it is "no
-activity", not a covered 0.00 period, so it never enters the coverage counts. A bucket mixing a known
-and an unknown baseline is unknown as a whole. `measured_periods` is how many buckets have data and
+activity", not a covered 0.00 period, so it never enters the coverage counts. A bucket mixing known
+and unknown rows keeps only the known rows (summed per row), so an unknown row's cost is never
+subtracted from a known baseline. `measured_periods` is how many buckets have data and
 `baseline_periods` how many of those could be re-priced.
 
 A per-bucket flow is `None` unless every row in the bucket measured it; totals sum the known buckets

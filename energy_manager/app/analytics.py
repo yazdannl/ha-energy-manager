@@ -118,6 +118,12 @@ def savings_from_daily(
     (self-consumption).  The stored daily rows carry cycles, not throughput, so the split uses
     ``cycles * capacity_kwh``; pass the capacity of the batteries in use and treat the split as the
     documented estimate it is (0.0 when no capacity is known).
+
+    ``baseline_cost_eur``/``savings_eur`` are only known when the bucket has at least one row that
+    could be re-priced, and are summed per row: an unknown row's cost is never subtracted from a
+    known baseline (a month bucket can span days from before and after a baseline gap).  A bucket
+    with no such row reports ``None`` for both, never a fabricated 0, and exposes ``has_data`` so a
+    bucket with no stored rows is never counted as a covered period (SPEC 11).
     """
     start, end = range_bounds(range_key, now)
     keys = _bucket_days(start, end, range_key)
@@ -129,8 +135,6 @@ def savings_from_daily(
     # empty bucket is also unknown: it has no activity to re-price, so it must not look like a
     # covered 0.00 period (SPEC 11).
     baseline_known: set[str] = set()
-    # Buckets with at least one row whose baseline was unknowable: the whole bucket is unknown.
-    baseline_missing: set[str] = set()
     bucket_rows: set[str] = set()
     # Per-bucket coverage of each measured series and per-bucket sums of the measured battery
     # flows.  A series is covered only when every row in the bucket had it; a flow is known only
@@ -177,30 +181,31 @@ def savings_from_daily(
         bucket.cost_eur += float(row.get("cost_eur") or 0.0)
         bucket.revenue_eur += float(row.get("revenue_eur") or 0.0)
         bucket_rows.add(key)
-        if row.get("baseline_cost_eur") is None:
-            # One interval the load could not be re-priced against makes the whole bucket
-            # unknown: a partially covered bucket must never look comparable when it is not.
-            baseline_missing.add(key)
-        else:
+        baseline = row.get("baseline_cost_eur")
+        if baseline is not None:
+            # Sum the rows that *could* be re-priced, per row.  A bucket spanning rows from before
+            # and after a gap (a month in the year/all range) keeps its known portion; its savings
+            # is accumulated per row so an unknown row's cost can never be subtracted from a known
+            # baseline (which is what made old all-range totals look like a large loss).
             baseline_known.add(key)
-            bucket.baseline_cost_eur += float(row.get("baseline_cost_eur") or 0.0)
+            bucket.baseline_cost_eur += float(baseline)
+            row_savings = row.get("savings_eur")
+            if row_savings is None:
+                row_savings = float(baseline) - (
+                    float(row.get("cost_eur") or 0.0) - float(row.get("revenue_eur") or 0.0)
+                )
+            bucket.savings_eur += float(row_savings)
         bucket.cycles += float(row.get("battery_cycles") or 0.0)
 
     ordered = []
     for key in sorted(buckets):
         bucket = buckets[key]
         has_data = key in bucket_rows
-        baseline_knowable = has_data and key in baseline_known and key not in baseline_missing
-        if not baseline_knowable:
-            # No rows at all, or a row whose load/grid could not be re-priced: unknown, never a
-            # fabricated zero.  An empty bucket therefore has no baseline to be "covered" by, so
-            # the UI can no longer mislabel four empty days as four covered periods (SPEC 11).
+        if not (has_data and key in baseline_known):
+            # No rows at all, or no row with a knowable baseline: unknown, never a fabricated
+            # zero.  An empty bucket therefore has no baseline to be "covered" by, so the UI can
+            # no longer mislabel empty days as covered periods (SPEC 11).
             bucket = replace(bucket, baseline_cost_eur=None, savings_eur=None)
-        else:
-            bucket = replace(
-                bucket,
-                savings_eur=bucket.baseline_cost_eur - (bucket.cost_eur - bucket.revenue_eur),
-            )
         if has_data:
             known = flow_known.get(key, set())
             sums = flow_sums.get(key, {})
@@ -216,8 +221,8 @@ def savings_from_daily(
         values = [getattr(b, name) for b in ordered if getattr(b, name) is not None]
         return sum(values) if values else None
 
-    # Only fully covered buckets contribute a total; an empty or partially covered bucket must not
-    # be silently added as zero (SPEC 11).
+    # Only buckets with a known baseline contribute a total; an empty bucket must not be silently
+    # added as zero (SPEC 11).
     known_buckets = [b for b in ordered if b.baseline_cost_eur is not None]
     measured_buckets = [b for b in ordered if b.has_data]
     totals = {

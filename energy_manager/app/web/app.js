@@ -4297,10 +4297,12 @@
         el("p", { text: "The server reports null because the realised load for these periods could not be re-priced against a do-nothing baseline. Unknown is not zero: the add-on will not guess a saving. Periods that are knowable are still summed and shown." })
       ]));
     }
-    // Comparable figures: baseline and actual net cost over the same covered periods.
+    // Comparable figures: baseline and actual net cost over the same covered periods.  The actual
+    // net cost of those periods is baseline − savings, which stays exact even when a bucket also
+    // contains rows that could not be re-priced (a month in the year/all range).
     if (covered.length) {
       var baselineSum = covered.reduce(function (sum, b) { return sum + (b.baseline_cost_eur || 0); }, 0);
-      var netSum = covered.reduce(function (sum, b) { return sum + ((b.cost_eur || 0) - (b.revenue_eur || 0)); }, 0);
+      var netSum = covered.reduce(function (sum, b) { return sum + (b.baseline_cost_eur - (b.savings_eur || 0)); }, 0);
       body.appendChild(el("ul", { class: "stat-row" }, [
         el("li", null, [el("span", { class: "stat-label", text: "Baseline cost (covered periods)" }), el("span", { class: "stat-value", text: fmtEur(baselineSum) })]),
         el("li", null, [el("span", { class: "stat-label", text: "Actual net cost (same periods)" }), el("span", { class: "stat-value", text: fmtEur(netSum) })])

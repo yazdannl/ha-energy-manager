@@ -170,8 +170,15 @@ def test_savings_daily_buckets_by_range():
 
 
 def test_savings_savings_is_baseline_minus_actual():
-    rows = [daily_row("2026-01-01", cost_eur=1.0, revenue_eur=0.1, baseline_cost_eur=1.5)]
+    # The stored per-row saving is baseline - (cost - revenue); the bucket sums those rows.
+    rows = [daily_row("2026-01-01", savings=0.6, cost_eur=1.0, revenue_eur=0.1, baseline_cost_eur=1.5)]
     buckets, _ = analytics.savings_from_daily(rows, "day", NOW)
+    assert abs(buckets[0].savings_eur - (1.5 - (1.0 - 0.1))) < 1e-9
+    # A row without a stored saving falls back to its own baseline and net cost.
+    legacy = [
+        {"day": "2026-01-01", "cost_eur": 1.0, "revenue_eur": 0.1, "baseline_cost_eur": 1.5, "savings_eur": None}
+    ]
+    buckets, _ = analytics.savings_from_daily(legacy, "day", NOW)
     assert abs(buckets[0].savings_eur - (1.5 - (1.0 - 0.1))) < 1e-9
 
 
@@ -189,17 +196,23 @@ def test_savings_empty_buckets_are_not_covered_periods():
     assert abs(totals["buckets"] - 30.0) < 1e-9
 
 
-def test_savings_partially_covered_bucket_is_unknown():
-    """A bucket mixing a known and an unknown baseline is unknown as a whole, never partial."""
+def test_savings_partially_covered_bucket_sums_only_known_rows():
+    """A bucket mixing known and unknown rows keeps the known portion, per row, not the whole cost.
+
+    A month bucket in the year/all range spans days written before and after a baseline gap; the
+    unknown day's cost must never be subtracted from the known day's baseline.
+    """
     rows = [
         {"day": "2026-01-01", "cost_eur": 0.0, "revenue_eur": 0.0, "baseline_cost_eur": 1.0},
         {"day": "2026-01-01", "cost_eur": 1.0, "revenue_eur": 0.0, "baseline_cost_eur": None},
     ]
     buckets, totals = analytics.savings_from_daily(rows, "day", NOW)
     assert buckets[0].has_data is True
-    assert buckets[0].baseline_cost_eur is None and buckets[0].savings_eur is None
-    assert totals["baseline_cost_eur"] is None and totals["savings_eur"] is None
-    assert totals["baseline_periods"] == 0.0 and totals["measured_periods"] == 1.0
+    assert abs(buckets[0].baseline_cost_eur - 1.0) < 1e-9
+    assert abs(buckets[0].savings_eur - 1.0) < 1e-9  # 1.0 baseline - 0.0 known net cost
+    assert abs(totals["baseline_cost_eur"] - 1.0) < 1e-9
+    assert abs(totals["savings_eur"] - 1.0) < 1e-9
+    assert totals["baseline_periods"] == 1.0 and totals["measured_periods"] == 1.0
     assert isinstance(buckets[0], SavingsBucket)
     assert analytics.BASELINE_NOTE.startswith("Baseline:")
 
