@@ -502,7 +502,10 @@ class ZendureNativeDriver(BaseDriver):
         self._refresh()
         setpoint = self._read_limit_setpoint()
         if setpoint is None:
-            return self._read_power()
+            # Same rule as the Zendure device path (0.21.1): the limits *are* the command here, so
+            # an unreadable echo must fail open (write) rather than fall back to the measured flow,
+            # which can read 0 W while the limits still execute.
+            return None
         smart = parse_number(self._properties().get(SMART_MODE_KEY))
         wanted = 0 if abs(setpoint) <= self.tolerance_w else 1
         if smart is not None and int(round(smart)) != wanted:

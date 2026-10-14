@@ -319,6 +319,47 @@ def test_device_path_commanded_power_reports_the_limits_not_the_measured_flow():
     assert driver.commanded_power() == 0.0
 
 
+def test_device_path_hold_never_treats_the_measured_flow_as_proof():
+    """0.21.1: a hold must neutralise the *limits*, even while the measured flow reads 0 W.
+
+    The live 2026-10-14 shape: the arbitrage charge's down-ramp ended with ``input_limit = 153 W``
+    and ``ac_mode = input``; the plan then held, and every tick was skipped as "already there"
+    because a device-path mapping has no setpoint entity, so the pre-write check fell back to the
+    measured pair (0 W).  The inverter stayed armed to charge from the grid for six hours and only
+    the next process start -- an unconditional hold -- disarmed it.
+    """
+    state = make_state()
+    state.states[AC_MODE] = {"state": "input", "attributes": {"options": ["input", "output"]}}
+    state.states[INPUT_LIMIT] = {"state": "153", "attributes": {}}
+    state.states[OUTPUT_LIMIT] = {"state": "0", "attributes": {}}
+    state.states[GRID_IN] = {"state": "0", "attributes": {}}
+    state.states[OUTPUT] = {"state": "0", "attributes": {}}
+    driver = make_driver(state, control_path="device")
+    assert driver._read_power() == 0.0  # the flow says idle
+    assert driver.commanded_power() == pytest.approx(153.0)  # the armed limit says otherwise
+
+    result = driver.apply(0.0, dry_run=False)
+    assert result.code != Reason.IDEMPOTENT_SKIP, result.message
+    assert result.ok is True, result.message
+    assert state.states[INPUT_LIMIT]["state"] == "0.0"
+    assert state.states[OUTPUT_LIMIT]["state"] == "0.0"
+
+
+def test_device_path_unreadable_limits_fail_open_to_a_write():
+    """An unreadable limit echo must never degrade to the measured pair (which can read 0 W)."""
+    state = make_state()
+    state.states[INPUT_LIMIT] = {"state": "unavailable", "attributes": {}}
+    state.states[OUTPUT_LIMIT] = {"state": "unavailable", "attributes": {}}
+    driver = make_driver(state, control_path="device")
+    assert driver._read_power() == 0.0
+    assert driver._idempotent_power() is None
+
+    result = driver.apply(0.0, dry_run=False)
+    assert result.code != Reason.IDEMPOTENT_SKIP, result.message
+    written = [call[2].get("entity_id") for call in state.service_calls]
+    assert INPUT_LIMIT in written and OUTPUT_LIMIT in written, written
+
+
 def test_device_path_reads_the_direction_option_from_the_entity():
     """The integration localises the select labels, so the option comes from the entity itself."""
     state = make_state()
@@ -513,8 +554,10 @@ def test_mqtt_writes_only_what_would_change():
     state.service_calls.clear()
     driver.apply(400.0, dry_run=False)
     calls = [call[2].get("entity_id") for call in state.service_calls]
-    # nothing left to quiet and the direction already reads "Input mode": only the magnitudes
-    assert calls == [MQTT_INPUT_LIMIT, MQTT_OUTPUT_LIMIT], calls
+    # The bridge publishes the device's own properties, and its report of the two limits is real
+    # evidence (0.21.1): a target the echo already matches writes nothing at all -- neither the
+    # manager/smartMode/direction nor the magnitudes are re-published.
+    assert calls == [], calls
 
 
 def test_mqtt_reports_commanded_until_the_device_echoes_the_limits():

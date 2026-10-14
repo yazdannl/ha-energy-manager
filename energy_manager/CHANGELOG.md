@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.21.1
+
+- **A hold can no longer be "confirmed" by a 0 W flow while the inverter is still armed.** On a
+`device_limits` path the mapping has no setpoint entity, so `_idempotent_power` -- the pre-write
+"already there" check -- fell back to the *measured* AC pair. When the pack is full, or simply idle,
+that flow reads 0 W, so a hold target of 0 W was skipped as `idempotent_skip` while `input_limit`
+was still armed. Live on 2026-10-14 the arbitrage charge's down-ramp ended with `input_limit = 153 W`
+and `ac_mode = input`, the plan then held from 04:00Z, every 30 s tick was skipped for six hours, and
+only the next process start -- which holds unconditionally -- neutralised the inverter at 05:50:56Z.
+The measured flow stayed 0 W throughout (no energy was bought), but the pack was set to charge from
+the grid at whatever the price was, up to 0.4378 EUR/kWh: a stale setpoint that the dispatcher
+believed it had already cleared.
+- The device path now follows the rule its `commanded_power()` already followed: the "already there"
+  report is the `input_limit`/`output_limit` echo, never the measured flow, and an unreadable echo
+  fails **open** (the write happens, never the skip). The same rule applies to the `zendure_native`
+  driver, and the `zendure_mqtt` bridge now skips when its limit echo already matches the target
+  instead of re-publishing the magnitudes on every tick.
+- Four tests pin it: the live shape (limits armed at 153 W, measured pair 0/0, target 0 W) must write
+  rather than skip; an unreadable echo must fail open on both the entity and the native driver; and
+  the MQTT bridge writes nothing when the echo matches. All four fail on the 0.21.0 tree with
+  `idempotent_skip`.
+
 ## 0.21.0
 
 - **The sell floor prices only the energy above the reserve.** `optimizer.reserve_soc_pct` is a

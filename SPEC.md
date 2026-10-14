@@ -916,7 +916,12 @@ class BatteryDriver(Protocol):
 Writes go through the HA service API (`POST /api/services/...`) or state-setting only where a
 service does not exist. Each `apply` is idempotent within a slot: skip the write when the device
 already reports the target within tolerance (avoid hammering the device — the SolarFlow is a BLE/cloud
-device with finite write budget).
+device with finite write budget). On a *device-limits* path (`control_path: "device"`, and the
+`zendure_mqtt` bridge, whose mapping has no setpoint entity) "the device already reports the target"
+means the **`input_limit`/`output_limit` echo**, never the measured AC flow: the flow can read 0 W
+while the limits still execute, which is how a hold was skipped as "already there" and left a 153 W
+charge limit armed on the live 2026-10-14 install (0.21.1). If that echo cannot be read, the check
+fails **open** -- the write happens rather than the skip.
 
 `zendure.py` must: put the Zendure manager into manual dispatch before controlling power, express
 charge vs discharge with the driver's own entity semantics (verified in `docs/EXTERNAL_APIS.md`),

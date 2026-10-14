@@ -1505,7 +1505,10 @@ source; `read_cell_voltage()` is the optional driver hook (`zendure_native` impl
 guess.
 
 - **Idempotent within a slot**: no write when the device already reports the target within tolerance
-  (the SolarFlow is BLE/cloud with a finite write budget). Result code `idempotent_skip`.
+  (the SolarFlow is BLE/cloud with a finite write budget). Result code `idempotent_skip`. On a
+  device-limits path the report that counts is the `input_limit`/`output_limit` echo, never the
+  measured flow, which can read 0 W while the limits still execute (0.21.1); an unreadable echo
+  fails open to a write.
 - **Never assume a write landed**: read back, tolerate the delay until the device reports its next
   event, retry, and treat a persistent mismatch as `driver_error`. "Persistent" means the *write*
   itself never landed: a command that is in force but whose effect the device has not (yet) shown is

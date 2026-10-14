@@ -449,13 +449,24 @@ class ZendureDriver(BaseDriver):
         return MANAGER_SIGN * value if self._control_path() == "manager_manual_power" else value
 
     def _idempotent_power(self) -> float | None:
-        """Audit finding 1: never decide from measured flow on the manager path.
+        """The pre-write "already there" check.  Never the measured flow on a device path.
 
-        The manager applies a manual setpoint only on the next P1 event, so ``grid_input``/
-        ``output_home`` still show the *previous* command (often 0/0) right after a real write.
-        Comparing the commanded setpoint is what makes an "already there" skip truthful; the
-        measured value is only a fallback when the setpoint cannot be read.
+        Audit finding 1: the manager applies a manual setpoint only on the next P1 event, so
+        ``grid_input``/``output_home`` still show the *previous* command (often 0/0) right after a
+        real write.  Comparing the commanded setpoint is what makes an "already there" skip
+        truthful; the measured value is only a fallback when the setpoint cannot be read.
+
+        The device path has the same trap in a worse form: its mapping has no setpoint entity at
+        all, so ``_commanded_power()`` is always ``None`` there and the measured pair was all that
+        was left -- a hold that reads 0 W of flow (pack full, or simply idle) was skipped as
+        "already there" while ``input_limit`` was still armed.  Live 2026-10-14: the down-ramp
+        ended with ``input_limit = 153 W`` and ``ac_mode = input``, the plan held for six hours,
+        every tick was an idempotent skip, and only the next process start -- which holds
+        unconditionally -- disarmed the inverter (0.21.1).  The limits are the command on this
+        path, so an unreadable limit echo fails *open*: the write happens, never the skip.
         """
+        if self._control_path() == "device_limits":
+            return self._read_limit_setpoint()
         commanded = self._commanded_power()
         return commanded if commanded is not None else self._read_power()
 

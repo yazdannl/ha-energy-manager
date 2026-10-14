@@ -314,6 +314,21 @@ def test_hold_writes_zero_limits_and_smart_mode_off(device):
     }
 
 
+def test_unreadable_limits_never_fall_back_to_the_measured_flow(device):
+    """0.21.1: the limits *are* the command here, so a missing echo fails open (writes)."""
+    del device.properties["inputLimit"]
+    del device.properties["outputLimit"]
+    device.properties.update({"gridInputPower": 0, "outputHomePower": 0})
+    driver = driver_for(device)
+    driver.read_state()  # one refresh, so the measured pair is in hand
+
+    assert driver._read_power() == 0.0  # the measured pair still reads "idle"
+    assert driver._idempotent_power() is None  # never the flow
+    result = driver.apply(0.0, dry_run=False)
+    assert result.code != Reason.IDEMPOTENT_SKIP, result.message
+    assert result.ok is True, result.message
+
+
 def test_holds_are_never_skipped_as_idempotent(device):
     driver = driver_for(device)
     driver.hold(dry_run=False)

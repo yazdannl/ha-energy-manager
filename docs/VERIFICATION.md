@@ -1574,6 +1574,66 @@ same store/engine path the add-on uses.
 
 ---
 
+### 8.23 A hold is proven by the limits, never by the measured flow (0.21.1)
+
+`BatteryDriver._apply` skips a write when the device already reports the target within
+`tolerance_w` (`idempotent_skip`), so the reference it reads decides whether a command is ever sent.
+`ZendureDriver._idempotent_power` asked `_commanded_power()`, which resolves
+`_setpoint_entity()` -- and a `control_path: "device"` mapping has **no** `power_setpoint_entity`
+(the live mapping carries only `charge_limit_entity`/`discharge_limit_entity` and the measured
+pair), so it always returned `None` and the check fell back to `self._read_power()`: the *measured*
+AC flow. That is the trap the module's own comments describe for `commanded_power()` ("the base
+class's fallback to the measured pair can read 0 W while those limits are still executing") -- it was
+fixed there for the applied-command latch (0.17.1) but not for the pre-write check.
+
+Live consequence, 2026-10-14: the 22:00Z arbitrage charge ramped down as the pack filled and its
+last write was `input_limit = 153 W` at 00:02:16Z (with `ac_mode = input`); the measured pair read
+0/0 W from 00:08:41Z (pack full) and the plan became `hold / efficiency_loss` at 04:00:00Z. Every
+30 s tick then computed `current = _read_power() = 0.0` against `target = 0.0`, skipped as
+`idempotent_skip`, and left the inverter armed to charge from the grid at whatever the price was
+(01:00-05:00 ran 0.34-0.44 EUR/kWh). No energy flowed, because the pack was full -- but the device
+was live. The add-on published throughout (hourly price, the 04:00Z plan, a 05:45Z forecast), so
+this was not a stalled loop: it was a wrong skip. The setpoint was only neutralised at 05:50:56Z by
+the **boot neutralisation** of the next process start, which calls `hold()` and therefore
+`_apply(..., allow_idempotent_skip=False)`.
+
+The fix makes the device path follow the rule `commanded_power()` already followed: the report that
+counts is the `input_limit`/`output_limit` echo (`_read_limit_setpoint()`), and an unreadable echo
+returns `None`, which fails **open** -- `_apply` cannot skip and the write happens. The same two
+lines apply to `ZendureNativeDriver._idempotent_power`, which had the identical
+`if setpoint is None: return self._read_power()` fallback. On `zendure_mqtt` (also a
+`device_limits` path; its docstring already says "its report of them is real evidence") this means a
+target the echo already matches now writes nothing at all, instead of re-publishing the magnitudes
+every tick.
+
+Four tests pin it, and all four fail on the frozen 0.21.0 tree (verified by running the new test
+files against that source in a throwaway worktree):
+
+| test | on the 0.21.0 tree | what it pins |
+|---|---|---|
+| `test_device_path_hold_never_treats_the_measured_flow_as_proof` | **fails**: `assert 'idempotent_skip' != 'idempotent_skip'` | the live shape -- limits armed at 153 W, measured pair 0/0 W, target 0 W -- writes and zeroes both limits |
+| `test_device_path_unreadable_limits_fail_open_to_a_write` | **fails**: `assert 0.0 is None` | an unreadable limit echo is never replaced by the measured flow; the write lands |
+| `test_unreadable_limits_never_fall_back_to_the_measured_flow` (`zendure_native`) | **fails**: `assert 0.0 is None` | same rule on the zenSDK path, with the measured pair present and 0 W |
+| `test_mqtt_writes_only_what_would_change` | **fails**: `assert [input_limit, output_limit] == []` | the bridge skips when its echo matches, and still writes when it does not |
+
+Documentation: SPEC §9.2 states the device-path rule and the fail-open direction, and
+`docs/REFERENCE.md` repeats it in the driver contract list.
+
+Measured on this tree: `python3 -m pytest tests -q` -> **946 passed** (3 new; 943 before),
+`sh tools/audit.sh` -> **clean, 116 files scanned**, `node tools/ui_render_check.js` -> **127 passed,
+0 failed** (unchanged).
+
+What is *not* verified: this release was written from the device-side history of the live install
+(the inverter's own AC input-limit number and grid-input power entities, the plan and SoC sensors)
+plus the code path, because the add-on and Supervisor logs are not reachable from this
+host (ingress returns 401; the Supervisor log endpoints return `unknown_error`) and Home Assistant's
+error log is empty. The *cause* of the 05:50:56Z process restart is therefore still unexplained --
+only its effect (the boot hold) is observable. Whether a *stalled* control loop can leave a live
+setpoint is covered separately by the guard thread's `Dispatcher.watchdog()` (0.13.0-era, SPEC
+9.1 step 5), which holds every driver unconditionally; no new timer was added here.
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:
