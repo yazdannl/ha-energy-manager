@@ -1,0 +1,172 @@
+{
+ "corpus": "Utrecht 175 residential PV systems (CC-BY-4.0, doi 10.5281/zenodo.10953360)",
+ "rows": 1885671,
+ "systems": 174,
+ "observed_days": 1461.0,
+ "summary": {
+  "physics_only": {
+   "mae_w": 188.198,
+   "rmse_w": 284.147,
+   "mae_pct_nameplate": 8.077,
+   "energy_bias_pct": 9.518
+  },
+  "ridge": {
+   "mae_w": 137.71,
+   "rmse_w": 224.453,
+   "mae_pct_nameplate": 5.898,
+   "energy_bias_pct": 0.518
+  },
+  "gbt": {
+   "mae_w": 110.791,
+   "rmse_w": 187.223,
+   "mae_pct_nameplate": 4.742,
+   "energy_bias_pct": 0.087
+  }
+ },
+ "folds": [
+  {
+   "fold": 0,
+   "test_systems": 34,
+   "physics_only": {
+    "mae_w": 207.279,
+    "rmse_w": 310.086,
+    "mae_pct_nameplate": 7.921,
+    "energy_bias_pct": 9.173
+   },
+   "ridge": {
+    "mae_w": 151.368,
+    "rmse_w": 245.204,
+    "mae_pct_nameplate": 5.788,
+    "energy_bias_pct": 1.402
+   },
+   "gbt": {
+    "mae_w": 121.988,
+    "rmse_w": 203.642,
+    "mae_pct_nameplate": 4.682,
+    "energy_bias_pct": 0.437
+   }
+  },
+  {
+   "fold": 1,
+   "test_systems": 35,
+   "physics_only": {
+    "mae_w": 196.775,
+    "rmse_w": 279.28,
+    "mae_pct_nameplate": 8.177,
+    "energy_bias_pct": 9.947
+   },
+   "ridge": {
+    "mae_w": 142.706,
+    "rmse_w": 217.273,
+    "mae_pct_nameplate": 5.945,
+    "energy_bias_pct": 0.601
+   },
+   "gbt": {
+    "mae_w": 113.87,
+    "rmse_w": 179.845,
+    "mae_pct_nameplate": 4.73,
+    "energy_bias_pct": 0.493
+   }
+  },
+  {
+   "fold": 2,
+   "test_systems": 35,
+   "physics_only": {
+    "mae_w": 157.344,
+    "rmse_w": 249.782,
+    "mae_pct_nameplate": 8.054,
+    "energy_bias_pct": 8.841
+   },
+   "ridge": {
+    "mae_w": 113.237,
+    "rmse_w": 193.503,
+    "mae_pct_nameplate": 5.798,
+    "energy_bias_pct": 0.313
+   },
+   "gbt": {
+    "mae_w": 91.132,
+    "rmse_w": 162.065,
+    "mae_pct_nameplate": 4.648,
+    "energy_bias_pct": -0.234
+   }
+  },
+  {
+   "fold": 3,
+   "test_systems": 35,
+   "physics_only": {
+    "mae_w": 188.459,
+    "rmse_w": 288.197,
+    "mae_pct_nameplate": 8.188,
+    "energy_bias_pct": 9.971
+   },
+   "ridge": {
+    "mae_w": 139.085,
+    "rmse_w": 228.364,
+    "mae_pct_nameplate": 6.069,
+    "energy_bias_pct": 0.202
+   },
+   "gbt": {
+    "mae_w": 111.674,
+    "rmse_w": 189.041,
+    "mae_pct_nameplate": 4.889,
+    "energy_bias_pct": 0.434
+   }
+  },
+  {
+   "fold": 4,
+   "test_systems": 35,
+   "physics_only": {
+    "mae_w": 191.133,
+    "rmse_w": 293.392,
+    "mae_pct_nameplate": 8.048,
+    "energy_bias_pct": 9.66
+   },
+   "ridge": {
+    "mae_w": 142.154,
+    "rmse_w": 237.918,
+    "mae_pct_nameplate": 5.892,
+    "energy_bias_pct": 0.071
+   },
+   "gbt": {
+    "mae_w": 115.29,
+    "rmse_w": 201.522,
+    "mae_pct_nameplate": 4.762,
+    "energy_bias_pct": -0.696
+   }
+  }
+ ],
+ "temporal": {
+  "physics_only": {
+   "mae_w": 189.017,
+   "rmse_w": 284.967,
+   "mae_pct_nameplate": 8.091,
+   "energy_bias_pct": 9.423
+  },
+  "ridge": {
+   "mae_w": 137.063,
+   "rmse_w": 221.228,
+   "mae_pct_nameplate": 5.853,
+   "energy_bias_pct": 0.207
+  },
+  "gbt": {
+   "mae_w": 131.67,
+   "rmse_w": 220.993,
+   "mae_pct_nameplate": 5.62,
+   "energy_bias_pct": -0.399
+  }
+ },
+ "yield_gate": {
+  "measured_median_kwh_per_kwp": 2864.35,
+  "predicted_median_kwh_per_kwp": 2847.373,
+  "reported_median_annual_kwh_per_kwp": 1004.5,
+  "measured_p10_p90": [
+   1616.646,
+   3197.282
+  ],
+  "predicted_p10_p90": [
+   1660.181,
+   3171.77
+  ]
+ },
+ "elapsed_seconds": 532.9
+}

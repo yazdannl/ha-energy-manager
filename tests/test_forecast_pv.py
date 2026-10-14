@@ -63,9 +63,43 @@ def model() -> "pv.PvResidualModel":
 
 
 def _case_inputs(case: dict) -> tuple[list[float], datetime]:
-    latitude, longitude, tilt, azimuth, dc, ac, ghi, t_ambient, stamp = case["in"]
-    values = [_from_bits(value) for value in (latitude, longitude, tilt, azimuth, dc, ac, ghi, t_ambient)]
+    """The case's inputs, decoded, with the weather terms and the derived attenuation appended.
+
+    ``attenuation`` is not stored in the record: it is recomputed from ``cloud_pct`` through the same
+    helper the forecast uses, so that a golden case pins the derivation rather than a copy of it.
+    """
+    (
+        latitude,
+        longitude,
+        tilt,
+        azimuth,
+        dc,
+        ac,
+        ghi,
+        t_ambient,
+        cloud_pct,
+        wind_ms,
+        rh_pct,
+        rain_mm,
+        stamp,
+    ) = case["in"]
+    values = [
+        _from_bits(value)
+        for value in (latitude, longitude, tilt, azimuth, dc, ac, ghi, t_ambient,
+                      cloud_pct, wind_ms, rh_pct, rain_mm)
+    ]
     return values, datetime.fromtimestamp(int(stamp), tz=timezone.utc)
+
+
+def _weather_kwargs(inputs: list[float]) -> dict:
+    cloud_pct, wind_ms, rh_pct, rain_mm = inputs[8:12]
+    return {
+        "cloud_pct": cloud_pct,
+        "attenuation": pv.cloud_attenuation(cloud_pct),
+        "wind_ms": wind_ms,
+        "rh_pct": rh_pct,
+        "rain_mm": rain_mm,
+    }
 
 
 def test_the_artifact_is_available_and_declares_its_contract(golden: dict) -> None:
@@ -108,7 +142,8 @@ def test_features_match_the_training_arithmetic(golden: dict) -> None:
     worst = 0.0
     worst_name = ""
     for case in golden["cases"]:
-        (latitude, longitude, tilt, azimuth, dc, ac, ghi, t_ambient), moment = _case_inputs(case)
+        inputs, moment = _case_inputs(case)
+        latitude, longitude, tilt, azimuth, dc, ac, ghi, t_ambient = inputs[:8]
         geometry = pv.solar_geometry(latitude, longitude, moment, tilt, azimuth)
         features, _physics, _poa = pv.feature_vector(
             geometry=geometry,
@@ -118,6 +153,7 @@ def test_features_match_the_training_arithmetic(golden: dict) -> None:
             dc_capacity_wp=dc,
             ac_capacity_wp=ac,
             moment=moment,
+            **_weather_kwargs(inputs),
         )
         expected = [_from_bits(value) for value in case["features"]]
         for index, (mine, reference) in enumerate(zip(features, expected)):
@@ -131,7 +167,8 @@ def test_features_match_the_training_arithmetic(golden: dict) -> None:
 def test_physics_and_ratio_are_reproduced_exactly(golden: dict, model: "pv.PvResidualModel") -> None:
     """The physical estimate and the ensemble output are bit-for-bit the training pipeline's."""
     for case in golden["cases"]:
-        (latitude, longitude, tilt, azimuth, dc, ac, ghi, t_ambient), moment = _case_inputs(case)
+        inputs, moment = _case_inputs(case)
+        latitude, longitude, tilt, azimuth, dc, ac, ghi, t_ambient = inputs[:8]
         geometry = pv.solar_geometry(latitude, longitude, moment, tilt, azimuth)
         features, physics, _poa = pv.feature_vector(
             geometry=geometry,
@@ -141,6 +178,7 @@ def test_physics_and_ratio_are_reproduced_exactly(golden: dict, model: "pv.PvRes
             dc_capacity_wp=dc,
             ac_capacity_wp=ac,
             moment=moment,
+            **_weather_kwargs(inputs),
         )
         assert physics == _from_bits(case["physics_w"]), f"physics at {moment.isoformat()}"
         assert model.predict_ratio(features) == _from_bits(
@@ -151,7 +189,8 @@ def test_physics_and_ratio_are_reproduced_exactly(golden: dict, model: "pv.PvRes
 def test_the_estimate_path_agrees_with_the_pieces(golden: dict, model: "pv.PvResidualModel") -> None:
     """``estimate_slot`` is the composed entry point, so it is checked against its own parts."""
     for case in golden["cases"]:
-        (latitude, longitude, tilt, azimuth, dc, ac, ghi, t_ambient), moment = _case_inputs(case)
+        inputs, moment = _case_inputs(case)
+        latitude, longitude, tilt, azimuth, dc, ac, ghi, t_ambient = inputs[:8]
         estimate = pv.estimate_slot(
             model,
             moment=moment,
@@ -163,6 +202,7 @@ def test_the_estimate_path_agrees_with_the_pieces(golden: dict, model: "pv.PvRes
             ac_capacity_wp=ac,
             ghi_wm2=ghi,
             t_ambient_c=t_ambient,
+            **_weather_kwargs(inputs),
         )
         clamped = _from_bits(case["clamped_ratio"])
         if estimate.elevation_deg <= 0.0:

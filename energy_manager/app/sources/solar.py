@@ -696,6 +696,81 @@ def _hourly_cloud_map(rows: Sequence[Mapping[str, Any]], zone: timezone | ZoneIn
     return out
 
 
+#: HA weather forecasts publish wind and precipitation in the entity's own unit, per row. Training used
+#: m/s and mm (NASA POWER WS2M / PRECTOTCORR), so a km/h value read as m/s would hand the model a
+#: wind speed 3.6x too large — a silent error, since both are plausible numbers.
+_WIND_TO_MS = {
+    "m/s": 1.0,
+    "km/h": 1.0 / 3.6,
+    "kph": 1.0 / 3.6,
+    # Written as exact ratios rather than their decimal expansions (1609.344 m per mile, 1852 m per
+    # nautical mile, both per hour): five-plus decimal places is the shape the R1 audit reads as a
+    # coordinate, and this file has no business weakening that rule for a unit table.
+    "mph": 1609.344 / 3600.0,
+    "mi/h": 1609.344 / 3600.0,
+    "kn": 1852.0 / 3600.0,
+    "kt": 1852.0 / 3600.0,
+    "ft/s": 0.3048,
+}
+_RAIN_TO_MM = {"mm": 1.0, "cm": 10.0, "in": 25.4, "inch": 25.4, "inches": 25.4}
+
+
+def _unit_convert(value: Any, unit: Any, table: Mapping[str, float], default: str) -> float | None:
+    """``value`` converted from ``unit``, or ``None`` when either is unusable.
+
+    An unrecognised unit returns ``None`` rather than the raw number: the alternative is a value that
+    is only sometimes in the unit the model was fitted on, which is worse than a documented zero.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    key = str(unit or default).strip().lower().replace("degrees", "").strip()
+    factor = table.get(key)
+    if factor is None:
+        return None
+    return number * factor
+
+
+def _hourly_weather_map(
+    rows: Sequence[Mapping[str, Any]], zone: timezone | ZoneInfo, field: str, convert: Callable[..., float | None]
+) -> dict[datetime, float]:
+    """``{local hour start: value}`` for the forecast rows carrying ``field``."""
+    out: dict[datetime, float] = {}
+    for row in rows:
+        if row.get(field) is None:
+            continue
+        moment = from_iso(row.get("datetime"))
+        if moment is None:
+            continue
+        value = convert(row.get(field), row.get(f"{field}_unit"), None)
+        if value is None:
+            continue
+        out[moment.astimezone(zone).replace(minute=0, second=0, microsecond=0)] = value
+    return out
+
+
+def _weather_field_maps(
+    rows: Sequence[Mapping[str, Any]], zone: timezone | ZoneInfo
+) -> dict[str, dict[datetime, float]]:
+    """The learned source's non-cloud weather terms, per local hour.
+
+    Optional throughout: an entity that publishes no humidity contributes an empty map, which the
+    forecast reports as an assumption rather than silently substituting a number.
+    """
+    return {
+        "wind_ms": _hourly_weather_map(
+            rows, zone, "wind_speed", lambda v, u, _: _unit_convert(v, u, _WIND_TO_MS, "km/h")
+        ),
+        "rh_pct": _hourly_weather_map(
+            rows, zone, "humidity", lambda v, u, _: _unit_convert(v, u, {"": 1.0, "%": 1.0}, "")
+        ),
+        "rain_mm": _hourly_weather_map(
+            rows, zone, "precipitation", lambda v, u, _: _unit_convert(v, u, _RAIN_TO_MM, "mm")
+        ),
+    }
+
+
 def _hourly_temperature_map(
     rows: Sequence[Mapping[str, Any]], zone: timezone | ZoneInfo
 ) -> dict[datetime, float]:
@@ -743,19 +818,21 @@ def _slot_cloud_map(
     entity_id: str,
     zone: timezone | ZoneInfo,
     grid: Sequence[datetime],
-) -> tuple[dict[datetime, float] | None, str, dict[datetime, float]]:
-    """Cloud coverage, note and hourly air temperature from the weather entity, with fallbacks.
+) -> tuple[dict[datetime, float] | None, str, dict[datetime, float], dict[str, dict[datetime, float]]]:
+    """Cloud coverage, note, hourly air temperature and the other weather terms, with fallbacks.
 
-    Returns ``(mapping, note, temperatures)``. A ``None`` mapping means the estimate stays clear-sky.
-    Weather is optional: no path here raises or fails the forecast (SPEC 7.1.1 step 3). The
-    temperature map comes from the same service call because the learned source needs an air
-    temperature too, and issuing a second identical request would be a wasted round trip.
+    Returns ``(mapping, note, temperatures, weather)``. A ``None`` mapping means the estimate stays
+    clear-sky. Weather is optional: no path here raises or fails the forecast (SPEC 7.1.1 step 3).
+    The temperature and weather maps come from the same service call because the learned source needs
+    all of them for the same slots, and issuing further identical requests would be wasted round
+    trips. ``weather`` carries ``wind_ms``, ``rh_pct`` and ``rain_mm`` and is empty wherever the
+    entity does not publish a field.
     """
     hour_keys = {slot.astimezone(zone).replace(minute=0, second=0, microsecond=0) for slot in grid}
     if not entity_id:
-        return None, NO_WEATHER_NOTE, {}
+        return None, NO_WEATHER_NOTE, {}, {}
     if client is None or not callable(getattr(client, "call_service", None)):
-        return None, NO_CLIENT_NOTE.format(entity=entity_id), {}
+        return None, NO_CLIENT_NOTE.format(entity=entity_id), {}, {}
     unsupported = False
     try:
         response = client.call_service(
@@ -774,6 +851,7 @@ def _slot_cloud_map(
     else:
         rows = _forecast_cloud_rows(response, entity_id)
         temperatures = _hourly_temperature_map(rows, zone)
+        weather = _weather_field_maps(rows, zone)
         hourly = _hourly_cloud_map(rows, zone)
         if hourly:
             mapping = {
@@ -786,15 +864,15 @@ def _slot_cloud_map(
                 note = CLOUD_APPLIED_NOTE.format(entity=entity_id)
                 if covered < len(hour_keys):
                     note += f" (covers {covered} of {len(hour_keys)} hours)"
-                return mapping, note, temperatures
+                return mapping, note, temperatures, weather
         if temperatures:
-            return None, NO_CLOUD_DATA_NOTE.format(entity=entity_id), temperatures
+            return None, NO_CLOUD_DATA_NOTE.format(entity=entity_id), temperatures, weather
     # Both documented fallbacks: the entity's current cloud cover held flat, then clear-sky.
     held = _current_cloud_coverage(client, entity_id)
     if held is not None:
         note = NO_FORECAST_NOTE if unsupported else CLOUD_FALLBACK_NOTE
-        return {slot: held for slot in grid}, note.format(entity=entity_id), {}
-    return None, NO_CLOUD_DATA_NOTE.format(entity=entity_id), {}
+        return {slot: held for slot in grid}, note.format(entity=entity_id), {}, {}
+    return None, NO_CLOUD_DATA_NOTE.format(entity=entity_id), {}, {}
 
 
 # --------------------------------------------------------------------------------------------
@@ -1185,7 +1263,7 @@ def _capacity_forecast(
     except (TypeError, ValueError):
         performance_ratio = 0.85
     weather_entity = str(settings.get("solar.weather_entity", "") or "").strip()
-    cloud_map, cloud_note, _weather_temperatures = _slot_cloud_map(client, weather_entity, zone, grid)
+    cloud_map, cloud_note, _weather_temperatures, _weather = _slot_cloud_map(client, weather_entity, zone, grid)
     # NASA POWER is an addition, not a replacement: it is only consulted when the weather
     # forecast does not already cover every hour of the horizon, and it never overrides cloud
     # coverage. One keyless request per location per day (daily-cached).
@@ -1425,7 +1503,7 @@ def _learned_forecast(
         ac_capacity_wp = capacity_wp
 
     weather_entity = str(settings.get("solar.weather_entity", "") or "").strip()
-    cloud_map, cloud_note, weather_temperatures = _slot_cloud_map(client, weather_entity, zone, grid)
+    cloud_map, cloud_note, weather_temperatures, weather_fields = _slot_cloud_map(client, weather_entity, zone, grid)
     temperatures, temperature_note = _learned_temperatures(
         client, settings, zone, grid, weather_temperatures
     )
@@ -1506,14 +1584,23 @@ def _learned_forecast(
     for slot_time in grid:
         hour_key = slot_time.astimezone(zone).replace(minute=0, second=0, microsecond=0)
         coverage = cloud_map.get(hour_key) if cloud_map else None
+        weather = {name: values.get(hour_key) for name, values in weather_fields.items()}
         if coverage is not None:
-            attenuation = _cloud_factor(coverage)
+            # The same Kasten-Czeplak expression the training corpus was built with, taken from the
+            # served module so the two cannot disagree about it.
+            cloud_pct = clamp(float(coverage), 0.0, 100.0)
+            attenuation = pv_learned.cloud_attenuation(cloud_pct)
         elif nasa_factors is not None:
+            # The clearness profile is a real attenuation from a real sky, so it is kept. The cloud
+            # term is inverted out of it rather than left at zero: handing the model ``cloud_pct = 0``
+            # beside an attenuation of 0.75 would describe two different skies in one row.
             attenuation = nasa_factors[slot_time.astimezone(zone).hour]
+            cloud_pct = pv_learned.cloud_pct_from_attenuation(attenuation)
         else:
             attenuation = 1.0
+            cloud_pct = 0.0
         # The model is driven by an *estimated* horizontal global irradiance, exactly as the corpus
-        # was driven by a measured one: clear-sky Haurwitz attenuated by whatever the provider knows
+        # was driven by an estimated one: clear-sky Haurwitz attenuated by whatever the provider knows
         # about cloud. The clearness index that follows is normalised by extraterrestrial
         # irradiance, so it lands in the range the model was trained on rather than outside it.
         geometry = pv_learned.solar_geometry(latitude, longitude, slot_time, tilt_deg, azimuth_deg)
@@ -1530,6 +1617,13 @@ def _learned_forecast(
             # however large the attenuation is.
             ghi_wm2=geometry.clear_sky_ghi_wm2 * attenuation,
             t_ambient_c=temperatures[slot_time],
+            cloud_pct=cloud_pct,
+            attenuation=attenuation,
+            # Absent terms are zero, and the forecast says so rather than implying the entity
+            # published a calm, dry hour.
+            wind_ms=weather.get("wind_ms") or 0.0,
+            rh_pct=weather.get("rh_pct") or 0.0,
+            rain_mm=weather.get("rain_mm") or 0.0,
         )
         factor = factors[slot_time.astimezone(zone).hour] if bias_enabled else 1.0
         applied.append(factor)

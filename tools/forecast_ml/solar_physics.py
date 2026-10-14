@@ -107,6 +107,25 @@ def cos_aoi(latitude, declination, hour_angle, tilt_deg, azimuth_deg):
     )
 
 
+#: Kasten-Czeplak attenuation (SPEC 7.1.1 step 3), the expression the add-on applies to a cloud
+#: percentage. It lives here as well as in the runtime because the corpus has to be built with the
+#: same constants the forecast will use: a different pair would put a fixed offset into the residual.
+CLOUD_MAX_ATTENUATION = 0.75
+CLOUD_COVERAGE_EXPONENT = 3.4
+
+
+def clear_sky_ghi(cos_zenith):
+    """Haurwitz clear-sky horizontal global irradiance, W/m^2."""
+    cos_z = np.maximum(cos_zenith, 1e-6)
+    return np.where(cos_zenith > 0.0, 1098.0 * cos_z * np.exp(-0.059 / cos_z), 0.0)
+
+
+def cloud_attenuation(cloud_pct):
+    """Attenuation factor for a cloud coverage percentage."""
+    coverage = np.clip(cloud_pct, 0.0, 100.0) / 100.0
+    return 1.0 - CLOUD_MAX_ATTENUATION * coverage ** CLOUD_COVERAGE_EXPONENT
+
+
 def erbs_diffuse_fraction(kt):
     """Erbs correlation: diffuse fraction of global horizontal irradiance from clearness index."""
     kt = np.clip(kt, 0.0, 1.0)

@@ -63,6 +63,10 @@ RESIDUAL_MIN, RESIDUAL_MAX = 0.3, 1.8
 _BITS_FORMAT = "<d"
 _BITS_UNSIGNED = "<Q"
 
+#: Arrays the corpus must carry for the weather terms to be buildable. Named separately so a stale
+#: corpus fails with a clear message instead of a KeyError somewhere in the middle of a fold.
+WEATHER_ARRAYS = ("cloud_pct", "attenuation", "clear_sky_ghi", "wind_ms", "rh_pct", "rain_mm")
+
 FEATURE_NAMES = [
     "sun_elevation_deg",
     "cos_zenith",
@@ -86,6 +90,18 @@ FEATURE_NAMES = [
     "hour_cos",
     "doy_sin",
     "doy_cos",
+    # Weather terms (0.23.0). These exist because the model was being fitted against an irradiance
+    # estimator that is not the one the add-on runs: training saw satellite-observed GHI, while in
+    # service GHI is reconstructed as clear-sky Haurwitz attenuated by a forecast cloud percentage.
+    # Handing the model the raw ingredients lets it learn the attenuation mapping instead of the
+    # residual having to absorb a difference between two estimators. Every one of these is a field a
+    # runtime weather forecast publishes, which is the entry requirement for being here at all.
+    "cloud_pct",
+    "attenuation",
+    "clear_sky_ghi_wm2",
+    "wind_ms",
+    "rh_pct",
+    "rain_mm",
 ]
 
 
@@ -102,7 +118,15 @@ def build_features(npz: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.nd
     n_hours, n_systems = power.shape
 
     ghi = npz["ghi"].astype("float64")
+    attenuation = sp.cloud_attenuation(npz["cloud_pct"].astype("float64"))
     t2m = npz["t2m"].astype("float64")
+    del ghi  # superseded by ghi_grid below; kept only so a corpus missing it fails loudly here
+    for name in WEATHER_ARRAYS:
+        if name not in npz:
+            raise SystemExit(
+                f"corpus is missing '{name}': rebuild it through ingest.py so the model is fitted on "
+                "the same irradiance chain and weather terms the add-on will serve it"
+            )
     latitude = npz["latitude"].astype("float64")
     longitude = npz["longitude"].astype("float64")
     tilt = npz["tilt"].astype("float64")
@@ -139,7 +163,14 @@ def build_features(npz: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.nd
     )
     cos_zenith = np.cos(np.radians(90.0 - elevation))
 
-    ghi_grid = np.repeat(ghi[:, None], n_systems, axis=1)
+    # Clear-sky irradiance is per (hour, system), not one series for the corpus centroid, because
+    # that is how the add-on builds it: its own site geometry times the forecast attenuation. A single
+    # centroid series here put a small latitude-dependent offset into the clear-sky feature, which the
+    # golden-vector cross-check caught at 4.3 W/m^2. That is 0.5% -- small, but the exact shape of the
+    # train/serve mismatch this pipeline exists to prevent, so it is fixed rather than documented.
+    clear_sky_grid = sp.clear_sky_ghi(cos_zenith)
+    attenuation_grid = np.repeat(attenuation[:, None], n_systems, axis=1)
+    ghi_grid = clear_sky_grid * attenuation_grid
     t2m_grid = np.repeat(t2m[:, None], n_systems, axis=1)
     tilt_grid = np.repeat(tilt[None, :], n_hours, axis=0)
     dc_grid = np.repeat(dc_capacity[None, :], n_hours, axis=0)
@@ -175,7 +206,10 @@ def build_features(npz: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.nd
             np.cos(np.radians(sun_azimuth[rows, columns])),
             tilt[columns],
             np.sin(np.radians(tilt[columns])),
-            ghi[rows],
+            # The per-system irradiated value, not the 1-D corpus series: every other irradiance
+            # feature here is per-system, and reading the centroid series for this one column was
+            # exactly the inconsistency the cross-check is there to catch.
+            ghi_grid[rows, columns],
             poa[rows, columns],
             clearness[rows, columns],
             diffuse_fraction[rows, columns],
@@ -190,6 +224,12 @@ def build_features(npz: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.nd
             np.cos(2.0 * np.pi * hour_of_day[rows] / 24.0),
             np.sin(2.0 * np.pi * day_of_year[rows] / 365.0),
             np.cos(2.0 * np.pi * day_of_year[rows] / 365.0),
+            npz["cloud_pct"][rows],
+            npz["attenuation"][rows],
+            clear_sky_grid[rows, columns],
+            npz["wind_ms"][rows],
+            npz["rh_pct"][rows],
+            npz["rain_mm"][rows],
         ]
     ).astype("float64")
     _ = azimuth_from_south  # retained for parity with the runtime feature contract

@@ -122,6 +122,19 @@ FEATURE_NAMES: tuple[str, ...] = (
     "hour_cos",
     "doy_sin",
     "doy_cos",
+    # Weather terms (0.23.0). Training used to be driven by satellite-observed irradiance while the
+    # add-on rebuilds irradiance from a cloud percentage, so the residual was partly correcting the
+    # difference between two estimators — measured at 111.0 W versus 150.5 W held-out MAE. These are
+    # the ingredients of the serving chain itself, which is why each one is a field a weather
+    # forecast publishes. ``attenuation`` and ``clear_sky_ghi_wm2`` are kept alongside ``ghi_wm2``
+    # so the model can learn this site's cloud-to-irradiance mapping rather than being stuck with
+    # Kasten-Czeplak's.
+    "cloud_pct",
+    "attenuation",
+    "clear_sky_ghi_wm2",
+    "wind_ms",
+    "rh_pct",
+    "rain_mm",
 )
 
 _BITS_FORMAT = "<d"
@@ -233,6 +246,43 @@ def clear_sky_ghi(cos_zenith: float) -> float:
     if cos_zenith <= 0.0:
         return 0.0
     return 1098.0 * cos_zenith * math.exp(-0.059 / cos_zenith)
+
+
+#: Kasten-Czeplak attenuation constants, the same two the training pipeline and SPEC 7.1.1 use.
+#: They now only seed the ``attenuation`` feature: the model is free to learn a different mapping,
+#: which is the point of handing it ``cloud_pct`` as well.
+CLOUD_MAX_ATTENUATION = 0.75
+CLOUD_COVERAGE_EXPONENT = 3.4
+
+
+def cloud_attenuation(cloud_pct: float) -> float:
+    """Attenuation factor for a cloud coverage percentage (Kasten-Czeplak).
+
+    Non-finite or absent coverage is treated as clear. That is the documented interpretation
+    everywhere else in the add-on, and it is the safe direction: an invented attenuation would
+    silently cut a forecast that nothing measured.
+    """
+    try:
+        coverage = min(max(float(cloud_pct), 0.0), 100.0) / 100.0
+    except (TypeError, ValueError):
+        return 1.0
+    return 1.0 - CLOUD_MAX_ATTENUATION * coverage ** CLOUD_COVERAGE_EXPONENT
+
+
+def cloud_pct_from_attenuation(attenuation: float) -> float:
+    """The cloud coverage Kasten-Czeplak implies for an attenuation factor.
+
+    This exists so the two weather features stay mutually consistent when the attenuation did not
+    come from a cloud number — the climatological NASA clearness profile is the case that matters.
+    Passing ``cloud_pct = 0`` alongside an attenuation of 0.75 would tell the model two contradictory
+    things about the same sky; inverting the same expression instead keeps ``cloud_pct`` inside the
+    range the model was fitted on and keeps the pair readable as one observation.
+    """
+    try:
+        factor = min(max(float(attenuation), 1.0 - CLOUD_MAX_ATTENUATION), 1.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return 100.0 * ((1.0 - factor) / CLOUD_MAX_ATTENUATION) ** (1.0 / CLOUD_COVERAGE_EXPONENT)
 
 
 def solar_geometry(
@@ -354,6 +404,11 @@ def feature_vector(
     dc_capacity_wp: float,
     ac_capacity_wp: float,
     moment: datetime,
+    cloud_pct: float = 0.0,
+    attenuation: float = 1.0,
+    wind_ms: float = 0.0,
+    rh_pct: float = 0.0,
+    rain_mm: float = 0.0,
 ) -> tuple[list[float], float, float]:
     """``(features, physics_ac_w, poa_wm2)`` for one instant, in :data:`FEATURE_NAMES` order.
 
@@ -398,6 +453,16 @@ def feature_vector(
         math.cos(2.0 * math.pi * hour_of_day / 24.0),
         math.sin(2.0 * math.pi * day_of_year / 365.0),
         math.cos(2.0 * math.pi * day_of_year / 365.0),
+        cloud_pct,
+        # Both are passed in rather than one derived from the other here: ``ghi_wm2`` is built by the
+        # caller from the attenuation that was actually applied, and re-deriving it would let the
+        # two features disagree about the same slot when the attenuation came from the NASA
+        # clearness profile instead of from a cloud number.
+        attenuation,
+        geometry.clear_sky_ghi_wm2,
+        wind_ms,
+        rh_pct,
+        rain_mm,
     ]
     return features, expected, poa
 
@@ -567,6 +632,11 @@ def estimate_slot(
     ac_capacity_wp: float,
     ghi_wm2: float,
     t_ambient_c: float,
+    cloud_pct: float = 0.0,
+    attenuation: float = 1.0,
+    wind_ms: float = 0.0,
+    rh_pct: float = 0.0,
+    rain_mm: float = 0.0,
 ) -> SlotEstimate:
     """One slot's learned PV estimate, in kW.
 
@@ -594,6 +664,11 @@ def estimate_slot(
         dc_capacity_wp=dc_capacity_wp,
         ac_capacity_wp=ac_capacity_wp,
         moment=moment,
+        cloud_pct=cloud_pct,
+        attenuation=attenuation,
+        wind_ms=wind_ms,
+        rh_pct=rh_pct,
+        rain_mm=rain_mm,
     )
     ratio = model.predict_clamped_ratio(features)
     return SlotEstimate(

@@ -36,7 +36,13 @@ from pathlib import Path
 import numpy as np
 
 import solar_physics as sp
-from train_base import FEATURE_NAMES, build_features, export_gbt, predict_artifact_scalar
+from train_base import (
+    FEATURE_NAMES,
+    WEATHER_ARRAYS,
+    build_features,
+    export_gbt,
+    predict_artifact_scalar,
+)
 
 _BITS_FORMAT = "<d"
 _BITS_UNSIGNED = "<Q"
@@ -65,16 +71,18 @@ ARRAYS = [
 #: Local hours, spanning night, both shoulders and solar noon.
 HOURS = [0, 6, 12, 18]
 
-#: Synthetic irradiance and air temperature. ``ghi`` at or near zero is the overcast case; the
-#: training corpus's clear-sky ceiling is well under the solar constant, so the top value stays
-#: inside the distribution the model was fitted on.
+#: Synthetic irradiance, air temperature and the weather terms. ``ghi`` at or near zero is the
+#: overcast case; the training corpus's clear-sky ceiling is well under the solar constant, so the top
+#: value stays inside the distribution the model was fitted on. The weather columns are varied
+#: independently of ``ghi`` on purpose: a case where cloud and irradiance always agree could not
+#: detect a runtime that derives one from the wrong field of the other.
 CONDITIONS = [
-    (0.0, -5.0),
-    (50.0, 2.0),
-    (250.0, 8.0),
-    (600.0, 15.0),
-    (850.0, 22.0),
-    (1000.0, 32.0),
+    (0.0, -5.0, 0.0, 0.0, 0.0, 0.0),
+    (50.0, 2.0, 95.0, 4.5, 92.0, 1.2),
+    (250.0, 8.0, 60.0, 2.0, 78.0, 0.0),
+    (600.0, 15.0, 25.0, 1.1, 55.0, 0.4),
+    (850.0, 22.0, 5.0, 0.3, 38.0, 0.0),
+    (1000.0, 32.0, 100.0, 8.8, 97.0, 12.5),
 ]
 
 #: Days of the year: winter, the leap day, the spring equinox and the summer solstice.
@@ -89,6 +97,11 @@ def _to_bits(value: float) -> int:
     return int(struct.unpack(_BITS_UNSIGNED, struct.pack(_BITS_FORMAT, float(value)))[0])
 
 
+#: See the note at the use site: this gate exists to catch a logic difference between the single-row
+#: path and the vectorised training path, not float32 round-trip noise.
+CROSS_CHECK_TOLERANCE = 1e-4
+
+
 def _from_bits(bits: int) -> float:
     return float(struct.unpack(_BITS_FORMAT, struct.pack(_BITS_UNSIGNED, int(bits)))[0])
 
@@ -101,8 +114,11 @@ def single_row(
     azimuth_deg: float,
     dc_capacity_wp: float,
     ac_capacity_wp: float,
-    ghi_wm2: float,
     t_ambient_c: float,
+    cloud_pct: float,
+    wind_ms: float,
+    rh_pct: float,
+    rain_mm: float,
 ) -> tuple[list[float], float]:
     """Features and physical AC expectation for one instant, via the training primitives.
 
@@ -126,6 +142,13 @@ def single_row(
     sun_azimuth = sp.sun_azimuth_deg(latitude, declination, hour_angle)
     incidence = sp.cos_aoi(latitude, declination, hour_angle, tilt_deg, azimuth_deg)
     cos_zenith = np.cos(np.radians(90.0 - elevation))
+
+    # Built exactly as the add-on builds it and as ``build_features`` builds it: site geometry times
+    # whatever the provider knows about cloud. Deriving it here rather than accepting it as an
+    # argument is what makes the golden vectors pin the whole chain rather than only its tail.
+    att = float(sp.cloud_attenuation(float(cloud_pct)))
+    clear_sky = float(sp.clear_sky_ghi(cos_zenith))
+    ghi_wm2 = clear_sky * att
 
     poa, clearness, diffuse_fraction, dni = sp.plane_of_array(
         ghi_wm2, cos_zenith, incidence, tilt_deg
@@ -158,8 +181,14 @@ def single_row(
         float(np.cos(2.0 * np.pi * hour_of_day / 24.0)),
         float(np.sin(2.0 * np.pi * day_of_year / 365.0)),
         float(np.cos(2.0 * np.pi * day_of_year / 365.0)),
+        float(cloud_pct),
+        att,  # the same expression the runtime applies, so the pair cannot disagree
+        float(clear_sky),
+        float(wind_ms),
+        float(rh_pct),
+        float(rain_mm),
     ]
-    return features, float(expected)
+    return features, float(expected), ghi_wm2
 
 
 def cross_check(npz_path: str, sample: int = 400) -> float:
@@ -177,8 +206,8 @@ def cross_check(npz_path: str, sample: int = 400) -> float:
     azimuth = data["azimuth"].astype("float64")
     dc_capacity = data["dc_capacity"].astype("float64")
     ac_capacity = data["ac_capacity"].astype("float64")
-    ghi = data["ghi"].astype("float64")
     t2m = data["t2m"].astype("float64")
+    weather = {name: data[name].astype("float64") for name in WEATHER_ARRAYS}
     # ``row_hours`` carries hours-since-epoch, not a row offset: map it back to the irradiance row.
     hour_index = {int(value): position for position, value in enumerate(data["hours"])}
 
@@ -189,7 +218,7 @@ def cross_check(npz_path: str, sample: int = 400) -> float:
         column = int(systems[index])
         hour = hour_index[int(row_hours[index])]
         moment = datetime.fromtimestamp(int(row_hours[index]) * 3600, tz=timezone.utc)
-        mine, physics = single_row(
+        mine, physics, _derived_ghi = single_row(
             latitude[column],
             longitude[column],
             moment,
@@ -197,8 +226,11 @@ def cross_check(npz_path: str, sample: int = 400) -> float:
             azimuth[column],
             dc_capacity[column],
             ac_capacity[column],
-            ghi[hour],
             t2m[hour],
+            weather["cloud_pct"][hour],
+            weather["wind_ms"][hour],
+            weather["rh_pct"][hour],
+            weather["rain_mm"][hour],
         )
         reference = features[index]
         worst = max(worst, max(abs(a - b) for a, b in zip(mine, reference)))
@@ -228,8 +260,10 @@ def emit(artifact_path: str, out_path: str) -> dict:
                 seen_hours.add(stamp)
                 for site_index, (latitude, longitude) in enumerate(SITES):
                     for tilt, azimuth, dc_capacity, ac_capacity in ARRAYS:
-                        ghi, t_ambient = CONDITIONS[(site_index + hour + day_of_year) % len(CONDITIONS)]
-                        features, physics = single_row(
+                        ghi, t_ambient, cloud_pct, wind_ms, rh_pct, rain_mm = CONDITIONS[
+                            (site_index + hour + day_of_year) % len(CONDITIONS)
+                        ]
+                        features, physics, derived_ghi = single_row(
                             latitude,
                             longitude,
                             moment,
@@ -237,8 +271,11 @@ def emit(artifact_path: str, out_path: str) -> dict:
                             azimuth,
                             dc_capacity,
                             ac_capacity,
-                            ghi,
                             t_ambient,
+                            cloud_pct,
+                            wind_ms,
+                            rh_pct,
+                            rain_mm,
                         )
                         row = np.array([features], dtype="float64")
                         ratio = float(predict_artifact_scalar(artifact, row)[0])
@@ -253,8 +290,12 @@ def emit(artifact_path: str, out_path: str) -> dict:
                                     _to_bits(azimuth),
                                     _to_bits(dc_capacity),
                                     _to_bits(ac_capacity),
-                                    _to_bits(ghi),
+                                    _to_bits(derived_ghi),
                                     _to_bits(t_ambient),
+                                    _to_bits(cloud_pct),
+                                    _to_bits(wind_ms),
+                                    _to_bits(rh_pct),
+                                    _to_bits(rain_mm),
                                     stamp,
                                 ],
                                 "features": [_to_bits(value) for value in features],
@@ -293,10 +334,19 @@ def main() -> int:
 
     if args.npz and not args.skip_cross_check:
         worst = cross_check(args.npz)
-        if worst > 1e-9:
+        # The corpus stores its weather columns as float32, so the single-row path recomputes them in
+        # float64 from a float32 input while the vectorised path reads the stored array. The two
+        # cannot agree bit-for-bit and are not expected to; what must not happen is a *logic*
+        # difference. This tolerance sits four orders below the smallest one this gate has actually
+        # caught (4.0 W/m^2, for a centroid-versus-per-system clear-sky series) and four orders above
+        # the float32 round-trip noise, so it neither hides a real error nor fails on arithmetic.
+        if worst > CROSS_CHECK_TOLERANCE:
             # Lower-case on purpose: an upper-case word before a hyphen reads as a device serial
             # to the repository's R1 scanner, which then has to be allowlisted, which weakens it.
-            print("cross-check failed: the single-row path is not the training path")
+            print(
+                f"cross-check failed: {worst:.3e} exceeds the {CROSS_CHECK_TOLERANCE:.0e} tolerance, "
+                "so the single-row path is not the training path"
+            )
             return 1
     emit(args.artifact, args.out)
     return 0

@@ -6,6 +6,9 @@ Inputs (paths passed on the command line, all outside the repository):
 * the wide power CSV — comma separated, one row per **minute** in UTC, one column per system id,
   empty cell = missing
 * a PVGIS ``seriescalc`` JSON — hourly horizontal irradiance and air temperature
+* a NASA POWER hourly JSON — cloud cover, wind, humidity and rain for the same window. Required:
+  the irradiance the model trains on is rebuilt from it as clear-sky x cloud attenuation, so
+  that training and serving use one chain rather than two
 
 Output: a single ``.npz`` holding an hourly grid, per-system AC power and a validity count, plus the
 irradiance series, plus the per-system geometry the model needs.
@@ -122,11 +125,86 @@ def read_pvgis(path: Path) -> dict[str, np.ndarray]:
     return {"hours": hours, "ghi": ghi, "t2m": t2m, "h_sun": h_sun}
 
 
+#: NASA POWER hourly series this pipeline consumes, and the corpus array each becomes. The keys are
+#: the runtime analogues the add-on reads out of a weather forecast, which is why they are here: a
+#: feature the add-on cannot observe at serving time would quietly make the model worse.
+WEATHER_SERIES = {
+    "CLOUD_AMT": "cloud_pct",  # weather forecast ``cloud_coverage``
+    "WS2M": "wind_ms",  # weather forecast ``wind_speed``
+    "RH2M": "rh_pct",  # weather forecast ``humidity``
+    "PRECTOTCORR": "rain_mm",  # weather forecast ``precipitation``
+}
+#: POWER's documented fill value. A filled hour carries no information and is filled with the series
+#: median instead of being read as a real observation of zero.
+NASA_FILL = -999.0
+
+
+#: Haurwitz clear-sky GHI, the same expression ``app/sources/solar.py`` evaluates.
+def haurwitz(cos_zenith: np.ndarray) -> np.ndarray:
+    """Clear-sky horizontal global irradiance, W/m^2 (SPEC 7.1.1)."""
+    cos_z = np.maximum(cos_zenith, 1e-6)
+    return np.where(cos_zenith > 0.0, 1098.0 * cos_z * np.exp(-0.059 / cos_z), 0.0)
+
+
+#: Kasten-Czeplak attenuation, the same constants SPEC 7.1.1 fixes for the add-on.
+CLOUD_MAX_ATTENUATION = 0.75
+CLOUD_COVERAGE_EXPONENT = 3.4
+
+
+def kasten(cloud_pct: np.ndarray) -> np.ndarray:
+    """Attenuation factor for a cloud coverage percentage."""
+    coverage = np.clip(cloud_pct, 0.0, 100.0) / 100.0
+    return 1.0 - CLOUD_MAX_ATTENUATION * coverage ** CLOUD_COVERAGE_EXPONENT
+
+
+def read_weather(path: Path, hours: np.ndarray) -> dict[str, np.ndarray]:
+    """NASA POWER hourly JSON aligned onto the corpus hours.
+
+    POWER stamps hours as ``YYYYMMDDHH`` in UTC; the corpus carries epoch seconds, so the join is
+    explicit rather than positional. A missing hour is refused rather than interpolated: every
+    training row already requires irradiance, and inventing weather for it would hide a bad window.
+    """
+    payload = json.loads(path.read_text())
+    block = payload.get("parameter", payload)
+    wanted = hours * 3600
+    out: dict[str, np.ndarray] = {}
+    for series, name in WEATHER_SERIES.items():
+        rows = block.get(series)
+        if not isinstance(rows, dict):
+            raise SystemExit(f"weather file has no {series}; it must carry {sorted(WEATHER_SERIES)}")
+        aligned: dict[int, float] = {}
+        for stamp, value in rows.items():
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number <= NASA_FILL + 1.0:
+                continue
+            aligned[int(np.datetime64(f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]}T{stamp[8:10]}:00:00", "s").astype("int64"))] = number
+        values = np.array([aligned.get(int(h), np.nan) for h in wanted], dtype="float64")
+        missing = int((~np.isfinite(values)).sum())
+        if missing:
+            median = float(np.nanmedian(values)) if np.isfinite(values).any() else 0.0
+            print(f"  {name}: {missing} missing hours filled with the median ({median:g})")
+            values = np.where(np.isfinite(values), values, median)
+        out[name] = values.astype("float32")
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metadata", required=True)
     parser.add_argument("--power", required=True, nargs="+", help="one or more wide power CSVs, merged")
     parser.add_argument("--pvgis", required=True)
+    parser.add_argument(
+        "--weather",
+        required=True,
+        help=(
+            "NASA POWER hourly JSON covering the corpus window. Required, not optional: without the "
+            "cloud series the training irradiance would come from a different estimator than the "
+            "one the add-on serves, which is the defect this pipeline exists to avoid"
+        ),
+    )
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -162,32 +240,46 @@ def main() -> int:
         minutes[row] = np.minimum(used, 32767).astype("int16")
 
     irradiance_rows = np.array([pvgis_index[int(h)] for h in hours], dtype="int64")
-    ghi = pvgis["ghi"][irradiance_rows]
+    observed_ghi = pvgis["ghi"][irradiance_rows]
     t2m = pvgis["t2m"][irradiance_rows]
     pvgis_elevation = pvgis["h_sun"][irradiance_rows]
 
     # Cross-check: our own geometry against PVGIS's own reported sun height for the same stamp.
     moments = hours.astype("int64") * 3600
-    day = (moments // 86400).astype("int64")
-    seconds_into_day = moments - day * 86400
+    seconds_into_day = moments - (moments // 86400) * 86400
     fractional_hour = seconds_into_day / 3600.0
-    epoch_day = np.datetime64("1970-01-01")
+    stamps = np.array(moments, dtype="datetime64[s]")
     day_of_year = (
-        (np.array(moments, dtype="datetime64[s]") - epoch_day).astype("timedelta64[D]").astype("int64")
-        % 365
-    ) + 1
+        (stamps - stamps.astype("datetime64[Y]")).astype("timedelta64[D]").astype("int64") + 1
+    )
     latitude = float(metadata["lat"].median())
     longitude = float(metadata["lon"].median())
     declination = sp.declination_rad(day_of_year)
     hour_angle = sp.hour_angle_rad(latitude, longitude, day_of_year, fractional_hour)
     our_elevation = sp.sun_elevation_deg(latitude, declination, hour_angle)
-    daylight = (ghi > 0.0) | (pvgis_elevation > 0.0)
+    cos_zenith = np.cos(np.radians(90.0 - our_elevation))
+    daylight = (observed_ghi > 0.0) | (pvgis_elevation > 0.0)
     if daylight.any():
         error = our_elevation[daylight] - pvgis_elevation[daylight]
         print(
             f"sun height cross-check over {int(daylight.sum())} daylight hours: "
             f"bias {np.mean(error):+.3f} deg, max abs {np.max(np.abs(error)):.3f} deg"
         )
+
+    # The irradiance the add-on will actually reconstruct in service: clear-sky Haurwitz attenuated
+    # by observed cloud. Training against this instead of against ``observed_ghi`` is the whole point
+    # of the weather series: the model then corrects physics rather than correcting the difference
+    # between two irradiance estimators. ``observed_ghi`` is kept so the two can still be compared.
+    weather = read_weather(Path(args.weather), hours)
+    clear_sky_ghi = haurwitz(cos_zenith)
+    attenuation = kasten(weather["cloud_pct"])
+    runtime_ghi = clear_sky_ghi * attenuation
+    kt = runtime_ghi[daylight] / (sp.SOLAR_CONSTANT * np.maximum(cos_zenith[daylight], 1e-6))
+    print(
+        f"  runtime-chain GHI: mean {runtime_ghi[daylight].mean():.1f} W/m2 vs observed "
+        f"{observed_ghi[daylight].mean():.1f} ({runtime_ghi[daylight].mean() - observed_ghi[daylight].mean():+.1f}), "
+        f"clearness p50 {np.percentile(kt, 50):.3f} max {kt.max():.3f}"
+    )
 
     np.savez_compressed(
         args.out,
@@ -204,9 +296,13 @@ def main() -> int:
         annual_yield=metadata["annual_yield"].to_numpy(dtype="float32"),
         begin_ts=metadata["begin_ts"].astype("int64").to_numpy() // 10**9,
         end_ts=metadata["end_ts"].astype("int64").to_numpy() // 10**9,
-        ghi=ghi.astype("float32"),
+        ghi=runtime_ghi.astype("float32"),
+        ghi_observed=observed_ghi.astype("float32"),
+        clear_sky_ghi=clear_sky_ghi.astype("float32"),
+        attenuation=attenuation.astype("float32"),
         t2m=t2m.astype("float32"),
         pvgis_elevation=pvgis_elevation.astype("float32"),
+        **weather,
     )
 
     valid = np.isfinite(power)
@@ -217,7 +313,7 @@ def main() -> int:
         f"  per-system coverage: min {per_system.min() * 100:.1f}% "
         f"median {np.median(per_system) * 100:.1f}% max {per_system.max() * 100:.1f}%"
     )
-    print(f"  daylight hours: {int((ghi > 5.0).sum())}")
+    print(f"  daylight hours: {int((observed_ghi > 5.0).sum())}")
     return 0
 
 
