@@ -764,7 +764,7 @@ parameters and answers `{config_entry_id: {"wh_hours": {<ISO timestamp>: <Wh>}}}
 are summed point by point, and one `entry_id` selects a single provider. A missing command, an empty
 dashboard or an unavailable provider is a note, never a failed forecast.
 
-#### 7.1.4 Learned residual model (`solar.source = learned`, 0.22.0)
+#### 7.1.4 Learned residual model (`solar.source = learned`, 0.22.0; irradiance chain and weather terms 0.23.0)
 
 A model trained offline on 174 other Dutch rooftop arrays, shipped as a committed artifact and served
 by `app/forecast/pv.py` with the standard library only (R3). It answers the one question a fresh
@@ -791,14 +791,41 @@ soiling terms that ratio stands in for. The forecast notes say so. Multiplying a
 against one reference by an estimate derived from the other would be wrong by the difference between
 them.
 
-**Irradiance is estimated, and the forecast says so.** The training corpus carried *measured*
-horizontal global irradiance; at runtime the source is handed clear-sky Haurwitz attenuated by
-forecast cloud cover (§7.1.1 step 3) or by the NASA POWER clearness profile (§7.1.1 step 3b). The
-clearness index is normalised by extraterrestrial irradiance, so an estimated value lands inside the
-range the model was trained on rather than outside it — which is the property that makes serving it
-viable at all. It does not make the estimate measured, so the uncertainty band stays the §7.1.1 one
-(35 % clear-sky, 30 % with NASA clearness, 25 % with cloud coverage) rather than the artifact's own
-held-out accuracy, and a note states that the model is driven by a clearness index.
+**The model is fitted on the chain it is served, and that is not a detail.** Through 0.22.0 the
+corpus carried *satellite-observed* horizontal global irradiance from PVGIS-SARAH2, while the add-on
+reconstructs irradiance as clear-sky Haurwitz attenuated by forecast cloud. Those are two different
+estimators of the same quantity, so the residual the model learned was partly a correction for an
+irradiance model that is never used in service. Measured on the chain it would actually see, the
+0.22.0 artifact degrades from 115.8 W to 150.5 W in-sample and picks up an ~8 % energy bias.
+
+From 0.23.0 the corpus is built from the serving chain — `Haurwitz(geometry) x Kasten-Czeplak(observed
+cloud)` — and the model is handed the ingredients of that chain as features rather than only its
+result: `cloud_pct`, `attenuation`, `clear_sky_ghi_wm2`, `wind_ms`, `rh_pct` and `rain_mm`, each
+computed per system from per-system geometry. Every one of these is a field a runtime weather forecast
+publishes, which is the entry requirement: a feature the add-on cannot observe at serving time would
+quietly make the model worse.
+
+| training chain → served chain | held-out systems | held-out years |
+| --- | --- | --- |
+| SARAH2 → SARAH2 (0.22.0, as shipped) | 5.102 % | 5.548 % |
+| SARAH2 → runtime chain (0.22.0, in service) | ~8 % (degrades) | — |
+| runtime → runtime, 22 features | 5.454 % | — |
+| **runtime → runtime, 28 features (0.23.0)** | **4.742 %** | **5.620 %** |
+
+Energy bias falls to +0.087 % against a physics prior of +9.518 %. `attenuation` is single-sourced
+through `pv.cloud_attenuation`, and the NASA clearness path inverts that same expression into a
+consistent `cloud_pct` rather than passing `cloud_pct = 0` beside an attenuation of 0.75 — two
+contradictory statements about one sky.
+
+**The clearness index is still normalised by extraterrestrial irradiance**, so an estimated value lands
+inside the range the model was trained on rather than outside it, which is the property that makes
+serving it viable at all. It does not make the estimate measured, so the uncertainty band stays the
+§7.1.1 one (35 % clear-sky, 30 % with NASA clearness, 25 % with cloud coverage) rather than the
+artifact's own held-out accuracy, and a note states that the model is driven by an estimated clearness
+index. Wind speed, humidity and precipitation come from the same `weather.get_forecasts` call as the
+cloud map; a field the entity does not publish is passed as zero **and stated as an assumption**, and
+its unit is converted from the entity's own (`_WIND_TO_MS`, `_RAIN_TO_MM`) because a km/h value read
+as m/s is a 3.6x error that still looks like a plausible number.
 
 **Air temperature** comes from the weather entity's hourly forecast when there is one, else the
 current reading of `load.temperature_entity` held flat, else a stated constant
@@ -1589,6 +1616,35 @@ than by weakening `tools/audit.sh`.
 ---
 
 ## 16. Amendment log (why the spec changed)
+
+**0.23.0 the PV model is fitted on the chain it is served, and given the weather (user challenge: "are
+we taking cloud cover, temperature and rain into account? if we're not, what use does it have?").**
+The challenge was right, and the audit found something worse than a missing feature.
+
+- **The real defect was a train/serve mismatch, not an omission.** Training carried satellite-observed
+  GHI; service builds GHI from a cloud percentage. So the learned residual was partly correcting an
+  irradiance model the add-on never uses. Scored on the chain it would actually see, the 0.22.0
+  artifact fell from 115.8 W to 150.5 W with an ~8 % energy bias — meaning the number validated
+  offline was not the number in service. Fixing the chain and adding weather terms takes held-out
+  systems to 4.742 % and held-out years to 5.620 %, against 5.102 % / 5.548 % before. Both splits
+  travel in the artifact.
+- **What was already right, and was verified rather than assumed.** Cloud cover, air and module
+  temperature, panel tilt/azimuth/capacity and the inverter limit were all in the model. PVGIS `G(i)`
+  is genuinely horizontal for this corpus (its clearness index never exceeds 0.80; plane-of-array
+  data misread as horizontal would exceed 1.0), so the training irradiance was not silently
+transposed twice, and the corpus/timestamp alignment was checked by lag correlation rather than
+  trusted (lag 0 wins at r = 0.879).
+- **What was missing:** wind (the NOCT model ignores convective cooling), rain, humidity, and any
+  ability for the model to learn this site's own cloud-to-irradiance mapping rather than inheriting
+  Kasten-Czeplak's. All four are now features, and all four are obtainable at runtime from the same
+  `weather.get_forecasts` call the cloud map already uses.
+- **The golden-vector gate earned its keep twice.** It caught the clear-sky and irradiance features
+  being built per-system on one path and at the corpus centroid on the other (4.3 and 4.0 W/m²) — the
+  same defect in miniature, and exactly the kind that shows up as "the forecast is a bit off" rather
+  than as a failure. Its tolerance is now documented as 1e-4: four orders below the smallest error it
+  has caught, four orders above float32 round-trip noise.
+- **Deliberately not done:** the load model, and a scoring route over the forecast archive. The
+  fine-tune head still cannot learn on an install with no PV measurement, which is the next piece.
 
 **0.22.0 learned PV residual model, forecast archive and fine-tune head (user request: finish the
 forecasting work and deploy it).** Three additions, and the reasoning matters more than the shape:

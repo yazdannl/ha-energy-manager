@@ -26,7 +26,7 @@ installation gets a physically plausible forecast before it has any local histor
 ## Measured results
 
 Fitted on the Dutch corpus, validated **two independent ways**: on held-out **systems** (5 folds, 34–35
-unseen arrays per fold) and on held-out **years**. 1,863,412 daylight rows across 174 systems over
+unseen arrays per fold) and on held-out **years**. 1,885,671 daylight rows across 174 systems over
 **1,461 days (2014–2017)**. Rows are hourly, and every row has a complete hour (≥45 of 60 minutes)
 with the sun above 5° and the array above 2% of nameplate.
 
@@ -34,9 +34,9 @@ with the sun above 5° and the array above 2% of nameplate.
 
 | model | MAE (W) | RMSE (W) | MAE (% of nameplate) | energy bias |
 | --- | --- | --- | --- | --- |
-| physics only (ratio = 1) | 163.4 | 247.8 | 7.064% | **+14.44%** |
-| ridge (linear, same features) | 132.4 | 213.2 | 5.669% | +0.41% |
-| **gradient-boosted trees** | **119.2** | **194.4** | **5.102%** | **+0.11%** |
+| physics only (ratio = 1) | 188.2 | 284.1 | 8.077% | **+9.52%** |
+| ridge (linear, same features) | 137.7 | 224.5 | 5.898% | +0.52% |
+| **gradient-boosted trees** | **110.8** | **187.2** | **4.742%** | **+0.09%** |
 
 ### Held-out years — the test a system split cannot perform
 
@@ -45,9 +45,9 @@ years, and 700,000+ rows of weather the model has never seen.
 
 | model | MAE (W) | RMSE (W) | MAE (% of nameplate) | energy bias |
 | --- | --- | --- | --- | --- |
-| physics only | 164.5 | 250.6 | 7.099% | +14.52% |
-| ridge | 133.6 | 217.2 | 5.708% | +1.65% |
-| **gradient-boosted trees** | **129.6** | **211.0** | **5.548%** | **+1.19%** |
+| physics only | 189.0 | 285.0 | 8.091% | +9.42% |
+| ridge | 137.1 | 221.2 | 5.853% | +0.21% |
+| **gradient-boosted trees** | **131.7** | **221.0** | **5.620%** | **−0.40%** |
 
 This is the number that matters for a *base* model, because a base model's entire job is to work
 before any local data exists. Error rises only ~9% (119.2 → 129.6 W) when the training year and the
@@ -59,6 +59,24 @@ energy by ~14%, which is ordinary — it carries no soiling, cabling, mismatch o
 correction removes almost all of that bias, and the tree ensemble removes a further ~20% of the
 remaining error.
 
+### The model is fitted on the irradiance chain it is served
+
+Corpus rows are driven by `Haurwitz clear-sky x Kasten-Czeplak(observed cloud)`, not by the
+satellite-observed GHI the earlier revisions used. The add-on rebuilds irradiance exactly this way at
+runtime, and a model fitted on a different estimator spends part of its residual correcting the
+difference: scored on the chain it would actually see, the SARAH2-fitted artifact degraded from 115.8 W
+to 150.5 W with an ~8% energy bias. The observed GHI is still carried through as `ghi_observed` so the
+two estimators can be compared rather than one silently replacing the other.
+
+The weather series (cloud, wind, humidity, rain) come from `--weather`, a NASA POWER hourly JSON, and
+become both the irradiance chain and six model features. Each one is a field a runtime weather forecast
+publishes; that is the test for including it. `--weather` is required rather than optional, because
+omitting it would silently restore the mismatch.
+
+The numbers above are therefore the physics prior scored on a *worse* irradiance input than before
+(8.077% against 7.064%), offset by a model that is handed the ingredients of that input and beats both
+of the earlier revisions on both splits.
+
 ### The aggregate gate
 
 There is no PV measurement at the target installation, so a model could reconstruct a meter while
@@ -66,10 +84,10 @@ splitting it wrongly. Row-level error cannot detect that, hence this second, fal
 
 | quantity (window = 1,461 days) | value |
 | --- | --- |
-| measured in corpus | **3,036.7 kWh/kWp** |
-| model prediction | **3,043.5 kWh/kWp** (+0.22%) |
-| p10–p90 across systems, measured | 1,750 – 3,434 |
-| p10–p90 across systems, predicted | 1,808 – 3,381 |
+| measured in corpus | **2,864.3 kWh/kWp** |
+| model prediction | **2,847.4 kWh/kWp** (−0.59%) |
+| p10–p90 across systems, measured | 1,617 – 3,197 |
+| p10–p90 across systems, predicted | 1,660 – 3,172 |
 
 The model reproduces the *spread* across systems, not just the median: that is the part a single
 global multiplier could not do, and it is the strongest evidence here that the model learned
