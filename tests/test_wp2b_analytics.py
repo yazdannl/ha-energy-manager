@@ -38,9 +38,10 @@ def daily_row(day: str, savings: float = 0.12, **values) -> dict:
 
 
 def test_baseline_is_the_do_nothing_net_cost():
-    """Audit finding 13: the baseline must credit exports and be null without a load forecast."""
+    """Audit finding 13: the baseline must credit exports and stay null when the load is unknowable."""
     now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
-    # exporting 2.5 kWh with no battery: the baseline is a net *credit*, not a cost
+    # exporting 2.5 kWh with no battery: the baseline is a net *credit*, not a cost.  Metered load
+    # and PV win when both are present, so g0 = 0.5 - 3.0 = -2.5.
     row = analytics.daily_row_delta(
         None,
         day="2026-01-01",
@@ -56,15 +57,35 @@ def test_baseline_is_the_do_nothing_net_cost():
     )
     assert abs(row["baseline_cost_eur"] - (-0.25)) < 1e-9
     assert abs(row["savings_eur"] - (row["baseline_cost_eur"] - (row["cost_eur"] - row["revenue_eur"]))) < 1e-9
-    # no load forecast at all: the baseline and the saving are unknown, never a fabricated 0
-    unknown = analytics.daily_row_delta(
+
+    # No load and no PV sensor, but a meter and a measured battery flow: the grid identity
+    # g0 = grid - p (SPEC 8.1) is the realised load - pv, so the baseline is knowable and exact.
+    identified = analytics.daily_row_delta(
         None,
         day="2026-01-01",
         dt_hours=1.0,
         grid_kw=2.0,
         load_kw=None,
         pv_kw=None,
-        battery_kw=0.0,
+        battery_kw=-1.0,
+        price_buy=0.30,
+        price_sell=0.10,
+        capacity_kwh=5.0,
+        now=now,
+    )
+    assert abs(identified["baseline_cost_eur"] - 0.30 * 3.0) < 1e-9
+    assert abs(identified["savings_eur"] - (identified["baseline_cost_eur"] - identified["cost_eur"])) < 1e-9
+
+    # No load, no PV, no meter and no battery reading: the load is unknowable, so the baseline and
+    # the saving are unknown, never a fabricated 0.
+    unknown = analytics.daily_row_delta(
+        None,
+        day="2026-01-01",
+        dt_hours=1.0,
+        grid_kw=None,
+        load_kw=None,
+        pv_kw=None,
+        battery_kw=None,
         price_buy=0.30,
         price_sell=0.10,
         capacity_kwh=5.0,
@@ -75,6 +96,37 @@ def test_baseline_is_the_do_nothing_net_cost():
     buckets, totals = analytics.savings_from_daily([unknown], "day", now)
     assert totals["savings_eur"] is None
     assert buckets[0].savings_eur is None
+    assert buckets[0].has_data is True and buckets[0].baseline_cost_eur is None
+
+    # A grid gap poisons the baseline for the whole day, even after a measurable interval.
+    good = analytics.daily_row_delta(
+        None,
+        day="2026-01-01",
+        dt_hours=1.0,
+        grid_kw=1.0,
+        load_kw=1.0,
+        pv_kw=0.0,
+        battery_kw=0.0,
+        price_buy=0.30,
+        price_sell=0.10,
+        capacity_kwh=5.0,
+        now=now,
+    )
+    assert good["baseline_cost_eur"] is not None
+    gap = analytics.daily_row_delta(
+        good,
+        day="2026-01-01",
+        dt_hours=1.0,
+        grid_kw=None,
+        load_kw=1.0,
+        pv_kw=0.0,
+        battery_kw=0.0,
+        price_buy=0.30,
+        price_sell=0.10,
+        capacity_kwh=5.0,
+        now=now,
+    )
+    assert gap["baseline_cost_eur"] is None and gap["savings_eur"] is None
 
 
 def test_savings_daily_buckets_by_range():
@@ -92,8 +144,11 @@ def test_savings_daily_buckets_by_range():
     week_buckets, _ = analytics.savings_from_daily(rows, "week", NOW)
     assert len(week_buckets) == 7  # one bucket per day, empty days included
     assert week_buckets[-1].key == "2026-01-01"
-    # 7-day window = Dec 26 .. Jan 1: Dec 31 + Jan 1
-    assert abs(sum(bucket.savings_eur for bucket in week_buckets) - 3.0) < 1e-9
+    # Empty days carry no baseline: unknown, not 0, so only the measured buckets contribute.
+    assert all(bucket.has_data for bucket in week_buckets if bucket.savings_eur is not None)
+    assert abs(sum(bucket.savings_eur or 0.0 for bucket in week_buckets) - 3.0) < 1e-9
+    empty = [bucket for bucket in week_buckets if not bucket.has_data]
+    assert empty and all(bucket.baseline_cost_eur is None for bucket in empty)
 
     month_buckets, month_totals = analytics.savings_from_daily(rows, "month", NOW)
     assert len(month_buckets) == 30
@@ -118,6 +173,33 @@ def test_savings_savings_is_baseline_minus_actual():
     rows = [daily_row("2026-01-01", cost_eur=1.0, revenue_eur=0.1, baseline_cost_eur=1.5)]
     buckets, _ = analytics.savings_from_daily(rows, "day", NOW)
     assert abs(buckets[0].savings_eur - (1.5 - (1.0 - 0.1))) < 1e-9
+
+
+def test_savings_empty_buckets_are_not_covered_periods():
+    """An empty bucket is 'no activity', not a covered 0.00 period (the live 25-of-30 bug)."""
+    rows = [daily_row("2026-01-01", savings=2.0)]
+    buckets, totals = analytics.savings_from_daily(rows, "month", NOW)
+    known = [b for b in buckets if b.baseline_cost_eur is not None]
+    assert len(known) == 1 and known[0].has_data is True
+    empty = [b for b in buckets if not b.has_data]
+    assert len(empty) == 29
+    assert all(b.baseline_cost_eur is None and b.savings_eur is None for b in empty)
+    assert totals["measured_periods"] == 1.0 and totals["baseline_periods"] == 1.0
+    assert abs(totals["savings_eur"] - 2.0) < 1e-9
+    assert abs(totals["buckets"] - 30.0) < 1e-9
+
+
+def test_savings_partially_covered_bucket_is_unknown():
+    """A bucket mixing a known and an unknown baseline is unknown as a whole, never partial."""
+    rows = [
+        {"day": "2026-01-01", "cost_eur": 0.0, "revenue_eur": 0.0, "baseline_cost_eur": 1.0},
+        {"day": "2026-01-01", "cost_eur": 1.0, "revenue_eur": 0.0, "baseline_cost_eur": None},
+    ]
+    buckets, totals = analytics.savings_from_daily(rows, "day", NOW)
+    assert buckets[0].has_data is True
+    assert buckets[0].baseline_cost_eur is None and buckets[0].savings_eur is None
+    assert totals["baseline_cost_eur"] is None and totals["savings_eur"] is None
+    assert totals["baseline_periods"] == 0.0 and totals["measured_periods"] == 1.0
     assert isinstance(buckets[0], SavingsBucket)
     assert analytics.BASELINE_NOTE.startswith("Baseline:")
 

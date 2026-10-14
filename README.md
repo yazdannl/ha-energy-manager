@@ -386,12 +386,17 @@ The shipped defaults cannot move hardware, and the guarantees are enforced in co
 
 For every metered interval the add-on recomputes the import cost and the export revenue from the
 metered load and PV with the battery power set to zero, and compares that with what actually
-happened. Including the export credit is deliberate: leaving it out made a household with no battery
-look like it was saving money.
+happened. When there is no load or PV sensor but there is a grid meter and a measured battery flow,
+it uses the grid identity instead — the battery's own net contribution is removed from the metered
+grid (`load − pv = grid − p`), which is the same realised consumption and needs no extra sensor.
+Including the export credit is deliberate: leaving it out made a household with no battery look like
+it was saving money.
 
-If the load for an interval is not knowable (no load entity mapped and no grid sensor to derive it
-from), the baseline cannot be computed: the baseline and the savings for that bucket are reported as
-**unknown** — the UI shows `--` rather than a fabricated zero.
+If the realised load still cannot be re-priced (no load/PV reading, no grid + battery pair, or no
+price for the side the baseline lands on), the baseline cannot be computed: the baseline and the
+savings for that bucket are reported as **unknown** — the UI shows `--` rather than a fabricated
+zero. A period with no stored rows is *no activity*, not a covered zero-cost period, and is not
+counted in the baseline coverage.
 
 Baselines are computed **before** old raw rows are trimmed and stored in `savings_daily`, so the
 history stays comparable across retention limits.

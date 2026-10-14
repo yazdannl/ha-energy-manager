@@ -662,8 +662,9 @@ def test_savings_totals_include_the_split(wired):
     assert "arbitrage_kwh" in body["totals"], body["totals"]
     assert "self_consumption_kwh" in body["totals"], body["totals"]
     assert "cycles" in body["totals"]
+    assert "measured_periods" in body["totals"] and "baseline_periods" in body["totals"]
     assert body["range"] == "day"
-    assert body["buckets"] and {"key", "start", "end", "savings_eur", "baseline_cost_eur"} <= set(
+    assert body["buckets"] and {"key", "start", "end", "savings_eur", "baseline_cost_eur", "has_data"} <= set(
         body["buckets"][0]
     )
     # unknown range is a 400

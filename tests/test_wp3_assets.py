@@ -309,7 +309,7 @@ def test_savings_unknown_state_copy():
     app = read(WEB / "app.js")
     assert "Baseline and savings are unknown for this range" in app
     assert "Unknown is not zero" in app
-    assert "no load forecast for this range" in app
+    assert "could not be re-priced against a baseline" in app
     assert "skipped, not plotted as zero" in app
     charts = read(WEB / "charts.js")
     assert "No baseline or savings to plot for this range" in charts

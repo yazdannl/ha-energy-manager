@@ -568,6 +568,14 @@ function classTokens(text) {
   check("the savings view states measured-series coverage",
     /Measured-series coverage/.test(savingsText) && /battery \d+ of \d+/.test(savingsText),
     savingsText.slice(0, 200));
+  const coverage = A.savingsCoverage([
+    { has_data: false, baseline_cost_eur: null },
+    { has_data: true, baseline_cost_eur: null },
+    { has_data: true, baseline_cost_eur: 1.2 }
+  ]);
+  check("savings coverage counts data-bearing buckets only, never empty periods",
+    coverage.withData.length === 2 && coverage.covered.length === 1,
+    JSON.stringify({ withData: coverage.withData.length, covered: coverage.covered.length }));
   const savingsCells = view().querySelectorAll("td").map((node) => node.textContent);
   check("an unmeasured bucket reports its cycle energy as unknown, not planned",
     savingsCells.indexOf("-- (unmeasured)") >= 0);

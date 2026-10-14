@@ -4232,13 +4232,31 @@
   // Source of truth: energy_manager/app/analytics.py BASELINE_NOTE (returned as `baseline_note`).
   var BASELINE_FALLBACK = "Baseline: the same measured consumption at the same prices with the battery doing nothing. Savings = baseline cost - actual cost.";
 
+  // Baseline coverage must count only buckets that carry measured rows.  An empty bucket has no
+  // activity to re-price, so it must never look like a covered period (the bug that made a month
+  // of empty days display "Baseline available for 25 of 30 periods" with a 0.00 EUR total).
+  // `has_data` is additive; an older API without it keeps its buckets treated as measured.
+  function savingsCoverage(buckets) {
+    var withData = buckets.filter(function (b) { return b.has_data !== false; });
+    return {
+      withData: withData,
+      covered: withData.filter(function (b) { return b.baseline_cost_eur != null; })
+    };
+  }
+
   function renderSavingsTotals(body, payload) {
     var t = payload.totals || {};
     var buckets = Array.isArray(payload.buckets) ? payload.buckets : [];
-    var covered = buckets.filter(function (b) { return b.baseline_cost_eur != null; });
+    var cov = savingsCoverage(buckets);
+    var covered = cov.covered;
+    var withData = cov.withData;
     var savingsKnown = isNum(t.savings_eur);
     var baselineKnown = isNum(t.baseline_cost_eur);
-    var reason = (!savingsKnown || !baselineKnown) ? "unknown — no load forecast for this range" : "";
+    var reason = (!savingsKnown || !baselineKnown)
+      ? (withData.length
+          ? "unknown — the realised load could not be re-priced against a baseline"
+          : "unknown — no measured activity in this range yet")
+      : "";
     // Loss, unknown and stale are three different states and never share one visual treatment
     // (UI_REVIEW §3.6).
     function savingsCard() {
@@ -4262,17 +4280,21 @@
     ]);
     body.appendChild(cards);
     // Coverage first: a partial baseline is scope, not a total (UI_REVIEW §3.6).
-    var missing = buckets.length - covered.length;
-    if (buckets.length && covered.length && covered.length < buckets.length) {
+    var missing = withData.length - covered.length;
+    if (withData.length && covered.length && covered.length < withData.length) {
       body.appendChild(el("div", { class: "banner banner-warn" }, [
-        el("p", { class: "banner-title", text: "Baseline available for " + covered.length + " of " + buckets.length + " periods" }),
-        el("p", { text: "The saving and the baseline cost describe only the periods with a load forecast. " + missing + " period" + (missing === 1 ? " has" : "s have") + " no baseline, so " + (missing === 1 ? "its" : "their") + " cost is not part of the comparison — the whole-range import/export/PV figures below still cover every period." })
+        el("p", { class: "banner-title", text: "Baseline available for " + covered.length + " of " + withData.length + " measured periods" }),
+        el("p", { text: "The saving and the baseline cost describe only the measured periods that could be re-priced. " + missing + " measured period" + (missing === 1 ? " has" : "s have") + " no baseline, so " + (missing === 1 ? "its" : "their") + " cost is not part of the comparison — the whole-range import/export/PV figures below still cover every period." })
       ]));
+    }
+    if (buckets.length && withData.length < buckets.length) {
+      var empty = buckets.length - withData.length;
+      body.appendChild(el("p", { class: "legend-note", text: empty + " of " + buckets.length + " periods in this range have no recorded activity, so they carry no baseline and no saving." }));
     }
     if (!savingsKnown || !baselineKnown) {
       body.appendChild(el("div", { class: "banner banner-warn" }, [
         el("p", { class: "banner-title", text: "Baseline and savings are unknown for this range" }),
-        el("p", { text: "The server reports null because there is no load forecast to re-price the metered intervals against. Unknown is not zero: the add-on will not guess a saving without the load. Buckets that are knowable are still summed and shown." })
+        el("p", { text: "The server reports null because the realised load for these periods could not be re-priced against a do-nothing baseline. Unknown is not zero: the add-on will not guess a saving. Periods that are knowable are still summed and shown." })
       ]));
     }
     // Comparable figures: baseline and actual net cost over the same covered periods.
@@ -4329,20 +4351,25 @@
   function renderSavingsBuckets(body, payload) {
     var buckets = Array.isArray(payload.buckets) ? payload.buckets : [];
     if (!buckets.length) { body.appendChild(el("p", { class: "muted", text: "No buckets in this range yet." })); return; }
-    var covered = buckets.filter(function (b) { return b.baseline_cost_eur != null; }).length;
-    if (covered < buckets.length) {
-      body.appendChild(el("p", { class: "legend-note", text: covered + " of " + buckets.length + " buckets have a baseline (a load forecast to re-price against). A bucket without one shows -- for baseline and savings: unknown, not zero." }));
+    var cov = savingsCoverage(buckets);
+    if (cov.covered.length < cov.withData.length) {
+      body.appendChild(el("p", { class: "legend-note", text: cov.covered.length + " of " + cov.withData.length + " measured buckets have a baseline (a load the meter and battery could be re-priced against). A bucket without one shows -- for baseline and savings: unknown, not zero." }));
     }
     var rows = buckets.map(function (b) {
       var flow = function (key, fmt) { return b[key] == null ? "--" : fmt(b[key]); };
+      // A bucket with no stored row is "no recorded activity", not a measured zero.
+      var val = function (key, fmt) {
+        if (b.has_data === false || b[key] == null) return "--";
+        return fmt(b[key]);
+      };
       return [
         b.key || "",
         fmtDateTime(b.start) + " – " + fmtDateTime(b.end),
-        fmtKwh(b.import_kwh),
-        fmtKwh(b.export_kwh),
-        fmtKwh(b.pv_kwh),
-        fmtEur(b.cost_eur),
-        fmtEur(b.revenue_eur),
+        val("import_kwh", fmtKwh),
+        val("export_kwh", fmtKwh),
+        val("pv_kwh", fmtKwh),
+        val("cost_eur", fmtEur),
+        val("revenue_eur", fmtEur),
         b.baseline_cost_eur == null ? "--" : fmtEur(b.baseline_cost_eur),
         b.savings_eur == null ? "--" : fmtEur(b.savings_eur),
         b.battery_measured ? (isNum(b.cycles) ? b.cycles.toFixed(2) + " cycles" : "--") : "-- (unmeasured)",
@@ -4370,7 +4397,7 @@
     });
     select.addEventListener("change", function () { root.location.hash = "#/savings?range=" + select.value; });
     controls.body.appendChild(el("div", { class: "toolbar" }, [el("label", { for: "savings-range" }, ["Range ", select])]));
-    controls.body.appendChild(el("p", { class: "legend-note", text: "Savings are computed from the stored actuals and the same prices, so trimming history never changes them. Baseline and savings are null (shown as --) when there is no load forecast to re-price against. Measured battery flows count only confirmed measurements — a dry-run, blocked or unconfirmed setpoint earns nothing." }));
+    controls.body.appendChild(el("p", { class: "legend-note", text: "Savings are computed from the stored actuals and the same prices, so trimming history never changes them. Baseline and savings are null (shown as --) when the realised load cannot be re-priced: there is no load/PV reading and no meter + battery pair to derive it from. Measured battery flows count only confirmed measurements — a dry-run, blocked or unconfirmed setpoint earns nothing." }));
 
     asyncPanel(host, "Totals", { load: load, render: renderSavingsTotals });
     asyncPanel(host, "Savings vs baseline", {
@@ -5760,6 +5787,7 @@
     fmtKwh: fmtKwh,
     fmtPrice: fmtPrice,
     fmtEur: fmtEur,
+    savingsCoverage: savingsCoverage,
     fmtPct: fmtPct,
     fmtDuration: fmtDuration,
     timeAgo: timeAgo,

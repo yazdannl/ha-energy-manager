@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.22.1
+
+- **The Savings view works on an install with no load or PV sensor.** The baseline was only ever
+  computed from a *measured* `load_w`, so a meter + battery setup with no load/PV entity stored
+  `baseline_cost_eur = NULL` for every interval and the whole section reported `--` forever. The
+  do-nothing baseline now falls back to the grid identity `g0 = grid − battery` (exactly `load − pv`,
+  SPEC §8.1) when there is no load/PV reading; metered `load − pv` still wins when both exist. No
+  forecast is used — the baseline prices the same realised kWh. A missing buy/sell price on the side
+  the baseline lands on, or a grid gap, now makes the baseline unknown rather than pricing it at 0.
+- **Empty periods are no longer counted as covered.** `savings_from_daily` left buckets with no
+  stored rows at their default `baseline_cost_eur = 0`, so a month with 4 days of history claimed
+  "Baseline available for 25 of 30 periods" and compared 0.00 EUR with 0.00 EUR. Such buckets now
+  report `null` baseline/savings plus an additive `has_data` flag, a bucket mixing a known and an
+  unknown baseline is unknown as a whole, and totals add `measured_periods`/`baseline_periods`. The
+  UI counts coverage from `has_data` and shows `--` (not `0.00`) for periods with no activity.
+- **`sensor.sem_savings_today` no longer fabricates a zero.** A null saving published `0.0` EUR and
+  `month_eur`/`year_eur` did the same; it now publishes `unknown` (and `null` attributes). Its
+  `baseline_kwh` attribute also read a `battery_cycles` key the totals never had and silently
+  published `import − export` instead of the do-nothing net grid energy; it is now
+  `import − export − charged + discharged`, or `null` when the baseline is unknown.
+- Additive API fields: a savings bucket gains `has_data`; totals gain `measured_periods` and
+  `baseline_periods`. Rows written before this release keep their stored NULL baseline (no backfill),
+  so older history stays `--` and only new ticks get a baseline.
+
 ## 0.22.0
 
 - **A learned PV model, trained offline and served from the committed artifact** (`solar.source =

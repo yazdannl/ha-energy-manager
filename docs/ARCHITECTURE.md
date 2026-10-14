@@ -212,9 +212,14 @@ rows are gone.
 `savings = baseline − actual`, where the baseline is the **do-nothing net cost** of the same realised
 consumption: the import cost at the same prices minus the export revenue the same PV surplus would
 have earned, with no battery flows. The export credit is included deliberately — omitting it made a
-battery-less household look like it was saving money. When the load for an interval cannot be
-established (no load entity and no grid sensor to derive it from), the baseline is not knowable and
-both the baseline and the savings for that bucket are reported as `null` (unknown), never as zero. It
+battery-less household look like it was saving money. The realised do-nothing grid power comes from
+the metered load and PV when both exist, and otherwise from the grid identity `grid − p`
+(SPEC 8.1: `grid = load − pv + p`), so a meter-and-battery installation with no load or PV sensor
+still gets an exact baseline. No forecast is used: the baseline prices the same realised kWh. When
+the load cannot be established (no load/PV reading and no grid + battery pair, or no price on the
+side the baseline lands on), the baseline is not knowable and both the baseline and the savings for
+that bucket are reported as `null` (unknown), never as zero. A bucket with no stored rows is "no
+activity", carries `has_data: false` and is likewise unknown, never a covered 0.00 period. It
 is recomputed per day from the `actuals` rows before trimming, and the same definition is shown in
 the UI and in the README. It is a counterfactual re-pricing rather than a measured bill change, and
 it only covers price components present in the selected price series.

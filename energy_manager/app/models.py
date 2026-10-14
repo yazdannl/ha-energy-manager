@@ -620,6 +620,10 @@ class SavingsBucket:
     load_measured: bool = False
     pv_measured: bool = False
     battery_measured: bool = False
+    # Additive (0.22.1): whether any stored row fell in this bucket.  False is "no recorded
+    # activity" (the bucket is listed for a steady chart), which is different from a bucket that
+    # has data but no knowable baseline.  Both report baseline/savings as None.
+    has_data: bool = False
 
 
 @dataclass

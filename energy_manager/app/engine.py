@@ -2850,6 +2850,28 @@ class Engine:
         """Per-day coverage flag: 1 only when every interval measured that series."""
         return int(self._savings_today.get(key) or 0)
 
+    @staticmethod
+    def _baseline_grid_kwh(totals: Mapping[str, Any]) -> float | None:
+        """Do-nothing net grid energy (kWh) for a savings range, or ``None`` when unknowable.
+
+        ``baseline = actual - p``: the metered net grid minus the battery's own net contribution
+        (``charged - discharged``).  Unknown when the range has no knowable baseline or no measured
+        battery flow -- never a fabricated zero.
+        """
+        if totals.get("baseline_cost_eur") is None:
+            return None
+        charged = totals.get("charged_kwh")
+        discharged = totals.get("discharged_kwh")
+        if charged is None or discharged is None:
+            return None
+        return round(
+            float(totals.get("import_kwh") or 0.0)
+            - float(totals.get("export_kwh") or 0.0)
+            - float(charged)
+            + float(discharged),
+            2,
+        )
+
     def _replan_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -3844,9 +3866,6 @@ class Engine:
             if config is not None and battery.soc_pct is not None:
                 if battery.soc_pct <= max(config.min_soc_pct, 0.0) + 1.0:
                     at_floor = True
-        capacity_kwh = sum(
-            float(config.capacity_kwh or 0.0) for config in configs.values() if config.enabled
-        )
         # Cost basis (SPEC 5/12, 0.18.0): the fleet's energy-weighted mean basis and the value of
         # the AC-equivalent energy held. No ledger means "unknown", never a fabricated 0.
         basis_block = self.cost_basis_block()
@@ -3935,21 +3954,31 @@ class Engine:
                 },
             ),
             SEM_SAVINGS: (
-                round(float(today.get("savings_eur") or 0.0), 2),
+                # Unknown is not zero (SPEC 11): a range with no knowable baseline publishes
+                # "unknown" rather than a fabricated 0.00 EUR (audit finding 13).
+                (
+                    round(float(today["savings_eur"]), 2)
+                    if today.get("savings_eur") is not None
+                    else "unknown"
+                ),
                 {
                     "friendly_name": "Smart Energy Manager savings today",
                     "unit_of_measurement": "EUR",
-                    "month_eur": round(float(month.get("savings_eur") or 0.0), 2),
-                    "year_eur": round(float(year.get("savings_eur") or 0.0), 2),
-                    # Do-nothing grid energy: what the meter would have seen with the battery
-                    # idle, estimated from the stored row (audit minor: `baseline_kwh` used to be
-                    # a stored key that nothing ever wrote).
-                    "baseline_kwh": round(
-                        float(today.get("import_kwh") or 0.0)
-                        - float(today.get("export_kwh") or 0.0)
-                        + float(today.get("battery_cycles") or 0.0) * capacity_kwh,
-                        2,
+                    "month_eur": (
+                        round(float(month["savings_eur"]), 2)
+                        if month.get("savings_eur") is not None
+                        else None
                     ),
+                    "year_eur": (
+                        round(float(year["savings_eur"]), 2)
+                        if year.get("savings_eur") is not None
+                        else None
+                    ),
+                    # Do-nothing net grid energy: the metered net grid minus the battery's own
+                    # net contribution (``baseline = actual - p``), or None when the baseline is
+                    # unknown. The old value read a ``battery_cycles`` key the totals never had
+                    # and quietly published import - export as if it were the baseline.
+                    "baseline_kwh": self._baseline_grid_kwh(today),
                 },
             ),
             SEM_SOC_AVG: (

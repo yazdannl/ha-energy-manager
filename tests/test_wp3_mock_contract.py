@@ -605,7 +605,7 @@ def test_savings_and_accuracy_payloads(fixtures):
         ), "mock baseline_note must match analytics.BASELINE_NOTE verbatim"
         for bucket in payload["buckets"]:
             assert_fields(bucket, ["key", "start", "end", "import_kwh", "export_kwh", "pv_kwh", "cost_eur",
-                                   "revenue_eur", "baseline_cost_eur", "savings_eur", "cycles"], "SavingsBucket")
+                                   "revenue_eur", "baseline_cost_eur", "savings_eur", "cycles", "has_data"], "SavingsBucket")
             if bucket["baseline_cost_eur"] is None:
                 assert bucket["savings_eur"] is None, "unknown baseline must imply unknown savings, never 0"
         known = [b for b in payload["buckets"] if b["baseline_cost_eur"] is not None]

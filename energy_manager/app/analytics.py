@@ -126,8 +126,11 @@ def savings_from_daily(
     arbitrage_kwh = 0.0
     self_consumption_kwh = 0.0
     # Buckets whose rows carried no usable baseline: their savings are unknown, not zero.  An
-    # empty bucket stays a plain zero (no activity, nothing to be unsure about).
+    # empty bucket is also unknown: it has no activity to re-price, so it must not look like a
+    # covered 0.00 period (SPEC 11).
     baseline_known: set[str] = set()
+    # Buckets with at least one row whose baseline was unknowable: the whole bucket is unknown.
+    baseline_missing: set[str] = set()
     bucket_rows: set[str] = set()
     # Per-bucket coverage of each measured series and per-bucket sums of the measured battery
     # flows.  A series is covered only when every row in the bucket had it; a flow is known only
@@ -174,19 +177,31 @@ def savings_from_daily(
         bucket.cost_eur += float(row.get("cost_eur") or 0.0)
         bucket.revenue_eur += float(row.get("revenue_eur") or 0.0)
         bucket_rows.add(key)
-        if row.get("baseline_cost_eur") is not None:
+        if row.get("baseline_cost_eur") is None:
+            # One interval the load could not be re-priced against makes the whole bucket
+            # unknown: a partially covered bucket must never look comparable when it is not.
+            baseline_missing.add(key)
+        else:
             baseline_known.add(key)
             bucket.baseline_cost_eur += float(row.get("baseline_cost_eur") or 0.0)
         bucket.cycles += float(row.get("battery_cycles") or 0.0)
-        if key in baseline_known:
-            bucket.savings_eur = bucket.baseline_cost_eur - (bucket.cost_eur - bucket.revenue_eur)
 
     ordered = []
     for key in sorted(buckets):
         bucket = buckets[key]
-        if key in bucket_rows and key not in baseline_known:
+        has_data = key in bucket_rows
+        baseline_knowable = has_data and key in baseline_known and key not in baseline_missing
+        if not baseline_knowable:
+            # No rows at all, or a row whose load/grid could not be re-priced: unknown, never a
+            # fabricated zero.  An empty bucket therefore has no baseline to be "covered" by, so
+            # the UI can no longer mislabel four empty days as four covered periods (SPEC 11).
             bucket = replace(bucket, baseline_cost_eur=None, savings_eur=None)
-        if key in bucket_rows:
+        else:
+            bucket = replace(
+                bucket,
+                savings_eur=bucket.baseline_cost_eur - (bucket.cost_eur - bucket.revenue_eur),
+            )
+        if has_data:
             known = flow_known.get(key, set())
             sums = flow_sums.get(key, {})
             bucket = replace(
@@ -194,12 +209,17 @@ def savings_from_daily(
                 **{name: (float(sums.get(name, 0.0)) if name in known else None) for name in MEASURED_FLOWS},
                 **{f"{name}_measured": name in measured_series.get(key, set()) for name in MEASURED_SERIES},
             )
+        bucket = replace(bucket, has_data=has_data)
         ordered.append(bucket)
 
     def _total_flow(name: str) -> float | None:
         values = [getattr(b, name) for b in ordered if getattr(b, name) is not None]
         return sum(values) if values else None
 
+    # Only fully covered buckets contribute a total; an empty or partially covered bucket must not
+    # be silently added as zero (SPEC 11).
+    known_buckets = [b for b in ordered if b.baseline_cost_eur is not None]
+    measured_buckets = [b for b in ordered if b.has_data]
     totals = {
         "import_kwh": sum(b.import_kwh for b in ordered),
         "export_kwh": sum(b.export_kwh for b in ordered),
@@ -207,16 +227,21 @@ def savings_from_daily(
         "cost_eur": sum(b.cost_eur for b in ordered),
         "revenue_eur": sum(b.revenue_eur for b in ordered),
         "baseline_cost_eur": (
-            sum(float(b.baseline_cost_eur or 0.0) for b in ordered) if baseline_known else None
+            sum(float(b.baseline_cost_eur) for b in known_buckets) if known_buckets else None
         ),
         "savings_eur": (
-            sum(float(b.savings_eur or 0.0) for b in ordered) if baseline_known else None
+            sum(float(b.savings_eur) for b in known_buckets) if known_buckets else None
         ),
         "cycles": sum(b.cycles for b in ordered),
         "arbitrage_kwh": arbitrage_kwh,
         "self_consumption_kwh": self_consumption_kwh,
         "battery_throughput_kwh": arbitrage_kwh + self_consumption_kwh,
         "buckets": float(len(ordered)),
+        # Additive (0.22.1): how much of the range actually has measured rows, and how much of
+        # that could be re-priced.  The UI states coverage from these counts instead of guessing
+        # from a baseline that empty buckets used to carry as 0.
+        "measured_periods": float(len(measured_buckets)),
+        "baseline_periods": float(len(known_buckets)),
         # Additive (0.13.0): measured battery flows and how many buckets actually measured each
         # series.  ``None`` for a flow means no bucket in this range had a complete measurement.
         "charged_kwh": _total_flow("charged_kwh"),
@@ -249,6 +274,12 @@ def daily_row_delta(
     ``battery_kw`` must be a *measured* flow; ``None`` means no confirmed measurement for this
     interval, which makes the day's battery flows and cycle count unknown rather than a planned
     value (0.13.0).  The grid/load/PV coverage flags record which measured series were present.
+
+    The do-nothing baseline needs the realised ``load - pv`` for the interval.  It is taken from
+    the metered load and PV when both exist, and otherwise from the grid identity
+    ``load - pv = grid - p`` (SPEC 8.1), so a meter + battery installation with no load or PV
+    sensor still gets a baseline.  No forecast is used: the baseline prices the same *realised*
+    kWh, which a forecast would not.
     """
     row = dict(previous or {})
     row["day"] = day
@@ -263,11 +294,30 @@ def daily_row_delta(
     # load/PV and tariff (import cost minus export revenue).  Omitting the export credit made a
     # no-battery household look like it was saving money, and a missing load forecast silently
     # turned the whole bill into "negative savings" (audit finding 13).
+    #
+    # The realised do-nothing *grid* power ``g0`` (kW, positive = import) has two measured forms:
+    #   1. metered load and PV: ``g0 = load - pv`` (SPEC 11);
+    #   2. the grid identity ``g0 = grid - p`` (SPEC 8.1: ``grid = load - pv + p``): exact for the
+    #      realised interval and needing neither a load nor a PV sensor.  Its only extra reading is
+    #      the measured battery flow, which the day already needs to earn any credit at all.
+    # Without either, the load is not knowable and the baseline stays unknown -- never a guess.
+    baseline_grid: float | None = None
+    if load_kw is not None and pv_kw is not None:
+        baseline_grid = float(load_kw) - float(pv_kw)
+    elif grid_kw is not None and battery_kw is not None:
+        baseline_grid = float(grid_kw) - float(battery_kw)
     baseline: float | None = None
-    if load_kw is not None:
-        do_nothing_import = max(0.0, float(load_kw) - float(pv_kw or 0.0))
-        do_nothing_export = max(0.0, float(pv_kw or 0.0) - float(load_kw))
-        baseline = buy * do_nothing_import * hours - sell * do_nothing_export * hours
+    if baseline_grid is not None and grid_kw is not None:
+        # The side the baseline lands on needs its price: pricing an unknown buy or sell at 0 would
+        # make the counterfactual look like a real number (audit finding 13).
+        if (baseline_grid > 0.0 and price_buy is None) or (
+            baseline_grid < 0.0 and price_sell is None
+        ):
+            baseline = None
+        else:
+            baseline = (
+                buy * max(0.0, baseline_grid) * hours - sell * max(0.0, -baseline_grid) * hours
+            )
 
     def add(key: str, value: float) -> None:
         row[key] = float(row.get(key) or 0.0) + value
@@ -293,11 +343,10 @@ def daily_row_delta(
     add("pv_kwh", max(0.0, float(pv_kw)) * hours if pv_kw is not None else 0.0)
     add("cost_eur", cost)
     add("revenue_eur", revenue)
-    if baseline is None:
-        # No import baseline is knowable without the load: report "unknown", never a fabricated 0.
-        row["baseline_cost_eur"] = None
-    else:
-        add("baseline_cost_eur", baseline)
+    # The saving compares the baseline with the metered grid, so a grid gap poisons the period's
+    # baseline too: a partially metered day has no knowable actual net cost.  ``add_known`` keeps
+    # that poison sticky, exactly like the measured battery flows (audit finding 13).
+    add_known("baseline_cost_eur", baseline)
     # Measured AC battery flows: only real, confirmed flow earns credit.  This covers charging and
     # discharging (a clamped or ramp-limited write counts what was measured, not what was asked)
     # and prices each leg with the price series in force at flow time.

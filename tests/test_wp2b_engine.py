@@ -413,6 +413,69 @@ def savings_tick(engine, clock, values, batteries, *, minutes=30):
     return dict(engine._savings_today)  # noqa: SLF001
 
 
+def test_savings_baseline_uses_meter_identity_without_load_or_pv_sensor():
+    """The live setup has a meter and a battery, no load/PV sensor: g0 = grid - p still prices it."""
+    engine, _store, _ha, clock, _settings = build_engine()
+    engine.plan_now("test")  # a plan gives the interval its sell price too
+    # Charging 1 kW while importing 0.5 kW means the house would have exported 0.5 kW with the
+    # battery idle (SPEC 8.1: grid = load - pv + p).
+    row = savings_tick(
+        engine, clock, {"grid_w": 500.0, "pv_w": None, "load_w": None},
+        [measured_battery(power_w=1000.0)],
+    )
+    slot = engine.active_plan().slot_at(clock.now)
+    assert row["grid_measured"] == 1 and row["load_measured"] == 0 and row["pv_measured"] == 0
+    assert row["baseline_cost_eur"] is not None
+    assert abs(row["baseline_cost_eur"] - (-slot.sell * 0.25)) < 1e-9  # 0.5 kW export for 0.5 h
+    assert abs(row["savings_eur"] - (row["baseline_cost_eur"] - row["cost_eur"] + row["revenue_eur"])) < 1e-9
+
+
+def test_savings_baseline_unknown_without_any_load_or_meter_reading():
+    """With no load, no PV and no grid/battery pair the load is unknowable: unknown, not zero."""
+    engine, _store, _ha, clock, _settings = build_engine()
+    row = savings_tick(
+        engine, clock, {"grid_w": None, "pv_w": None, "load_w": None},
+        [measured_battery(power_w=1000.0)],
+    )
+    assert row["baseline_cost_eur"] is None
+    assert row["savings_eur"] is None
+
+
+def test_savings_sensor_publishes_unknown_not_zero():
+    """SPEC 11: a null saving is 'unknown', never a fabricated 0.00 EUR on the HA sensor."""
+    engine, store, ha, clock, _settings = build_engine()
+    store.savings = {
+        "2026-01-01": {
+            "import_kwh": 5.0, "export_kwh": 1.0, "cost_eur": 1.2, "revenue_eur": 0.1,
+            "baseline_cost_eur": None, "savings_eur": None,
+            "charged_kwh": None, "discharged_kwh": None,
+        }
+    }
+    engine._savings_cache = None  # noqa: SLF001 - force the publisher to re-read the store
+    engine.publish_states(clock.now)
+    reading = ha.published["sensor.sem_savings_today"]
+    assert reading["state"] == "unknown"
+    assert reading["attributes"]["month_eur"] is None
+    assert reading["attributes"]["year_eur"] is None
+    assert reading["attributes"]["baseline_kwh"] is None
+
+    # A knowable baseline with measured flows publishes the do-nothing net grid energy
+    # (baseline = actual net grid - p), not the old import - export mislabelled as "baseline".
+    store.savings = {
+        "2026-01-01": {
+            "import_kwh": 5.0, "export_kwh": 1.0, "cost_eur": 1.2, "revenue_eur": 0.1,
+            "baseline_cost_eur": 1.5, "savings_eur": 0.4,
+            "charged_kwh": 2.0, "discharged_kwh": 1.0,
+        }
+    }
+    engine._savings_cache = None  # noqa: SLF001
+    clock.advance(seconds=60)  # SPEC 12 publish throttle
+    engine.publish_states(clock.now)
+    reading = ha.published["sensor.sem_savings_today"]
+    assert reading["state"] == "0.4"
+    assert reading["attributes"]["baseline_kwh"] == 3.0  # 5 - 1 - 2 + 1
+
+
 def test_savings_never_credits_a_dry_run_command():
     """A dry-run/advisory dispatch writes nothing; the generic setpoint read-back is not energy."""
     engine, store, _ha, clock, _settings = build_engine()

@@ -562,6 +562,10 @@ def savings_bucket_dict(bucket: SavingsBucket) -> dict[str, Any]:
         "load_measured": bucket.load_measured,
         "pv_measured": bucket.pv_measured,
         "battery_measured": bucket.battery_measured,
+        # Additive (0.22.1): False = no stored row in this bucket (compared with a measured row
+        # whose baseline is unknown).  Both carry None baseline/savings; only a data-bearing bucket
+        # can appear in the baseline coverage counts.
+        "has_data": bucket.has_data,
     }
 
 

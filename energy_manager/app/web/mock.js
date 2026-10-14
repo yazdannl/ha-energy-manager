@@ -881,7 +881,8 @@
         grid_measured: true,
         load_measured: known,
         pv_measured: true,
-        battery_measured: batteryOk
+        battery_measured: batteryOk,
+        has_data: true
       });
     }
     return out;
@@ -904,6 +905,7 @@
       arbitrage_kwh: 2.1 * buckets.length, self_consumption_kwh: 3.8 * buckets.length,
       battery_throughput_kwh: 5.9 * buckets.length, buckets: buckets.length,
       charged_kwh: null, discharged_kwh: null, charge_cost_eur: null, discharge_value_eur: null,
+      measured_periods: 0, baseline_periods: 0,
       measured_buckets: { grid: 0, load: 0, pv: 0, battery: 0 }
     };
     var knownBaseline = false;
@@ -928,6 +930,8 @@
         totals.baseline_cost_eur += b.baseline_cost_eur;
         totals.savings_eur += b.savings_eur || 0;
       }
+      if (b.has_data !== false) totals.measured_periods += 1;
+      if (b.baseline_cost_eur !== null) totals.baseline_periods += 1;
     });
     if (!knownBaseline) {
       totals.baseline_cost_eur = null;
