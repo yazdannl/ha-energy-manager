@@ -397,7 +397,9 @@ a hidden field holding a non-default value is still surfaced):
 Always-visible price keys: the provider/contract selectors, the adders and fees
 (`price.vat_pct`, `price.energy_tax_eur_per_kwh`, `price.import_fee_eur_per_kwh`,
 `price.export_fee_eur_per_kwh`, `price.unit`, `price.scale_divisor`) and the feed-in path
-(`price.feed_in_eur_per_kwh`, `price.feed_in_entity`, `price.feed_in_tax_inclusive`).
+(`price.feed_in_eur_per_kwh`, `price.feed_in_entity`, `price.feed_in_tax_inclusive`,
+`price.feed_in_mode`, `price.energy_tax_confirmed`, `price.feed_in_tax_deduction_eur_per_kwh`,
+`price.saldering_assume_nettable`).
 
 Always-visible solar keys: `solar.source`, `solar.enabled`, `solar.bias_correction`,
 `solar.measured_entity`, `solar.sources`, `solar.merge_strategy`. The `solar.sources` editor is a
@@ -538,6 +540,10 @@ is the authority for the `advanced` classification (the test suite asserts the e
 | `price.feed_in_entity` | str | `""` | — | **Feed-in price entity** *(advanced)* |
 | `price.feed_in_tax_inclusive` | bool | `true` | — | **Feed-in incl. VAT** *(advanced)* — off = add `price.vat_pct` |
 | `price.feed_in_energy_tax_refund` | bool | `true` | — | **Energy tax refunded** — on = feed-in pays the same consumer price minus the feed-in cost; off = the energy-tax component is not paid back and is subtracted too |
+| `price.feed_in_mode` | choice `derived\|explicit\|buy_minus_fee\|saldering\|tiered` | `derived` | — | **Feed-in contract** — how export is credited. `derived` = the pre-stage-1b rule (the live forecast path). The others are priced by `sources/feed_in.py`, which is exact-or-refuse (`unpriced_export`) and **not wired into the live forecast yet**: until the optimizer consumes the complete result, the forecast keeps using the derived price |
+| `price.energy_tax_confirmed` | bool | `false` | — | **Energy tax confirmed** — on = the energy-tax component is a stated value, including a confirmed `0`; with the refund off, an unconfirmed component refuses the export leg instead of pricing `sell = buy` |
+| `price.feed_in_tax_deduction_eur_per_kwh` | float, nullable | `null` | 0…1 | **Feed-in tax deduction** — per-kWh tax/levy deducted from the feed-in price once saldering ends. Unset = use the slot's own energy-tax component |
+| `price.saldering_assume_nettable` | bool | `false` | — | **Assume nettable** — `saldering` only: when the period import/export state is unavailable, assume this period still has nettable import (an assumption shown in the plan, never a fact) |
 
 #### Solar
 
@@ -920,6 +926,34 @@ overnight. Returns `None` when nothing matches.
 A configured feed-in source that cannot be read degrades to the derived price with a note — pricing
 export must never fail the buy forecast. Only an explicit `price.feed_in_eur_per_kwh = 0` forces a
 zero sell price. `optimizer.allow_export` defaults to off, so nothing exports until the user asks.
+
+**Contract-correct feed-in accounting (optimizer v2 stage 1b, `sources/feed_in.py`).** The module
+`settle_feed_in(settings, slots, period_state, limits)` is *exact-or-refuse*: `explicit` and
+`buy_minus_fee` are exogenous and energy-only, so exact; `saldering` is exact only while the period
+allowance `I − E` covers the reachable export bound; `tiered` is exact only while the reachable
+volume stays below the next tier boundary. Anything else refuses the *battery-sourced* export leg
+(`Reason.UNPRICED_EXPORT`) and prices forced PV export at `forced_export_price_floor`, the minimum
+over every reachable settlement rate; when even that bound is unknown the result's `floor` is `None`
+and no tariff-dependent optimisation may run. The reachable export bound is
+`Σ min(export limit, max(0, pv − load) + max_discharge_power) · dt` and is deliberately **not**
+capped by the pack's energy (PV surplus can export without the battery, and a grid recharge can feed
+a later discharge); any missing, malformed or non-finite bound means *unknown*, never zero.
+`saldering` settles import first inside a slot (`eligible = min(export, max(0, I + import − E))`,
+excess at the post-saldering feed-in price) and needs the period state; without it, or without the
+reachability limits, it refuses, and `price.saldering_assume_nettable` only applies when the state is
+unavailable (supplied state wins). Malformed inputs — a non-finite or negative explicit tariff, a
+confirmed but missing slot tax, an unresolved configured feed-in entity, a tier table that is not
+strictly increasing with finite rates, negative PV/load samples or negative cumulative period
+imports/exports/tier volumes — refuse whole rather than being repaired into a number. The derived
+`buy − fee − tax` post-saldering rate is used only when no explicit source is configured; a
+configured source that is unresolved or invalid refuses instead, because a derived rate could exceed
+the real explicit rate and break the lower-bound guarantee.
+The module rejects `price.feed_in_mode = derived` outright: that rule is the live legacy path in
+`_apply_feed_in`, and re-implementing it here would risk diverging from what actually prices the
+forecast. The live forecast path does **not** call the module yet: `price.feed_in_mode` is config-only
+until the optimizer consumes the complete result (`export_allowed`/`reason`/`floor`), so a refusal
+can never be silently degraded into zero-priced slots. The `period_state` and `limits` inputs are not
+yet wired to real sensors or the optimizer — this stage ships the accounting only.
 
 ### 4.3 Solar formulas
 

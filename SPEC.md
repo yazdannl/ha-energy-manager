@@ -195,6 +195,10 @@ price.feed_in_eur_per_kwh  null  # explicit flat feed-in tariff; null = derive i
 price.feed_in_entity       ""    # optional HA sensor with the live feed-in price (overrides the flat tariff)
 price.feed_in_tax_inclusive true  # false = add price.vat_pct to the flat tariff/entity value
 price.feed_in_energy_tax_refund true  # false = the energy-tax component is not paid back on feed-in
+price.feed_in_mode       derived|explicit|buy_minus_fee|saldering|tiered  # derived = pre-1b rule (byte-for-byte)
+price.energy_tax_confirmed false # true = the energy-tax component is a stated value, including a confirmed 0
+price.feed_in_tax_deduction_eur_per_kwh null  # stated per-kWh tax/levy after saldering; null = slot component
+price.saldering_assume_nettable false # saldering only: assume the period allowance is still positive
 price.unit               auto|eur_per_kwh|eur_per_mwh|micro_eur_per_kwh
 price.scale_divisor      1.0   # fixed-point divisor for providers publishing integers (per source)
 price.bzn                NL    # bidding zone for the energy_charts day-ahead source
@@ -1548,7 +1552,8 @@ the authority: the test suite asserts the exact set in both directions. The esse
 keys are now only the ones the setup cards and the safety group need:
 
 `mode`, `dry_run`, `notify.enabled`, `price.provider`, `price.export_fee_eur_per_kwh`,
-`price.feed_in_energy_tax_refund`, the fixed rates (`price.fixed_price_eur_per_kwh`,
+`price.feed_in_energy_tax_refund`, `price.feed_in_mode`, `price.energy_tax_confirmed`,
+`price.feed_in_tax_deduction_eur_per_kwh`, `price.saldering_assume_nettable`, the fixed rates (`price.fixed_price_eur_per_kwh`,
 `price.fixed_day_price_eur_per_kwh`, `price.fixed_night_price_eur_per_kwh`), `grid.power_entity`,
 `solar.enabled`, `solar.source`, `solar.measured_entity`, `optimizer.horizon_hours`,
 `optimizer.allow_grid_charge`, `optimizer.min_spread_eur_per_kwh`,
@@ -1706,6 +1711,71 @@ than by weakening `tools/audit.sh`.
 ---
 
 ## 16. Amendment log (why the spec changed)
+
+**Optimizer v2 stage 1b — contract-correct feed-in accounting, pricing only (no version bump).** The
+DP prices export at `slot.sell`, and a 0.10 EUR/kWh marginal export error moves more money than the
+whole search this stage prepares for (docs/OPTIMIZER_V2.md section 1), so the settlement function has
+to be exact before anything is dispatched against it. This stage ships the accounting as a pure
+module and changes no live behaviour: `price.feed_in_mode` defaults to `derived`, the live forecast
+path is byte-for-byte the pre-1b `sources/price.py::_apply_feed_in`, and it does **not** consult the
+mode at all until a consumer enforces the module's complete result.
+
+- **`sources/feed_in.py` is a pure function of `(settings, slots, period_state, limits)`.** It returns
+a `FeedInResult` — mode, per-slot `sell`, `export_allowed`, a reason slug, the forced-export floor and
+notes — and never reads HA, the clock or the store. `period_state` (period import/export totals) and
+the reachability limits are inputs; wiring them to real sensors and to the optimizer is the follow-up
+stage, so no `optimize/*`, `engine.py`, `models.py` or `api.py` changes here (the offline mock's
+settings parity fixture carries the four new keys). `derived` is
+rejected by `settle_feed_in` rather than re-implemented: it is the live path, and a second copy could
+diverge from what actually prices the forecast.
+- **Exact-or-refuse, never a guessed rate.** `explicit` and `buy_minus_fee` are exogenous and
+energy-only, so exact. `saldering` is exact only while the period allowance `I − E` covers the
+reachable export bound; otherwise it refuses the *battery-sourced* export leg
+(`Reason.UNPRICED_EXPORT`) and prices forced PV export at the minimum over every reachable settlement
+rate. `tiered` is exact only while the reachable volume stays below the next tier boundary above the
+starting volume. When no justified floor exists the result carries `floor = None` and the plan must
+perform no tariff-dependent optimisation. The live forecast path has no channel for
+`export_allowed`/`reason`/`floor`, so it never calls the module: a refusal must not become
+ordinary zero-priced slots.
+- **Unknown is never zero.** A missing, malformed or non-finite input refuses instead of being
+substituted: an infinite discharge capability does not become zero capability (which would wrongly
+declare a threshold contract exact), a non-finite explicit tariff is unusable, a confirmed but
+missing slot tax is not a confirmed zero, and a malformed tier table (non-increasing bounds,
+non-finite rates, `+inf` anywhere but last) is refused whole instead of silently extending another
+rate across the interval. Negative samples are malformed too: a negative PV/load sample would
+understate reachable exports, and negative cumulative period imports/exports or a negative tier
+volume would manufacture allowance or distance to a boundary. A configured but unresolved or invalid
+explicit source refuses rather than substituting the derived `buy − fee − tax` rate (which could
+exceed the real explicit rate and break the lower-bound guarantee); the derived post-saldering
+formula is used only when no explicit source is configured. `settle_saldering_schedule` requires
+equal-length series and non-negative, finite totals/flows rather than truncating or accepting a
+negative balance as allowance.
+- **The reachable export bound is not capped by pack energy.** It is
+`Σ min(grid/inverter export limit, max(0, pv − load) + max_discharge_power) · dt`: PV surplus can
+export without the battery, and a grid recharge followed by a discharge exports more than one pack's
+worth. A pack-energy bound under-counts exactly the paths a threshold contract makes expensive, so a
+missing `max_discharge_kw` or a PV/load series that does not cover every slot means "unbounded",
+never zero.
+- **`derived` keeps its exact meaning; the new modes add the tax gate.** With
+`price.feed_in_energy_tax_refund` off, `derived` still subtracts whatever per-slot component the
+provider published, as before. `buy_minus_fee` and `saldering` price `sell = buy − fee − tax` only
+when the component is *confirmed* (`price.energy_tax_confirmed`, default false); an unstated
+component is unknown, not zero, so they refuse instead of silently pricing `sell = buy`.
+`price.feed_in_tax_deduction_eur_per_kwh` states the component once saldering ends, and a confirmed
+`0.0` is a valid confirmation (the legacy path never reads the override).
+- **`saldering` uses the supported in-slot convention only.** Import settles before export within a
+slot (`eligible = min(export, max(0, I + import − E))`, excess at the post-saldering price), and a
+contract that nets the whole period at settlement requires an explicit export price. The module
+exposes `settle_saldering_schedule` for the whole-schedule arithmetic, tested against independently
+written arithmetic. `price.saldering_assume_nettable` applies only when the period state is
+unavailable; a supplied state, including a known exhausted allowance, wins over the assumption.
+- **The `advanced` classification does not move.** The four new feed-in keys are essential, like the
+existing feed-in keys, so the frozen `ADVANCED_KEYS` set is unchanged.
+- **Known limits, named rather than implied away:** the VAT-share exclusion of the 2027
+`buy_minus_fee` formula is not modelled yet (a flat fee and the confirmed tax are); the `tiered` tier
+table arrives through the reachability inputs rather than a setting until the wiring lands; and
+`price.feed_in_mode` is config-only today — selecting another mode stores the contract for the
+follow-up but does not change the live forecast, which keeps using the derived price.
 
 **0.25.0 named load devices (user request: add named load devices such as a heat pump with a device type
 and its own energy meter, so temperature-driven loads are modelled).** The base model fitted one

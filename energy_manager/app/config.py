@@ -122,6 +122,20 @@ DEFAULTS: dict[str, Any] = {
     # buy price minus price.export_fee_eur_per_kwh, and minus its energy-tax component too when this
     # is off (a contract that does not pay the energy tax back).
     "price.feed_in_energy_tax_refund": True,
+    # Contract-correct feed-in accounting (SPEC.md 4.2, optimizer v2 stage 1b). "derived" keeps the
+    # pre-stage-1b behaviour byte-for-byte; the other modes route through sources/feed_in.py, which
+    # prices exactly or refuses the battery-sourced export leg (never approximates silently).
+    "price.feed_in_mode": "derived",
+    # A stated energy-tax/levy component is usable only when it is *confirmed*: False means "never
+    # stated", not zero. With the refund off, an unconfirmed component refuses the export leg
+    # instead of silently pricing sell = buy.
+    "price.energy_tax_confirmed": False,
+    # Per-kWh tax/levy deducted from the feed-in price after saldering ends. None = use the slot's
+    # own energy-tax component (or 0 for a source that publishes none).
+    "price.feed_in_tax_deduction_eur_per_kwh": None,
+    # saldering only: when the period import/export state is unavailable, explicitly assume the
+    # period still has nettable import. Shown as an assumption in the plan, never a fact.
+    "price.saldering_assume_nettable": False,
     # -- solar --------------------------------------------------------------------------
     "solar.enabled": True,
     "solar.source": "forecast_solar",
@@ -251,6 +265,12 @@ _MODE_CHOICES = ("off", "advisory", "auto")
 _LOG_CHOICES = ("debug", "info", "warning", "error")
 _PRICE_SOURCE_CHOICES = ("zonneplan_entity", "energy_charts", "entity_forecast", "static")
 _PRICE_PROVIDER_CHOICES = ("entity", "zonneplan", "day_ahead", "fixed")
+#: Feed-in contract (optimizer v2 stage 1b). ``derived`` is the pre-1b behaviour; the others are
+#: priced by :mod:`app.sources.feed_in`. The live forecast path still uses ``derived`` until the
+#: optimizer consumes the module's complete result (``export_allowed``/``reason``/``floor``); a
+#: refusal must never be silently turned into zero-priced slots. ``tiered`` needs the tier table from
+#: the plan's reachability inputs, so a mode without one refuses safely until the wiring lands.
+_FEED_IN_MODE_CHOICES = ("derived", "explicit", "buy_minus_fee", "saldering", "tiered")
 _PRICE_CONTRACT_CHOICES = ("dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night")
 _PRICE_UNIT_CHOICES = ("auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh")
 _SOLAR_SOURCE_CHOICES = ("forecast_solar", "capacity", "derived", "learned")
@@ -374,6 +394,10 @@ SETTINGS_META: dict[str, _Meta] = {
     "price.feed_in_entity": _Meta("str", "price", "Feed-in price entity", "HA sensor with the current feed-in price; overrides the derived and flat feed-in prices.", advanced=True),
     "price.feed_in_tax_inclusive": _Meta("bool", "price", "Feed-in incl. VAT", "For the flat tariff/entity only: off = add price.vat_pct to the value.", advanced=True),
     "price.feed_in_energy_tax_refund": _Meta("bool", "price", "Energy tax refunded", "On = feed-in pays the same consumer price you buy at, minus the feed-in cost. Off = the energy-tax component is not paid back and is subtracted too."),
+    "price.feed_in_mode": _Meta("choice", "price", "Feed-in contract", "How export is credited. derived = today's rule (the consumer price you pay minus the feed-in cost, minus the energy-tax component when it is not refunded). explicit = a stated feed-in tariff. buy_minus_fee = the consumer price minus the feed-in cost and the confirmed tax. saldering = the period nets export against import at the buy price while the allowance lasts, then pays the feed-in price. tiered = volume tiers (the tier table comes from the plan's reachability inputs). A contract the add-on cannot price exactly refuses the battery-sourced export leg instead of guessing. Not wired into the live forecast yet: until the optimizer consumes the full settlement result, the forecast keeps using the derived price.", _FEED_IN_MODE_CHOICES),
+    "price.energy_tax_confirmed": _Meta("bool", "price", "Energy tax confirmed", "On = the energy-tax component is a confirmed value, including a confirmed 0. A contract that does not refund the tax refuses the battery-sourced export leg while this is off, rather than silently pricing sell = buy."),
+    "price.feed_in_tax_deduction_eur_per_kwh": _Meta("float", "price", "Feed-in tax deduction", "Per-kWh tax/levy deducted from the feed-in price once saldering ends. Unset = use the slot's own energy-tax component.", minimum=0.0, maximum=1.0, nullable=True),
+    "price.saldering_assume_nettable": _Meta("bool", "price", "Assume nettable", "saldering only: when the period import/export state is unavailable, assume this period still has nettable import. Shown as an assumption in the plan, never a fact."),
     "solar.enabled": _Meta("bool", "solar", "Solar forecast", "Enable the PV forecast."),
     "solar.source": _Meta("choice", "solar", "Solar source", "forecast_solar = the Forecast.Solar API (needs planes); capacity = estimate from the array's watt peak; derived = learn the array from the meter's export moments minus what the battery was charging, no numbers to enter; learned = a model trained on 174 other Dutch arrays that corrects its own physics for this array (needs solar.capacity_wp).", _SOLAR_SOURCE_CHOICES),
     "solar.planes": _Meta("json", "solar", "PV planes", "forecast_solar only. List of {kwp, tilt_deg, azimuth_deg (compass: 0=north), damping}.", advanced=True),
