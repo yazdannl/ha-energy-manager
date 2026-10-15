@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.24.0
+
+- **The load and PV forecasts can now learn on an install that measures nothing but grid and battery.**
+This began as a question — we know the grid export and we know the night load, so can we not calibrate
+against them? — and the blind spot was structural. `load = grid + pv − battery` is the identity that
+makes both quantities recoverable, and the add-on already used it, but only in one direction and only
+when *both* pv and the battery flow were already mapped. So an install whose inverter reported nothing
+had no load labels, no pv labels, and a fine-tune head that could never fit anything while appearing to
+be waiting for data.
+- **Night-derived load (SPEC §7.2 tier 3b).** Below −6° of sun elevation production is zero for any
+array — deeper than the horizon on purpose, because a tilted plane still collects diffuse light at 0° —
+so `load = grid − battery` needs no pv series at all. About half of every day qualifies. A missing
+location is refused rather than guessed.
+- **The night tier cannot learn a day shape, and says so.** The hours it never saw are filled from the
+documented default residential shape, and `assumed_daytime_shape` plus a forecast note record it,
+because a level measured at night and a shape read from a table are different kinds of knowledge.
+That fill has to happen *inside* profile building rather than as a patch on the finished profile: the
+unobserved buckets otherwise contribute 0.0 to `profile_mean`, so the level `scale` is computed from a
+mostly-empty day and then inflates every hour up to its clamp. The first version of this made a
+synthetic 1 kW house forecast **2.0 kW at night** — wrong on exactly the hours it had measured, and
+wrong in the direction that reads like a discovery rather than a bug. A second, subtler version
+normalised by the default shape's own mean and came out 5.7% high, which `scale` then clawed back by
+pushing the measured hours off their level.
+- **Inferred values get their own columns** (`actuals.pv_derived_kw`, `actuals.load_derived_kw`,
+schema 4). The sampler derives pv as `load − grid + battery` and load itself at night, and writes them
+separately rather than into `pv_kw`/`load_kw`: writing them together would have been fewer lines and
+would have destroyed, permanently and in the table the fine-tune head learns from, the ability to tell
+a measurement from this add-on's own arithmetic. Existing rows keep their NULLs — nothing is
+retroactively claimed to have been inferred. The head prefers the measured column and falls back only
+when it is empty across the whole window, and reports which it used.
+- **Refusals rather than approximations.** Inference stops when a battery is configured but its flow is
+unreadable, since the cycling would be attributed to the house or to the roof; the nearest *earlier*
+forecast slot is used for a lookup rather than a future one, because a value the add-on had not yet
+produced cannot be an observation of the past.
+- Still outstanding, and the next piece: **named load devices** (`load.devices[]`), so a heat pump's own
+meter can carry its own temperature response instead of being averaged into one house-wide slope. The
+design is settled in SPEC §16 — subtract each measured device from the total before learning the base
+profile, learn the device's own profile and slope, add it back — and the subtraction is the part that
+matters: adding a device on top of a base that already contains it double-counts it.
+
 ## 0.23.1
 
 - **`year` and `all` savings no longer stay `--`.** 0.22.1 treated a bucket that mixed rows with and

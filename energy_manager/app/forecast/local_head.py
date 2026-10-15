@@ -121,6 +121,14 @@ def _measured_column(kind: str) -> str | None:
     return {"solar": "pv_kw", "load": "load_kw"}.get(str(kind))
 
 
+#: The inferred fallback for each kind, used only where the measured column is empty (0.24.0). An
+#: install with no pv or load sensor has nothing in ``pv_kw``/``load_kw``, so without this the head can
+#: never fit on it -- but an inferred label is weaker than a measured one, so it is a fallback rather
+#: than an alternative, and which one was used is reported.
+def _derived_column(kind: str) -> str | None:
+    return {"solar": "pv_derived_kw", "load": "load_derived_kw"}.get(str(kind))
+
+
 def fit_factors(samples: Sequence[Sample], *, shrinkage: float = SHRINKAGE) -> list[float]:
     """Closed-form per-hour multipliers, shrunk toward 1.0.
 
@@ -151,19 +159,22 @@ def collect_samples(
     Both sides are reduced to hourly means first. The archive holds 15-minute slots while the sampler
     writes at its own cadence, so an exact timestamp join would match almost nothing and report a
     flattering empty result rather than an honest small one.
+
+    Where the measured column is empty throughout the window, the inferred one is used instead (an
+    install with no pv or load sensor has nothing else). It is a fallback, not a peer: a row that has a
+    measurement always wins, and the caller reports which source it ended up with.
     """
     column = _measured_column(kind)
     if store is None or column is None:
         return []
-    measured: dict[str, list[float]] = {}
-    for row in store.actuals_range(start, end):
-        value = row.get(column)
-        if value is None:
-            continue
-        measured.setdefault(str(row["ts"])[:13], []).append(float(value))
+    rows = store.actuals_range(start, end)
+    measured = _hourly_means(rows, column)
+    if not measured:
+        derived = _derived_column(kind)
+        measured = _hourly_means(rows, derived) if derived else {}
     if not measured:
         return []
-    means = {hour: sum(values) / len(values) for hour, values in measured.items()}
+    means = measured
     samples: list[Sample] = []
     for row in store.forecast_archive_range(start, end, kind):
         mean = means.get(str(row["target_ts"])[:13])
@@ -182,6 +193,38 @@ def collect_samples(
         )
     samples.sort(key=lambda sample: sample.moment)
     return samples
+
+
+def _hourly_means(rows: Sequence[Mapping[str, Any]], column: str) -> dict[str, float]:
+    """Mean of ``column`` per UTC hour, keyed by the first thirteen characters of the timestamp."""
+    buckets: dict[str, list[float]] = {}
+    for row in rows:
+        value = row.get(column)
+        if value is None:
+            continue
+        buckets.setdefault(str(row["ts"])[:13], []).append(float(value))
+    return {hour: sum(values) / len(values) for hour, values in buckets.items() if values}
+
+
+def label_source(store: Any, *, start: datetime, end: datetime, kind: str = "solar") -> str:
+    """``measured``, ``derived`` or ``none``: which series a fit for ``kind`` would learn from.
+
+    Reported rather than inferred from the sample count, because "the head is learning" means
+    something quite different when its labels were produced by this add-on's own arithmetic.
+    """
+    column = _measured_column(kind)
+    if store is None or column is None:
+        return "none"
+    try:
+        rows = store.actuals_range(start, end)
+    except Exception:  # noqa: BLE001 - a reporting helper must never be the thing that fails
+        return "none"
+    if _hourly_means(rows, column):
+        return "measured"
+    derived = _derived_column(kind)
+    if derived and _hourly_means(rows, derived):
+        return "derived"
+    return "none"
 
 
 def _mean_absolute_error(samples: Sequence[Sample], factors: Sequence[float]) -> float | None:

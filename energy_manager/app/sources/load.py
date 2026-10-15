@@ -23,6 +23,7 @@ slots. Cold start reports ``confidence: low``.
 from __future__ import annotations
 
 import logging
+import math
 import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -163,6 +164,10 @@ class HistoryResult:
     source: str = "fallback"
     status: ProviderStatus = field(default_factory=lambda: ProviderStatus(kind="load", name="fallback"))
     notes: list[str] = field(default_factory=list)
+    #: Set by the night-only tier, whose samples cover roughly half the day by construction. The
+    #: profile builder has to know, because an unobserved bucket there means "not looked at" rather
+    #: than "measured zero", and reading it as the latter forecasts zero load all day.
+    assumed_daytime_shape: bool = False
 
     @property
     def ok(self) -> bool:
@@ -430,6 +435,193 @@ def _map_battery_flows(settings: Any, roles: dict[str, str]) -> str:
     )
 
 
+#: The sun elevation below which production is zero for any array. Deliberately deeper than the
+#: horizon: at 0 degrees a tilted plane can still be lit by diffuse sky, so "the sun is down" is not
+#: the same claim as "this array is producing nothing". Six degrees below civil twilight makes the
+#: claim safe for a roof at any tilt, which is what lets the night tier drop the pv series entirely.
+NIGHT_ELEVATION_MAX_DEG = -6.0
+
+
+def night_hours(
+    stamps: Iterable[datetime], latitude: float, longitude: float
+) -> set[datetime]:
+    """The subset of ``stamps`` at which no array can be producing power.
+
+    Only the sun is consulted, never a measurement, because this is the condition that lets the caller
+    treat pv as exactly zero without having a pv sensor to check it against. The geometry is the same
+    one the solar forecast uses, taken from :mod:`app.forecast.pv` rather than re-derived, so "night"
+    cannot come to mean two different things inside one add-on.
+    """
+    from ..forecast import pv
+
+    out: set[datetime] = set()
+    latitude_rad = math.radians(latitude)
+    for stamp in stamps:
+        utc = stamp.astimezone(timezone.utc)
+        day_of_year = utc.timetuple().tm_yday
+        fractional_hour = utc.hour + utc.minute / 60.0
+        declination = pv.declination_rad(day_of_year)
+        hour_angle = pv.hour_angle_rad(longitude, day_of_year, fractional_hour)
+        if pv.sun_elevation_deg(latitude_rad, declination, hour_angle) <= NIGHT_ELEVATION_MAX_DEG:
+            out.add(stamp)
+    return out
+
+
+def _night_load_samples(
+    series: Mapping[str, Mapping[datetime, float]],
+    latitude: float,
+    longitude: float,
+) -> list[tuple[datetime, float]]:
+    """Gross household load from grid and battery alone, over night hours only (SPEC 7.2 tier 3b).
+
+    ``load = grid - battery`` (kW, AC side; battery positive = charging) with pv omitted because it is
+    provably zero, which is the whole point of the tier: the ordinary derived path needs a pv series,
+    so an install whose inverter reports nothing can never learn its own consumption. About half of
+    every day is night, and those hours are enough to learn a level and a temperature slope.
+
+    What it cannot learn is the *shape* of the day, and it does not pretend to -- the caller fills the
+    unobserved buckets from the documented default shape and says so in the forecast notes. A battery
+    whose flow is unknown is excluded for the same reason as the derived tier: its cycling would
+    otherwise be learned as household load.
+    """
+    grid = _grid_from_series(series)
+    if not grid:
+        return []
+    battery = series.get("battery")
+    charge, discharge = series.get("charge"), series.get("discharge")
+    if battery is None and charge is None and discharge is None:
+        return []
+    nights = night_hours(grid, latitude, longitude)
+    out: list[tuple[datetime, float]] = []
+    for stamp, grid_kw in sorted(grid.items()):
+        if stamp not in nights:
+            continue
+        if battery is not None and stamp in battery:
+            load = float(grid_kw) - float(battery[stamp])
+        elif charge is not None or discharge is not None:
+            load = (
+                float(grid_kw)
+                - float((charge or {}).get(stamp, 0.0))
+                + float((discharge or {}).get(stamp, 0.0))
+            )
+        else:
+            continue  # a night with no battery flow sample: unknown, never read as zero
+        out.append((stamp, max(0.0, load)))
+    return out
+
+
+def _fill_assumed_shape(
+    medians: list[float], p10s: list[float], p90s: list[float]
+) -> tuple[list[float], list[float], list[float]]:
+    """Replace buckets with no samples by the default residential shape, at the observed level.
+
+    Only meaningful for a profile learned from night hours, where an empty bucket is a fact about the
+    *observation window* rather than about the house. Two failures follow from skipping it, and the
+    second is worse than the first:
+
+    * an empty bucket reads as a median of 0.0 kW, forecasting a literal zero for those hours;
+    * ``profile_mean`` is then averaged over a mostly-empty day, so the level ``scale`` is computed
+      against a fraction of real consumption and inflates *every* hour by up to its clamp. Measured on
+      a synthetic 1 kW house: the night hours, the only ones actually observed, came out at 2.0 kW.
+
+    So this runs inside :func:`build_profile` before the level is derived, not as a patch applied to
+    the finished dict afterwards. The magnitude still comes entirely from the observed hours.
+    """
+    if not any(medians):
+        return medians, p10s, p90s
+    # The level of the hours that were *observed*, not the mean over all 48 buckets: averaging in the
+    # thirty-six empty ones would describe a mostly-empty day, and the filled daytime would then be
+    # scaled to a fraction of consumption -- which is the same inflation by a different route.
+    observed = statistics.fmean([value for value in medians if value > 0.0])
+    empty = [index for index, value in enumerate(medians) if value <= 0.0]
+    if not empty:
+        return medians, p10s, p90s
+    # Chosen so the finished day averages exactly the observed level, rather than normalising by the
+    # shape's own mean. Those differ: the shape's mean is taken over all 24 hours, while only the
+    # unobserved ones are being filled, and the daytime half of a residential shape sits above its own
+    # average. Normalising by the shape mean made a synthetic 1 kW house come out 5.7% high, which the
+    # recent-window ``scale`` then clawed back by pushing the *measured* night hours below 1 kW.
+    shape_total = sum(DEFAULT_SHAPE[index % 24] for index in empty)
+    factor = observed * len(empty) / shape_total if shape_total > 0 else 0.0
+    for index in empty:
+        value = DEFAULT_SHAPE[index % 24] * factor
+        medians[index] = round(value, 4)
+        if p10s[index] <= 0.0:
+            p10s[index] = round(value * 0.55, 4)
+        if p90s[index] <= 0.0:
+            p90s[index] = round(value * 1.55, 4)
+    return medians, p10s, p90s
+
+
+def _fetch_derived_series(
+    client: Any, derived_entities: Mapping[str, str], now: datetime, days: int, ws: Any = None
+) -> dict[str, dict[datetime, float]]:
+    """Hourly series for whichever assigned roles report anything (long-term statistics first)."""
+    series: dict[str, dict[datetime, float]] = {}
+    for role, entity_id in derived_entities.items():
+        samples, _ = _history_samples(client, ws, entity_id, role, now, days)
+        if samples:
+            series[role] = dict(samples)
+    return series
+
+
+def _resolve_location(settings: Any, client: Any) -> tuple[float, float, str] | None:
+    """``(latitude, longitude, timezone)`` or ``None``; never raises.
+
+    The night tier runs while the add-on is collecting history, so a missing location must degrade to
+    "this tier is unavailable" rather than propagate out of a collection pass.
+    """
+    if client is None or not callable(getattr(client, "get_config", None)):
+        return None
+    from ..config import ConfigError, resolve_location
+    from ..harest import HAError
+
+    options = {
+        "latitude_override": settings.get("latitude_override"),
+        "longitude_override": settings.get("longitude_override"),
+        "timezone": settings.get("timezone"),
+    }
+    try:
+        return resolve_location(client.get_config(), options)
+    except (HAError, ConfigError):
+        return None
+
+
+def _night_derived_samples(
+    settings: Any,
+    client: Any,
+    derived_entities: Mapping[str, str] | None,
+    now: datetime,
+    days: int,
+    ws: Any = None,
+) -> tuple[list[tuple[datetime, float]], str]:
+    """Night-only gross household load, needing grid and battery but no pv sensor (SPEC 7.2 tier 3b).
+
+    This is the tier that breaks the circularity an install without a pv sensor is stuck in: the
+    derived path cannot run without pv, pv cannot be inferred without a load estimate, and neither is
+    needed once the sun is down. A missing location is refused explicitly rather than guessed, because
+    guessing it would admit daylight hours as if pv were zero and inflate the learned load.
+    """
+    if not derived_entities:
+        return [], "no derived entity mapping supplied"
+    series = _fetch_derived_series(client, derived_entities, now, days, ws=ws)
+    if not any(role in series for role in ("battery", "charge", "discharge")):
+        return [], (
+            "night load needs a battery flow series: without it the grid reading includes the "
+            "battery's cycling, which is not household consumption"
+        )
+    if not any(role in series for role in ("grid_power", "grid_import", "grid_export")):
+        return [], "night load needs grid_power or grid_import/grid_export"
+    location = _resolve_location(settings, client)
+    if location is None:
+        return [], "night load needs the location, to know when the sun is down"
+    latitude, longitude, _zone = location
+    samples = _night_load_samples(series, latitude, longitude)
+    if not samples:
+        return [], "no night hour had both a grid and a battery-flow sample"
+    return samples, ""
+
+
 def _derived_samples(
     client: Any,
     derived_entities: Mapping[str, str] | None,
@@ -450,11 +642,7 @@ def _derived_samples(
     """
     if not derived_entities:
         return [], "no derived entity mapping supplied"
-    series: dict[str, dict[datetime, float]] = {}
-    for role, entity_id in derived_entities.items():
-        samples, _ = _history_samples(client, ws, entity_id, role, now, days)
-        if samples:
-            series[role] = dict(samples)
+    series = _fetch_derived_series(client, derived_entities, now, days, ws=ws)
     if "pv" not in series:
         return [], (
             "derived load needs a pv series (solar.measured_entity or derived_entities['pv']): "
@@ -685,6 +873,30 @@ def collect_history(
                 return result(samples, "derived", ProviderStatus(kind="load", name="derived", ok=True, last_success=moment, detail={"samples": len(samples)}))
             if note:
                 notes.append(f"derived: {note}")
+        # Night-only fallback: the derived tier needs a pv series, which an install with no inverter
+        # reporting has no way to supply, and without it that install can never learn its own load.
+        # Night hours are pv-free by geometry, so they need nothing but grid and battery.
+        samples, note = _night_derived_samples(settings, client, derived_roles, moment, days, ws=ws)
+        if samples:
+            return HistoryResult(
+                LoadSamples(samples, temperatures),
+                "derived-night",
+                ProviderStatus(
+                    kind="load",
+                    name="derived-night",
+                    ok=True,
+                    last_success=moment,
+                    detail={"samples": len(samples), "assumed_daytime_shape": True},
+                ),
+                notes
+                + [
+                    f"night load: {len(samples)} night hours calibrated from grid and battery with no "
+                    "pv sensor; the daytime shape is the default residential one scaled to that level"
+                ],
+                assumed_daytime_shape=True,
+            )
+        if note:
+            notes.append(f"night load: {note}")
     if mode == "entity" and not entity:
         notes.append("load.mode=entity but no load.entity is mapped")
     notes.append("falling back to the flat profile")
@@ -747,11 +959,16 @@ def build_profile(
     tz: str | ZoneInfo | None = None,
     temperatures: Mapping[datetime, float] | None = None,
     window_days: int = WINDOW_DAYS,
+    assumed_daytime_shape: bool = False,
 ) -> dict[str, Any]:
     """Learn the 48-bucket median profile, level scale, EWMA bias and temperature slope.
 
     ``temperatures`` defaults to the series carried by a :class:`LoadSamples` (the collection path);
     a plain list therefore learns exactly the no-temperature profile it always did.
+
+    ``assumed_daytime_shape`` fills buckets outside the observation window from the default shape, and
+    must be decided *here* rather than by the caller, because the level and the bias both depend on
+    the medians it produces.
     """
     moment = now or utcnow()
     zone = _zone(tz)
@@ -766,6 +983,8 @@ def build_profile(
     medians = [_quantile(values, 0.5) if values else 0.0 for values in buckets]
     p10s = [_quantile(values, 0.1) if values else 0.0 for values in buckets]
     p90s = [_quantile(values, 0.9) if values else 0.0 for values in buckets]
+    if assumed_daytime_shape:
+        medians, p10s, p90s = _fill_assumed_shape(medians, p10s, p90s)
 
     weekday_median = statistics.fmean(medians[:24]) if any(medians[:24]) else 0.0
     weekend_median = statistics.fmean(medians[24:]) if any(medians[24:]) else 0.0
@@ -817,6 +1036,7 @@ def build_profile(
         "temperature_hours": len({_hour_key(stamp) for stamp, _ in usable} & set(temperatures)),
         "samples": len(usable),
         "days": days,
+        "assumed_daytime_shape": bool(assumed_daytime_shape),
         "updated_at": moment.astimezone(timezone.utc).isoformat(timespec="seconds"),
     }
 
@@ -842,14 +1062,24 @@ def update_load_profile(
     now: datetime | None = None,
     tz: str | ZoneInfo | None = None,
     temperatures: Mapping[datetime, float] | None = None,
+    assumed_daytime_shape: bool = False,
 ) -> dict[str, Any]:
     """Learn and persist the load profile from hourly samples.
 
     When ``samples`` came from :func:`collect_history` and ``load.temperature_entity`` is mapped,
     the aligned temperatures ride along on the list and feed the regression term here.
+
+    ``assumed_daytime_shape`` forwards to :func:`build_profile`, which has to make the decision before
+    it derives the level: an unobserved bucket is not a measured zero.
     """
     moment = now or utcnow()
-    profile = build_profile(samples, now=moment, tz=tz, temperatures=temperatures)
+    profile = build_profile(
+        samples,
+        now=moment,
+        tz=tz,
+        temperatures=temperatures,
+        assumed_daytime_shape=assumed_daytime_shape,
+    )
     save_profile(store, profile, moment)
     return profile
 

@@ -39,7 +39,7 @@ from .models import (
 
 __all__ = ["DEFAULT_RETENTION", "SCHEMA_VERSION", "Store"]
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Forward-only. Append new (version, statements) entries; never edit a released entry.
 MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
@@ -211,6 +211,19 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
             "CREATE INDEX IF NOT EXISTS idx_forecast_archive_issued ON forecast_archive(issued_at)",
         ),
     ),
+    (
+        4,
+        (
+            # 0.24.0 derived load and pv (SPEC.md 7.2 tier 3b): what the add-on can infer when a role
+            # has no sensor at all. Kept in their own columns rather than written into ``load_kw`` and
+            # ``pv_kw``, because an inferred value and a measured one must stay tellable apart: the
+            # fine-tune head corrects a model with these, and a correction fitted on a number the
+            # add-on produced itself is only as good as the arithmetic behind it. Rows written before
+            # this release keep NULLs, so nothing is retroactively claimed to have been inferred.
+            "ALTER TABLE actuals ADD COLUMN pv_derived_kw REAL",
+            "ALTER TABLE actuals ADD COLUMN load_derived_kw REAL",
+        ),
+    ),
 ]
 #: Retention policy used by :meth:`Store.trim` (SPEC.md section 11).
 DEFAULT_RETENTION = {
@@ -235,6 +248,10 @@ _ACTUAL_COLUMNS = (
     "price_sell",
     "plan_power_w",
     "dispatch_power_w",
+    # Inferred rather than measured (0.24.0). Distinct columns on purpose: the fine-tune head learns
+    # from these, and it must be able to say which of the two it learned from.
+    "pv_derived_kw",
+    "load_derived_kw",
 )
 
 #: Which measured ``actuals`` column scores each archived forecast kind. A kind absent here is a

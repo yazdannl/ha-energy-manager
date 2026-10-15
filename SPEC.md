@@ -871,7 +871,37 @@ Sources in priority order, all producing 15-minute `LoadForecast` slots with `p1
    charge`, assembled from mapped power sensors (the Energy-dashboard roles when `grid.*` is empty;
    each series is read through long-term statistics when a WebSocket client is available, energy
    counters included).
+3b. **Night-derived** (0.24.0) when the derived tier cannot run because there is no `pv` series at
+   all. Once the sun is below −6° — deeper than the horizon, because a tilted plane still collects
+   diffuse light at 0° — production is zero for any array, so `load = grid − battery` needs no pv
+   reading and the circularity is broken: the derived tier needs pv, pv can only be inferred from
+   load, and an install whose inverter reports nothing has neither. A missing location is refused
+   rather than guessed, since guessing it would admit daylight as if production were zero.
+
+   The night tier observes roughly half the day and therefore **cannot learn a day shape**; it fills
+   the hours it never saw from the documented default residential shape. Two things must be true for
+   that to be safe, and neither is automatic:
+
+   * the fill happens *inside* profile building, before the level is derived. An unobserved bucket
+     otherwise reads as a measured 0.0 kW — forecasting a literal zero all day — and, worse,
+     `profile_mean` is then averaged over a mostly-empty day, so `scale` corrects the mistake by
+     inflating **every** hour up to its clamp, including the hours that were actually measured;
+   * the fill is normalised so the finished day averages the observed level, rather than by the default
+     shape's own mean. Those differ, because only the unobserved hours are being filled and the
+     daytime half of a residential shape sits above its own average; normalising by the shape mean made
+     a synthetic 1 kW house forecast 2.0 kW at night.
+
+   The forecast reports the assumption (`assumed_daytime_shape` in the profile, a note on the tier),
+   because a level measured at night and a shape taken from a table are different kinds of knowledge.
 4. **Fallback** flat profile from `load.base_kwh_per_day` spread by a default residential shape.
+
+**Which series a label came from is always recorded** (0.24.0). The sampler writes inferred values to
+`actuals.pv_derived_kw` / `actuals.load_derived_kw`, never into `pv_kw` / `load_kw`, so an inferred row
+and a measured one stay tellable apart; rows written earlier keep their NULLs rather than being
+retroactively claimed as inferred. The fine-tune head (§7.5) prefers a measurement and falls back to
+the inferred column only where the measured one is empty throughout its window, reporting which it
+used (`label_source`). A correction fitted on a number this add-on produced itself is only as good as
+the arithmetic behind it, and the user needs to be able to see that it is that kind of number.
 
 Model: median per (weekend|weekday, hour) profile over the last 8 weeks, scaled by
 `recent_7d_mean / profile_mean` (clamped `[0.5, 2.0]`), then an EWMA bias correction per hour bucket
@@ -1624,6 +1654,40 @@ than by weakening `tools/audit.sh`.
 ---
 
 ## 16. Amendment log (why the spec changed)
+
+**0.24.0 break the load/pv circularity (user request: calibrate from the meter, since we know the grid
+export and we know the night load).** The observation was correct and the blind spot was structural:
+`load = grid + pv − battery` is the identity that makes both quantities recoverable, and the add-on
+already used it — but only in one direction, and only when *both* pv and the battery flow were already
+mapped. An install measuring nothing but grid and battery therefore had no load labels, no pv labels,
+and a fine-tune head that could never fit anything. It would have reported "insufficient" forever while
+looking like it was waiting for data.
+
+- **§7.2 tier 3b, night-derived load.** The sun below −6° (deeper than the horizon, since a tilted plane
+  still collects diffuse light at 0°) makes production zero for any array, so `load = grid − battery`
+  needs no pv series at all. About half of every day qualifies. A missing location is refused rather
+  than guessed: guessing it would admit daylight hours as if production were zero and inflate the
+  learned consumption everywhere.
+- **The night tier cannot learn a day shape, and says so.** It fills the hours it never saw from the
+  default residential shape, and that fill has to happen *inside* profile building. Patching the
+  finished profile is not equivalent: the unobserved buckets contribute 0.0 to `profile_mean`, so the
+  level `scale` is derived from a mostly-empty day and then inflates every hour up to its clamp. In a
+  synthetic 1 kW house the first version forecast 2.0 kW at night — wrong on precisely the hours it had
+  measured, and wrong in the direction that looks like a discovery rather than a bug. The fill is also
+  normalised so the day averages the observed level, not the shape's own mean, for the same reason at
+  smaller magnitude (5.7% high, which `scale` then clawed back by pushing the measured hours off their
+  level).
+- **Inferred labels get their own columns** (`actuals.pv_derived_kw` / `load_derived_kw`, schema 4).
+  Writing them into `pv_kw`/`load_kw` would have been fewer lines and would have destroyed the ability
+  to tell a measurement from this add-on's own arithmetic forever, in a table the fine-tune head learns
+  from. The head prefers the measurement, falls back only when the measured column is empty across its
+  whole window, and reports which it used. The engine refuses to infer anything when a battery is
+  configured but its flow is unreadable, because the cycling would land on the house or on the roof.
+- **Not done, and the next piece:** named load devices (`load.devices[]`), so a heat pump's own meter
+  can be modelled with its own temperature response instead of being averaged into one house-wide
+  slope. The design is fixed — subtract each measured device from the total before learning the base
+  profile, learn the device's own profile and slope, add it back in the forecast — and the subtraction
+  is what makes it safe: adding a device on top of a base that already contains it double-counts it.
 
 **0.23.0 the PV model is fitted on the chain it is served, and given the weather (user challenge: "are
 we taking cloud cover, temperature and rain into account? if we're not, what use does it have?").**

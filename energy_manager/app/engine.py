@@ -66,6 +66,11 @@ log = logging.getLogger(__name__)
 #: as ``sources.measure.MEASUREMENT_MINUTES``); the optimiser's own grid stays at
 #: ``optimizer.slot_minutes``.  A regression test pins the two together.
 ACTUALS_MINUTES = 5
+#: The cadence the load and solar providers emit slots on (``sources/load.SLOT_MINUTES``). Named here
+#: rather than imported so the engine keeps one dependency direction, and asserted against both
+#: providers in the tests: a silent divergence would make every slot lookup in ``_slot_forecast_at``
+#: miss its exact key and fall back to the previous slot, an hour of drift nobody would notice.
+SLOT_MINUTES = 15
 
 #: How long a learned-capacity profile read is cached in the engine (SPEC 5); maintenance rewrites
 #: it at most once a day, so a few minutes of staleness changes nothing and keeps the tick cheap.
@@ -2740,6 +2745,7 @@ class Engine:
             "plan_power_w": slot.power_w if slot is not None else None,
             "dispatch_power_w": battery_kw * 1000.0 if battery_kw is not None else None,
         }
+        row.update(self._derived_actuals(row, now))
         self._actuals_ring.append(row)
         del self._actuals_ring[: max(0, len(self._actuals_ring) - 2000)]
         self._store_call(
@@ -2754,7 +2760,63 @@ class Engine:
             price_sell=row["price_sell"],
             plan_power_w=row["plan_power_w"],
             dispatch_power_w=row["dispatch_power_w"],
+            pv_derived_kw=row.get("pv_derived_kw"),
+            load_derived_kw=row.get("load_derived_kw"),
         )
+
+    def _derived_actuals(self, row: Mapping[str, Any], now: datetime) -> dict[str, float | None]:
+        """Load and pv inferred from what *is* measured, where the roles themselves are unmapped.
+
+        An install can measure nothing but grid and battery, and then the fine-tune head has no labels
+        at all: ``pv_kw`` and ``load_kw`` stay empty forever and the correction it exists to learn can
+        never be fitted. The added-on identity ``load = grid + pv - battery`` (SPEC 7.2) is what makes
+        this recoverable, rearranged for whichever of the two is unknown:
+
+        * load, when pv is *provably* zero -- which is not a guess, it is the sun below the horizon,
+          the same condition the night-learning tier uses;
+        * pv, from that learned load: ``pv = load - grid + battery`` (grid positive = import).
+
+        Both are refused rather than approximated when the battery flow is unknown while batteries are
+        configured: its cycling would otherwise be attributed to the house or to the roof, which is
+        precisely the error the derived load tier already refuses to make.
+        """
+        out: dict[str, float | None] = {"pv_derived_kw": None, "load_derived_kw": None}
+        grid = row.get("grid_kw")
+        if grid is None:
+            return out
+        battery = row.get("battery_kw")
+        with self._lock:
+            has_batteries = bool(self._state.batteries)
+        if has_batteries and battery is None:
+            return out
+        battery = float(battery or 0.0)
+        load_derived = None
+        if row.get("load_kw") is None:
+            load_derived = self._slot_forecast_at("load", now)
+        if load_derived is not None:
+            out["load_derived_kw"] = float(load_derived)
+            if row.get("pv_kw") is None:
+                out["pv_derived_kw"] = max(0.0, float(load_derived) - float(grid) + battery)
+        return out
+
+    def _slot_forecast_at(self, kind: str, now: datetime) -> float | None:
+        """The forecast value covering ``now``, or the nearest earlier one, else ``None``.
+
+        Not a plain dict lookup on the floored 15-minute slot: the sampler runs on its own cadence, so
+        a tick can land in a slot the last forecast never produced (a horizon that starts later, or a
+        provider that answered for fewer slots). Falling back to the most recent earlier slot keeps the
+        inferred row useful instead of silently dropping it, and never looks *forward* -- a value the
+        add-on had not produced yet cannot be an observation of the past.
+        """
+        with self._lock:
+            slots = self._slot_forecasts.get(kind) or {}
+            value = slots.get(quarter_floor(now, SLOT_MINUTES))
+            if value is not None:
+                return float(value)
+            earlier = [moment for moment in slots if moment <= now]
+        if not earlier:
+            return None
+        return float(slots[max(earlier)])
 
     def _savings_tick(self, values: Mapping[str, Any], now: datetime) -> None:
         previous_at = self._last_sample_at

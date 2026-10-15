@@ -38,7 +38,7 @@ from .notify import Notifier
 
 log = logging.getLogger("app.main")
 
-APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.23.1"
+APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.24.0"
 COMMIT = os.environ.get("SEM_COMMIT") or os.environ.get("GITHUB_SHA") or ""
 DEFAULT_PORT = 8099
 DEFAULT_OPTIONS = "/data/options.json"
@@ -310,7 +310,17 @@ def build_maintenance(
                         settings, ha, now=now, days=60, derived_entities=history_roles
                     )
                 if history is not None and getattr(history, "ok", False) and history.samples:
-                    update_profile(store, history.samples, now=now, tz=timezone_name)
+                    update_profile(
+                        store,
+                        history.samples,
+                        now=now,
+                        tz=timezone_name,
+                        # Only the night-only tier sets this; it tells the builder that buckets it
+                        # never saw are unobserved rather than measured at zero.
+                        assumed_daytime_shape=bool(
+                            getattr(history, "assumed_daytime_shape", False)
+                        ),
+                    )
                     log.info("load profile refreshed from %s samples", len(history.samples))
             except Exception as exc:
                 log.warning("load profile learning failed: %s", exc)
