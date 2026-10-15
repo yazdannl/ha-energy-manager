@@ -382,12 +382,21 @@ def _apply_feed_in(
     A configured feed-in source that cannot be read degrades to the derived price with a note:
     failing to price export must never fail the buy forecast. Returns False only when there is
     nothing to price (no slots).
+
+    Provenance is recorded on the forecast as the additive ``forecast.feed_in_source`` attribute
+    (the orchestrator-owned ``PriceForecast`` is not edited): ``"entity"`` or ``"flat"`` only when
+    that explicit source really resolved, ``"derived"`` when no explicit source is configured, and
+    ``"unavailable"`` when a configured source failed and the slots carry the derived price.  The
+    optimizer wiring must never hand ``"unavailable"`` slots to the settlement as if they were an
+    authoritative explicit tariff.
     """
     entity = str(settings.get("price.feed_in_entity", "") or "")
     tariff: float | None = None
+    provenance = "derived"
     origin = ""
     try:
         if entity:
+            provenance = "entity"
             if client is None:
                 raise ProviderError("no Home Assistant client")
             state = client.get_state(entity)
@@ -399,13 +408,19 @@ def _apply_feed_in(
             tariff = eur_per_kwh_from_raw(_to_float(state.get("state")), unit, divisor)
             origin = f"{entity} ({attributes.get('unit_of_measurement')})"
         elif settings.get("price.feed_in_eur_per_kwh", None) is not None:
+            provenance = "flat"
             tariff = float(settings.get("price.feed_in_eur_per_kwh"))
             origin = "price.feed_in_eur_per_kwh"
     except Exception as err:  # noqa: BLE001 - a broken feed-in sensor must not break the buy price
+        provenance = "unavailable"
         forecast.notes.append(
             f"configured feed-in source unavailable ({type(err).__name__}: {err}); "
             "using the derived feed-in price"
         )
+    if tariff is None and provenance in ("entity", "flat"):
+        # The configured source resolved to nothing usable (a malformed state that did not raise):
+        # the slots below carry the derived price, so the provenance must say so.
+        provenance = "unavailable"
     export_fee = _fees(settings)[1]
     if tariff is not None:
         if not bool(settings.get("price.feed_in_tax_inclusive", True)):
@@ -416,6 +431,7 @@ def _apply_feed_in(
         forecast.notes.append(
             f"sell price {net:.4f} EUR/kWh received ({origin}; feed-in cost {export_fee:.4f} EUR/kWh)"
         )
+        forecast.feed_in_source = provenance
         return bool(forecast.slots)
 
     # Derived: the consumer price you pay, minus the feed-in cost, minus the energy-tax component
@@ -438,6 +454,7 @@ def _apply_feed_in(
                 "(set price.energy_tax_eur_per_kwh to state it)"
             )
     forecast.notes.append(detail)
+    forecast.feed_in_source = provenance
     return bool(forecast.slots)
 
 

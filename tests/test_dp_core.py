@@ -238,6 +238,101 @@ def test_cost_basis_sell_floor():
 
 
 @requires_core
+def test_refuse_battery_export_bounds_battery_export_to_zero():
+    """Optimizer v2 stage 1b: the contract refuses only the battery-sourced export leg (D2)."""
+    scenario = _scenario(
+        pv=[0.0, 3.0, 0.0, 4.0],
+        load=[1.2, 0.4, 1.5, 0.2],
+        buy=[0.45, 0.08, 0.42, 0.10],
+        sell=[0.35, 0.35, 0.35, 0.35],
+        refuse_battery_export=True,
+    )
+    _assert_same(scenario)
+    reference = _python_ref(scenario)
+    for i, slot in enumerate(scenario.slots):
+        base = slot.load_kw - slot.pv_kw
+        if base > 0.0:
+            assert reference.powers[i] >= -base - 1e-9, "a deficit slot may not export"
+        else:
+            assert reference.powers[i] >= -1e-9, "a surplus slot refuses battery discharge"
+
+
+@requires_core
+def test_refuse_battery_export_keeps_forced_pv_export_at_a_negative_floor():
+    """A negative justified floor must still price the forced PV export (never suppress it)."""
+    scenario = _scenario(
+        pv=[4.0, 4.0],
+        load=[0.3, 0.3],
+        buy=[0.05, 0.05],
+        sell=[-0.20, -0.20],
+        start_kwh=7.6,
+        refuse_battery_export=True,
+    )
+    _assert_same(scenario)
+    reference = _python_ref(scenario)
+    assert all(power >= -1e-9 for power in reference.powers), reference.powers
+    assert reference.powers[0] + scenario.slots[0].load_kw - scenario.slots[0].pv_kw < 0.0
+
+
+@requires_core
+def test_refuse_battery_export_combines_with_the_cost_basis_sell_floor():
+    _assert_same(
+        _scenario(
+            pv=[0.0, 0.0, 4.0, 0.0],
+            load=[0.5, 0.5, 0.4, 0.5],
+            buy=[0.50, 0.20, 0.10, 0.45],
+            sell=[0.05, 0.05, 0.05, 0.05],
+            sell_floor_eur_per_kwh=0.30,
+            refuse_battery_export=True,
+        )
+    )
+
+
+@requires_core
+def test_a_core_ignoring_the_refusal_option_is_rejected(monkeypatch):
+    """An old core (no refusal branch) can never dispatch: the validator rebuilds the bound (D1)."""
+    scenario = _scenario(
+        pv=[0.0, 3.0, 0.0, 4.0],
+        load=[1.2, 0.4, 1.5, 0.2],
+        buy=[0.45, 0.08, 0.42, 0.10],
+        sell=[0.35, 0.35, 0.35, 0.35],
+        refuse_battery_export=True,
+    )
+    real_solve = _fast._core.solve
+
+    def ignoring(pv, load, buy, sell, minutes, config):
+        config = {key: value for key, value in config.items() if key != "refuse_battery_export"}
+        return real_solve(pv, load, buy, sell, minutes, config)
+
+    monkeypatch.setattr(_fast._core, "solve", ignoring)
+    assert (
+        _fast.solve(
+            scenario.slots,
+            scenario.agg,
+            scenario.start_kwh,
+            scenario.opts,
+            scenario.target_penalty,
+            scenario.e_target,
+            scenario.salvage,
+            scenario.minutes,
+        )
+        is None
+    )
+    assert not _fast.available(), "a core that ignores the refusal bound must be disabled"
+    plan = dp.solve(
+        scenario.slots,
+        aggregate=scenario.agg,
+        start_kwh=scenario.start_kwh,
+        options=scenario.opts,
+        generated_at=T0,
+    )
+    reference = _python_ref(scenario)
+    assert [slot.power_w for slot in plan.slots] == pytest.approx(
+        [power * 1000.0 for power in reference.powers], abs=1e-9
+    )
+
+
+@requires_core
 def test_negative_and_unknown_prices():
     _assert_same(
         _scenario(

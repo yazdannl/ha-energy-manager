@@ -198,6 +198,11 @@ DEFAULTS: dict[str, Any] = {
     # hours). An internal shadow price: the reported plan money is the true grid cost either way.
     "optimizer.pv_charge_preference": "auto",
     "optimizer.target_soc_pct_end": None,
+    # Optimizer v2 stage 1b wiring (docs/OPTIMIZER_V2.md section 7): one kill switch for the whole
+    # contract-correct feed-in integration. off = v1 pricing byte-for-byte and the settlement is
+    # never called; shadow = settle and record a plan diff (learning profile + journal) while
+    # dispatching v1 unchanged; on = dispatch the plan built from the settlement.
+    "optimizer.feed_in_wiring": "off",
     # -- cost basis and the sell floor (SPEC 5, 0.18.0) ------------------------------------
     # The ledger is derived from the applied dispatch log and the measured flows, so the floor
     # refuses a discharge/export below what the energy actually in the pack cost. Default on: with
@@ -271,6 +276,11 @@ _PRICE_PROVIDER_CHOICES = ("entity", "zonneplan", "day_ahead", "fixed")
 #: refusal must never be silently turned into zero-priced slots. ``tiered`` needs the tier table from
 #: the plan's reachability inputs, so a mode without one refuses safely until the wiring lands.
 _FEED_IN_MODE_CHOICES = ("derived", "explicit", "buy_minus_fee", "saldering", "tiered")
+#: Optimizer v2 stage 1b wiring (docs/OPTIMIZER_V2.md section 7): one kill switch for the whole
+#: feed-in integration.  ``off`` never calls the settlement and keeps v1 byte-identical;
+#: ``shadow`` settles and records a plan diff while dispatching v1 unchanged; ``on`` dispatches the
+#: plan built from the settlement.
+_FEED_IN_WIRING_CHOICES = ("off", "shadow", "on")
 _PRICE_CONTRACT_CHOICES = ("dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night")
 _PRICE_UNIT_CHOICES = ("auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh")
 _SOLAR_SOURCE_CHOICES = ("forecast_solar", "capacity", "derived", "learned")
@@ -459,6 +469,7 @@ SETTINGS_META: dict[str, _Meta] = {
     "optimizer.pv_charge_preference": _Meta("choice", "optimizer", "PV charge preference", "How the plan values PV energy it charges into the pack: auto = the export price it forgoes (the economically exact default, so PV wins whenever its export price is below the buy price), prefer_pv = free (absorb the surplus before buying anything), avoid_pv = the slot's buy price (export the PV and charge from the grid in the cheapest hours). A shadow price for planning only: the reported plan money stays the true grid cost.", _PV_CHARGE_PREFERENCE_CHOICES),
     "optimizer.sell_floor_enabled": _Meta("bool", "optimizer", "Sell floor", "Refuse a discharge or export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at). Off, or before a basis exists, behaves exactly as before."),
     "optimizer.sell_floor_margin_eur_per_kwh": _Meta("float", "optimizer", "Sell floor margin", "Require this much above the break-even before a sale is allowed.", minimum=0.0, maximum=1.0, advanced=True),
+    "optimizer.feed_in_wiring": _Meta("choice", "optimizer", "Feed-in wiring", "How the optimizer consumes the contract-correct feed-in settlement (price.feed_in_mode). off = today's behaviour; the settlement is never called. shadow = settle and record a plan diff against the v1 schedule (learning profile feed_in_shadow + journal) while dispatching v1 unchanged. on = dispatch the plan built from the settlement: the contract's per-slot price replaces the derived one and, when the battery-sourced export leg is refused, only battery-sourced export is blocked while forced PV surplus is still priced at the settlement's justified floor. An unpriceable contract (derived, or no justified floor) never re-prices with the v1 formula: planning fails safe by holding, and the independent safety layer (cell-voltage emergency charge, watchdog) covers an unsafe hold. Requires price.feed_in_mode to be a supported contract before turning it on.", _FEED_IN_WIRING_CHOICES),
     "optimizer.target_soc_pct_end": _Meta("float", "optimizer", "End SoC target %", "Unset = no hard terminal target.", minimum=0.0, maximum=100.0, nullable=True, advanced=True),
     "control.tick_seconds": _Meta("int", "control", "Tick seconds", "", minimum=5, maximum=3600, advanced=True),
     "control.replan_minutes": _Meta("int", "control", "Replan minutes", "", minimum=1, maximum=1440, advanced=True),

@@ -56,6 +56,10 @@ typedef struct {
     long power_steps;
     int allow_grid_charge;
     int allow_export;
+    /* Optimizer v2 stage 1b (docs/OPTIMIZER_V2.md section 2.3): the feed-in contract refused the
+     * battery-sourced export leg.  Policy only; the Python reference's grid_window_kw is the
+     * authority and _fast._validated rebuilds every bound from it (D1). */
+    int refuse_battery_export;
     double max_import_kw;
     double max_export_kw;
     double min_spread_eur_per_kwh;
@@ -206,7 +210,15 @@ static void grid_window(const Config *c, double base, double sell, double buy, d
         double cap = -(c->max_export_kw + base);
         if (cap > lo) lo = cap;
     }
-    if (!c->allow_export || !(sell > 0.0)) {
+    /* Export bounds, in the Python reference's precedence (D2): the user's allow_export is
+     * strictest, then the contract refusal (forced PV surplus still exports), then the v1
+     * zero/unknown-price rule. */
+    if (!c->allow_export) {
+        if (-base > lo) lo = -base;
+    } else if (c->refuse_battery_export) {
+        double cap = base > 0.0 ? -base : 0.0;
+        if (cap > lo) lo = cap;
+    } else if (!(sell > 0.0)) {
         if (-base > lo) lo = -base;
     }
     if (!c->allow_grid_charge) {
@@ -555,6 +567,7 @@ static int parse_config(PyObject *cfg, Config *c) {
     if (cfg_long(cfg, "power_steps", &c->power_steps, 1) < 0) return -1;
     if (cfg_bool(cfg, "allow_grid_charge", &c->allow_grid_charge, 1) < 0) return -1;
     if (cfg_bool(cfg, "allow_export", &c->allow_export, 1) < 0) return -1;
+    if (cfg_bool(cfg, "refuse_battery_export", &c->refuse_battery_export, 0) < 0) return -1;
     if (cfg_double(cfg, "max_import_kw", &c->max_import_kw, 1) < 0) return -1;
     if (cfg_double(cfg, "max_export_kw", &c->max_export_kw, 1) < 0) return -1;
     if (cfg_double(cfg, "min_spread_eur_per_kwh", &c->min_spread_eur_per_kwh, 1) < 0) return -1;

@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import threading
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import date, datetime, timedelta
@@ -1527,8 +1528,18 @@ class Engine:
                 else None
             ),
             "fleet_basis_eur_per_kwh": cost_basis_ledger.fleet_basis_eur_per_kwh(basis_entries),
+            # Optimizer v2 stage 1b: the active plan prices export at the contract's justified
+            # floor (a refusal plan), so the ledger's PV charge price is a conservative bound,
+            # not the real export rate.  shadow plans never set this: their slots keep v1 prices.
+            "feed_in_floor_is_bound": self._feed_in_floor_is_bound(),
             "batteries": rows,
         }
+
+    def _feed_in_floor_is_bound(self) -> bool:
+        block = getattr(self._plan, "feed_in", None)
+        if not isinstance(block, dict) or block.get("shadow"):
+            return False
+        return bool(block.get("floor_eur_per_kwh") is not None and not block.get("export_allowed"))
 
     def update_cost_bases(self, now: datetime | None = None, *, force: bool = False) -> dict[str, Any]:
         """Advance every enabled battery's cost-basis ledger from its applied dispatch log (SPEC 5).
@@ -3126,8 +3137,24 @@ class Engine:
         except Exception as exc:  # noqa: BLE001 - the floor is an optimisation, never a blocker
             log.warning("cost-basis update failed: %s", exc)
         sell_floor = self.fleet_sell_floor()
-        try:
-            plan = dp.solve_from_forecasts(
+        wiring = self._feed_in_wiring()
+        feed_in_request = None
+        if wiring != "off":
+            try:
+                feed_in_request = self._feed_in_request(configs, price)
+            except Exception as exc:  # noqa: BLE001 - a broken request must not break planning
+                # The request is built before the solve handlers, so its own failure needs the
+                # same routing: "on" fails safe (withhold + hold), "shadow" just skips the
+                # counterfactual and still solves and dispatches v1 (review round 2).
+                if wiring == "on":
+                    self._withhold_unpriceable_feed_in(reason, exc, wiring)
+                    self._note_replan_outcome(None)
+                    return None
+                log.warning("feed-in shadow request failed; v2 skipped: %s", exc)
+                feed_in_request = None
+
+        def solve(feed_in_arg: Any | None) -> Plan:
+            return dp.solve_from_forecasts(
                 price,
                 solar if solar is not None else SolarForecast(source="unavailable"),
                 load,
@@ -3139,7 +3166,18 @@ class Engine:
                 dry_run=bool(self.snapshot().dry_run),
                 maintenance=maintenance,
                 sell_floor_eur_per_kwh=sell_floor,
+                feed_in=feed_in_arg,
             )
+
+        try:
+            plan = solve(feed_in_request if wiring == "on" else None)
+        except dp.FeedInUnavailable as exc:
+            # Fail-safe (docs/OPTIMIZER_V2.md 2.3, section 7): the contract cannot price this plan,
+            # so there is no tariff-dependent optimisation.  Withhold it (the dispatcher then holds
+            # at 0 W) and never re-price with the v1 derived formula.
+            self._withhold_unpriceable_feed_in(reason, exc, wiring)
+            self._note_replan_outcome(None)
+            return None
         except ValueError as exc:
             self._journal.event("warning", "plan_infeasible", str(exc)[:200], {"reason": reason})
             self._note_replan_outcome(None)
@@ -3165,6 +3203,10 @@ class Engine:
             # the UI and from dispatch with a one-off reason the UI can show (SPEC 9.1).
             self._journal_pending_plan(reason)
             return plan
+
+        if wiring == "shadow" and feed_in_request is not None:
+            # Compute-only counterfactual: v1 stays the plan that is persisted and dispatched.
+            self._record_feed_in_shadow(plan, solve, feed_in_request, reason)
 
         plan.batteries = self._plan_battery_snapshot(plan, configs, now)
         changed = self._plan_changed(self._plan, plan)
@@ -3214,11 +3256,21 @@ class Engine:
         price = self._price
         solar = self._solar
         load = self._load
-        price_vector = (
-            tuple((to_iso(slot.t), round(slot.buy, 4), round(slot.sell, 4)) for slot in price.slots[:96])
-            if price is not None
-            else ()
-        )
+        price_vector: tuple[Any, ...] = ()
+        if price is not None:
+            # A missing/non-finite sell is unknown, never a crash or a fabricated number: this
+            # fingerprint only feeds a change comparison (review round 2).
+            slots: list[tuple[Any, Any, Any]] = []
+            for slot in price.slots[:96]:
+                sell = self._finite_setting(getattr(slot, "sell", None))
+                slots.append(
+                    (
+                        to_iso(slot.t),
+                        round(float(slot.buy), 4),
+                        None if sell is None else round(sell, 4),
+                    )
+                )
+            price_vector = tuple(slots)
         pv_total = round(sum(slot.pv_kw for slot in solar.slots), 3) if solar is not None else 0.0
         load_total = round(sum(slot.load_kw for slot in load.slots), 3) if load is not None else 0.0
         return price_vector, pv_total, load_total
@@ -3232,6 +3284,159 @@ class Engine:
             if old.action != new.action or abs(old.power_w - new.power_w) > 25.0:
                 return True
         return False
+
+    # ---------------------------------------------------------------- feed-in wiring (stage 1b)
+
+    def _feed_in_wiring(self) -> str:
+        """``optimizer.feed_in_wiring``: ``off`` (default), ``shadow`` or ``on``.
+
+        An unknown stored value behaves as ``off``: the kill switch fails closed to v1, never to a
+        half-enabled tariff path (docs/OPTIMIZER_V2.md section 7).
+        """
+        value = str(self._settings.get("optimizer.feed_in_wiring", "off") or "off").strip().lower()
+        return value if value in ("shadow", "on") else "off"
+
+    @staticmethod
+    def _finite_setting(value: Any) -> float | None:
+        """A finite float, or ``None``: missing, malformed or non-finite is unknown, never zero."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        number = float(value)
+        return number if math.isfinite(number) else None
+
+    def _feed_in_request(self, configs: Sequence[BatteryConfig], price: PriceForecast) -> Any:
+        """The settlement inputs the engine can justify today (D4).
+
+        The period state and the tier table have no configured source yet, so ``saldering`` prices
+        only through ``price.saldering_assume_nettable`` and ``tiered`` refuses rather than
+        inventing a billing state.  ``explicit_price_eur_per_kwh`` is only passed when the
+        forecast's own provenance says an explicit source really resolved (``feed_in_source`` is
+        ``"entity"`` or ``"flat"``) and that rate is finite -- a configured-but-unavailable
+        source keeps its *derived* slots, and handing that number over as an explicit tariff would
+        bypass the settlement's refusal.  ``None`` lets the module resolve the flat tariff itself
+        or refuse.  Every rate is read tolerantly (``None``, never a fabricated ``0.0``).
+        """
+        aggregate = dp.BatteryAggregate.from_configs(
+            configs, float(self._settings.get("optimizer.reserve_soc_pct", 0.0) or 0.0)
+        )
+        explicit = None
+        if getattr(price, "feed_in_source", None) in ("entity", "flat") and price.slots:
+            explicit = self._finite_setting(getattr(price.slots[0], "sell", None))
+        export_limit = self._finite_setting(
+            float(self._settings.get("optimizer.max_grid_export_w", 0) or 0.0) / 1000.0
+        )
+        return dp.FeedInRequest(
+            settings=self._settings,
+            explicit_price_eur_per_kwh=explicit,
+            max_discharge_kw=self._finite_setting(aggregate.p_discharge_kw),
+            export_limit_kw=export_limit if export_limit and export_limit > 0 else None,
+        )
+
+    def _withhold_unpriceable_feed_in(self, reason: str, exc: Exception, wiring: str) -> None:
+        """Fail safe: no tariff-dependent optimisation when the contract cannot price the plan.
+
+        A hold is physically safe: the battery stays at 0 W and the dispatcher's stale/expiry path
+        already refuses to follow a withheld plan.  Where a hold is unsafe, the independent safety
+        layer still runs -- the cell-voltage guard charges a latched battery out of danger
+        (SPEC 9.3 gate 4b) and the watchdog holds every driver on a stalled loop -- both without a
+        plan.  The refusal-with-known-floor path is the opposite case and stays a normal plan: it
+        already optimises self-consumption only, with forced PV export priced at the floor.
+        """
+        detail = str(exc)[:200]
+        self._journal.event(
+            "warning", "feed_in_unpriceable", detail, {"reason": reason, "wiring": wiring}
+        )
+        self._alert_once(
+            Reason.UNPRICED_EXPORT,
+            f"feed-in contract cannot price this plan; planning is paused: {detail}",
+        )
+        self._drop_plan_for_stale_inputs(f"feed-in contract cannot price the plan: {detail}")
+
+    def _record_feed_in_shadow(
+        self,
+        plan: Plan,
+        solve: Callable[[Any], Plan],
+        request: Any,
+        reason: str,
+    ) -> None:
+        """Solve the counterfactual and record the plan diff (compute-only; v1 is dispatched).
+
+        The shadow v2 schedule (and the contract prices in it) must never reach the ``plans``
+        table: the cost-basis ledger resolves the newest plan per slot, so a persisted shadow row
+        would silently re-price the ledger.  The diff goes to a learning profile and the journal.
+        """
+        try:
+            shadow = solve(request)
+            diff = self._feed_in_plan_diff(plan, shadow)
+            block: dict[str, Any] = dict(getattr(shadow, "feed_in", {}) or {})
+            block["shadow"] = True
+            block["diff"] = diff
+        except dp.FeedInUnavailable as exc:
+            block = {
+                "shadow": True,
+                "export_allowed": False,
+                "reason": Reason.UNPRICED_EXPORT,
+                "floor_eur_per_kwh": None,
+                "notes": [str(exc)[:300]],
+                "diff": {"changed_slots": None, "slots": [], "note": "no v2 schedule"},
+            }
+        except ValueError as exc:
+            block = {
+                "shadow": True,
+                "reason": None,
+                "notes": [f"v2 solve failed: {exc}"[:300]],
+                "diff": {"changed_slots": None, "slots": [], "note": "no v2 schedule"},
+            }
+        plan.feed_in = block
+        summary = plan.summary
+        summary.feed_in_mode = block.get("mode")
+        summary.feed_in_export_allowed = block.get("export_allowed")
+        summary.feed_in_reason = block.get("reason")
+        summary.feed_in_floor_eur_per_kwh = block.get("floor_eur_per_kwh")
+        self._store_call(
+            "profile_put",
+            "feed_in_shadow",
+            "latest",
+            {"generated_at": to_iso(plan.generated_at), "reason": reason, "feed_in": block},
+        )
+        self._journal.event(
+            "info",
+            "feed_in_shadow",
+            "feed-in shadow plan recorded (v1 dispatched unchanged)",
+            {
+                "reason": reason,
+                "changed_slots": block.get("diff", {}).get("changed_slots"),
+                "export_allowed": block.get("export_allowed"),
+                "feed_in_reason": block.get("reason"),
+            },
+        )
+
+    @staticmethod
+    def _feed_in_plan_diff(v1: Plan, v2: Plan) -> dict[str, Any]:
+        """Per-slot v1 vs v2 schedule diff, with the action and reason slug on each side."""
+        slots: list[dict[str, Any]] = []
+        for old, new in zip(v1.slots, v2.slots):
+            if (
+                old.action != new.action
+                or abs(old.power_w - new.power_w) > 25.0
+                or old.reason != new.reason
+            ):
+                slots.append(
+                    {
+                        "t": to_iso(new.t),
+                        "v1_power_w": old.power_w,
+                        "v2_power_w": new.power_w,
+                        "v1_action": getattr(old.action, "value", old.action),
+                        "v2_action": getattr(new.action, "value", new.action),
+                        "v1_reason": old.reason,
+                        "v2_reason": new.reason,
+                    }
+                )
+        return {
+            "changed_slots": len(slots),
+            "slot_count": min(len(v1.slots), len(v2.slots)),
+            "slots": slots,
+        }
 
     def _live_energy_kwh(self, configs: Sequence[BatteryConfig]) -> float:
         with self._lock:

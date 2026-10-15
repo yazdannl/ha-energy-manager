@@ -328,9 +328,14 @@
         wear_eur_per_kwh: MOCK_WEAR,
         break_even_sell_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR,
         sell_floor_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR,
-        maintenance: MOCK_MAINTENANCE
+        maintenance: MOCK_MAINTENANCE,
+        feed_in_mode: null,
+        feed_in_export_allowed: null,
+        feed_in_reason: null,
+        feed_in_floor_eur_per_kwh: null
       },
       maintenance: MOCK_MAINTENANCE,
+      feed_in: null,
       slots: slots,
       batteries: [{ id: "battery_1", name: "Example Battery 1", share_w: slots.length ? slots[0].power_w : 0, round_trip_efficiency: roundTrip, wear_eur_per_kwh: MOCK_WEAR, break_even_sell_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR }]
     };
@@ -624,6 +629,7 @@
     ["optimizer.pv_charge_preference", "str", "auto", "PV charge preference", "How the plan values PV energy it charges into the pack: auto = the export price it forgoes (default), prefer_pv = free (absorb the surplus before buying anything), avoid_pv = the slot's buy price (export the PV and charge from the grid in the cheapest hours). A shadow price for planning only: the reported plan money stays the true grid cost.", "optimizer", ["auto", "prefer_pv", "avoid_pv"]],
     ["optimizer.sell_floor_enabled", "bool", true, "Sell floor", "Refuse a discharge or export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at).", "optimizer", null],
     ["optimizer.sell_floor_margin_eur_per_kwh", "float", 0.0, "Sell floor margin", "Require this much above the break-even before a sale is allowed.", "optimizer", null],
+    ["optimizer.feed_in_wiring", "str", "off", "Feed-in wiring", "How the optimizer consumes the contract-correct feed-in settlement (price.feed_in_mode). off = today's behaviour and the settlement is never called; shadow = settle and record a plan diff while v1 stays dispatched; on = dispatch the settlement plan. An unpriceable contract never re-prices with the derived formula: planning holds instead.", "optimizer", ["off", "shadow", "on"]],
     ["optimizer.target_soc_pct_end", "float", null, "End SoC target %", "Unset = no hard terminal target.", "optimizer", null],
 
     ["control.tick_seconds", "int", 30, "Tick seconds", "", "control", null],
@@ -1078,6 +1084,7 @@
       // The fleet values are the energy-weighted means of the priced rows (engine.cost_basis_block).
       sell_floor_eur_per_kwh: mode === "off" ? null : row.sell_floor_eur_per_kwh,
       fleet_basis_eur_per_kwh: row.cost_basis_eur_per_kwh,
+      feed_in_floor_is_bound: false,
       batteries: rows
     };
   }

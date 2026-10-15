@@ -1112,7 +1112,12 @@
       bookings: enabledRows.reduce(function (sum, row) { return sum + row.bookings; }, 0),
       // "Empty" is a ledger with nothing priced: a fresh install, a pack emptied to its floor, or
       // every battery's ledger reset.  It is never the same state as a stale figure.
-      empty: enabledRows.length > 0 && enabledRows.every(function (row) { return row.basis === null; })
+      empty: enabledRows.length > 0 && enabledRows.every(function (row) { return row.basis === null; }),
+      // Optimizer v2 stage 1b: the active plan prices export at the feed-in contract's justified
+      // floor (a refusal plan), so the ledger's PV charge price is a conservative bound.  The
+      // server sets this only for a dispatched refusal plan, never for a shadow record.
+      floorIsBound: !!(block && block.feed_in_floor_is_bound === true),
+      feedInReason: summary.feed_in_reason || null
     };
   }
 
@@ -1172,6 +1177,9 @@
       draw(el("p", { class: "muted", text: model.bookings > 0 ? "The pack is empty: the ledger holds no priced energy, so there is no break-even price yet." : "No ledger yet: no charging interval has been booked, so there is no break-even price yet." }));
     }
     draw(el("p", { class: "legend-note", text: costBasisContextText(model) }));
+    if (model.floorIsBound) {
+      draw(el("p", { class: "field-help", text: "Feed-in contract: the battery-sourced export leg is refused (unpriced_export), so PV charging is priced at the contract's justified floor. That floor is a conservative bound, not the real export rate." }));
+    }
     if (model.stale) {
       draw(el("div", { class: "banner banner-warn" }, [
         el("p", { class: "banner-title", text: "The ledger is stalled" }),

@@ -49,6 +49,7 @@ from ..models import Reason
 __all__ = [
     "MODES",
     "FeedInLimits",
+    "FeedInRequest",
     "FeedInResult",
     "PeriodState",
     "ScheduleSettlement",
@@ -106,6 +107,29 @@ class FeedInLimits:
     explicit_price_eur_per_kwh: float | None = None
     tiers: Sequence[tuple[float, float]] = ()
     tier_volume_kwh: float | None = None
+
+
+@dataclass(frozen=True)
+class FeedInRequest:
+    """Live-wiring request for :func:`settle_feed_in` (docs/OPTIMIZER_V2.md section 2).
+
+    The planner fills the PV/load series and the slot duration in from the aligned plan slots; the
+    caller supplies only what it has already resolved: the settings mapping, the period state and
+    the reachability limits. ``period_state`` and the tier inputs stay unset until a source exists
+    for them, so ``saldering`` prices only through ``price.saldering_assume_nettable`` and
+    ``tiered`` refuses (D4); the wiring never invents a billing state.
+    """
+
+    settings: Any
+    period_state: PeriodState | None = None
+    #: A caller-resolved explicit feed-in rate, already net of fee/VAT (the live forecast's own
+    #: ``slot.sell`` for a configured explicit source). ``None`` lets the module resolve the flat
+    #: tariff itself, or refuse a configured-but-unreadable entity.
+    explicit_price_eur_per_kwh: float | None = None
+    tiers: Sequence[tuple[float, float]] = ()
+    tier_volume_kwh: float | None = None
+    max_discharge_kw: float | None = None
+    export_limit_kw: float | None = None
 
 
 @dataclass(frozen=True)
