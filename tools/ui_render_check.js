@@ -375,6 +375,16 @@ function classTokens(text) {
     fleetHost.textContent.includes(A.fmtPrice(fleetBasis, 3))
     && Math.abs(A.costBasisView(fleetStatus, null).energyKwh - fleetEnergy) < 1e-9,
     A.fmtPrice(fleetBasis, 3));
+  // Optimizer v2 stage 1b: a contract refusal prices PV charge at the justified floor, and the
+  // status flag must say so instead of letting the floor read as the real export rate.
+  const boundStatus = Object.assign({}, fleetStatus, {
+    cost_basis: Object.assign({}, fleetStatus.cost_basis, { feed_in_floor_is_bound: true }),
+  });
+  const boundHost = document.createElement("div");
+  A.renderBatteryEnergyPrice((node) => boundHost.appendChild(node), { status: boundStatus, plan: null });
+  check("a contract refusal flags the floor as a conservative bound",
+    /conservative bound/.test(boundHost.textContent) && /unpriced_export/.test(boundHost.textContent),
+    boundHost.textContent.slice(-220));
   const stalledView = A.costBasisView({
     cost_basis: { enabled: true, batteries: [{ id: "b", name: "B", cost_basis_eur_per_kwh: 0.2, energy_kwh: 1.0, stale: true, no_samples_since: "2026-01-01T00:00:00Z" }] },
   }, null);

@@ -187,6 +187,16 @@ def test_validation_rejects_bad_values():
     assert coerce_setting("dry_run", "false") is False
     assert coerce_setting("optimizer.slot_minutes", 15.0) == 15
     assert coerce_setting("price.bzn", "DE-LU") == "DE-LU"
+    # Optimizer v2 stage 1b: the kill switch is a choice that defaults to today's behaviour and
+    # must reject anything else (an unknown stored value falls back to off in the engine).
+    assert DEFAULTS["optimizer.feed_in_wiring"] == "off"
+    meta = SETTINGS_META["optimizer.feed_in_wiring"]
+    assert meta.type == "choice" and meta.choices == ("off", "shadow", "on")
+    assert meta.advanced is False
+    for value in ("off", "shadow", "on"):
+        assert coerce_setting("optimizer.feed_in_wiring", value) == value
+    with pytest.raises(ConfigError):
+        coerce_setting("optimizer.feed_in_wiring", "yes")
     # SPEC 8.1 (0.19.0): the PV charge preference round-trips and rejects a typo.
     for value in ("auto", "prefer_pv", "avoid_pv"):
         assert coerce_setting("optimizer.pv_charge_preference", value) == value

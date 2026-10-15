@@ -298,6 +298,13 @@ def plan_summary_dict(summary: PlanSummary) -> dict[str, Any]:
     # Additive (0.17.0): scheduled full-charge maintenance.  ``None`` when a summary was restored
     # from a store written before the field existed, or when no battery is due in this horizon.
     payload["maintenance"] = getattr(summary, "maintenance", None)
+    # Additive (stage 1b): the feed-in contract decision (mode, export_allowed, reason, floor).
+    # ``reason`` is ``unpriced_export`` whenever the battery-sourced export leg was refused.  Read
+    # with ``getattr`` so a summary restored from an older store yields null.
+    payload["feed_in_mode"] = getattr(summary, "feed_in_mode", None)
+    payload["feed_in_export_allowed"] = getattr(summary, "feed_in_export_allowed", None)
+    payload["feed_in_reason"] = getattr(summary, "feed_in_reason", None)
+    payload["feed_in_floor_eur_per_kwh"] = getattr(summary, "feed_in_floor_eur_per_kwh", None)
     return payload
 
 
@@ -312,6 +319,7 @@ def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dic
             "infeasible_reason": "no_plan",
             "summary": plan_summary_dict(PlanSummary()),
             "maintenance": None,
+            "feed_in": None,
             "slots": [],
             "batteries": [],
         }
@@ -333,6 +341,9 @@ def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dic
         # Additive (0.17.0): the same block as ``summary.maintenance`` at the top level, so a client
         # that reads the plan without walking its summary still sees why it charges to the ceiling.
         "maintenance": getattr(plan, "maintenance", None),
+        # Additive (stage 1b): the same feed-in block as ``summary.feed_in_*`` plus the settlement
+        # notes and, in shadow mode, the recorded v1-vs-v2 plan diff.
+        "feed_in": getattr(plan, "feed_in", None),
         "slots": [
             {
                 "t": to_iso(slot.t),

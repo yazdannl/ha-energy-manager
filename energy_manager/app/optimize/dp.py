@@ -53,9 +53,26 @@ from ..models import (
     slot_range,
     utcnow,
 )
+from ..sources.feed_in import FeedInLimits, FeedInRequest, FeedInResult, settle_feed_in
 from . import _fast
 
 log = logging.getLogger(__name__)
+
+
+class FeedInUnavailable(ValueError):
+    """The feed-in contract cannot price this plan (SPEC 4.2; docs/OPTIMIZER_V2.md section 2).
+
+    Raised by :func:`solve_from_forecasts` when the settlement has no justified bound
+    (``floor is None``) or the configured mode is ``derived``/unknown.  The caller must perform no
+    tariff-dependent optimisation for that plan and fail safe (hold, or self-consumption-only
+    where a hold is unsafe); the contract is never re-priced by the v1 derived formula.
+    ``result`` carries the settlement when there was one (its reason is
+    :data:`Reason.UNPRICED_EXPORT`).
+    """
+
+    def __init__(self, message: str, result: FeedInResult | None = None) -> None:
+        super().__init__(message)
+        self.result = result
 
 MAX_STATES = 400
 MAX_ITERATIONS = 2_000_000
@@ -142,6 +159,13 @@ class OptimizerOptions:
     #: configured margin. ``None`` = no floor (setting off, or no ledger yet) and today's plan.
     #: The engine derives it from the ledger and passes it in; the DP never reads the store.
     sell_floor_eur_per_kwh: float | None = None
+    #: Optimizer v2 stage 1b (docs/OPTIMIZER_V2.md section 2.3): the feed-in contract refused the
+    #: battery-sourced export leg for this plan.  A planning-only bound: no flow below the
+    #: house's own demand may export, while the forced PV surplus still exports and is priced at
+    #: the settlement's justified floor.  ``False`` (the default, and the only value
+    #: ``from_settings`` produces) keeps the schedule bit-for-bit as before; the engine sets it
+    #: from a :class:`~app.sources.feed_in.FeedInResult`, never from a setting of its own.
+    refuse_battery_export: bool = False
 
     @classmethod
     def from_settings(cls, settings: Any) -> "OptimizerOptions":
@@ -254,6 +278,11 @@ class SlotInput:
     price_stale: bool = False
     pv_source: str = ""  # provider that supplied pv_kw for this slot
     price_source: str = ""  # provider that supplied buy/sell for this slot
+    #: The slot's energy-tax component (SPEC 4.2, optimizer v2 stage 1b): the pure contract
+    #: settlement reads it for ``buy_minus_fee`` and for the post-saldering rate.  ``None`` means
+    #: the source published none, which the settlement treats as unknown, never zero.  Appended
+    #: last so every existing positional construction keeps its meaning.
+    energy_tax: float | None = None
 
 
 def _forward_fill(times: Sequence[datetime], points: Sequence[datetime], values: Sequence[Any]):
@@ -270,6 +299,20 @@ def _forward_fill(times: Sequence[datetime], points: Sequence[datetime], values:
         else:
             out.append((None, None))
     return out
+
+
+def _finite_slot_price(value: Any) -> float:
+    """A finite slot price, else ``0.0``: an unknown export price pays nothing and never exports.
+
+    ``SlotInput.sell`` is a float and the solver's own zero/unknown-price bound already refuses
+    battery export at ``sell <= 0``, so a missing, malformed or non-finite value degrades to the
+    documented "nothing received" default instead of crashing the entire forecast (review round 2).
+    The buy price stays strict: a missing consumer price is an error, not a free kWh.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    number = float(value)
+    return number if math.isfinite(number) else 0.0
 
 
 def align_slots(
@@ -317,10 +360,11 @@ def align_slots(
                 pv_kw=max(0.0, float(sslot.pv_kw)) if sslot is not None else 0.0,
                 load_kw=float(lslot.load_kw) if lslot is not None else 0.0,
                 buy=float(pslot.buy),
-                sell=float(pslot.sell),
+                sell=_finite_slot_price(pslot.sell),
                 load_p10_kw=getattr(lslot, "p10_kw", None),
                 load_p90_kw=getattr(lslot, "p90_kw", None),
                 price_stale=stale,
+                energy_tax=getattr(pslot, "energy_tax", None),
                 pv_source=str(getattr(sslot, "source", "") or getattr(solar, "source", "") or "")
                 if sslot is not None
                 else "",
@@ -471,9 +515,16 @@ def grid_window_kw(
         hi = min(hi, opts.max_import_kw - base)  # import cap: base + p <= limit
     if opts.max_export_kw > 0:
         lo = max(lo, -(opts.max_export_kw + base))  # export cap: -(base + p) <= limit
-    # Exporting at a zero (or unknown) sell price earns nothing and only spends energy, so it is
-    # never planned -- independent of ``allow_export`` (audit minor).
-    if not opts.allow_export or slot.sell is None or float(slot.sell) <= 0.0:
+    # Export bounds, in this precedence (D2, docs/OPTIMIZER_V2.md section 2.3):
+    #   (a) ``allow_export`` is the user's own permission -- off means nothing exports;
+    #   (b) the contract refusal blocks only the battery-sourced leg, so the forced PV surplus
+    #       still exports and is priced at the settlement's floor (even a negative one);
+    #   (c) v1's zero/unknown-price rule, unchanged.
+    if not opts.allow_export:
+        lo = max(lo, -base)
+    elif opts.refuse_battery_export:
+        lo = max(lo, -max(0.0, base))
+    elif slot.sell is None or float(slot.sell) <= 0.0:
         lo = max(lo, -base)
     if not opts.allow_grid_charge:
         hi = min(hi, max(0.0, slot.pv_kw - slot.load_kw))
@@ -1267,8 +1318,18 @@ def solve_from_forecasts(
     dry_run: bool = True,
     maintenance: Mapping[str, Any] | None = None,
     sell_floor_eur_per_kwh: float | None = None,
+    feed_in: FeedInRequest | None = None,
 ) -> Plan:
-    """Align the three forecasts, then solve.  Raises ``ValueError`` when inputs are unusable."""
+    """Align the three forecasts, then solve.  Raises ``ValueError`` when inputs are unusable.
+
+    ``feed_in`` is the optimizer v2 stage 1b wiring (docs/OPTIMIZER_V2.md section 2): the contract
+    settlement replaces the per-slot sell price (a pure input change, so the C core stays valid)
+    and, when the battery-sourced export leg is refused, tightens the DP bounds to forced PV
+    export only.  ``None`` (and every caller that omits it, including the kill switch) never calls
+    the settlement and keeps the v1 schedule bit-for-bit.  When the contract cannot price the plan
+    (no justified ``floor``, or ``derived``/unknown mode) this raises :class:`FeedInUnavailable`
+    instead of silently falling back to the v1 derived pricing.
+    """
     moment = now or utcnow()
     options = OptimizerOptions.from_settings(settings)
     hours = int(clamp(options.horizon_hours, 12, 48))
@@ -1282,7 +1343,35 @@ def solve_from_forecasts(
     flattened = bool(slots) and all(s.price_stale for s in slots)
     if flattened:
         sources["price_stale"] = "flat"
-    return solve(
+    result: FeedInResult | None = None
+    if feed_in is not None and slots:
+        limits = FeedInLimits(
+            pv_kw=[slot.pv_kw for slot in slots],
+            load_kw=[slot.load_kw for slot in slots],
+            max_discharge_kw=feed_in.max_discharge_kw,
+            export_limit_kw=feed_in.export_limit_kw,
+            # The horizon grid is uniform and the reachable-export bound is deliberately an
+            # upper bound: a shortened first slot (0.20.1) keeps the full slot length here.
+            slot_hours=options.slot_minutes / 60.0,
+            explicit_price_eur_per_kwh=feed_in.explicit_price_eur_per_kwh,
+            tiers=feed_in.tiers,
+            tier_volume_kwh=feed_in.tier_volume_kwh,
+        )
+        try:
+            result = settle_feed_in(feed_in.settings, slots, feed_in.period_state, limits)
+        except ValueError as exc:
+            # ``derived`` (the live legacy path) or an unknown mode: unpriceable by contract.
+            # Unknown is never zero, so this refuses instead of re-pricing with the v1 formula.
+            raise FeedInUnavailable(str(exc)) from exc
+        if result.floor is None:
+            raise FeedInUnavailable(
+                "feed-in settlement has no justified export floor; no tariff-dependent "
+                "optimisation for this plan",
+                result,
+            )
+        slots = [replace(slot, sell=float(result.sells[i])) for i, slot in enumerate(slots)]
+        options = replace(options, refuse_battery_export=not result.export_allowed)
+    plan = solve(
         slots,
         aggregate=aggregate,
         start_kwh=start_kwh,
@@ -1298,3 +1387,24 @@ def solve_from_forecasts(
         # (0.20.1, SPEC 8.16).
         now=moment,
     )
+    if result is not None:
+        # Additive (stage 1b): the contract decision rides on the plan and its summary the same way
+        # the eta/floor/maintenance context does, so /plan, /status and the ledger see it without a
+        # models.py change.  ``Reason.UNPRICED_EXPORT`` is carried in ``reason`` whenever the
+        # battery-sourced export leg was refused.
+        plan.feed_in = {
+            "mode": result.mode,
+            "export_allowed": bool(result.export_allowed),
+            "reason": result.reason,
+            "floor_eur_per_kwh": None if result.floor is None else float(result.floor),
+            "max_export_kwh": result.max_export_kwh,
+            "notes": list(result.notes),
+        }
+        summary = plan.summary
+        summary.feed_in_mode = result.mode
+        summary.feed_in_export_allowed = bool(result.export_allowed)
+        summary.feed_in_reason = result.reason
+        summary.feed_in_floor_eur_per_kwh = (
+            None if result.floor is None else float(result.floor)
+        )
+    return plan

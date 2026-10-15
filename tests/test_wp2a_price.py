@@ -212,6 +212,37 @@ def test_broken_feed_in_sensor_does_not_fail_the_buy_forecast():
     by_name = {status.name: status for status in statuses}
     assert by_name["zonneplan_entity"].detail["sell_known"] is True
     assert any("configured feed-in source unavailable" in note for note in forecast.notes)
+    # Provenance: a configured source that failed must never read as an explicit tariff.
+    assert forecast.feed_in_source == "unavailable"
+
+
+def test_feed_in_provenance_names_the_path_that_resolved():
+    derived, _ = load_price_forecast(
+        settings(), None, now=NOW, providers={"zonneplan_entity": slot_provider()}
+    )
+    assert derived.feed_in_source == "derived"
+
+    flat, _ = load_price_forecast(
+        settings(**{"price.feed_in_eur_per_kwh": 0.09}),
+        None,
+        now=NOW,
+        providers={"zonneplan_entity": slot_provider()},
+    )
+    assert flat.feed_in_source == "flat" and flat.slots[0].sell == pytest.approx(0.09)
+
+    client = FakeClient(
+        {
+            "state": "0.08",
+            "attributes": {"unit_of_measurement": "€/kWh", "friendly_name": "Example feed-in"},
+        }
+    )
+    entity, _ = load_price_forecast(
+        settings(**{"price.feed_in_entity": "sensor.example_feed_in"}),
+        client,
+        now=NOW,
+        providers={"zonneplan_entity": slot_provider()},
+    )
+    assert entity.feed_in_source == "entity" and entity.slots[0].sell == pytest.approx(0.08)
 
 
 def test_default_allow_export_is_off_until_a_feed_in_is_confirmed():

@@ -151,6 +151,7 @@ def _config(
         "power_steps": int(opts.power_steps),
         "allow_grid_charge": bool(opts.allow_grid_charge),
         "allow_export": bool(opts.allow_export),
+        "refuse_battery_export": bool(opts.refuse_battery_export),
         "max_import_kw": opts.max_import_kw,
         "max_export_kw": opts.max_export_kw,
         "min_spread_eur_per_kwh": opts.min_spread_eur_per_kwh,

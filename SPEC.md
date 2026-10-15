@@ -1777,6 +1777,54 @@ table arrives through the reachability inputs rather than a setting until the wi
 `price.feed_in_mode` is config-only today — selecting another mode stores the contract for the
 follow-up but does not change the live forecast, which keeps using the derived price.
 
+**Optimizer v2 stage 1b wiring — the optimizer consumes the settlement (no version bump; default off).**
+Stage 1b shipped the accounting behind `price.feed_in_mode` but no live consumer, so nothing was
+priced by a contract and nothing could be refused. This amendment wires
+`sources/feed_in.py::settle_feed_in` into the live planning path behind one kill switch and adds no
+new behaviour by default.
+
+- **One kill switch: `optimizer.feed_in_wiring = off | shadow | on` (default `off`).** `off` never
+calls the settlement and keeps the v1 schedule bit-for-bit (a regression monkeypatches the settlement
+to raise and asserts both the call list and the plan powers). `shadow` settles and solves a second,
+compute-only plan, records the v1-vs-v2 per-slot diff (powers, actions, reasons) in the
+`feed_in_shadow` learning profile and the journal, and dispatches v1 unchanged. `on` dispatches the
+plan built from the settlement. The shadow v2 schedule is **never** persisted to `plans`: the
+cost-basis ledger resolves the newest plan per slot, so a persisted shadow row would silently
+re-price the ledger with contract prices that were never dispatched.
+- **Decision use is a pure input change.** `FeedInResult.sells` replaces each aligned slot's `sell`,
+and when `export_allowed` is false the new `OptimizerOptions.refuse_battery_export` tightens the
+grid window to `lo = max(lo, -max(0.0, base))` (`base = load - pv`). In a deficit that lets the pack
+serve the house but forbids export; in a surplus it forbids battery discharge (`p >= 0`) while the
+forced PV surplus still exports and is priced at the justified floor (`sells = floor`), negative
+floors included. Export-bound precedence is fixed and tested: the user's `allow_export` first
+(strictest), then the contract refusal, then v1's zero/unknown-price rule; the refusal must run
+before that rule or a negative floor would suppress the forced export instead of pricing it.
+- **The C core mirrors the same branch** (`Config.refuse_battery_export`, `grid_window`). The
+runtime validator remains the authority: it rebuilds every bound with `dp.grid_window_kw` and
+re-derives the one-step choice, so a core that ignores the option is rejected and disabled rather
+than dispatched, and the Python reference runs. The differential suite covers the new option
+including the negative-floor case, and `tests/test_dp_core.py` proves the divergence is rejected.
+- **An unpriceable contract never falls back to v1 pricing.** `floor is None` (no justified bound)
+and `derived`/unknown modes raise `dp.FeedInUnavailable`; the engine withholds the plan
+(`feed_in_unpriceable` journal + `unpriced_export` alert) so the dispatcher holds at 0 W. A hold is
+physically safe; where it is not, the independent safety layer still runs without a plan -- the
+cell-voltage guard charges a latched battery out of danger (SPEC 9.3 gate 4b) and the watchdog holds
+every driver on a stalled loop. The refusal path *with* a known floor is the opposite case and stays
+a normal plan: it already performs self-consumption-only optimisation with forced PV export priced
+at the floor.
+- **Absent inputs are inputs, not guesses.** The period import/export state and the tier table have
+no configured source yet, so `saldering` prices live only through
+`price.saldering_assume_nettable` (shown as an assumption) and `tiered` refuses; the wiring never
+invents a billing state. `SlotInput` gained an `energy_tax` field (populated from `PriceSlot`) so
+`buy_minus_fee` and post-saldering rates can read the source's published component.
+- **Visibility.** The plan and its summary carry `feed_in_mode` / `feed_in_export_allowed` /
+`feed_in_reason` (`unpriced_export` when refused) / `feed_in_floor_eur_per_kwh`, surfaced by
+`/api/v1/plan` and `/status`; the status cost-basis block sets `feed_in_floor_is_bound`, which the
+Dashboard's Battery-energy-price card renders as a conservative bound. The ledger prices PV charge
+at the stored slot `sell`, which *is* that floor for a refusal plan, so the flag names the bound
+rather than re-pricing anything. Tests: the wiring suite (`tests/test_feed_in_wiring.py`), the core
+differential additions, the config/API/UI additions, and the full existing suite stay green.
+
 **0.25.0 named load devices (user request: add named load devices such as a heat pump with a device type
 and its own energy meter, so temperature-driven loads are modelled).** The base model fitted one
 whole-house profile and one whole-house temperature slope, so every device landed in that single

@@ -616,6 +616,7 @@ dashboard's own roles beside it, and a `Use the Energy dashboard` button clears 
 | `optimizer.target_soc_pct_end` | float, nullable | `null` | 0…100 | **End SoC target %** *(advanced)* — unset = no hard terminal target |
 | `optimizer.sell_floor_enabled` | bool | `true` | — | **Sell floor** — refuse a discharge or export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at). Off, or before a basis exists, behaves exactly as before |
 | `optimizer.sell_floor_margin_eur_per_kwh` | float | `0.0` | 0…1 | **Sell floor margin** *(advanced)* — require this much above the break-even before a sale is allowed |
+| `optimizer.feed_in_wiring` | choice `off\|shadow\|on` | `off` | — | **Feed-in wiring** — how the optimizer consumes the contract-correct settlement (`price.feed_in_mode`). `off` = today's behaviour and the settlement is never called; `shadow` = settle and record a plan diff (learning profile + journal) while v1 stays dispatched; `on` = dispatch the settlement plan. An unpriceable contract never re-prices with the derived formula: planning holds instead. Requires a supported `price.feed_in_mode` before turning it on |
 
 #### Control
 
@@ -926,6 +927,13 @@ overnight. Returns `None` when nothing matches.
 A configured feed-in source that cannot be read degrades to the derived price with a note — pricing
 export must never fail the buy forecast. Only an explicit `price.feed_in_eur_per_kwh = 0` forces a
 zero sell price. `optimizer.allow_export` defaults to off, so nothing exports until the user asks.
+
+The forecast records which path resolved, as the additive `feed_in_source` attribute:
+`"entity"`/`"flat"` only when that source really resolved, `"derived"` when none was configured,
+and `"unavailable"` when a configured source failed and the slots carry the derived price. The
+optimizer wiring reads it and only hands a rate to `sources/feed_in.py` as an authoritative explicit
+price when the provenance says `"entity"`/`"flat"` and the value is finite — a
+configured-but-unavailable source refuses instead of dispatching on the derived number.
 
 **Contract-correct feed-in accounting (optimizer v2 stage 1b, `sources/feed_in.py`).** The module
 `settle_feed_in(settings, slots, period_state, limits)` is *exact-or-refuse*: `explicit` and
@@ -1343,6 +1351,45 @@ the PV and charge from the grid in the cheapest hours). Only the solver's object
 shadow price: `cost_estimate_eur`, `baseline_cost_eur` and `saved_eur` stay the true grid cost of
 the returned schedule (SPEC 8.1), so no preference can invent a saving. `allow_grid_charge=false`
 keeps its PV-only bound and `min_spread` keeps charging only the grid part.
+
+**Feed-in contract wiring (stage 1b, `optimizer.feed_in_wiring`).** With `off` (default) nothing
+changes: the settlement is never called and the schedule is byte-for-byte the v1 one. With `shadow`
+the engine settles the contract and solves a second, compute-only plan, recording the v1-vs-v2
+per-slot diff (powers, actions, reasons) in the `feed_in_shadow` learning profile and a
+`feed_in_shadow` journal event while v1 remains the plan that is persisted and dispatched; the
+shadow v2 row is deliberately never written to `plans`, because the cost-basis ledger resolves the
+newest plan per slot and would otherwise price energy at contract values that never ran. With `on`
+the settlement's per-slot `sell` replaces the aligned slot price (a pure input change, so the C core
+and its validation contract are untouched) and a refused battery-sourced export leg sets
+`OptimizerOptions.refuse_battery_export`, which tightens the DP's grid window:
+
+```
+allow_export = false            -> lo = max(lo, -base)          # the user's own permission: nothing exports
+else refuse_battery_export      -> lo = max(lo, -max(0, base))  # battery-sourced export refused; forced PV surplus still exports
+else sell is None or sell <= 0  -> lo = max(lo, -base)          # v1's zero/unknown-price rule
+```
+
+In a deficit (`base = load - pv > 0`) the refusal bound is `-base`: the pack may serve the house,
+never the meter. In a surplus (`base < 0`) it is `0`: the pack may charge or hold, never discharge,
+while the forced PV surplus still exports and is priced at the settlement's justified floor -- a
+negative floor is priced as a cost, which is why the refusal branch runs before the `sell <= 0` rule.
+`allow_export` stays strictest, so a user who forbids export keeps forbidding it even under `on`. The
+C core implements the same branch (`Config.refuse_battery_export`); the runtime validator rebuilds
+the bound from `dp.grid_window_kw` and re-derives the one-step choice, so a core that ignores it is
+rejected and disabled, never dispatched.
+
+When the contract cannot price the plan at all (`floor is None`, or `price.feed_in_mode` is
+`derived`/unknown), `solve_from_forecasts` raises `FeedInUnavailable` and the engine performs no
+tariff-dependent optimisation: the plan is withheld (`feed_in_unpriceable`, alert code
+`unpriced_export`) so the dispatcher holds at 0 W. That hold is safe on its own, and the independent
+safety layer needs no plan -- the cell-voltage guard forces an emergency charge for a latched battery
+and the watchdog holds every driver on a stalled loop. A refusal *with* a known floor is different
+and stays a normal plan: it optimises self-consumption only, with forced PV export priced at the
+floor. The plan and `/status` expose `feed_in_mode` / `feed_in_export_allowed` / `feed_in_reason` /
+`feed_in_floor_eur_per_kwh`, and `cost_basis.feed_in_floor_is_bound` tells the dashboard that the
+ledger's PV charge price is that conservative bound rather than the real export rate. Today the
+period import/export state and the tier table have no configured source, so `saldering` prices live
+only through `price.saldering_assume_nettable` and `tiered` refuses.
 
 **Slot classification** (`_classify`) — stable action + reason slugs:
 

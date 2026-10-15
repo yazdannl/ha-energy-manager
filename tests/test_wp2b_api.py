@@ -493,6 +493,37 @@ def test_plan_route_works_with_no_plan():
     status, _headers, _content, body = call(app, "GET", "/api/v1/plan")
     assert status == 200
     assert body["feasible"] is False and body["slots"] == [] and body["summary"]["saved_eur"] == 0.0
+    assert body["feed_in"] is None
+
+
+def test_plan_and_summary_expose_the_feed_in_decision():
+    from app.api import plan_dict, plan_summary_dict
+
+    summary = PlanSummary()
+    summary.feed_in_mode = "saldering"
+    summary.feed_in_export_allowed = False
+    summary.feed_in_reason = Reason.UNPRICED_EXPORT
+    summary.feed_in_floor_eur_per_kwh = 0.1234
+    payload = plan_summary_dict(summary)
+    assert payload["feed_in_mode"] == "saldering"
+    assert payload["feed_in_export_allowed"] is False
+    assert payload["feed_in_reason"] == Reason.UNPRICED_EXPORT
+    assert payload["feed_in_floor_eur_per_kwh"] == 0.1234
+    plan = Plan(
+        generated_at=NOW,
+        horizon_start=NOW,
+        horizon_end=NOW + timedelta(hours=1),
+        slot_minutes=60,
+    )
+    plan.feed_in = {
+        "mode": "saldering",
+        "export_allowed": False,
+        "reason": Reason.UNPRICED_EXPORT,
+        "floor_eur_per_kwh": 0.1234,
+    }
+    assert plan_dict(plan, NOW)["feed_in"]["reason"] == Reason.UNPRICED_EXPORT
+    # A summary restored from an older store has no feed-in keys: they read null, never a guess.
+    assert plan_summary_dict(PlanSummary())["feed_in_reason"] is None
 
 
 def test_recompute_route():
