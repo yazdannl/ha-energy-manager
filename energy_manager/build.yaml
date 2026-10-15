@@ -1,5 +1,7 @@
-# Base images per architecture (SPEC.md section 15). The add-on is pure standard-library Python,
-# so no build-time dependencies are installed on top of the Home Assistant base image.
+# Base images per architecture (SPEC.md section 15). The add-on is pure standard-library Python
+# (zero third-party Python dependencies); the image optionally compiles the C accelerator in
+# app/optimize/_core.c with a throwaway Alpine build-base/python3-dev virtual package, and falls
+# back to the Python solver when it cannot be built.
 build_from:
   aarch64: ghcr.io/home-assistant/aarch64-base-python:3.13-alpine3.21
   amd64: ghcr.io/home-assistant/amd64-base-python:3.13-alpine3.21
