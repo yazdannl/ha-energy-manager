@@ -131,6 +131,10 @@ class Reason:
     #: Cost-basis sell floor (0.18.0): a discharge/export whose value leg sits below the
     #: break-even of the energy actually held is refused, in the plan and at dispatch.
     SELL_FLOOR = "sell_floor"
+    #: Optimizer v2 stage 1b: the tariff cannot price this export (unsupported contract, reachable
+    #: threshold, or an unconfirmed tax component), so the battery-sourced export leg is refused
+    #: rather than priced at a guessed rate. Forced PV export keeps its own conservative floor.
+    UNPRICED_EXPORT = "unpriced_export"
     IDEMPOTENT_SKIP = "idempotent_skip"
     # cell-voltage protection (0.16.0): a battery latched below its cutoff may not discharge and
     # is charged out of danger; a stale reading keeps the previous latch.
