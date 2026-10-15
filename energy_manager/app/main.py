@@ -320,8 +320,18 @@ def build_maintenance(
                         assumed_daytime_shape=bool(
                             getattr(history, "assumed_daytime_shape", False)
                         ),
+                        # The named-device meters read in the same pass (SPEC 7.2). They are attached
+                        # to the history result so the subtraction uses the meters that were actually
+                        # fetched, not whatever the settings say by the time learning runs.
+                        devices=getattr(history, "devices", None),
+                        device_samples=getattr(history, "device_samples", None),
                     )
                     log.info("load profile refreshed from %s samples", len(history.samples))
+                    # A device that could not be measured stays inside the base profile; the log is
+                    # where a user notices that before reading the forecast notes.
+                    for note in getattr(history, "notes", None) or []:
+                        if str(note).startswith("load.devices"):
+                            log.info("%s", note)
             except Exception as exc:
                 log.warning("load profile learning failed: %s", exc)
         trim = _callable(store, "trim")

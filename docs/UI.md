@@ -22,7 +22,7 @@ Hash routing (`app.js: splitHash()`), seven views, all rendered client-side:
 | `#/forecasts` | `viewForecasts` | Price / solar / load panels, per-day totals, accuracy trend, provider health |
 | `#/batteries` | `viewBatteries` | Battery cards, discovery-based add/edit wizard, bounded test discharge |
 | `#/savings` | `viewSavings` | Range totals, savings vs baseline chart, per-bucket table, baseline definition |
-| `#/settings` | `viewSettings` | Four setup cards (Price, Meter, Solar, Battery) with entity pickers, plus an **All settings** drawer holding the grouped, searchable form |
+| `#/settings` | `viewSettings` | Five setup cards (Price, Meter, Solar, Load, Battery) with entity pickers, plus an **All settings** drawer holding the grouped, searchable form |
 | `#/log` | `viewLog` | Filterable dispatch/event log with requested vs applied power |
 
 Unknown routes fall back to `#/dashboard`. Query options: `#/plan?hours=12|24|36|48`,
@@ -180,12 +180,14 @@ chart series skip nulls instead of plotting them as 0, and the legend says so.
 
 **Settings** — an always-visible toolbar holds the search field and the `Show all advanced` switch,
 and an always-visible **Safety summary** states the authority in force (mode · dry run) with links to
-the Safety group and to the Dashboard's `Stop now`. Below that the page opens on four
+the Safety group and to the Dashboard's `Stop now`. Below that the page opens on five
 dependency-complete setup cards, each carrying every input the selected option needs: **Price** (`price.provider`, the
 provider-specific fields — including the fixed day/night start hours and the day-ahead VAT, energy-tax
 and import-fee adders — the feed-in cost and the energy-tax refund toggle), **Meter**
 (`grid.power_entity`, a searchable picker), **Solar** (`solar.source` plus a measured-PV picker unless
-the source is `derived`, `solar.capacity_wp` for `capacity`, `solar.planes` for `forecast_solar`) and
+the source is `derived`, `solar.capacity_wp` for `capacity`, `solar.planes` for `forecast_solar`),
+**Load** (`load.entity` and `load.temperature_entity` pickers plus the named-device editor, one row per
+`load.devices` entry) and
 **Battery** (the fleet from the canonical `GET /api/v1/batteries`, plus a link into the wizard). The pickers ask `GET /api/v1/discover` and write the candidate row's
 `setting_key`, falling back to the card's own key; a typed entity id can always be used directly.
 `SEM_APP.setupCardKeys({priceProvider, priceContract, solarSource})` is the pure table of which keys

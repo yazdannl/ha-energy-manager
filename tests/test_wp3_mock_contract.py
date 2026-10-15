@@ -42,7 +42,7 @@ FROZEN_SETTING_KEYS = [
     "solar.capacity_wp", "solar.tilt_deg", "solar.azimuth_deg", "solar.performance_ratio",
     "solar.weather_entity", "solar.nasa_irradiance",
     "load.mode", "load.entity", "load.temperature_entity",
-    "load.base_kwh_per_day", "grid.power_entity", "grid.import_entity", "grid.export_entity",
+    "load.base_kwh_per_day", "load.devices", "grid.power_entity", "grid.import_entity", "grid.export_entity",
     # optimizer
     "optimizer.slot_minutes", "optimizer.horizon_hours", "optimizer.soc_step_kwh",
     "optimizer.power_steps", "optimizer.salvage_multiplier", "optimizer.cycle_cost_eur_per_kwh",
@@ -793,3 +793,25 @@ def test_mock_advanced_flags_match_the_frozen_classification(fixtures):
         f"mock/backend advanced drift -- only in the mock: {sorted(mock_advanced - real_advanced)}, "
         f"only in the backend: {sorted(real_advanced - mock_advanced)}"
     )
+
+
+def test_mock_load_devices_round_trips_through_the_real_parser(fixtures):
+    """The mock's own load.devices example must be a shape the validator and the model accept.
+
+    The editor ships its list to ``PATCH /api/v1/config`` as this JSON and the learner reads it back
+    as named devices (SPEC §7.2); a mock that shows a shape the backend would reject would make the
+    offline render check prove the wrong contract.
+    """
+    from app.config import Settings, coerce_setting
+    from app.sources.load import load_devices
+
+    config = fixtures["fixtures"]["config"]
+    row = next(setting for setting in config["settings"] if setting["key"] == "load.devices")
+    assert row["choices"] == ["heat_pump", "ev_charger", "water_heater", "pool_pump"]
+    coerced = coerce_setting("load.devices", row["value"])
+    assert coerced == row["value"], "coerce_setting rewrote the mock's example list"
+    devices = load_devices(Settings(None, options={"load.devices": row["value"]}))
+    assert [(device.entity, device.kind, device.temperature) for device in devices] == [
+        ("sensor.example_heat_pump_power", "heat_pump", True),
+        ("sensor.example_ev_charger_power", "ev_charger", False),
+    ]

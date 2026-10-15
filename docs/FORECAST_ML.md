@@ -3,7 +3,10 @@
 **Status: the PV half is shipped; the load half is still a plan.** `solar.source = learned` (SPEC.md
 §7.1.4), the forecast archive (§7.4) and the nightly fine-tune head (§7.5) shipped in 0.22.0, with
 measured results in §1.1. The load model below has not been built: there is no Dutch household-load
-corpus, and the existing `sources/load.py` tiers already learn from this installation's own meter. Any
+corpus, and the existing `sources/load.py` tiers already learn from this installation's own meter. One
+structural piece of it did ship — **named load devices** (`load.devices`, SPEC.md §7.2), which split
+one house-wide profile into `base + sum(devices)` with a per-device temperature term — because it needs
+no corpus: it is still this installation's own meter, in two or three pieces instead of one. Any
 further change to frozen contracts (`../SPEC.md`) still needs the usual amendment plus the gate set in
 `VERIFICATION.md`.
 
@@ -11,7 +14,7 @@ The goal is narrow: replace two hand-tuned estimators with learned ones.
 
 | Today | File | Replacement |
 | --- | --- | --- |
-| 48-bucket median profile + level scale + EWMA bias + one global temperature slope | `app/sources/load.py` | conditional-quantile load forecast |
+| 48-bucket median profile + level scale + EWMA bias + one global temperature slope (now per named device with its own subtracted profile) | `app/sources/load.py` | conditional-quantile load forecast |
 | 24 hourly scalar bias factors over a physics base | `app/sources/solar.py` | feature-conditioned PV residual model |
 
 Neither the optimizer (`app/optimize/dp.py`) nor the control path changes. A forecast is an input;
@@ -423,7 +426,12 @@ and a naive ratio against a published annual figure silently measures coverage r
    `insufficient` until roughly three days of scored slots exist, which is the honest starting state.
 6. **Load model — not started**, and now the only substantial piece left. It needs a household-load
    corpus for the cold start (Ausgrid is the free one that meters PV and consumption separately), or
-   an argument that the §7.2 tiers make a learned load head unnecessary.
+   an argument that the §7.2 tiers make a learned load head unnecessary. **Named load devices are the
+   local half of this and are shipped**: they do not give the base profile a corpus, but they stop a
+   heat pump and an EV charger from being averaged into one compromise slope, which is the part of
+   the load error a corpus could not have fixed either. The subtraction is what makes them safe — the
+   base is learned from the total minus every measurable device, and an unmeasurable device is left
+   inside the base and reported rather than added on top of itself.
 7. **A scoring surface** — an HTTP route over `Store.forecast_accuracy`, plus the UI card that shows
    the user whether the learned model is actually beating the physics it replaced.
 

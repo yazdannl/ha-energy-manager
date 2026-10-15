@@ -595,6 +595,11 @@
     ["load.entity", "str", "", "Load entity", "Runtime-picked load power sensor.", "load", null],
     ["load.temperature_entity", "str", "", "Outdoor temperature entity", "Optional regression term.", "load", null],
     ["load.base_kwh_per_day", "float", 0.0, "Fallback daily energy", "Flat profile until something is learned.", "load", null],
+    // Named devices (SPEC 7.2): the mock configures two so the Load card's editor renders real rows.
+    ["load.devices", "json", [
+      { entity: "sensor.example_heat_pump_power", kind: "heat_pump", name: "Heat pump" },
+      { entity: "sensor.example_ev_charger_power", kind: "ev_charger" }
+    ], "Named load devices", "Meters for individual loads that need their own profile and temperature response: each entry is {entity, kind, name}. kind is heat_pump, ev_charger, water_heater or pool_pump. A device meter is subtracted from the house total before the base profile is learned and added back on top of it; a device that cannot be measured stays inside the base and is named in the forecast notes.", "load", ["heat_pump", "ev_charger", "water_heater", "pool_pump"]],
 
     ["grid.power_entity", "str", "", "Grid power entity", "Signed grid power sensor, positive = import; enables the derived load tier.", "grid", null],
     ["grid.import_entity", "str", "", "Grid import entity", "Separate import power sensor (optional).", "grid", null],
@@ -747,7 +752,7 @@
     "control.grid_follow_deadband_w", "control.grid_follow_max_ratio",
     "control.grid_follow_max_w", "control.replan_minutes", "control.stale_plan_seconds",
     "control.stale_state_seconds", "control.tick_seconds", "currency", "grid.export_entity",
-    "grid.import_entity", "latitude_override", "load.base_kwh_per_day", "load.entity",
+    "grid.import_entity", "latitude_override", "load.base_kwh_per_day", "load.devices", "load.entity",
     "load.mode", "load.temperature_entity", "log_level", "longitude_override",
     "maintenance.full_charge_interval_days", "maintenance.full_charge_target_soc_pct",
     "notify.events",

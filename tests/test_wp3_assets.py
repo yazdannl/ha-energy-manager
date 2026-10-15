@@ -1044,6 +1044,41 @@ def test_solar_field_visibility_per_source():
     assert keys("unknown") == keys("api")
 
 
+def test_load_device_problems_mirror_the_config_rules():
+    """The Load card's client-side list rules (SPEC §7.2), so a save is never sent to be rejected.
+
+    The meter is the one field the add-on cannot infer and the one whose repetition would be
+    subtracted twice — a double count that hides inside the temperature slope — so both are refused
+    in the editor as well as by the server validator.
+    """
+    script = """
+    const fs = require("fs");
+    globalThis.location = { pathname: "/x/", search: "", hash: "" };
+    (0, eval)(fs.readFileSync("app.js", "utf8"));
+    const A = globalThis.SEM_APP;
+    const kinds = ["heat_pump", "ev_charger", "water_heater", "pool_pump"];
+    console.log(JSON.stringify({
+      ok: A.loadDeviceProblems([
+        { entity: "sensor.example_heat_pump_power", kind: "heat_pump" },
+        { entity: "sensor.example_ev_charger_power", kind: "ev_charger" }
+      ], kinds),
+      missing: A.loadDeviceProblems([{ entity: "", kind: "heat_pump" }], kinds),
+      repeated: A.loadDeviceProblems([
+        { entity: "sensor.example_heat_pump_power", kind: "heat_pump" },
+        { entity: "sensor.example_heat_pump_power", kind: "ev_charger" }
+      ], kinds),
+      unknown: A.loadDeviceProblems([{ entity: "sensor.example_boiler_power", kind: "boiler" }], kinds),
+      empty: A.loadDeviceProblems(null, kinds)
+    }));
+    """
+    data = json.loads(run_node_script(script))
+    assert data["ok"] == [], data["ok"]
+    assert data["empty"] == []
+    assert any("no meter" in problem for problem in data["missing"])
+    assert any("repeats" in problem for problem in data["repeated"])
+    assert any("unknown kind" in problem for problem in data["unknown"])
+
+
 def test_settings_groups_and_visibility_helpers():
     """The settings IA is tested through two pure helpers (SPEC 13.4), so node needs no DOM.
 

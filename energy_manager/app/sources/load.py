@@ -18,6 +18,11 @@ at prediction time only its slope is applied to the profile level
 (``load = profile + b * (T - T_mean)``) — the SPEC.md section 7.2 formula ``a + b*T`` carries the
 level that the learned profile already represents. Hourly values are linearly interpolated to 15-min
 slots. Cold start reports ``confidence: low``.
+
+Named devices (``load.devices``, SPEC.md section 7.2) are a second kind of profile: each measured
+device is subtracted from the house total before the base profile is learned and then added back as
+its own component, with its own temperature term when its kind has one. The subtraction is what keeps
+the sum honest; a device that cannot be measured stays inside the base and is reported instead.
 """
 
 from __future__ import annotations
@@ -47,21 +52,36 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_SHAPE",
+    "DEVICE_KIND_LABELS",
+    "DEVICE_KEY_PREFIX",
     "HistoryResult",
+    "LoadDevice",
     "LoadSamples",
     "build_profile",
+    "collect_device_samples",
     "collect_history",
     "collect_pv_export_samples",
     "collect_temperatures",
+    "device_config_problems",
+    "device_plan",
+    "load_device_profile",
+    "load_devices",
     "load_forecast",
     "load_profile",
     "pv_export_roles",
+    "save_device_profile",
     "save_profile",
+    "split_device_load",
     "update_load_profile",
 ]
 
 PROFILE_KIND = "load"
 PROFILE_KEY = "profile"
+#: ``learning_profiles`` key prefix for one named device (SPEC.md section 7.2). The store keys a
+#: profile by (kind, key), and the kind stays ``load`` so a device profile is stored the same way the
+#: base profile is; the entity id is the only per-device identity that stays unique when two devices
+#: share a kind (two EV chargers), so the key is derived from it.
+DEVICE_KEY_PREFIX = "device:"
 SLOT_MINUTES = 15
 WINDOW_DAYS = 56
 MIN_SAMPLES = 24
@@ -69,6 +89,37 @@ EWMA_ALPHA = 0.2
 BIAS_MIN, BIAS_MAX = 0.5, 2.0
 SCALE_MIN, SCALE_MAX = 0.5, 2.0
 MIN_TEMPERATURE_R2 = 0.05
+#: The p10/p90 band used when a profile has no quantiles for an hour (cold start, and any bucket with
+#: no median): +/- 30% around the point forecast, the numbers the fallback path always used.
+FALLBACK_P10_RATIO = 0.7
+FALLBACK_P90_RATIO = 1.3
+
+#: The closed ``load.devices[].kind`` set (SPEC.md section 7.2). A closed set is what lets the UI
+#: offer a dropdown instead of free text, and it is what lets the model pick a default per kind
+#: rather than asking the user a question they cannot answer. ``DEVICE_TEMPERATURE_KINDS`` and
+#: ``DEVICE_KIND_LABELS`` are keyed by it; ``config.LOAD_DEVICE_KINDS`` is the same set for
+#: validation, and tests pin the two together.
+DEVICE_KIND_LABELS: dict[str, str] = {
+    "heat_pump": "Heat pump",
+    "ev_charger": "EV charger",
+    "water_heater": "Water heater",
+    "pool_pump": "Pool pump",
+}
+#: Kinds whose draw is expected to respond to outdoor temperature, so their profile gets its own
+#: regression term. An EV charger is deliberately absent: its draw is a schedule, and a slope fitted
+#: to it would silently absorb whatever else varies with temperature as if it were the car.
+DEVICE_TEMPERATURE_KINDS = frozenset(("heat_pump", "water_heater", "pool_pump"))
+#: The share of the house's own hours a device meter must cover before its series is subtracted.
+#: Below it the base profile would be learned from a handful of hours to model a meter that is mostly
+#: unreachable, and the honest report is "not modelled" rather than a base profile with holes.
+DEVICE_MIN_COVERAGE = 0.5
+#: ... and at least this many usable hourly readings in the learning window (two days).
+DEVICE_MIN_SAMPLES = 48
+#: The statistics role a device meter is read under. Unlike the mapped grid/pv roles it carries no
+#: power-vs-energy promise, so the classification has to come from the statistics metadata (or the
+#: recorder state's unit), which is exactly the refusal this add-on wants on an energy counter with
+#: metadata it cannot establish.
+DEVICE_ROLE = "device"
 
 #: Generic residential shape (24 relative hourly weights, normalised to 24 in code).
 DEFAULT_SHAPE = (
@@ -168,6 +219,12 @@ class HistoryResult:
     #: profile builder has to know, because an unobserved bucket there means "not looked at" rather
     #: than "measured zero", and reading it as the latter forecasts zero load all day.
     assumed_daytime_shape: bool = False
+    #: Hourly kW per ``load.devices`` key (``DEVICE_KEY_PREFIX`` + entity), as collected, for the
+    #: subtraction in :func:`update_load_profile` and :func:`collect_device_samples`.
+    device_samples: dict[str, dict[datetime, float]] = field(default_factory=dict)
+    #: The parsed device list whose meters were read, so the learning pass subtracts exactly the
+    #: devices that were fetched rather than whatever the settings happen to say afterwards.
+    devices: list[LoadDevice] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -782,6 +839,37 @@ def collect_pv_export_samples(
     return out, ""
 
 
+def collect_device_samples(
+    settings: Any,
+    client: Any,
+    *,
+    ws: Any = None,
+    now: datetime,
+    days: int,
+    devices: Sequence[LoadDevice] | None = None,
+) -> tuple[dict[str, dict[datetime, float]], list[str]]:
+    """Hourly kW for every configured device meter, plus one note per meter that stayed silent.
+
+    Read through the same tiering as the house series (long-term statistics first, recorder second).
+    A device that cannot be read is not an error at all: :func:`update_load_profile` leaves it inside
+    the base profile and the forecast says so, which is the difference between a device that is
+    expensive to model and one that is modelled wrongly.
+    """
+    out: dict[str, dict[datetime, float]] = {}
+    notes: list[str] = []
+    for device in devices if devices is not None else load_devices(settings):
+        try:
+            samples, note = _history_samples(client, ws, device.entity, DEVICE_ROLE, now, days)
+        except Exception as exc:  # noqa: BLE001 - one broken meter must not stop the house series
+            notes.append(f"load.devices {device.label}: {type(exc).__name__}: {exc}")
+            continue
+        if samples:
+            out[device.key] = dict(samples)
+        else:
+            notes.append(f"load.devices {device.label}: {note or 'no usable history'}")
+    return out, notes
+
+
 def _temperature_samples(
     settings: Any, client: Any, moment: datetime, days: int
 ) -> tuple[dict[datetime, float], str]:
@@ -828,6 +916,11 @@ def collect_history(
     When ``load.temperature_entity`` is mapped its hourly history is fetched over the same window and
     attached to ``result.samples`` (see :class:`LoadSamples`) for the regression term; an empty or
     broken sensor is reported in ``notes`` and leaves the no-temperature behaviour untouched.
+
+    Every configured ``load.devices`` meter is read over the same window and attached to
+    ``result.device_samples``, keyed exactly as ``result.devices`` names it, so
+    :func:`update_load_profile` subtracts the meters that were actually read rather than whatever
+    the settings say afterwards. A meter that cannot be read is a note, never a failure.
     """
     moment = now or utcnow()
     mode = str(settings.get("load.mode", "auto") or "auto")
@@ -847,11 +940,26 @@ def collect_history(
         battery_note = _map_battery_flows(settings, derived_roles)
     notes: list[str] = []
     temperatures, temperature_note = _temperature_samples(settings, client, moment, days)
+    devices = load_devices(settings)
+    notes.extend(device_config_problems(settings))
+    device_samples: dict[str, dict[datetime, float]] = {}
+    if devices:
+        device_samples, device_notes = collect_device_samples(
+            settings, client, ws=ws, now=moment, days=days, devices=devices
+        )
+        notes.extend(device_notes)
 
     def result(samples: Iterable[tuple[datetime, float]], source: str, status: ProviderStatus) -> HistoryResult:
         if temperature_note:
             notes.append(temperature_note)
-        return HistoryResult(LoadSamples(samples, temperatures), source, status, notes)
+        return HistoryResult(
+            LoadSamples(samples, temperatures),
+            source,
+            status,
+            notes,
+            device_samples=dict(device_samples),
+            devices=list(devices),
+        )
 
     if mode in ("auto", "entity") and entity:
         samples, note = _statistics_samples(settings, client, ws, moment, days)
@@ -894,6 +1002,8 @@ def collect_history(
                     "pv sensor; the daytime shape is the default residential one scaled to that level"
                 ],
                 assumed_daytime_shape=True,
+                device_samples=dict(device_samples),
+                devices=list(devices),
             )
         if note:
             notes.append(f"night load: {note}")
@@ -901,6 +1011,224 @@ def collect_history(
         notes.append("load.mode=entity but no load.entity is mapped")
     notes.append("falling back to the flat profile")
     return result([], "fallback", ProviderStatus(kind="load", name="fallback", ok=True, detail={"reason": "no history"}))
+
+
+# --------------------------------------------------------------------------------------------
+# Named load devices (SPEC.md section 7.2)
+# --------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LoadDevice:
+    """One ``load.devices`` entry: a named load with its own meter (SPEC.md section 7.2).
+
+    ``key`` is the identity its learned profile is stored under, derived from the entity so a rename
+    of the display name keeps the learning history. ``temperature`` comes from the kind rather than
+    from the entry, so the model's own default cannot be overridden per device by accident.
+    """
+
+    key: str
+    entity: str
+    kind: str
+    name: str
+    temperature: bool = False
+
+    @property
+    def label(self) -> str:
+        return f"{self.name} ({self.kind})"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "entity": self.entity,
+            "kind": self.kind,
+            "name": self.name,
+            "temperature": self.temperature,
+        }
+
+
+def _parse_devices(settings: Any) -> tuple[list[LoadDevice], list[str]]:
+    """Parse ``load.devices`` into :class:`LoadDevice` entries plus one line per dropped entry.
+
+    The config validator rejects every shape this drops at save time, but add-on options are read as
+    written, so a hand-edited options file must still not be able to subtract one meter twice or
+    subtract the house meter from itself: both double-count, and a double-count hides inside the
+    temperature response as a steeper slope rather than showing up as an error.
+    """
+    raw = settings.get("load.devices") if hasattr(settings, "get") else None
+    if not isinstance(raw, list):
+        return [], []
+    house = str(settings.get("load.entity", "") or "").strip()
+    devices: list[LoadDevice] = []
+    problems: list[str] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(raw):
+        where = f"load.devices[{index}]"
+        if not isinstance(entry, Mapping):
+            problems.append(f"{where} is not an object")
+            continue
+        entity = str(entry.get("entity", "") or "").strip()
+        if not entity:
+            problems.append(f"{where} names no meter; it is not modelled")
+            continue
+        if entity == house:
+            problems.append(
+                f"{where} ({entity}) is the house meter itself (load.entity); it is not modelled, "
+                "because subtracting a total from itself would leave a base profile of zeros"
+            )
+            continue
+        if entity in seen:
+            problems.append(f"{where} ({entity}) repeats a meter already listed; it is not modelled")
+            continue
+        seen.add(entity)
+        kind = str(entry.get("kind", "") or "").strip().lower()
+        note = ""
+        if kind not in DEVICE_KIND_LABELS:
+            # An unknown kind is still a meter the house total contains, so it is subtracted like
+            # any other; what it does not get is a temperature term, because nothing here knows
+            # whether the device responds to weather.
+            note = f"unknown kind {kind!r}; modelled as a plain meter with no temperature term"
+            kind = kind or "unknown"
+        name = str(entry.get("name", "") or "").strip() or DEVICE_KIND_LABELS.get(kind, entity)
+        if note:
+            problems.append(f"{where} ({name}): {note}")
+        devices.append(
+            LoadDevice(
+                key=DEVICE_KEY_PREFIX + entity,
+                entity=entity,
+                kind=kind,
+                name=name,
+                temperature=kind in DEVICE_TEMPERATURE_KINDS,
+            )
+        )
+    return devices, problems
+
+
+def load_devices(settings: Any) -> list[LoadDevice]:
+    """The usable ``load.devices`` entries for this configuration (``[]`` when none are set)."""
+    return _parse_devices(settings)[0]
+
+
+def device_config_problems(settings: Any) -> list[str]:
+    """One line per ``load.devices`` entry that was dropped before it could be subtracted."""
+    return _parse_devices(settings)[1]
+
+
+@dataclass
+class DeviceSplit:
+    """The house total with every measurable device removed, plus why the rest stayed in it.
+
+    ``base`` is what the base profile is learned from; ``subtracted`` names the device keys that
+    were removed (the same keys the forecast is allowed to add back); ``skipped`` maps a device key
+    to the reason it was *not* removed, so it stays inside the base and is reported as not modelled.
+    """
+
+    base: list[tuple[datetime, float]] = field(default_factory=list)
+    subtracted: list[str] = field(default_factory=list)
+    skipped: dict[str, str] = field(default_factory=dict)
+    #: House hours left out because a subtracted device had no reading for them.
+    dropped_hours: int = 0
+    #: House hours where the device sum exceeded the total (the result is floor-ed at zero).
+    clamped_hours: int = 0
+
+
+def split_device_load(
+    samples: Iterable[tuple[datetime, float]],
+    devices: Sequence[LoadDevice],
+    device_samples: Mapping[str, Mapping[datetime, float]] | None,
+    *,
+    min_samples: int = DEVICE_MIN_SAMPLES,
+    min_coverage: float = DEVICE_MIN_COVERAGE,
+) -> DeviceSplit:
+    """Subtract every measurable device's meter from the house total, before the base is learned.
+
+    This is the load-bearing half of named devices: the measured total already contains the device,
+    so a base profile learned from the total and then added to the device's own profile counts the
+    device twice. The doubling hides inside the temperature term -- it reads as a steeper response,
+    not as a bug -- which is why the subtraction is explicit here and why a device that cannot be
+    measured is left inside the base and *reported* instead of being subtracted as a zero.
+
+    Only hours where the total and every subtracted device have a reading are kept: a missing device
+    reading is unknown, not zero, and reading it as zero would leave that device's draw in the base
+    and then add the device's own profile on top of it. The hours lost that way are counted, and a
+    device whose meter covers too little of the window is refused outright, because the alternative
+    is a base profile learned from whatever few hours both happened to cover.
+    """
+    house = [(stamp, float(value)) for stamp, value in samples]
+    skipped: dict[str, str] = {}
+    if not house:
+        return DeviceSplit(
+            skipped={device.key: "there is no house history to subtract it from" for device in devices}
+        )
+    house_stamps = {stamp for stamp, _ in house}
+    eligible: list[LoadDevice] = []
+    series_by_key: dict[str, Mapping[datetime, float]] = {}
+    for device in devices:
+        series = (device_samples or {}).get(device.key) or {}
+        if not series:
+            skipped[device.key] = "its meter returned no usable hours in the learning window"
+            continue
+        if len(series) < min_samples:
+            skipped[device.key] = (
+                f"its meter returned only {len(series)} usable hours in the learning window "
+                f"(fewer than {min_samples})"
+            )
+            continue
+        overlap = len(house_stamps.intersection(series))
+        coverage = overlap / len(house_stamps)
+        if coverage < min_coverage:
+            skipped[device.key] = (
+                f"its meter overlaps only {overlap} of the house's {len(house_stamps)} hours "
+                f"({coverage:.0%})"
+            )
+            continue
+        eligible.append(device)
+        series_by_key[device.key] = series
+    if not eligible:
+        # Nothing to remove: the house total is already the base profile's input.
+        return DeviceSplit(base=house, subtracted=[], skipped=skipped)
+    # Each device may cover enough on its own and still leave the base nearly empty once their gaps
+    # are combined (one meter down in the morning, another in the evening). The floor is therefore
+    # checked again on the intersection, and a set that cannot leave a usable base is refused whole
+    # rather than learned from whatever few hours every meter happened to share.
+    joint = set(house_stamps)
+    for device in eligible:
+        joint &= set(series_by_key[device.key])
+    if len(joint) < min_coverage * len(house_stamps):
+        reason = (
+            f"together with the other device meters it leaves only {len(joint)} of the house's "
+            f"{len(house_stamps)} hours to learn the base profile from"
+        )
+        for device in eligible:
+            skipped[device.key] = reason
+        return DeviceSplit(base=house, subtracted=[], skipped=skipped)
+    base: list[tuple[datetime, float]] = []
+    dropped = 0
+    clamped = 0
+    for stamp, total in sorted(house):
+        removed = 0.0
+        complete = True
+        for device in eligible:
+            value = series_by_key[device.key].get(stamp)
+            if value is None:
+                complete = False
+                break
+            removed += float(value)
+        if not complete:
+            dropped += 1
+            continue
+        value = total - removed
+        if value < 0.0:
+            clamped += 1
+            value = 0.0
+        base.append((stamp, value))
+    return DeviceSplit(
+        base=base,
+        subtracted=[device.key for device in eligible],
+        skipped=skipped,
+        dropped_hours=dropped,
+        clamped_hours=clamped,
+    )
 
 
 # --------------------------------------------------------------------------------------------
@@ -1055,6 +1383,23 @@ def save_profile(store: Any, profile: Mapping[str, Any], now: datetime | None = 
         store.profile_put(PROFILE_KIND, PROFILE_KEY, dict(profile), now)
 
 
+def load_device_profile(store: Any, key: str) -> dict[str, Any] | None:
+    """The stored profile for one device key, under the same kind as the base profile."""
+    if store is None or not key:
+        return None
+    got = store.profile_get(PROFILE_KIND, key)
+    if not got or not isinstance(got[1], Mapping):
+        return None
+    return dict(got[1])
+
+
+def save_device_profile(
+    store: Any, key: str, profile: Mapping[str, Any], now: datetime | None = None
+) -> None:
+    if store is not None and key:
+        store.profile_put(PROFILE_KIND, key, dict(profile), now)
+
+
 def update_load_profile(
     store: Any,
     samples: Iterable[tuple[datetime, float]],
@@ -1063,6 +1408,8 @@ def update_load_profile(
     tz: str | ZoneInfo | None = None,
     temperatures: Mapping[datetime, float] | None = None,
     assumed_daytime_shape: bool = False,
+    devices: Sequence[LoadDevice] | None = None,
+    device_samples: Mapping[str, Mapping[datetime, float]] | None = None,
 ) -> dict[str, Any]:
     """Learn and persist the load profile from hourly samples.
 
@@ -1071,8 +1418,21 @@ def update_load_profile(
 
     ``assumed_daytime_shape`` forwards to :func:`build_profile`, which has to make the decision before
     it derives the level: an unobserved bucket is not a measured zero.
+
+    With ``devices`` configured, the base profile is learned from the house total *minus* every
+    measurable device (see :func:`split_device_load`), and each subtracted device gets its own
+    profile under the same ``learning_profiles`` kind, keyed by ``DEVICE_KEY_PREFIX`` + entity. The
+    base records which devices were subtracted and which were not, because that record is what lets
+    the forecast decide whether adding a device back is reconstruction or double-counting. A device
+    that was not subtracted gets no profile refresh: its old profile, if any, must not be added back
+    to a base that still contains it.
     """
     moment = now or utcnow()
+    device_list = list(devices or [])
+    split: DeviceSplit | None = None
+    if device_list:
+        split = split_device_load(samples, device_list, device_samples)
+        samples = split.base
     profile = build_profile(
         samples,
         now=moment,
@@ -1080,6 +1440,34 @@ def update_load_profile(
         temperatures=temperatures,
         assumed_daytime_shape=assumed_daytime_shape,
     )
+    if split is not None:
+        profile["devices_subtracted"] = list(split.subtracted)
+        profile["devices_excluded"] = dict(split.skipped)
+        profile["devices_dropped_hours"] = split.dropped_hours
+        profile["devices_clamped_hours"] = split.clamped_hours
+        # Devices first: a run that dies between the two writes leaves the previous base in place,
+        # and a device profile is only ever added back when the base names its key as subtracted.
+        for device in device_list:
+            if device.key not in split.subtracted:
+                continue
+            series = (device_samples or {}).get(device.key) or {}
+            if not series:
+                continue
+            device_profile = build_profile(
+                list(series.items()),
+                now=moment,
+                tz=tz,
+                # Only the kinds that are expected to respond to weather get a term; the rest would
+                # be fitting a schedule, and a slope fitted to noise is worse than no slope at all.
+                temperatures=temperatures if device.temperature else None,
+                # Deliberately no assumed_daytime_shape: the default residential shape describes a
+                # house's occupancy, not one appliance's schedule. A device hour with no reading
+                # contributes nothing, which under-states the device rather than inventing a curve.
+            )
+            device_profile["entity"] = device.entity
+            device_profile["kind"] = device.kind
+            device_profile["name"] = device.name
+            save_device_profile(store, device.key, device_profile, moment)
     save_profile(store, profile, moment)
     return profile
 
@@ -1104,7 +1492,119 @@ def _fallback_hourly(base_kwh_per_day: float) -> list[float]:
     return [base_kwh_per_day * weight / total for weight in DEFAULT_SHAPE]
 
 
-def _hourly_values(
+@dataclass
+class DevicePlan:
+    """Which named devices this forecast adds above the base, and why the rest are left inside it."""
+
+    included: list[tuple[LoadDevice, dict[str, Any]]] = field(default_factory=list)
+    excluded: list[tuple[LoadDevice, str]] = field(default_factory=list)
+    #: Things the user should know about a device that *is* modelled (e.g. a kind change waiting
+    #: for the next learning run), kept as one forecast note per line.
+    notes: list[str] = field(default_factory=list)
+
+
+def device_plan(
+    base: Mapping[str, Any] | None,
+    devices: Sequence[LoadDevice],
+    profiles: Mapping[str, Mapping[str, Any] | None],
+) -> DevicePlan:
+    """Decide which devices the forecast may add back, and why the others may not.
+
+    A device is added back exactly when its meter was subtracted while the *current* base profile
+    was learned (``devices_subtracted``) and a profile of its own is stored. Anything else stays
+    inside the base and is named in the notes: adding a device the base still contains counts it
+    twice, and a doubling hides in the temperature response as a steeper slope instead of looking
+    like an error. The two conditions are separate on purpose -- a stale device profile must not be
+    added to a base that was learned without subtracting it, and a freshly configured device has no
+    profile to add yet.
+    """
+    plan = DevicePlan()
+    if not devices:
+        return plan
+    if base is None:
+        reason = (
+            "no base profile has been learned yet, so the fallback shape is the whole house and it "
+            "already contains every device"
+        )
+        plan.excluded = [(device, reason) for device in devices]
+        return plan
+    subtracted = {str(key) for key in (base.get("devices_subtracted") or [])}
+    for device in devices:
+        if device.key not in subtracted:
+            plan.excluded.append(
+                (
+                    device,
+                    "the current base profile was learned without subtracting it, so it is still "
+                    "inside the base",
+                )
+            )
+        elif not profiles.get(device.key):
+            plan.excluded.append(
+                (device, "it has no profile of its own yet, so it is still inside the base")
+            )
+        else:
+            component = dict(profiles[device.key] or {})
+            stored_kind = str(component.get("kind") or "")
+            if stored_kind and stored_kind != device.kind:
+                plan.notes.append(
+                    f"load.devices: {device.label} was last learned as {stored_kind!r}; the next "
+                    "learning run will re-model it as the kind it is configured as now"
+                )
+            if not device.temperature:
+                # The kind is the authority on the temperature term, at serving time exactly as at
+                # learning time: a slope fitted while the device was configured as something else
+                # must not survive a kind that forbids one.
+                component["b"] = 0.0
+                component["r2"] = 0.0
+            plan.included.append((device, component))
+    return plan
+
+
+def _device_notes(
+    base: Mapping[str, Any] | None,
+    plan: DevicePlan,
+    parse_problems: Sequence[str] = (),
+) -> list[str]:
+    """Forecast notes naming every device that was modelled and every one that was not.
+
+    The inclusion list is not decoration: a device left inside the base profile changes what the
+    base *means*, and that is invisible in a kW curve. The reason shown for an excluded device is
+    the one recorded when the base was learned ("its meter overlapped 3 of 720 hours"), because the
+    serving-time reason ("no profile stored") is only the symptom.
+    """
+    notes = list(parse_problems) + list(plan.notes)
+    if not plan.included and not plan.excluded:
+        return notes
+    if plan.included:
+        names = ", ".join(device.label for device, _profile in plan.included)
+        notes.append(
+            f"load.devices: {len(plan.included)} modelled ({names}); each meter was subtracted from "
+            "the house total before the base profile was learned, and is added back above it"
+        )
+    learned = base.get("devices_excluded") if isinstance(base, Mapping) else None
+    for device, reason in plan.excluded:
+        detail = str((learned or {}).get(device.key) or reason)
+        notes.append(
+            f"load.devices: {device.label} is not modelled because {detail}; it is still inside the "
+            "base profile, so adding it would count it twice"
+        )
+    dropped = int(base.get("devices_dropped_hours") or 0) if isinstance(base, Mapping) else 0
+    if dropped:
+        notes.append(
+            f"load.devices: {dropped} house hours were left out of the base profile because a "
+            "device meter had no reading for them (a missing reading is unknown, not zero)"
+        )
+    clamped = int(base.get("devices_clamped_hours") or 0) if isinstance(base, Mapping) else 0
+    if clamped:
+        notes.append(
+            f"load.devices: on {clamped} house hours the device meters summed to more than the "
+            "house total; the base contribution was floored at zero, which suggests the meters "
+            "overlap"
+        )
+    return notes
+
+
+def _hourly_bands(
     profile: Mapping[str, Any] | None,
     *,
     first_hour: datetime,
@@ -1112,16 +1612,30 @@ def _hourly_values(
     zone: ZoneInfo | timezone,
     base_kwh_per_day: float,
     temperature_c: Mapping[datetime, float] | None,
-) -> dict[datetime, float]:
-    """Predicted kW for every UTC hour in ``[first_hour, last_hour]``."""
-    values: dict[datetime, float] = {}
+) -> tuple[dict[datetime, float], dict[datetime, float], dict[datetime, float]]:
+    """``(p50, p10, p90)`` kW for every UTC hour in ``[first_hour, last_hour]``, one component.
+
+    One profile, or the flat fallback when it is ``None``: the caller sums the components (the base
+    and each modelled device) hour by hour. Every component sees the same clock and the same
+    temperature series -- a heat pump's own slope is applied to the outdoor temperature just as the
+    house's is, which is the whole reason a device gets its own profile.
+
+    The quantiles are the bucket's own p10/p90 scaled onto the level- and temperature-adjusted
+    median, and the fallback ratio only fills in where a bucket has no median of its own.
+    """
+    band: dict[datetime, float] = {}
+    low: dict[datetime, float] = {}
+    high: dict[datetime, float] = {}
     if not profile:
         shape = _fallback_hourly(base_kwh_per_day)
         cursor = first_hour
         while cursor <= last_hour:
-            values[cursor] = shape[cursor.astimezone(zone).hour]
+            value = max(0.0, shape[cursor.astimezone(zone).hour])
+            band[cursor] = value
+            low[cursor] = value * FALLBACK_P10_RATIO
+            high[cursor] = value * FALLBACK_P90_RATIO
             cursor += timedelta(hours=1)
-        return values
+        return band, low, high
 
     buckets = profile.get("buckets") or [{} for _ in range(48)]
     bias = profile.get("bias") or [1.0] * 48
@@ -1140,9 +1654,48 @@ def _hourly_values(
             temperature = temperatures.get(cursor)
             if temperature is not None:
                 value += slope * (float(temperature) - float(t_mean))
-        values[cursor] = max(0.0, value)
+        value = max(0.0, value)
+        band[cursor] = value
+        bucket_median = float(entry.get("median") or 0.0)
+        if value > 0.0 and bucket_median > 0.0:
+            low[cursor] = value * float(entry.get("p10") or 0.0) / bucket_median
+            high[cursor] = value * float(entry.get("p90") or 0.0) / bucket_median
+        else:
+            low[cursor] = value * FALLBACK_P10_RATIO
+            high[cursor] = value * FALLBACK_P90_RATIO
         cursor += timedelta(hours=1)
-    return values
+    return band, low, high
+
+
+def _hourly_values(
+    profile: Mapping[str, Any] | None,
+    *,
+    first_hour: datetime,
+    last_hour: datetime,
+    zone: ZoneInfo | timezone,
+    base_kwh_per_day: float,
+    temperature_c: Mapping[datetime, float] | None,
+) -> dict[datetime, float]:
+    """Predicted kW for every UTC hour in ``[first_hour, last_hour]`` (the p50 band)."""
+    return _hourly_bands(
+        profile,
+        first_hour=first_hour,
+        last_hour=last_hour,
+        zone=zone,
+        base_kwh_per_day=base_kwh_per_day,
+        temperature_c=temperature_c,
+    )[0]
+
+
+def _interpolated(
+    values: Mapping[datetime, float], hour_key: datetime, slot_time: datetime
+) -> float:
+    """One hour-quantity linearly interpolated to a 15-minute slot (flat at the last hour)."""
+    value = values.get(hour_key, 0.0)
+    next_value = values.get(hour_key + timedelta(hours=1))
+    if next_value is not None:
+        value = value + (next_value - value) * (slot_time.minute / 60.0)
+    return value
 
 
 def load_forecast(
@@ -1168,39 +1721,49 @@ def load_forecast(
     confidence = _confidence(learned)
     if not learned and base_kwh_per_day <= 0:
         source = "fallback-empty"
-    hourly = _hourly_values(
-        learned,
-        first_hour=start.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1),
-        last_hour=(grid[-1].replace(minute=0, second=0, microsecond=0) + timedelta(hours=2)) if grid else start,
-        zone=zone,
-        base_kwh_per_day=base_kwh_per_day,
-        temperature_c=temperature_c,
-    )
-    buckets = (learned or {}).get("buckets") or []
+    # The forecast is the base plus every device that may be added back (SPEC.md section 7.2). Each
+    # component is evaluated on the same clock, because a device is a second profile above the
+    # house's, not a correction to it; the bands then add the same way the point forecasts do.
+    devices = load_devices(settings)
+    profiles = {device.key: load_device_profile(store, device.key) for device in devices}
+    plan = device_plan(learned, devices, profiles)
+    first_hour = start.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+    last_hour = (grid[-1].replace(minute=0, second=0, microsecond=0) + timedelta(hours=2)) if grid else start
+    # The base is the first component: the learned profile, or the flat fallback when there is none
+    # (the plan excluded every device in that case, because the fallback is the whole house).
+    components: list[Mapping[str, Any] | None] = [learned]
+    components.extend(profile for _device, profile in plan.included)
+    hourly: dict[datetime, float] = {}
+    low: dict[datetime, float] = {}
+    high: dict[datetime, float] = {}
+    for component in components:
+        band, band_low, band_high = _hourly_bands(
+            component,
+            first_hour=first_hour,
+            last_hour=last_hour,
+            zone=zone,
+            base_kwh_per_day=base_kwh_per_day,
+            temperature_c=temperature_c,
+        )
+        for key, value in band.items():
+            hourly[key] = hourly.get(key, 0.0) + value
+            low[key] = low.get(key, 0.0) + band_low[key]
+            high[key] = high.get(key, 0.0) + band_high[key]
     slots: list[LoadSlot] = []
     for slot_time in grid:
         hour_key = slot_time.replace(minute=0, second=0, microsecond=0)
-        value = hourly.get(hour_key, 0.0)
-        next_key = hour_key + timedelta(hours=1)
-        next_value = hourly.get(next_key)
-        if next_value is not None:
-            fraction = slot_time.minute / 60.0
-            value = value + (next_value - value) * fraction
-        p10 = p90 = None
-        if learned and value > 0:
-            index = _bucket_index(slot_time.astimezone(zone))
-            entry = buckets[index] if index < len(buckets) else {}
-            median = float(entry.get("median") or 0.0)
-            if median > 0:
-                p10 = value * float(entry.get("p10") or 0.0) / median
-                p90 = value * float(entry.get("p90") or 0.0) / median
-        if p10 is None or p90 is None:
-            p10, p90 = max(0.0, value * 0.7), value * 1.3
+        value = _interpolated(hourly, hour_key, slot_time)
+        p10 = max(0.0, _interpolated(low, hour_key, slot_time))
+        p90 = max(0.0, _interpolated(high, hour_key, slot_time))
         slots.append(LoadSlot(t=slot_time, load_kw=max(0.0, value), p10_kw=p10, p90_kw=p90))
 
     notes: list[str] = []
     if not learned:
         notes.append("cold start: no learned profile yet")
+    # Which devices were subtracted and which were left inside the base is part of the numbers, not
+    # a detail: an exclusion changes what the base profile means, and the user cannot see it in a
+    # kW curve.
+    notes.extend(_device_notes(learned, plan, device_config_problems(settings)))
     forecast = LoadForecast(
         slots=slots,
         generated_at=moment,
@@ -1208,12 +1771,19 @@ def load_forecast(
         confidence=confidence,
         notes=notes,
     )
+    detail: dict[str, Any] = {
+        "confidence": confidence,
+        "samples": int((learned or {}).get("samples") or 0),
+    }
+    if devices:
+        detail["devices_modelled"] = len(plan.included)
+        detail["devices_excluded"] = len(plan.excluded)
     status = ProviderStatus(
         kind="load",
         name=source,
         active=True,
         ok=True,
         last_success=moment,
-        detail={"confidence": confidence, "samples": int((learned or {}).get("samples") or 0)},
+        detail=detail,
     )
     return forecast, status

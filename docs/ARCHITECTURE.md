@@ -20,7 +20,7 @@ next to it.
 | `app/store.py` | SQLite persistence: schema migrations, plans, measurements, actuals, dispatch log, events, settings, learned profiles. |
 | `app/sources/price.py` | Price forecast providers (`zonneplan_entity`, `energy_charts`, `entity_forecast`, `static`), unit normalisation and the fallback chain. |
 | `app/sources/solar.py` | PV forecast provider (Forecast.Solar, keyless or with a personal key; capacity/derived model with NASA POWER observed clearness), plane summation, cache and bias correction. |
-| `app/sources/load.py` | Load forecast: long-term statistics profile, level scaling, EWMA bias, optional temperature regression, flat fallback; the derived tier reads every series through statistics first (energy counters included). |
+| `app/sources/load.py` | Load forecast: long-term statistics profile, level scaling, EWMA bias, optional temperature regression, named devices (`load.devices`: each meter subtracted from the base and added back as its own profile with its own term), flat fallback; the derived tier reads every series through statistics first (energy counters included). |
 | `app/sources/measure.py` | Sampling of grid/PV/load/battery measurements into 5-minute `actuals` rows. |
 | `app/optimize/dp.py` | SoC dynamic program over `optimizer.slot_minutes` slots (60 by default); deterministic, with a bounded state/action grid. |
 | `app/optimize/allocate.py` | Split of the aggregate slot power across batteries, respecting per-battery limits and efficiency. |

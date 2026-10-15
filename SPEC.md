@@ -903,6 +903,53 @@ the inferred column only where the measured one is empty throughout its window, 
 used (`label_source`). A correction fitted on a number this add-on produced itself is only as good as
 the arithmetic behind it, and the user needs to be able to see that it is that kind of number.
 
+#### Named load devices (`load.devices`)
+
+One house-wide profile plus one house-wide temperature slope is the wrong shape for a heat pump (which
+answers to the weather) and for an EV charger (which answers to its schedule): blending them produces
+one compromise term that fits neither. `load.devices` is a list of `{entity, kind, name}` entries, each
+naming the meter of one such load. `kind` is a closed set — `heat_pump`, `ev_charger`, `water_heater`,
+`pool_pump` — and it decides whether the device gets its own temperature term: a heat pump, a water
+heater and a pool pump do; an EV charger's draw is a schedule and gets none, so a slope fitted to it
+cannot absorb whatever else varies with the weather as if it were the car.
+
+Each device is a second profile under the same `learning_profiles` kind as the base profile, keyed
+`device:<entity>` — the entity id is the only identity that stays unique when two devices share a kind
+— and the forecast is `base + sum(modelled devices)`.
+
+**The subtraction is what makes it safe, not a detail of it.** The measured total already contains the
+device, so the base profile is learned from the total minus every device that was actually measurable,
+and each of those is then added back above it. Adding a device to a base that still contains it
+double-counts it, and the doubling hides inside the temperature term: it reads as a steeper slope, not
+as an error. Concretely:
+
+* an hour is kept for the base only when the total and *every* subtracted device have a reading for it.
+  A missing device reading is unknown, not zero — reading it as zero would leave that device's draw in
+  the base and then add the device's profile on top of it. The hours lost this way are counted, and a
+  non-zero count is reported in the forecast notes;
+* a device whose meter covers less than half of the house's hours (or fewer than 48 usable hours) is
+  refused outright rather than subtracted from the few hours that overlap: it stays inside the base
+  profile, and the forecast names it with the reason recorded when the base was learned;
+* the base profile records which devices were `devices_subtracted` and why the rest were
+  `devices_excluded`. A stored device profile is added back only when the *current* base names its key
+  as subtracted, so a stale profile (device removed and re-added) is never added to a base that still
+  contains the device;
+* the kind is the authority on the temperature term at serving time as well as at learning time: a
+  device re-configured from heat pump to EV charger drops its stored slope immediately (the profile is
+  re-fitted on the next learning run) rather than contradicting the kind it is configured as now;
+* a device with no profile yet — configured after the last learning run, or unreadable — is not added,
+  because the base still contains it. Nothing is guessed to make the forecast look complete.
+
+A device's own profile is learned from the device's own meter (not from the leftover), with a
+temperature term only for the kinds above; it is deliberately *not* filled from the default
+residential shape, because that shape describes a house's occupancy and not one appliance's schedule.
+The forecast notes name every device that was modelled and every one that was not, with the reason,
+and the load provider's `detail` carries the two counts: an exclusion changes what the base profile
+*means*, and that is not visible in a kW curve.
+
+Cold start is the one case with no subtraction at all: `load.base_kwh_per_day` is a whole-house
+fallback, so while no base profile has been learned no device is added and the notes say so.
+
 Model: median per (weekend|weekday, hour) profile over the last 8 weeks, scaled by
 `recent_7d_mean / profile_mean` (clamped `[0.5, 2.0]`), then an EWMA bias correction per hour bucket
 over the last 7 days, then an optional least-squares temperature term
@@ -1461,9 +1508,9 @@ default look. Bootstrap's JavaScript is **not** vendored: interactions stay in `
 ### 13.2 Setup cards and the All settings drawer (frozen; amended 0.6.0)
 
 The settings form was first a single wall of ~75 fields, then a rail of groups that still showed 55
-essential rows. It now opens on **four setup cards** — Price, Meter, Solar, Battery — each carrying
-only the primary choice of its topic, with everything else one disclosure below in the **All settings
-drawer**:
+essential rows. It now opens on **five setup cards** — Price, Meter, Solar, Load, Battery — each
+carrying only the primary choice of its topic, with everything else one disclosure below in the **All
+settings drawer**:
 
 - The cards are the default surface. `SEM_APP.setupCardKeys({priceProvider, priceContract,
   solarSource})` is the pure table of the keys the cards own for the current selection; a card renders
@@ -1486,6 +1533,11 @@ drawer**:
   edited `grid.*` value is labelled as an override of that fallback, the dashboard's roles stay
   visible, and a `Use the Energy dashboard` action clears every explicit `grid.*` key through the
   normal dirty/Save flow.
+- The Load card carries the house meter, its optional outdoor-temperature sensor and the named-device
+  editor (§7.2): one row per `load.devices` entry, each with a meter picker, a kind dropdown fed from
+  the backend descriptor's choices (so a newer backend kind needs no UI release) and an optional
+  display name, plus add/remove/reorder. A row with no meter or a repeated meter is refused
+  client-side, never sent for the server to reject: a repeated meter would be subtracted twice.
 - A `save-bar` (sticky, outside the drawer) shows how many keys are changed with Save and Revert;
   navigating away with unsaved changes asks first.
 

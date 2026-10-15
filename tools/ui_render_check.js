@@ -668,6 +668,42 @@ function classTokens(text) {
     && [...sourceStatuses].every((n) => /(ok|degraded|failed|disabled|no status)/.test(n.textContent)),
     [...sourceStatuses].map((n) => n.textContent).join(" | "));
 
+  // SPEC 7.2: the Load card owns the named-device editor. The mock configures two devices, so the
+  // editor must render one row per device with its kind dropdown, its display name and its meter
+  // picker; a row without a meter must be refused client-side, never sent for the server to reject.
+  function loadCardNode() {
+    const host = byClass(view(), "setup-cards")[0];
+    if (!host) return null;
+    return [...host.querySelectorAll(".setup-card")].find((card) => /What the house draws/.test(card.textContent)) || null;
+  }
+  const deviceRows = () => (loadCardNode() ? loadCardNode().querySelectorAll(".device-row") : []);
+  const deviceKinds = () => (loadCardNode() ? loadCardNode().querySelectorAll(".device-kind") : []);
+  const deviceNames = () => (loadCardNode() ? loadCardNode().querySelectorAll(".device-name") : []);
+  check("the Load card renders the named-device editor",
+    !!loadCardNode() && deviceRows().length === 2 && deviceKinds().length === 2 && deviceNames().length === 2
+      && (loadCardNode().querySelectorAll(".picker").length >= 2),
+    `${deviceRows().length} rows, ${deviceKinds().length} kinds, ${deviceNames().length} names`);
+  const kindOptions = deviceKinds().length ? [...deviceKinds()[0].querySelectorAll("option")].map((o) => o.value) : [];
+  check("the device kind dropdown offers the closed kind set",
+    ["heat_pump", "ev_charger", "water_heater", "pool_pump"].every((kind) => kindOptions.includes(kind)),
+    kindOptions.join(", "));
+  const addDevice = loadCardNode()
+    ? [...loadCardNode().querySelectorAll("button")].find((b) => /Add device/.test(b.textContent))
+    : null;
+  check("the device editor can add a row", !!addDevice);
+  if (addDevice) {
+    addDevice.dispatchEvent({ type: "click" });
+    await sleep(20);
+    check("an added device row without a meter is refused before saving",
+      deviceRows().length === 3 && /has no meter/.test(loadCardNode().textContent),
+      `${deviceRows().length} rows`);
+  }
+  const deviceProblems = A.loadDeviceProblems([{ entity: "sensor.example_a", kind: "heat_pump" }, { entity: "sensor.example_a", kind: "ev_charger" }], ["heat_pump", "ev_charger"]);
+  check("a repeated device meter is refused client-side",
+    deviceProblems.length === 1 && /repeats/.test(deviceProblems[0]), deviceProblems.join(" | "));
+  check("an unknown device kind is refused client-side",
+    /unknown kind/.test(A.loadDeviceProblems([{ entity: "sensor.example_b", kind: "boiler" }], ["heat_pump"])[0] || ""));
+
   // SPEC 3: the Meter card names the Energy-dashboard fallback and lets a saved override go back
   // to it. The mock serves the dashboard roles and mirrors the engine's grid_resolution().
   function meterCardNode() {

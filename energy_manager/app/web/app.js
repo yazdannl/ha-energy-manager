@@ -4666,8 +4666,43 @@
     return { fields: keys, note: note || null };
   }
 
-  /* ---- setup cards (SPEC 13.2, amended) ---------------------------------------------------------------------
-   * The settings page opens on four setup cards that carry the primary choice of each topic *and
+  /* ---- named load devices (SPEC §7.2) -----------------------------------------------------------
+   * Each device has its own meter, its own (weekend|weekday, hour) profile and — for the kinds that
+   * respond to weather — its own temperature term. The kind is a closed set because it decides
+   * whether the model fits such a term at all; the local list mirrors load.py's kind table and the
+   * server's descriptor carries the same set as choices, which wins when present so a newer backend
+   * kind needs no UI release. Pure (no DOM), so the row rules have a node-testable surface. */
+  var LOAD_DEVICE_KINDS = ["heat_pump", "ev_charger", "water_heater", "pool_pump"];
+  var LOAD_DEVICE_KIND_LABELS = {
+    heat_pump: "Heat pump",
+    ev_charger: "EV charger",
+    water_heater: "Water heater",
+    pool_pump: "Pool pump"
+  };
+
+  /** Client-side problems of a load.devices list: what must be fixed before a save can succeed.
+   *  The meter is the one field the add-on cannot infer, and a repeated meter would be subtracted
+   *  twice — a double count that hides inside the temperature slope — so both are refused here
+   *  rather than left to the server's 400. */
+  function loadDeviceProblems(entries, kinds) {
+    var known = Array.isArray(kinds) && kinds.length ? kinds : LOAD_DEVICE_KINDS;
+    var out = [];
+    var seen = {};
+    (Array.isArray(entries) ? entries : []).forEach(function (entry, index) {
+      var where = "Device " + (index + 1);
+      var entity = entry && entry.entity != null ? String(entry.entity).trim() : "";
+      if (!entity) { out.push(where + " has no meter"); return; }
+      if (seen[entity]) out.push(where + " repeats " + entity + "; one meter cannot be two devices");
+      seen[entity] = true;
+      var kind = entry && entry.kind != null ? String(entry.kind) : "";
+      if (known.indexOf(kind) < 0) out.push(where + " has an unknown kind " + (kind || "(none)"));
+    });
+    return out;
+  }
+
+
+  /* ---- setup cards (SPEC 13.2, amended; the Load card was added with named devices) -------------
+   * The settings page opens on five setup cards that carry the primary choice of each topic *and
    * the fields that choice needs to be complete*: the capacity estimate needs the array's watt
    * peak, Forecast.Solar needs its plane, a fixed day/night tariff needs both rates and both window
    * start hours, and wholesale day-ahead prices need the adders that turn them into a consumer
@@ -4710,6 +4745,9 @@
     if (source !== "derived") keys.push("solar.measured_entity");
     // The merge list and its strategy are part of the Solar card whatever the single source is.
     keys.push("solar.sources", "solar.merge_strategy");
+    // The Load card carries the house meter, its optional outdoor-temperature sensor and the
+    // named-device editor (SPEC §7.2); load.mode and the fallback daily energy stay in the drawer.
+    keys.push("load.entity", "load.temperature_entity", "load.devices");
     return keys;
   }
 
@@ -5088,7 +5126,7 @@
       return section;
     }
     // ---- setup cards (SPEC 13.2 amended) ------------------------------------------------------
-    // Four cards carry the primary choice each; their keys are skipped by the groups below. A key
+    // Five cards carry the primary choice each; their keys are skipped by the groups below. A key
     // the card does not render (its source does not apply) falls back to the group, so nothing is
     // lost and nothing is rendered twice.
     function cardField(key) {
@@ -5342,6 +5380,120 @@
       return setupCard("Solar", "Optional. How the add-on should know your production — one source, or several merged.", children);
     }
 
+    // The named-device list (SPEC §7.2). Unlike the solar merge list there is no single-entry
+    // fallback, so an empty list is the normal state and means one house-wide profile. Every row is
+    // a meter picker, a kind dropdown and an optional display name: the kind decides whether the
+    // device gets its own temperature term, and the meter is the one thing the add-on cannot infer.
+    // Rows that cannot be saved (no meter, a repeated meter) are marked invalid by dirty(), so a
+    // save is never attempted with a list the server has to reject.
+    function loadDeviceKindSelect(value, kinds, onChange) {
+      var select = el("select", { class: "device-kind" });
+      kinds.forEach(function (option) {
+        var node = el("option", { value: option, text: LOAD_DEVICE_KIND_LABELS[option] || option });
+        if (String(value) === option) node.selected = true;
+        select.appendChild(node);
+      });
+      if (value && kinds.indexOf(String(value)) < 0) {
+        // A kind this UI does not know (a newer backend) must still be shown, not silently changed
+        // to the first option the moment the user touches another field.
+        var extra = el("option", { value: String(value), text: String(value) + " (unknown)" });
+        extra.selected = true;
+        select.appendChild(extra);
+      }
+      select.addEventListener("change", function () { onChange(select.value); });
+      return select;
+    }
+
+    function loadDeviceKinds() {
+      // The backend's descriptor carries the closed kind set (config.LOAD_DEVICE_KINDS) as choices;
+      // the local table is the fallback for a mock or an older payload, so never an empty dropdown.
+      var descriptor = descriptorByKey("load.devices");
+      var choices = descriptor && Array.isArray(descriptor.choices)
+        ? descriptor.choices.filter(function (choice) { return !!choice; })
+        : [];
+      return choices.length ? choices : LOAD_DEVICE_KINDS;
+    }
+
+    function loadDevicesEditor() {
+      var value = settingValue("load.devices");
+      var list = Array.isArray(value) ? value.map(function (entry) { return Object.assign({}, entry); }) : [];
+      var kinds = loadDeviceKinds();
+      var wrap = el("div", { class: "field", dataset: { key: "load.devices" } });
+      wrap.appendChild(el("label", { text: "Named load devices" }));
+      wrap.appendChild(el("span", { class: "field-key", text: "load.devices" }));
+      wrap.appendChild(el("p", { class: "field-help", text: "A device meter is subtracted from the house total before the base profile is learned, and the device is added back above it with its own (weekend|weekday, hour) profile and, for a heat pump, water heater or pool pump, its own temperature term. An EV charger draws on its schedule, so it gets no temperature term. A device that cannot be measured is not subtracted: it stays inside the base profile and the forecast says so, because adding it back on top of a base that already contains it would count it twice." }));
+      function commit(next, redraw) {
+        dirty("load.devices", next, wrap, loadDeviceProblems(next, kinds).length > 0);
+        if (redraw) draw();
+      }
+      function update(index, patch, redraw) {
+        commit(list.map(function (entry, i) { return i === index ? Object.assign({}, entry, patch) : entry; }), redraw);
+      }
+      function move(index, delta) {
+        var target = index + delta;
+        if (target < 0 || target >= list.length) return;
+        var next = list.slice();
+        var item = next.splice(index, 1)[0];
+        next.splice(target, 0, item);
+        commit(next, true);
+      }
+      function removeAt(index) {
+        commit(list.filter(function (_entry, i) { return i !== index; }), true);
+      }
+      var rows = el("div", { class: "device-list" });
+      if (!list.length) {
+        rows.appendChild(el("p", { class: "muted", text: "No named devices: the house is one profile." }));
+      }
+      list.forEach(function (entry, index) {
+        var row = el("div", { class: "device-row" });
+        row.appendChild(loadDeviceKindSelect(entry.kind, kinds, function (kind) { update(index, { kind: kind }, true); }));
+        var name = el("input", {
+          type: "text",
+          class: "device-name",
+          placeholder: "display name (optional)",
+          value: entry.name == null ? "" : String(entry.name)
+        });
+        // No redraw while typing: draw() rebuilds the form and the caret would be lost mid-name.
+        name.addEventListener("input", function () { update(index, { name: name.value.trim() }, false); });
+        row.appendChild(el("label", { class: "device-name-label" }, ["Name", name]));
+        row.appendChild(entityPicker({
+          kind: "load",
+          key: "load.devices[" + index + "].entity",
+          label: "device meter",
+          placeholder: "device power or energy meter",
+          value: entry.entity,
+          onPick: function (_target, entityId) { update(index, { entity: entityId }, true); }
+        }));
+        row.appendChild(button("Move up", "", function () { move(index, -1); }));
+        row.appendChild(button("Move down", "", function () { move(index, 1); }));
+        row.appendChild(button("Remove", "", function () { removeAt(index); }));
+        rows.appendChild(row);
+      });
+      wrap.appendChild(rows);
+      var problems = loadDeviceProblems(list, kinds);
+      if (problems.length) wrap.appendChild(el("p", { class: "field-help field-error", text: problems.join("; ") }));
+      wrap.appendChild(button("Add device", "", function () {
+        commit(list.concat([{ entity: "", kind: kinds[0] || "heat_pump" }]), true);
+      }));
+      return wrap;
+    }
+
+    function loadCard() {
+      var children = [
+        cardPicker("load.entity", "load", "household load power sensor name or entity id"),
+        cardPicker("load.temperature_entity", "load", "outdoor temperature sensor name or entity id")
+      ];
+      // The device editor carries load.devices itself (like the Solar card owns solar.sources), so
+      // the Load group skips the key and it appears exactly once.
+      cardKeys["load.devices"] = true;
+      children.push(loadDevicesEditor());
+      return setupCard(
+        "Load",
+        "What the house draws, and any named device that deserves its own profile. The base profile is learned from the total minus the device meters, and every modelled device is added back above it; a device that cannot be measured stays inside the base and is reported in the forecast notes.",
+        children
+      );
+    }
+
     function batteryCard() {
       // The canonical inventory is the /batteries endpoint, so a stale or empty descriptor can
       // never answer the question (UI_REVIEW §3.2 / open question 3).
@@ -5461,7 +5613,7 @@
       // The cards are the default surface. A search hides them, so every match is listed exactly
       // once in the drawer below (the cards own their keys and the groups skip them).
       if (!query) {
-        [priceCard(), meterCard(), solarCard(), batteryCard()].forEach(function (card) {
+        [priceCard(), meterCard(), solarCard(), loadCard(), batteryCard()].forEach(function (card) {
           if (card) cardsHost.appendChild(card);
         });
       }
@@ -5782,6 +5934,7 @@
     forecastEmptyState: forecastEmptyState,
     priceFieldVisibility: priceFieldVisibility,
     solarFieldVisibility: solarFieldVisibility,
+    loadDeviceProblems: loadDeviceProblems,
     settingsGroups: settingsGroups,
     settingsVisible: settingsVisible,
     setupCardKeys: setupCardKeys,

@@ -76,6 +76,14 @@ def test_ui_renders_and_settings_ia_holds():
         # SPEC 5 learned capacity: the Batteries card must state the effective value and where it
         # came from, never bury a learned estimate without its evidence.
         "the batteries card shows the effective capacity, marked learned",
+        # SPEC 7.2 named load devices: the Load card's editor must render one row per configured
+        # device, offer the closed kind set, and refuse an unsaveable row before a save is attempted.
+        "the Load card renders the named-device editor",
+        "the device kind dropdown offers the closed kind set",
+        "the device editor can add a row",
+        "an added device row without a meter is refused before saving",
+        "a repeated device meter is refused client-side",
+        "an unknown device kind is refused client-side",
         "the batteries card states the estimate's sample count and last update",
         "the batteries card states the configured seed next to the effective value",
         "the batteries card states the lowest cell voltage",

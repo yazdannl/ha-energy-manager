@@ -953,6 +953,14 @@ tbody tr:hover { background: var(--panel-2); }
 .source-weight-label { display: inline-flex; align-items: center; gap: var(--sp-1); font-size: 0.85rem; }
 .source-weight { width: 5rem; }
 .source-status { font-size: 0.78rem; overflow-wrap: anywhere; }
+/* Named load devices (SPEC 7.2): the same row shape as the solar merge list, with a per-row meter
+   picker under it. */
+.device-list { display: grid; gap: var(--sp-2); }
+.device-row { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--sp-2); }
+.device-kind { flex: 0 1 11rem; min-width: 0; }
+.device-name-label { display: inline-flex; align-items: center; gap: var(--sp-1); font-size: 0.85rem; }
+.device-name { width: 10rem; }
+.device-row .picker { flex: 1 1 18rem; min-width: 0; }
 .all-settings { margin-top: var(--sp-3); }
 
 .picker { display: grid; gap: var(--sp-2); }

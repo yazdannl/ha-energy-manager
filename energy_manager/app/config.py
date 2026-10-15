@@ -151,6 +151,10 @@ DEFAULTS: dict[str, Any] = {
     "load.entity": "",
     "load.temperature_entity": "",
     "load.base_kwh_per_day": 0.0,
+    # Named devices (SPEC.md section 7.2): a list of {entity, kind, name}. Each entry's meter is
+    # subtracted from the house total before the base profile is learned and added back as its own
+    # component, with its own temperature term when the kind has one. Empty = one house profile.
+    "load.devices": [],
     # -- grid (roles confirmed from /discover?kind=grid; grid.power_entity enables the derived load tier) --
     "grid.power_entity": "",  # signed grid power sensor, positive = import
     "grid.import_entity": "",  # separate import power sensor, optional
@@ -290,6 +294,14 @@ _SOLAR_SOURCE_KEYS: dict[str, tuple[str, ...]] = {
     ),
 }
 _LOAD_MODE_CHOICES = ("auto", "entity", "derived")
+#: The closed ``load.devices[].kind`` set (SPEC.md section 7.2). A device profile is learned per kind
+#: (and per meter), and the kind decides whether the device gets its own temperature term; a closed
+#: set is what lets the UI offer a dropdown and the model pick a default the user need not know.
+#: ``sources/load.py`` keys its kind table by these names, and a test pins the two together.
+LOAD_DEVICE_KINDS = ("heat_pump", "ev_charger", "water_heater", "pool_pump")
+#: The only keys a ``load.devices`` entry may carry: the meter, the kind, and an optional display
+#: name. Everything else the model needs is derived from the kind rather than entered per device.
+_LOAD_DEVICE_KEYS = ("entity", "kind", "name")
 _PV_CHARGE_PREFERENCE_CHOICES = ("auto", "prefer_pv", "avoid_pv")
 _NOTIFY_EVENT_CHOICES = (
     "plan_changed",
@@ -381,6 +393,20 @@ SETTINGS_META: dict[str, _Meta] = {
     "load.entity": _Meta("str", "load", "Load entity", "Runtime-picked load power sensor.", advanced=True),
     "load.temperature_entity": _Meta("str", "load", "Outdoor temperature entity", "Optional regression term.", advanced=True),
     "load.base_kwh_per_day": _Meta("float", "load", "Fallback daily energy", "Flat profile until something is learned.", minimum=0.0, maximum=1000.0, advanced=True),
+    "load.devices": _Meta(
+        "json",
+        "load",
+        "Named load devices",
+        "Meters for individual loads that need their own profile and their own temperature response: "
+        "a heat pump, an EV charger, a water heater or a pool pump. Each entry is {entity, kind, "
+        "name}; kind is one of " + ", ".join(LOAD_DEVICE_KINDS) + "; name is optional. A device's "
+        "meter is subtracted from the house total before the base profile is learned and added back "
+        "on top of it, so a device that cannot be measured is left inside the base and named in the "
+        "forecast notes rather than counted twice. Only a heat pump, water heater or pool pump gets "
+        "its own temperature term; an EV charger's draw is a schedule.",
+        LOAD_DEVICE_KINDS,
+        advanced=True,
+    ),
     "grid.power_entity": _Meta("str", "grid", "Grid power entity", "Signed grid power sensor, positive = import; enables the derived load tier."),
     "grid.import_entity": _Meta("str", "grid", "Grid import entity", "Separate import power sensor (optional).", advanced=True),
     "grid.export_entity": _Meta("str", "grid", "Grid export entity", "Separate export power sensor (optional).", advanced=True),
@@ -752,6 +778,13 @@ class Settings:
             ).get(key)
             if problem:
                 raise ConfigError(problem)
+        if key in ("load.devices", "load.entity"):
+            # Same rule for the device list: the house meter cannot be one of its own devices.
+            problem = load_device_patch_errors(
+                {key: coerced}, {name: self.get(name) for name in ("load.devices", "load.entity")}
+            ).get(key)
+            if problem:
+                raise ConfigError(problem)
         self._persist_setting(key, coerced)
         return coerced
 
@@ -773,9 +806,17 @@ class Settings:
         protection_errors = protection_patch_errors(
             values, {name: self.get(name) for name in _PROTECTION_KEYS}
         )
+        # A patch that moves load.entity and load.devices together is judged on its final state, so
+        # a device list is never rejected because the house meter happened to be applied first.
+        device_errors = load_device_patch_errors(
+            values, {name: self.get(name) for name in ("load.devices", "load.entity")}
+        )
         for key, value in values.items():
             if key in protection_errors:
                 errors.append({"key": key, "message": protection_errors[key]})
+                continue
+            if key in device_errors:
+                errors.append({"key": key, "message": device_errors[key]})
                 continue
             try:
                 self._persist_setting(key, coerce_setting(key, value))
@@ -1041,6 +1082,8 @@ def _validate_json_setting(key: str, value: Any) -> Any:
         return _validate_planes(value)
     if key == "solar.sources":
         return _validate_solar_sources(value)
+    if key == "load.devices":
+        return _validate_load_devices(value)
     if key == "batteries":
         if not isinstance(value, list):
             raise ConfigError("batteries must be a list")
@@ -1128,6 +1171,85 @@ def _validate_planes(value: Any) -> list[dict[str, Any]]:
             plane["damping"] = damping
         out.append(plane)
     return out
+
+
+def _validate_load_devices(value: Any) -> list[dict[str, Any]]:
+    """Validate ``load.devices`` (SPEC.md section 7.2): named loads, each with its own meter.
+
+    Every shape this refuses is a silent double-count downstream: the same meter twice, or the house
+    meter as one of its own devices, subtracts that meter more than once from the total and then
+    adds it back more than once, and the error reads as a steeper temperature slope rather than as a
+    mistake. The kind is checked against the closed set, because the kind is what decides whether
+    the device gets a temperature term -- an unknown kind would silently get none.
+    """
+    if not isinstance(value, list):
+        raise ConfigError("load.devices must be a list")
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(value):
+        where = f"load.devices[{index}]"
+        if not isinstance(entry, Mapping):
+            raise ConfigError(f"{where} must be an object")
+        unknown = sorted(set(entry) - set(_LOAD_DEVICE_KEYS))
+        if unknown:
+            raise ConfigError(f"{where} has unknown keys {unknown}; allowed: {list(_LOAD_DEVICE_KEYS)}")
+        entity = str(entry.get("entity", "") or "").strip()
+        if not entity:
+            raise ConfigError(f"{where}.entity is required: the device's power or energy meter")
+        if any(char.isspace() for char in entity):
+            raise ConfigError(
+                f"{where}.entity {entity!r} contains whitespace; it must be a Home Assistant entity "
+                "id or statistic id"
+            )
+        if entity in seen:
+            raise ConfigError(
+                f"{where}.entity {entity!r} is listed twice; one meter cannot be two devices"
+            )
+        seen.add(entity)
+        kind = str(entry.get("kind", "") or "").strip().lower()
+        if kind not in LOAD_DEVICE_KINDS:
+            raise ConfigError(f"{where}.kind must be one of {list(LOAD_DEVICE_KINDS)}")
+        item: dict[str, Any] = {"entity": entity, "kind": kind}
+        name = str(entry.get("name", "") or "").strip()
+        if name:
+            item["name"] = name
+        out.append(item)
+    return out
+
+
+def load_device_patch_errors(
+    values: Mapping[str, Any], current: Mapping[str, Any]
+) -> dict[str, str]:
+    """Cross-key check for ``load.devices``: no device meter may be the house meter itself.
+
+    ``load.entity`` is the total the device meters are subtracted from, so listing it as one of its
+    own devices subtracts the whole house from itself: the base profile would be learned from zeros
+    and the device's profile added back on top, producing a forecast that looks like a single
+    appliance and is wrong everywhere. Judged on the patch's *final* state so moving both keys in
+    one save is accepted or refused as a whole, the same rule the protection trio follows.
+    """
+    touched = set(values) & {"load.devices", "load.entity"}
+    if not touched:
+        return {}
+    merged = dict(current)
+    merged.update(values)
+    house = str(merged.get("load.entity", "") or "").strip()
+    raw = merged.get("load.devices")
+    if not house or not isinstance(raw, list):
+        return {}
+    clash = any(
+        isinstance(entry, Mapping) and str(entry.get("entity", "") or "").strip() == house
+        for entry in raw
+    )
+    if not clash:
+        return {}
+    message = (
+        f"load.entity {house!r} is also listed in load.devices; a device meter cannot be the house "
+        "total it is subtracted from"
+    )
+    if "load.devices" in touched:
+        return {"load.devices": message}
+    return {"load.entity": message}
 
 
 def _validate_solar_sources(value: Any) -> list[dict[str, Any]]:

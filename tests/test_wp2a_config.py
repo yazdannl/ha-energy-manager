@@ -50,6 +50,7 @@ SPEC_KEYS = {
     "load.entity",
     "load.temperature_entity",
     "load.base_kwh_per_day",
+    "load.devices",
     "grid.power_entity",
     "grid.import_entity",
     "grid.export_entity",
@@ -586,6 +587,8 @@ ADVANCED_KEYS = {
     "load.entity",
     "load.temperature_entity",
     "load.base_kwh_per_day",
+    # SPEC 7.2 named devices: the per-device editor lives on the Load card.
+    "load.devices",
     "grid.import_entity",
     "grid.export_entity",
     "control.tick_seconds",

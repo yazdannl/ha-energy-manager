@@ -334,7 +334,7 @@ Panels: **Savings range** (controls), **Totals**, **Savings vs baseline**, **Per
 
 ### 2.8 Settings
 
-Panels: **Settings** (always-visible toolbar + Safety summary, four setup cards, collapsed
+Panels: **Settings** (always-visible toolbar + Safety summary, five setup cards, collapsed
 **All settings** drawer) and **Add-on options** (read-only, `Option`/`Value` table).
 
 Always visible above the cards: the `.settings-toolbar` (`settings-search` + `settings-show-advanced`)
@@ -566,6 +566,7 @@ is the authority for the `advanced` classification (the test suite asserts the e
 | `load.entity` | str | `""` | — | **Load entity** *(advanced)* |
 | `load.temperature_entity` | str | `""` | — | **Outdoor temperature entity** *(advanced)* — optional regression term |
 | `load.base_kwh_per_day` | float | `0.0` | 0…1000 | **Fallback daily energy** *(advanced)* |
+| `load.devices` | json | `[]` | — | **Named load devices** *(advanced)* — ordered `[{entity, kind, name}]` (SPEC §7.2); `kind` is `heat_pump`, `ev_charger`, `water_heater` or `pool_pump`, `name` optional. Each meter is subtracted from the house total before the base profile is learned and added back above it with its own profile; only the heat pump, water heater and pool pump kinds get a temperature term. A device that cannot be measured stays inside the base and is named in the forecast notes |
 
 #### Grid
 
@@ -1066,6 +1067,19 @@ value = max(0, value)
 Hourly values are linearly interpolated onto the 15-minute slot grid (`p10`/`p90` become the band).
 Fallback when nothing is learned: `load.base_kwh_per_day` spread by `DEFAULT_SHAPE`
 (24 relative weights, normalised) and `confidence: low`.
+
+**Named devices** (`load.devices`, SPEC §7.2): the base profile is learned from the house total minus
+every device that was actually measurable, and each of those is stored as a second profile under the
+same `learning_profiles` kind, keyed `device:<entity>`. The forecast is `base + sum(devices)`: every
+component is evaluated on the same clock and the bands add. An hour enters the base only when the
+total and every subtracted device have a reading for it (a missing reading is unknown, not zero, and
+the dropped hours are counted and noted); a device covering under half the house's hours is refused
+rather than subtracted from a handful of them. The base records `devices_subtracted` and
+`devices_excluded`, and a stored device profile is added back only when the current base names its
+key as subtracted — so a device the base still contains can never be counted twice. Cold start adds
+no device at all: the flat fallback is the whole house. The kind is authoritative at serving time too:
+a device whose stored profile was learned under a different kind has its temperature term dropped
+until the next run, and the forecast notes say so.
 
 **Confidence**: `low` with no profile or fewer than `24 * 2` samples; `medium` under 14 days;
 `high` at 14+ days and enough samples.
@@ -1845,6 +1859,8 @@ into the caller. Messages contain generic text plus numbers — never entity ids
 | Load window / samples / EWMA | 56 days / 24 / 0.2 | `sources/load.py` |
 | Load scale and bias clamps | 0.5…2.0 both | `sources/load.py` |
 | Temperature term threshold | r² ≥ 0.05 | `sources/load.py` |
+| Device meter floors | 48 hourly readings, ≥ 50 % of the house's hours (checked per device and on their intersection) | `sources/load.py` |
+| Device temperature kinds | `heat_pump`, `water_heater`, `pool_pump` (not `ev_charger`) | `sources/load.py` |
 | Solar bias | α 0.2, clamp 0.3…1.8, decay 14 days | `sources/solar.py` |
 | Solar cache / rate limit | 30 min / 12 per hour, backoff 60→1800 s | `sources/solar.py` |
 | Solar planes cap | 4 | `sources/solar.py` |
