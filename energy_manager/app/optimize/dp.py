@@ -53,6 +53,7 @@ from ..models import (
     slot_range,
     utcnow,
 )
+from . import _fast
 
 log = logging.getLogger(__name__)
 
@@ -593,7 +594,27 @@ class _DpResult:
     internal_objective_eur: float = 0.0
 
 
-def _solve_once(
+@dataclass
+class _NumericResult:
+    """The numeric core of one solve: everything ``_classify`` and ``_DpResult`` need.
+
+    Produced either by the Python reference (:func:`_solve_once_numeric`) or by the validated C
+    accelerator (``_fast.solve``); both expose these exact attributes so the plan tail is shared.
+    """
+
+    iterations: int
+    effective_step_kwh: float
+    terminal_error_kwh: float
+    cycle_cost_eur: float
+    objective_eur: float
+    internal_objective_eur: float
+    states: int
+    energies: list[float]
+    powers: list[float]
+    windows: list[tuple[float, float, float, float]]
+
+
+def _solve_once_numeric(
     slots: Sequence[SlotInput],
     agg: BatteryAggregate,
     start_kwh: float,
@@ -601,17 +622,13 @@ def _solve_once(
     target_penalty: float,
     e_target: float | None,
     salvage: float,
-    minutes_of: Sequence[float] | None = None,
-) -> _DpResult:
-    # Per-slot modelled duration in minutes (0.20.1, SPEC 8.16): the caller passes a shorter first
-    # slot when the plan is made mid-slot; ``None`` keeps the uniform pre-0.20.1 model so existing
-    # callers stay bit-for-bit unchanged.
-    minutes = (
-        [float(value) for value in minutes_of]
-        if minutes_of is not None
-        else [float(opts.slot_minutes)] * len(slots)
-    )
-    dt = opts.slot_minutes / 60.0  # uniform reference, used only by _classify's tail heuristic
+    minutes: Sequence[float],
+) -> _NumericResult:
+    """The Python reference: value iteration + path reconstruction (SPEC 8.2).
+
+    ``minutes`` is the per-slot modelled duration (0.20.1, SPEC 8.16); the caller resolves it so a
+    mid-slot plan shortens only the first slot.
+    """
     anchors = [clamp(start_kwh, agg.e_min_kwh, agg.e_max_kwh)]
     if e_target is not None:
         anchors.append(e_target)
@@ -717,7 +734,78 @@ def _solve_once(
     terminal_error = abs(e_now - e_target) if e_target is not None else 0.0
     start_index = min(range(len(grid)), key=lambda k: abs(grid[k] - clamp(start_kwh, agg.e_min_kwh, agg.e_max_kwh)))
 
-    reasons = _classify(slots, agg, energies, powers, windows, e_target, start_kwh, dt, step, opts)
+    return _NumericResult(
+        iterations=iterations,
+        effective_step_kwh=step,
+        terminal_error_kwh=terminal_error,
+        cycle_cost_eur=cycle_cost,
+        objective_eur=objective,
+        internal_objective_eur=value[0][start_index],
+        states=len(grid),
+        energies=energies,
+        powers=powers,
+        windows=windows,
+    )
+
+
+def _solve_once(
+    slots: Sequence[SlotInput],
+    agg: BatteryAggregate,
+    start_kwh: float,
+    opts: OptimizerOptions,
+    target_penalty: float,
+    e_target: float | None,
+    salvage: float,
+    minutes_of: Sequence[float] | None = None,
+) -> _DpResult:
+    """Solve one scenario, preferring the validated C core, else the Python reference unchanged.
+
+    ``_fast.solve`` returns ``None`` when the extension is absent, failed to import, or produced a
+    result its runtime validation rejected; in every one of those cases the original Python DP
+    runs and the returned plan is identical to the pre-acceleration behaviour.
+    """
+    # Per-slot modelled duration in minutes (0.20.1, SPEC 8.16): the caller passes a shorter first
+    # slot when the plan is made mid-slot; ``None`` keeps the uniform pre-0.20.1 model so existing
+    # callers stay bit-for-bit unchanged.
+    minutes = (
+        [float(value) for value in minutes_of]
+        if minutes_of is not None
+        else [float(opts.slot_minutes)] * len(slots)
+    )
+    numeric = _fast.solve(slots, agg, start_kwh, opts, target_penalty, e_target, salvage, minutes)
+    if numeric is None:
+        numeric = _solve_once_numeric(
+            slots, agg, start_kwh, opts, target_penalty, e_target, salvage, minutes
+        )
+    else:
+        # Same diagnostic the reference emits when the complexity guard widens the step.  The C
+        # core returns the widened step; this only re-derives the condition that triggered it.
+        action_count = max(2, int(opts.power_steps) + 1)
+        budget = max(2, MAX_ITERATIONS // max(1, len(slots) * action_count))
+        anchors = [clamp(start_kwh, agg.e_min_kwh, agg.e_max_kwh)]
+        if e_target is not None:
+            anchors.append(e_target)
+        if len(_build_grid(agg, opts.soc_step_kwh, anchors)[0]) > budget:
+            log.debug(
+                "optimizer: coarsened to %d states (step %.4f kWh) for %d slots x %d actions",
+                numeric.states,
+                numeric.effective_step_kwh,
+                len(slots),
+                action_count,
+            )
+    dt = opts.slot_minutes / 60.0  # uniform reference, used only by _classify's tail heuristic
+    reasons = _classify(
+        slots,
+        agg,
+        numeric.energies,
+        numeric.powers,
+        numeric.windows,
+        e_target,
+        start_kwh,
+        dt,
+        numeric.effective_step_kwh,
+        opts,
+    )
     plan_slots = [
         PlanSlot(
             t=slot.t,
@@ -725,14 +813,14 @@ def _solve_once(
             sell=float(slot.sell or 0.0),
             pv_kw=slot.pv_kw,
             load_kw=slot.load_kw,
-            soc_kwh=energies[i],
-            power_w=powers[i] * 1000.0,
+            soc_kwh=numeric.energies[i],
+            power_w=numeric.powers[i] * 1000.0,
             action=reasons[i][0],
             reason=reasons[i][1],
             load_p10_kw=slot.load_p10_kw,
             load_p90_kw=slot.load_p90_kw,
             price_stale=slot.price_stale,
-            soc_pct=agg.soc_pct_for(energies[i]),
+            soc_pct=agg.soc_pct_for(numeric.energies[i]),
             pv_source=slot.pv_source,
             price_source=slot.price_source,
             minutes=minutes[i],
@@ -741,12 +829,12 @@ def _solve_once(
     ]
     return _DpResult(
         slots=plan_slots,
-        iterations=iterations,
-        effective_step_kwh=step,
-        terminal_error_kwh=terminal_error,
-        cycle_cost_eur=cycle_cost,
-        objective_eur=objective,
-        internal_objective_eur=value[0][start_index],
+        iterations=numeric.iterations,
+        effective_step_kwh=numeric.effective_step_kwh,
+        terminal_error_kwh=numeric.terminal_error_kwh,
+        cycle_cost_eur=numeric.cycle_cost_eur,
+        objective_eur=numeric.objective_eur,
+        internal_objective_eur=numeric.internal_objective_eur,
     )
 
 

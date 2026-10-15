@@ -249,19 +249,37 @@ explicitly opt-in.
   the per-architecture expectation is documented.
 - **Surface:** one deterministic Bellman sweep + path reconstruction over validated flat arrays.
   Tariffs, scenario construction, risk selection and orchestration stay in Python. GIL released
-  for parallel scenario solves; the Python DP stays the differential oracle.
-- **Correctness:** differential tests with numerical tolerances, malformed-input checks,
-  build/import/fallback coverage on all five musl architectures. **Every solve validates the
-  extension's output at runtime** — all values finite, the SoC trajectory feasible within the
-  limits, and the objective consistent with the reconstructed path. On any failure the extension
-  is disabled and the solve is redone in Python; an extension that returns incorrect results is
-  **never** treated as equivalent to an absent extension. The fallback is used only when the
-  extension is absent, fails to import, or fails this validation.
+  for parallel scenario solves; the Python DP stays the differential oracle. The core also returns
+  its state grid and its full value function (native-double bytes) so the loader can verify the
+  decision and the backward sweep, and it rejects unsupported dimensions or numerically
+  pathological bounds/efficiencies with an explicit error instead of narrowing or overflowing.
+- **Correctness:** differential tests with numerical tolerances, malformed-input and
+  boundary-dimension checks, build/import/fallback coverage on all five musl architectures.
+  **Every solve is verified before a plan can use it:** lengths, finiteness (including every entry
+  of the value-function buffer, with non-finite operands and accumulators failing closed before
+  any comparison) and the returned grid are checked against an independently rebuilt reference
+  grid; every returned power must lie in the SoC/grid bounds derived with the reference helpers and
+  the returned windows must match; every *unclamped* transition (terminal included) must stay
+  inside `[e_min, e_max]`; the objective and terminal error are re-derived from the reconstructed
+  path and the reported cycle cost must equal the wear accumulated over that path; and for every
+  slot the returned power must **equal** the reference's own choice — the same action set, the same
+  strict argmin (ties resolve to the lowest power), the same grid-snapped stored decision and the
+  same reconstruction clamp, so an off-action or tied-but-higher power is rejected even when its
+  cost ties. The terminal value row and a sample of `V_i[k]` entries are recomputed from `V_next`
+  (backward Bellman), with non-finite values failing closed. **Full equivalence** with the unchanged
+  Python reference is cross-checked on the first solve after load and every 20 solves
+  (`_fast._CHECK_INTERVAL`, configurable, 0 = off). Between cross-checks the guarantee is therefore
+  feasibility + strict decision consistency + self-consistency + sampled backward consistency, not
+  a full re-derivation of the value function; the periodic full check bounds the residual risk. On
+  any failure at any of these layers the extension is disabled for the process and the solve is
+  redone in Python; an extension that returns incorrect results is **never** treated as equivalent
+  to an absent extension. The fallback is used only when the extension is absent, fails to import,
+  or fails this verification.
 - Build deps are added and removed in the Dockerfile; a failed compile leaves the add-on fully
   functional on the Python fallback.
-- **Gate:** the budget benchmark, the differential suite, malformed-input and runtime-validation
-  tests, and the exercised fallback. No dispatch-behaviour change: the C core is verified against
-  the Python reference and ships as an accelerator only.
+- **Gate:** the budget benchmark, the differential suite, malformed-input / boundary-dimension /
+  runtime-verification / cross-check tests, and the exercised fallback. No dispatch-behaviour
+  change: the C core is verified against the Python reference and ships as an accelerator only.
 
 ## 7. Compatibility, safety and rollback
 
