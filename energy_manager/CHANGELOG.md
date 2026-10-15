@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.25.0
+
+- **Named load devices: `load.devices`.** One whole-house profile and one whole-house temperature slope
+meant every device landed in that single compromise term. A heat pump responds strongly to temperature,
+an EV charger responds to nothing but its schedule, and averaging the two fits neither — the pump's
+weather response drags the house slope up and the charger's flat draw flattens it back. Each device now
+has its own meter, its own (weekend|weekday, hour) profile and its own temperature term, and the total
+forecast is `base + Σ devices`.
+- **The subtraction is the whole trick.** The measured total already contains the device, so a base
+learned from the total and then added to the device's own profile counts it twice — and that error is
+invisible, because a doubled device reads as a *steeper* temperature response rather than as a bug. An
+hour therefore enters the base only if the total **and every** subtracted device have a reading there: a
+missing reading is unknown, not zero, and calling it zero leaves the device's draw in the base while its
+own profile is still added on top. The hours lost that way are counted and reported. A meter covering
+fewer than 48 hours, or under half the house's hours, is refused whole rather than modelled from the
+handful of hours the two happened to share.
+- **The base records what it subtracted** (`devices_subtracted` / `devices_excluded`), and a device
+profile is added back only when the current base names its key as subtracted. Re-deriving this from the
+current settings instead would let a stale profile be added to a base learned without subtracting it —
+and a device the base never removed *should* be inside it.
+- **`kind` decides whether there is a temperature term, at serving time too.** Only `heat_pump`,
+`water_heater` and `pool_pump` get a slope; an EV charger's draw is a schedule, and a slope fitted to it
+would absorb whatever else varies with temperature as if it were the car. Re-configuring a device from
+heat pump to EV charger drops its stored slope immediately rather than contradicting the kind until the
+next learning run.
+- **Devices are reported, not silently absorbed.** Every forecast names each modelled device and each
+unmodelled one with the reason recorded when the base was learned ("its meter overlapped 3 of 720
+hours"), because a device left inside the base changes what the base *means* and that is invisible in a
+kW curve. Cold start models no device: the fallback shape is the whole house and already contains them.
+- Config, a Load-card editor with a kind dropdown, and the usual validation. `kind` is a closed set that
+the UI choices and the backend share, validation rejects a repeated meter and one pointing at
+`load.entity` itself (subtracting the total from itself), and two devices of one kind are told apart by
+their entity so a rename keeps the learning history.
+- Known limits, named rather than implied away: a mostly-unreadable meter is refused entirely rather than
+partly subtracted, the coverage floors are judgement calls rather than settings, each device gets one
+slope for the whole week (the base model has the same limitation), the p10/p90 of the sum are the sums
+of the component bands, and a removed device's stored profile is left inert rather than collected.
+- 1026 tests, audit clean.
+
 ## 0.24.0
 
 - **The load and PV forecasts can now learn on an install that measures nothing but grid and battery.**

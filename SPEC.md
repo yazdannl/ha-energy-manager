@@ -1707,6 +1707,49 @@ than by weakening `tools/audit.sh`.
 
 ## 16. Amendment log (why the spec changed)
 
+**0.25.0 named load devices (user request: add named load devices such as a heat pump with a device type
+and its own energy meter, so temperature-driven loads are modelled).** The base model fitted one
+whole-house profile and one whole-house temperature slope, so every device landed in that single
+compromise term. A heat pump responds strongly to temperature, an EV charger responds to nothing but
+its schedule, and averaging them fits neither: the pump's weather response drags the house slope upward
+and the charger's flat draw flattens it back.
+
+`load.devices` is a list of `{entity, kind, name?}`. Each device gets its own (weekend|weekday, hour)
+profile and its own temperature term, and the forecast becomes `base + Σ devices`.
+
+- **The subtraction is the load-bearing half.** The measured total already contains the device, so a
+  base learned from the total and then added to the device's own profile counts it twice. That is worth
+  belabouring because the error is invisible: a device added twice reads as a *steeper* temperature
+  response, not as a bug, and a doubled constant looks like a discovery. So an hour enters the base only
+  if the total **and every** subtracted device have a reading there — a missing reading is unknown, not
+  zero, and treating it as zero leaves that device's draw in the base while its own profile is still
+  added on top. The hours lost that way are counted and reported, and a meter covering under 48 hours or
+  under 50% of the house's hours is refused whole rather than modelled from whatever few hours the two
+  happened to share.
+- **The interlock is recorded, not re-derived.** The base profile stores `devices_subtracted` and
+  `devices_excluded`, and a stored device profile is added back only when the *current* base names its
+  key as subtracted. Re-deriving this at serving time from the current settings would let a stale device
+  profile be added to a base learned without subtracting it, and a device that is not in the base
+  *should* be inside it.
+- **The kind decides the temperature term, at serving time as well as at learning time.** Only
+  `heat_pump`, `water_heater` and `pool_pump` get a slope. An EV charger's draw is a schedule; fitting a
+  slope to it would absorb whatever else varies with temperature as if it were the car. A device
+  re-configured from heat pump to EV charger therefore drops its stored slope immediately, rather than
+  contradicting the kind it is configured as now until the next learning run.
+- **Nothing is silently absorbed.** The forecast names every modelled and every unmodelled device with
+  the reason recorded when the base was learned ("its meter overlapped 3 of 720 hours"), because a device
+  left inside the base changes what the base *means* and that is invisible in a kW curve. Provider
+  `detail` carries the counts. Cold start models no device at all: the fallback shape is the whole house
+  and already contains every one of them.
+- **Two devices of one kind are told apart by their entity**, not their display name, since that is the
+  only identity that stays unique when both are heat pumps. The profile key is `device:<entity>` under
+  the existing `load` kind, so a rename keeps the learning history.
+- **Known limits, named rather than implied away:** a mostly-unreadable meter is refused entirely rather
+  than subtracted only where readable; the coverage and sample floors are judgement calls rather than
+  settings; each device gets one slope for the whole week, the same limitation the base model has; the
+  p10/p90 of the sum are the sums of the components' bands, which approximates the quantiles of the sum;
+  and a removed device's stored profile is left behind and inert rather than garbage-collected.
+
 **0.24.0 break the load/pv circularity (user request: calibrate from the meter, since we know the grid
 export and we know the night load).** The observation was correct and the blind spot was structural:
 `load = grid + pv − battery` is the identity that makes both quantities recoverable, and the add-on
