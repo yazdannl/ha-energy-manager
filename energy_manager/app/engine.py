@@ -31,7 +31,7 @@ from . import cost_basis as cost_basis_ledger
 from . import full_charge
 from .control import drivers as driver_registry
 from .control.dispatcher import Dispatcher, TickOutcome
-from .control.drivers.base import IDEMPOTENT_TOLERANCE_W, HAFacade
+from .control.drivers.base import IDEMPOTENT_TOLERANCE_W, BatteryDriver, HAFacade
 from .models import (
     Action,
     AlertRecord,
@@ -302,6 +302,7 @@ class Engine:
         registry_source: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
         states_source: Callable[[], Mapping[str, Mapping[str, Any]]] | None = None,
         device_client_factory: Callable[[], Any] | None = None,
+        driver_factory: Callable[[BatteryConfig], BatteryDriver] | None = None,
         notifier: Notifier | None = None,
         maintenance: Callable[[datetime], Any] | None = None,
         location: str = "",
@@ -320,6 +321,9 @@ class Engine:
         self._registry_source = registry_source
         self._states_source = states_source
         self._device_client_factory = device_client_factory
+        # Replay harness seam (docs/REPLAY_HARNESS.md section 1): ``None`` keeps the production
+        # registry call in ``_sync_drivers`` untouched.
+        self._driver_factory = driver_factory
         self._maintenance = maintenance
         self._clock = clock
         self._version = version
@@ -1724,9 +1728,14 @@ class Engine:
                     )
                     continue
                 try:
-                    drivers[config.id] = driver_registry.create(
-                        prepared, self._ha, clock=self._clock
-                    )
+                    if self._driver_factory is not None:
+                        # An injected plant replaces the registry driver wholesale, so a replay
+                        # never spends real ``time.sleep`` in the driver's read-back window.
+                        drivers[config.id] = self._driver_factory(prepared)
+                    else:
+                        drivers[config.id] = driver_registry.create(
+                            prepared, self._ha, clock=self._clock
+                        )
                 except ValueError as exc:
                     self._journal.event(
                         "error",
@@ -2141,12 +2150,23 @@ class Engine:
 
     def _control_loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                self._control_tick()
-            except Exception as exc:  # pragma: no cover - the loop must survive anything
-                log.exception("control tick failed")
-                self._journal.event("error", "control_tick_failed", str(exc)[:200])
+            self._control_step()
             self._stop.wait(self._dispatcher.tick_interval_s())
+
+    def _control_step(self, now: datetime | None = None) -> TickOutcome | None:
+        """One control iteration, callable without the thread (replay harness, stage 2a).
+
+        The step, not the loop, owns the defensive error handling so a replay that calls it
+        directly sees exactly what production does; ``None`` means the iteration failed.  ``now``
+        is only given by a virtual clock: with none, the tick resolves its own moment internally,
+        after the control lock, exactly as it did before the extraction.
+        """
+        try:
+            return self._control_tick(now)
+        except Exception as exc:  # pragma: no cover - the loop must survive anything
+            log.exception("control tick failed")
+            self._journal.event("error", "control_tick_failed", str(exc)[:200])
+            return None
 
     def _control_tick(self, now: datetime | None = None) -> TickOutcome:
         """Serialise every command path: a tick must never interleave with stop/exit holds."""
@@ -2947,14 +2967,22 @@ class Engine:
 
     def _replan_loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                reason = self._replan_reason()
-                if reason:
-                    self._replan(reason, self._clock())
-            except Exception as exc:  # pragma: no cover - defensive
-                log.exception("replan failed")
-                self._journal.event("error", "replan_failed", str(exc)[:200])
+            self._replan_step()
             self._stop.wait(1.0)
+
+    def _replan_step(self, now: datetime | None = None) -> None:
+        """One replan iteration; the engine still decides *whether* to replan (``_replan_reason``).
+
+        With no explicit ``now`` the moment is sampled only once a replan is due, after the reason
+        check, exactly as the thread did before the extraction.
+        """
+        try:
+            reason = self._replan_reason()
+            if reason:
+                self._replan(reason, self._clock() if now is None else now)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.exception("replan failed")
+            self._journal.event("error", "replan_failed", str(exc)[:200])
 
     def _planning_ready(self, configs: Sequence[BatteryConfig] | None = None) -> bool:
         """True when a plan has a real SoC to anchor on (SPEC 9.1).
@@ -3921,25 +3949,34 @@ class Engine:
 
     def _guard_loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                now = self._clock()
-                if self._dispatcher.stalled(now):
-                    with self._lock:
-                        mode = str(self._state.mode)
-                        dry_run = bool(self._state.dry_run)
-                    if mode == Mode.AUTO.value and not dry_run:
-                        self._dispatcher.watchdog(now)
-                        self._alert("error", "watchdog_hold", "control loop stalled: holding")
-                    else:
-                        self._dispatcher.note_tick(now)
-                self._retry_live_write_recovery(now)
-                self._check_battery_floor(now)
-                self._check_negative_price(now)
-                self._maybe_maintenance(now)
-                self.publish_states(now)
-            except Exception as exc:  # pragma: no cover - defensive
-                log.exception("guard loop failed")
+            self._guard_step()
             self._stop.wait(2.0)
+
+    def _guard_step(self, now: datetime | None = None) -> None:
+        """One guard iteration: watchdog hold, recovery, floor/price checks, maintenance, publish.
+
+        The defensive ``except`` lives here rather than in the thread, with the moment resolved
+        inside it, so a replay that drives the step directly gets exactly the error handling
+        production has.
+        """
+        try:
+            moment = self._clock() if now is None else now
+            if self._dispatcher.stalled(moment):
+                with self._lock:
+                    mode = str(self._state.mode)
+                    dry_run = bool(self._state.dry_run)
+                if mode == Mode.AUTO.value and not dry_run:
+                    self._dispatcher.watchdog(moment)
+                    self._alert("error", "watchdog_hold", "control loop stalled: holding")
+                else:
+                    self._dispatcher.note_tick(moment)
+            self._retry_live_write_recovery(moment)
+            self._check_battery_floor(moment)
+            self._check_negative_price(moment)
+            self._maybe_maintenance(moment)
+            self.publish_states(moment)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.exception("guard loop failed")
 
     def _retry_live_write_recovery(self, now: datetime) -> None:
         """Keep trying to neutralise a boot-time latch until it is empty (audit finding 3).
