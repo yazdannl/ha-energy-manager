@@ -40,3 +40,30 @@ The core also refuses memory-unsafe or numerically pathological inputs itself (d
 checked size arithmetic, explicit rejection of non-finite spans/ratios/efficiencies before any
 integer cast, input sequences snapshotted to an immutable tuple before conversion) so the loader's
 verification is never the only thing standing between a bad call and a corrupted process.
+
+## Build identity (why the loader can refuse a stale artifact)
+
+The image compiles the extension in place and removes any carried-over `.so` first; a development
+checkout does not, so a `.so` built before the last `_core.c` edit used to load silently and then
+either fail verification (disabling the accelerator for the process) or, worse, keep producing
+numbers that pass while the source had moved on. The build therefore embeds the SHA-256 prefix of
+the source it compiled, and `_fast._load_core()` refuses a build whose digest no longer matches the
+adjacent `_core.c` (one warning, Python reference stays active):
+
+```sh
+cd energy_manager/app/optimize && \
+gcc -O3 -ffp-contract=off -fPIC -shared \
+    -DCORE_BUILD_SHA="\"$(sha256sum _core.c | cut -c1-16)\"" \
+    $(python3-config --includes) \
+    -o "_core$(python3-config --extension-suffix)" _core.c
+```
+
+A manual `gcc` line that omits `-DCORE_BUILD_SHA` falls back to comparing mtimes, which still
+catches "edited the source, forgot to rebuild". The guard is deliberately one-sided: a missing
+`_core.c`, an unreadable file or an absent `__file__` (zipapp, frozen bundle, a packaged build
+that ships only the `.so`) is treated as "cannot check" and keeps the core active, because the
+accelerator is optional and disabling it is a performance loss. It cannot cover import-time
+hazards at all -- the import has already succeeded by the time the digest is readable -- only a
+build that no longer matches its source. `-ffp-contract=off` remains mandatory: without it GCC's
+FMA contraction changes the last bits and flips near-tie argmins, which the differential suite
+detects.

@@ -27,6 +27,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Source identity for the loader (docs/OPTIMIZER_C_CORE.md): the build compiles in the SHA-256
+ * prefix of the _core.c it was built from, so an artifact that was copied, restored or merely
+ * touched cannot pass as a build of the current source (the digest covers the source, not the
+ * compiler flags).  A manual gcc line may omit the define, and the loader then falls
+ * back to comparing mtimes. */
+#ifndef CORE_BUILD_SHA
+#define CORE_BUILD_SHA ""
+#endif
+
 /* Mirror the dp.py constants; MAX_STATES / MAX_ITERATIONS arrive in the config so the Python
  * module stays the single source of truth for the iteration budget. */
 #define EPS_KW 1e-6
@@ -980,4 +989,12 @@ static struct PyModuleDef core_module = {
     core_methods, NULL, NULL, NULL, NULL,
 };
 
-PyMODINIT_FUNC PyInit__core(void) { return PyModule_Create(&core_module); }
+PyMODINIT_FUNC PyInit__core(void) {
+    PyObject *module = PyModule_Create(&core_module);
+    if (module == NULL) return NULL;
+    if (PyModule_AddStringConstant(module, "build_sha", CORE_BUILD_SHA) < 0) {
+        Py_DECREF(module);
+        return NULL;
+    }
+    return module;
+}

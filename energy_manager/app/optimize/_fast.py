@@ -39,20 +39,107 @@ library.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 log = logging.getLogger(__name__)
 
-try:  # pragma: no cover - the branch taken depends on whether the image compiled the core
-    from . import _core
-except Exception as exc:  # noqa: BLE001 - any import failure simply means "no accelerator"
-    _core = None
-    _import_error = str(exc)
-else:
-    _import_error = None
+#: Hex chars of the source digest the build compiles in with ``-DCORE_BUILD_SHA=``.
+_BUILD_SHA_LEN = 16
+
+
+def _core_source_path() -> str:
+    """The ``_core.c`` this loader sits next to (the image ships it; the extension is built from it)."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "_core.c")
+
+
+def _digest(path: str, length: int = _BUILD_SHA_LEN) -> str | None:
+    """First ``length`` hex chars of the file's SHA-256, or ``None`` when it cannot be read."""
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()[:length]
+    except OSError:
+        return None
+
+
+def stale_reason(
+    module_file: str | None, source: str | None = None, build_sha: str = ""
+) -> str | None:
+    """Why a built extension does not match its source, or ``None`` when it may be used.
+
+    Identity first: the build embeds the SHA-256 prefix of the ``_core.c`` it compiled
+    (``-DCORE_BUILD_SHA``), so an artifact that was copied, restored from an archive or merely
+    ``touch``ed cannot pass as a build *of the current source* -- the digest covers the source, not
+    the compiler flags, which are part of the documented build recipe rather than of the identity.
+    A manual gcc line without that define falls back to comparing mtimes, which catches the common
+    "edited the source, forgot to rebuild" case.
+
+    A missing source, an unreadable file or an absent ``__file__`` stay permissive: this guard
+    exists to catch a development checkout that forgot to rebuild, never to disable a correctly
+    built accelerator.  It cannot cover import-time hazards at all -- the import has already
+    happened by the time the digest can be read -- only a build that no longer matches its source.
+    """
+    source_path = source or _core_source_path()
+    if not os.path.exists(source_path):
+        log.info(
+            "optimizer: %s is not present; the C core build cannot be matched against its source",
+            os.path.basename(source_path),
+        )
+        return None
+    if build_sha:
+        actual = _digest(source_path, len(build_sha))
+        if actual is None:
+            log.info(
+                "optimizer: %s is unreadable; the C core build cannot be verified against it",
+                os.path.basename(source_path),
+            )
+            return None
+        if actual != build_sha:
+            return (
+                f"{os.path.basename(module_file or 'the C core')} was built from different "
+                f"{os.path.basename(source_path)} source (build {build_sha[:8]}, source "
+                f"{actual[:8]}); rebuild it (see the Dockerfile) or remove it"
+            )
+        return None
+    if not module_file:
+        log.info("optimizer: the C core module exposes no __file__; its build cannot be verified")
+        return None
+    try:
+        if os.path.getmtime(module_file) < os.path.getmtime(source_path):
+            return (
+                f"{os.path.basename(module_file)} is older than {os.path.basename(source_path)}; "
+                "rebuild it (see the Dockerfile) or remove it"
+            )
+    except OSError:
+        log.info(
+            "optimizer: %s or %s is unreadable; the C core build cannot be verified",
+            os.path.basename(module_file),
+            os.path.basename(source_path),
+        )
+        return None
+    return None
+
+
+def _load_core() -> tuple[Any | None, str | None]:
+    """Import the optional extension, refusing a build that no longer matches its source."""
+    try:
+        from . import _core as module
+    except Exception as exc:  # noqa: BLE001 - any import failure simply means "no accelerator"
+        return None, str(exc)
+    reason = stale_reason(
+        getattr(module, "__file__", None), build_sha=str(getattr(module, "build_sha", "") or "")
+    )
+    if reason is not None:
+        log.warning("optimizer: ignoring the C core (%s); the Python reference stays active", reason)
+        return None, reason
+    return module, None
+
+
+_core, _import_error = _load_core()
 
 #: Full differential cross-check cadence (solves).  First solve after load always checks; 0 = off.
 _DEFAULT_CHECK_INTERVAL = 20

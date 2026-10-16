@@ -17,6 +17,7 @@ All numbers here are obviously synthetic.  No instance data.
 from __future__ import annotations
 
 import array
+import hashlib
 import logging
 import math
 import os
@@ -24,6 +25,8 @@ import random
 import sys
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from importlib.machinery import EXTENSION_SUFFIXES
+from pathlib import Path
 from time import perf_counter as _perf_counter
 
 import pytest
@@ -188,7 +191,8 @@ def _path_objective(powers: list[float], sc: Scenario) -> tuple[float, float, fl
 
 
 requires_core = pytest.mark.skipif(
-    _fast._core is None, reason="the C core was not compiled in this checkout"
+    _fast._core is None,
+    reason=f"no usable C core in this checkout ({_fast._import_error or 'not compiled'})",
 )
 
 
@@ -1025,6 +1029,86 @@ def test_raising_extension_call_disables_the_core(monkeypatch):
 def test_disabled_core_returns_none_without_touching_the_extension():
     _fast.disable("test")
     assert _fast.solve([], object(), 0.0, object(), 0.0, None, 0.0, []) is None
+
+
+# --------------------------------------------------------------------------------------------
+# A build older than its source is refused (development trap; the image always rebuilds)
+# --------------------------------------------------------------------------------------------
+
+
+def _write_pair(tmp_path, source_mtime: float = 1000.0, built_mtime: float = 2000.0):
+    source = tmp_path / "_core.c"
+    built = tmp_path / "_core.so"
+    source.write_text("/* source */")
+    built.write_text("binary")
+    os.utime(source, (source_mtime, source_mtime))
+    os.utime(built, (built_mtime, built_mtime))
+    return str(built), str(source)
+
+
+def _sha(text: str, length: int = _fast._BUILD_SHA_LEN) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:length]
+
+
+def test_a_build_from_different_source_is_refused_by_digest(tmp_path):
+    """Identity, not timestamps: a copied, restored or touched artifact must not pass as fresh."""
+    built, source = _write_pair(tmp_path)
+    with open(source, "w") as handle:
+        handle.write("/* changed after the build */")
+    reason = _fast.stale_reason(built, source, build_sha=_sha("/* source */"))
+    assert reason is not None and "different" in reason
+    assert _fast.stale_reason(built, source, build_sha=_sha("/* changed after the build */")) is None
+
+
+def test_a_build_without_a_digest_falls_back_to_mtime(tmp_path):
+    """A manual gcc line has no digest; the older-than-source check still catches the trap."""
+    built, source = _write_pair(tmp_path, source_mtime=2000.0, built_mtime=1000.0)
+    assert _fast.stale_reason(built, source) is not None
+    newer, _ = _write_pair(tmp_path, source_mtime=1000.0, built_mtime=2000.0)
+    assert _fast.stale_reason(newer, source) is None
+    assert _fast.stale_reason(None, source) is None
+    assert _fast.stale_reason(str(tmp_path / "absent.so"), source) is None
+
+
+def test_a_missing_source_stays_permissive_and_is_logged(tmp_path, caplog):
+    """Nothing to compare against must never disable a correctly built accelerator."""
+    built, _ = _write_pair(tmp_path)
+    with caplog.at_level(logging.INFO, logger="app.optimize._fast"):
+        assert _fast.stale_reason(built, str(tmp_path / "absent.c"), build_sha="0123456789abcdef") is None
+    assert "cannot be matched" in " ".join(record.getMessage() for record in caplog.records)
+
+
+def test_a_built_core_on_disk_must_be_accepted():
+    """A present .so the guard refuses is a build problem, not a silent skip.
+
+    Without this, a stale artifact makes every differential/verification/budget test skip with a
+    misleading reason and the suite stays green with the accelerator off.  Only the extension names
+    this interpreter would actually import count: a version-tagged leftover from another interpreter
+    must not fail the run (a plain ``_core.so`` is importable everywhere, so it does count).
+    """
+    directory = Path(_fast.__file__).parent
+    importable = [directory / f"_core{suffix}" for suffix in EXTENSION_SUFFIXES]
+    if not any(path.exists() for path in importable):
+        pytest.skip("no importable extension on disk: nothing to check")
+    assert _fast._import_error is None, _fast._import_error
+
+
+@requires_core
+def test_load_core_refuses_a_build_that_does_not_match_its_source(monkeypatch, tmp_path):
+    """The import path itself consults the guard, using the real predicate on a real source."""
+    _built, source = _write_pair(tmp_path)
+    with open(source, "w") as handle:
+        handle.write("/* source this build did not come from */")
+    monkeypatch.setattr(_fast, "_core_source_path", lambda: source)
+    module, error = _fast._load_core()
+    assert module is None and error is not None
+    # When the real core carries a digest the refusal must come from the digest, not from a
+    # coincidental mtime ordering (which would also pass if build_sha were dropped).
+    if str(getattr(_fast._core, "build_sha", "") or ""):
+        assert "different" in error, error
+    monkeypatch.undo()
+    module, error = _fast._load_core()
+    assert error is None and module is not None
 
 
 # --------------------------------------------------------------------------------------------

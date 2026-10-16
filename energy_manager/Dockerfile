@@ -32,9 +32,15 @@ RUN rm -f /app/app/optimize/_core*.so
 RUN set -e; \
     if apk add --no-cache --virtual .build-deps build-base python3-dev; then \
         if ! ( cd /app/app/optimize && \
+               touch _core.c && \
+               SHA="$(sha256sum _core.c | cut -c1-16)" && \
+               test -n "$SHA" && \
                gcc -O3 -ffp-contract=off -fPIC -shared \
+                   -DCORE_BUILD_SHA="\"$SHA\"" \
                    $(python3-config --includes) \
-                   -o "_core$(python3-config --extension-suffix)" _core.c ); then \
+                   -o "_core$(python3-config --extension-suffix)" _core.c && \
+               python3 -c "import _core; assert _core.build_sha, 'no source digest compiled in'" ); then \
+            rm -f /app/app/optimize/_core*.so; \
             echo "optimizer: C core not built; the Python reference stays active"; \
         fi; \
         apk del .build-deps || true; \
