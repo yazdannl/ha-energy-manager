@@ -1777,6 +1777,50 @@ table arrives through the reachability inputs rather than a setting until the wi
 `price.feed_in_mode` is config-only today — selecting another mode stores the contract for the
 follow-up but does not change the live forecast, which keeps using the derived price.
 
+**0.26.0 optimizer v2 stages 1a, 1b and 2 (user request: maximise total profit over the whole horizon by
+generating many candidate plans and comparing them, with the algorithm reviewed by an independent
+reviewer until it was satisfied, and re-implemented in C so many plans can be simulated).** The three
+stages landed together because each is a precondition for the next: a solve fast enough to plan many
+futures, a tariff that prices export honestly, and a harness that can prove a policy change on a
+recording before it reaches the house. The detailed contract for each lives in `docs/OPTIMIZER_V2.md`
+(the staged design) and `docs/REPLAY_HARNESS.md` (the replay contract); the stage-1b amendments below
+carry the settlement and wiring specifics.
+
+- **Stage 1a -- the DP solve runs in C, validated per solve, with the Python reference kept.** The
+optimizer is a value iteration over a discretised energy grid, deliberately pure (no I/O, no clock, no
+module state), which is what makes it portable -- and what makes it the bottleneck: a live-like
+120-slot, 30 h solve takes ~0.42 s in Python, and every candidate policy has to pay that again. The
+same solve now runs through a CPython extension with the GIL released (16.6-17.3 ms for the 120-slot
+sweep on the development host, ~25-30 ms on the validated path once the reference grid, bounds and
+action set are re-derived), and nothing else changes: `_fast.py` loads it, every solve is validated
+before its result is used, a full Python-vs-C differential runs on the first solve after load and
+then periodically (`_CHECK_INTERVAL`), and any mismatch permanently disables the accelerator for the
+process and re-solves in Python. The extension is compiled in the add-on image with
+`-ffp-contract=off`, because GCC's default FMA contraction changes the last bits and flips near-tie
+argmins -- the differential suite caught exactly that. A stale build is refused by an embedded source
+digest rather than trusted, and the differential tests are skipped (never silently passed) when no
+core is present.
+- **Stage 1b -- the feed-in side of the contract is priced** (`sources/feed_in.py`, see the amendment
+below) and **wired into the planning path behind one kill switch**
+(`optimizer.feed_in_wiring = off | shadow | on`, default `off`; see the wiring amendment below).
+- **Stage 2 -- the replay harness** (`energy_manager/app/replay/`, contract in
+`docs/REPLAY_HARNESS.md`): the real `Engine` is re-driven through its own step seams on a virtual
+clock against a scratch copy of a recording, and the result is compared with what the house actually
+did. Three gates (plant fidelity, decision fidelity, accounting fidelity) have their tolerances frozen
+in an episode manifest *before* the run; arms E1 (fidelity), E2 (tariff model), E3 (terminal
+inventory) and E4 (policy) then report paired per-window money, with every refusal, unknown price,
+unknown flow or unmeasured gate withholding the affected window's number instead of substituting a
+zero. Recordings are read with the as-of rules of SPEC 3 (a settings or learning row newer than the
+window start is refused, never interpolated), the harness writes only to its own scratch copy, and the
+live store path is refused.
+- **The measured state at release.** Full suite 1441 tests; `tools/audit.sh` clean; the C-core
+differential and the `<20 ms` budget asserted; a real 21-minute recording replayed end to end with
+all three gates passing and the recorded ledger reproduced to 0.000161 EUR/kWh. The harness's own
+honest limits are stated in its report and in `docs/REPLAY_HARNESS.md`: arm E3's terminal-*vector*
+side and arm E4's SAA/candidate policies are labelled `not_shipped` until stage 3, and an interval is
+only evidence once the episode spans at least one plan horizon (the 21-minute window is labelled
+`illustrative_interval`).
+
 **Optimizer v2 stage 1b wiring — the optimizer consumes the settlement (no version bump; default off).**
 Stage 1b shipped the accounting behind `price.feed_in_mode` but no live consumer, so nothing was
 priced by a contract and nothing could be refused. This amendment wires

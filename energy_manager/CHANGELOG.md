@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.26.0
+
+- **The plan is solved in C, validated per solve, with the Python reference kept.** The DP over SoC is
+pure and deterministic, which makes it portable and makes it the bottleneck: a 120-slot, 30 h solve
+costs ~0.4 s in Python, and any policy that compares many futures pays that per candidate. The same
+solve now runs as a CPython extension in ~17 ms with the GIL released, and nothing else changes — the
+core is a drop-in for one function, every solve is validated against a reference grid, bounds and
+action set, a full Python-vs-C differential runs periodically and on demand, and any mismatch
+permanently disables the accelerator for the process and re-solves in Python. A core that disagrees is
+not a slow core, it is a wrong one, so it is refused rather than trusted.
+- **The feed-in side of the contract is priced, and the optimizer can consume it — off by default.**
+Sell is not always buy: a feed-in price may exclude VAT, carry redelivery costs, or be subject to
+saldering or tiers, and treating `sell = buy` makes exporting stored energy look far better than it
+is while making self-consumption of that charge worth far more. `sources/feed_in.py` settles the
+modes (`derived`, `explicit`, `buy_minus_fee`, `saldering`, `tiered`) with the tax gate that
+distinguishes a *confirmed* zero from an unstated one, and a new kill switch
+(`optimizer.feed_in_wiring = off | shadow | on`, default `off`) lets the planning path consume it:
+`shadow` solves a compute-only second plan and journals the difference while dispatching the old one,
+`on` dispatches the settled plan, and an unpriceable contract refuses the plan (hold, then the
+alert) instead of falling back to v1 pricing. With the switch off the schedule is bit-for-bit v1.
+- **A recording can be replayed against the engine's own code.** `python -m energy_manager.app.replay`
+re-drives the real `Engine` through its step seams on a virtual clock against a scratch copy of a
+recorded store, with a simulated or recorded plant, so a policy or tariff change can be measured
+against what the house actually did. Arms E1 (fidelity), E2 (tariff model), E3 (terminal inventory)
+and E4 (policy) report paired per-window money with three gates — plant fidelity, decision fidelity
+and accounting fidelity — whose tolerances are frozen in an episode manifest *before* the run so they
+cannot be widened to fit. A window whose price, flow or reference is unknown is withheld (rendered as
+absent, never as zero), as is an arm whose gate could not be measured; the bootstrap interval is
+labelled illustrative unless it spans a plan horizon. The contract is `docs/REPLAY_HARNESS.md`.
+- **Nothing new is on by default.** The accelerator is semantics-identical, the feed-in wiring is
+`off`, and the replay harness is a CLI with no API or UI surface, so the deployed behaviour of the
+live optimizer is unchanged by this release — which is exactly what makes 0.27.0's policy work
+measurable rather than hopeful.
+
 ## 0.25.0
 
 - **Named load devices: `load.devices`.** One whole-house profile and one whole-house temperature slope
