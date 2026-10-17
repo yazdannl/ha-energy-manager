@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "energy_manager"))
 
 from app import capacity as capacity_learning
+from app import cost_basis as cost_basis_ledger
 from app.main import EXAMPLE_BATTERY, _selfcheck_settings
 from app.models import (
     Action,
@@ -26,6 +27,10 @@ from app.models import (
     to_iso,
 )
 from app.replay.episode import (
+    BASE_DERIVED,
+    BASE_MEASURED,
+    BASE_MIXED,
+    BASE_REFUSED,
     INCOMPLETE_ACTUALS,
     LIVE_STORE,
     MALFORMED_JSON,
@@ -37,6 +42,7 @@ from app.replay.episode import (
     EpisodeError,
     open_episode,
 )
+from app.replay.plant import SIMULATED, plant_factory
 from app.store import Store
 
 START = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
@@ -186,6 +192,154 @@ def recording(
     return path
 
 
+def derived_actuals(
+    start: datetime = START, end: datetime = END, *, measured: bool = False
+) -> list[dict]:
+    """Rows whose pv/load columns are absent and whose derived pair is the only base.
+
+    ``pv_derived_kw == max(0, load_derived_kw - grid_kw + battery_kw)`` is the identity the column is
+    defined by, so this is what a real instance without pv/load sensors records; ``measured`` fills
+    the measured columns instead, which is what the other fixtures do.
+    """
+    rows = []
+    moment = quarter_floor(start, 5)
+    while moment < end:
+        load, grid, battery = 1.2, 0.2, 0.0
+        rows.append(
+            {
+                "ts": to_iso(moment),
+                "pv_kw": 1.0 if measured else None,
+                "load_kw": load if measured else None,
+                "pv_derived_kw": max(0.0, load - grid + battery),
+                "load_derived_kw": load,
+                "grid_kw": grid,
+                "battery_kw": battery,
+                "soc_kwh": 2.75,
+                "price_buy": 0.25,
+                "price_sell": 0.05,
+            }
+        )
+        moment += timedelta(minutes=5)
+    return rows
+
+
+def test_the_derived_pair_is_the_base_and_the_window_is_labelled(tmp_path: Path) -> None:
+    path = recording(tmp_path, actual_rows=derived_actuals())
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.base.window(START, END) == BASE_DERIVED
+        split = episode.base.split(START, END)
+        assert split[BASE_DERIVED] == 12 and split[BASE_REFUSED] == 0
+        reading = episode.base_at(START)
+        assert reading is not None and reading.source == BASE_DERIVED
+        assert reading.load_kw == pytest.approx(1.2) and reading.pv_kw == pytest.approx(1.0)
+        assert reading.base_kw == pytest.approx(0.2), "the base the plant reconstructs from"
+        # The effective series carries the same numbers the planner and the sampler consumed.
+        assert episode.series["pv_kw"][0][1] == pytest.approx(1.0)
+        assert episode.series["load_kw"][0][1] == pytest.approx(1.2)
+        driver = plant_factory(episode, SIMULATED)(BATTERY)
+        assert driver.grid_kw() == pytest.approx(0.2)
+
+
+def test_measured_columns_are_labelled_measured(tmp_path: Path) -> None:
+    path = recording(tmp_path, actual_rows=derived_actuals(measured=True))
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.base.window(START, END) == BASE_MEASURED
+        assert episode.base.split(START, END) == {
+            BASE_MEASURED: 12,
+            BASE_DERIVED: 0,
+            BASE_MIXED: 0,
+            BASE_REFUSED: 0,
+        }
+        reading = episode.base_at(START)
+        assert reading is not None and reading.source == BASE_MEASURED
+
+
+def test_a_window_that_mixes_the_two_sources_is_labelled_mixed(tmp_path: Path) -> None:
+    rows = derived_actuals()
+    rows[0]["pv_kw"] = 1.0  # only the pv column was measured in that bucket
+    path = recording(tmp_path, actual_rows=rows)
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.base.window(START, END) == BASE_MIXED
+        split = episode.base.split(START, END)
+        assert split[BASE_MIXED] == 1 and split[BASE_DERIVED] == 11
+
+
+def test_a_derived_base_that_fails_the_recording_identity_is_refused(tmp_path: Path) -> None:
+    rows = derived_actuals()
+    rows[0]["pv_derived_kw"] = 9.9  # no longer max(0, load_derived - grid + battery)
+    path = recording(tmp_path, actual_rows=rows)
+    with open_episode(path, START, END, 60.0) as episode:
+        # The window still opens: the identity check guards the base, not the episode.
+        assert episode.base.refused == (START,)
+        assert episode.base.split(START, END)[BASE_REFUSED] == 1
+        assert episode.base_at(START) is None, "a half-written bucket has no base"
+        assert episode.base_at(START + timedelta(minutes=5)) is not None, "and no older one is used"
+        driver = plant_factory(episode, SIMULATED)(BATTERY)
+        assert driver.grid_kw() is None, "a half-written row never becomes a plant's base"
+
+
+def test_a_bucket_with_neither_measured_nor_derived_still_refuses(tmp_path: Path) -> None:
+    rows = derived_actuals()
+    rows[2]["pv_derived_kw"] = None
+    rows[2]["load_derived_kw"] = None
+    path = recording(tmp_path, actual_rows=rows)
+    with pytest.raises(EpisodeError) as error:
+        open_episode(path, START, END, 60.0)
+    assert error.value.reason == INCOMPLETE_ACTUALS
+    assert to_iso(START + timedelta(minutes=10)) in str(error.value)
+
+
+def test_the_cut_takes_a_removed_plans_slots_with_it(tmp_path: Path) -> None:
+    """A plan issued inside the window carries slots from before it; those go with the plan.
+
+    Cutting slots by their own timestamp alone would leave rows of a plan the cut just removed, and
+    because row ids are reused after a delete, the next plan saved would collide with them.
+    """
+    path = recording(tmp_path)
+    store = Store(path)
+    try:
+        store.save_plan(
+            Plan(
+                generated_at=START + timedelta(minutes=7),
+                horizon_start=START - timedelta(minutes=30),
+                horizon_end=END,
+                slot_minutes=15,
+                summary=PlanSummary(),
+                batteries=[{"id": BATTERY.id, "share_w": 0}],
+                slots=[
+                    PlanSlot(
+                        t=START - timedelta(minutes=30) + timedelta(minutes=15 * index),
+                        buy=0.25,
+                        sell=0.05,
+                        pv_kw=1.0,
+                        load_kw=1.2,
+                        soc_kwh=2.75,
+                        power_w=0.0,
+                        action=Action.HOLD,
+                        reason="later",
+                    )
+                    for index in range(6)
+                ],
+                mode="auto",
+                dry_run=False,
+            )
+        )
+    finally:
+        store.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        connection = episode.store().connection
+        orphaned = connection.execute(
+            "SELECT COUNT(*) FROM plan_slots WHERE plan_id NOT IN (SELECT id FROM plans)"
+        ).fetchone()[0]
+        after = connection.execute(
+            "SELECT COUNT(*) FROM plan_slots WHERE t >= ?", (to_iso(START),)
+        ).fetchone()[0]
+        plans = connection.execute("SELECT COUNT(*) FROM plans WHERE created_at >= ?", (to_iso(START),)).fetchone()[0]
+    assert orphaned == 0, "every surviving slot belongs to a surviving plan"
+    assert after == 0, "no slot of the removed plan reaches past the boundary either"
+    assert plans == 0
+
+
 def test_open_episode_copies_the_recording_and_leaves_the_source_alone(tmp_path: Path) -> None:
     path = recording(tmp_path)
     before = path.read_bytes()
@@ -213,6 +367,133 @@ def test_open_episode_copies_the_recording_and_leaves_the_source_alone(tmp_path:
     finally:
         episode.close()
     assert not Path(episode.scratch_path).exists()
+
+
+def test_the_scratch_copy_is_cut_at_the_window_start(tmp_path: Path) -> None:
+    path = recording(tmp_path)
+    store = Store(path)
+    try:
+        store.add_dispatch(
+            ts=START + timedelta(minutes=5),
+            battery_id=BATTERY.id,
+            requested_w=250.0,
+            applied_w=250.0,
+            dry_run=False,
+            result="ok",
+            code="ok",
+        )
+        store.add_event(ts=START + timedelta(minutes=5), code="later", message="after")
+        store.upsert_savings_daily((START + timedelta(days=1)).date(), import_kwh=2.0)
+        store.archive_forecast(
+            [
+                (
+                    "solar",
+                    "selfcheck",
+                    START + timedelta(hours=2),
+                    START + timedelta(minutes=5),
+                    2.0,
+                    10.0,
+                )
+            ]
+        )
+        store.save_plan(default_plan(START + timedelta(minutes=30), END))
+    finally:
+        store.close()
+
+    with open_episode(path, START, END, 60.0) as episode:
+        store = episode.store()
+        # The recording's own in-window rows are still visible to the episode ...
+        assert episode.series["grid_kw"] and episode.boundary.source_rows["actuals"]
+        assert episode.plans and episode.dispatch
+        # ... but the store the engine writes into holds nothing from the window: production's
+        # store never holds a row newer than "now", so no reader needs an upper bound.
+        assert store.actuals_range(START - timedelta(hours=1), END) == []
+        assert [row["ts"] for row in store.dispatch_log(limit=50)] == [
+            to_iso(START - timedelta(minutes=1))
+        ], "the setpoint in force is kept; every later recorded decision is gone"
+        assert [row["code"] for row in store.events(limit=50)] == ["probe"]
+        assert store.savings_daily_range(
+            START.date().isoformat(), (START + timedelta(days=1)).date().isoformat()
+        ) == []
+        assert episode.truncation.cut_at == START
+        for table in (
+            "actuals",
+            "measurements",
+            "dispatch_log",
+            "events",
+            "savings_daily",
+            "plans",
+            "plan_slots",
+        ):
+            assert episode.truncation.rows.get(table), f"{table} had rows after the boundary"
+        # A vintage issued before the boundary is as-of data and stays; a later issue does not.
+        assert episode.truncation.rows["forecast_archive"] == 1
+        assert store.forecast_archive_range(START, END)
+
+    # The cut is a property of the scratch copy: the recording keeps its own future.
+    source = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+    try:
+        assert (
+            source.execute(
+                "SELECT COUNT(*) FROM dispatch_log WHERE ts >= ?", (to_iso(START),)
+            ).fetchone()[0]
+            == 1
+        )
+        assert source.execute(
+            "SELECT COUNT(*) FROM plan_slots WHERE t >= ?", (to_iso(START),)
+        ).fetchone()[0] == 8
+    finally:
+        source.close()
+
+
+def test_a_newer_cost_basis_row_is_dropped_so_the_ledger_can_rebuild(tmp_path: Path) -> None:
+    path = recording(
+        tmp_path,
+        profiles=[
+            (
+                cost_basis_ledger.PROFILE_KIND,
+                BATTERY.id,
+                {"basis_eur_per_kwh": 0.21, "energy_kwh": 5.0},
+                START + timedelta(minutes=39),
+            )
+        ],
+    )
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.profiles == {}, "a newer ledger row is never an as-of value"
+        assert episode.truncation.dropped_profiles == ((cost_basis_ledger.PROFILE_KIND, BATTERY.id),)
+        assert episode.truncation.rows.get("learning_profiles") == 1
+        assert episode.store().profile_get(cost_basis_ledger.PROFILE_KIND, BATTERY.id) is None
+
+
+def test_a_newer_capacity_row_is_dropped_and_the_configured_value_stands(tmp_path: Path) -> None:
+    path = recording(
+        tmp_path,
+        profiles=[
+            (
+                capacity_learning.PROFILE_KIND,
+                BATTERY.id,
+                {"capacity_kwh": 9.5},
+                START + timedelta(minutes=39),
+            )
+        ],
+    )
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.truncation.dropped_profiles == ((capacity_learning.PROFILE_KIND, BATTERY.id),)
+        assert episode.batteries[0].capacity_kwh == pytest.approx(BATTERY.capacity_kwh)
+        assert episode.store().profile_get(capacity_learning.PROFILE_KIND, BATTERY.id) is None
+
+
+def test_a_newer_control_row_still_refuses_the_window(tmp_path: Path) -> None:
+    # No rebuild path exists for a control row inside a replay, so dropping it would silently change
+    # what the engine does: the window is refused instead.
+    path = recording(
+        tmp_path,
+        profiles=[("control", "live_writes", {"enabled": True}, START + timedelta(minutes=5))],
+    )
+    with pytest.raises(EpisodeError) as error:
+        open_episode(path, START, END, 60.0)
+    assert error.value.reason == NO_VINTAGE
+    assert "no rebuild path" in str(error.value)
 
 
 def test_a_live_store_path_is_refused_even_through_a_symlink(tmp_path: Path) -> None:
@@ -732,3 +1013,18 @@ def test_a_power_row_without_a_value_is_not_a_measurement(tmp_path: Path) -> Non
         assert state.power_measured is False
     finally:
         episode.close()
+
+
+def test_a_windows_label_is_the_bucket_in_force_at_its_start(tmp_path: Path) -> None:
+    """The window label names the base its ticks used, not an average over the range.
+
+    A bucket's base is held until the next bucket begins, so a window starting inside a bucket would
+    otherwise read as ``absent`` while every one of its ticks was running on that bucket's value;
+    ``split`` is where the per-bucket counts live (documented at ``Episode.base.window``).
+    """
+    path = recording(tmp_path, actual_rows=derived_actuals())
+    with open_episode(path, START, END, 60.0) as episode:
+        inside = START + timedelta(minutes=6)
+        assert episode.base.split(inside, inside + timedelta(minutes=3))[BASE_DERIVED] == 0
+        assert episode.base.window(inside, inside + timedelta(minutes=3)) == BASE_DERIVED
+        assert episode.base.window(inside, inside + timedelta(minutes=3)) == episode.base.at(inside)
