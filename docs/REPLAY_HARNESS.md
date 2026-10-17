@@ -149,8 +149,13 @@ every arm would make every `Δprofit` zero by construction): only the price seri
 and only its own settlement applies to the arm's own import/export.
 
 - `cost` = the arm's import intervals × the rate recorded with them (`actuals.price_buy`);
-- `revenue` = the arm's export intervals × `actuals.price_sell`, cross-checked against
-  `sources/feed_in.py` for that slot (one implementation of the contract, not two);
+- `revenue` = the arm's export intervals × `actuals.price_sell`, checked for **recording
+  self-consistency** against `sources/feed_in.py` for that slot (one implementation of the contract,
+  not two). Production very likely *writes* that column from the same rule, so a match says the
+  recording's own columns and the assumed model are one rule — never that the household was paid
+  that price: an external invoice is the only source for that and is out of scope. A recording that
+  books no price column of its own (every slot a plan-slot fallback) is refused as unverifiable
+  (`tariff_unverifiable_fallback_only`) rather than counted as a match;
 - a row whose price column is NULL is **refused**, not priced from a later slot; the recorded plan
   slot's `buy`/`sell` is the fallback only where the actuals column is absent, and the report says
   which source was used;
@@ -189,16 +194,36 @@ The harness ships only when, on a recorded day:
    widened to fit the observed divergence.
 
 E2 (tariff error), E3 (terminal error) and E4 (policy gain) are only reported as evidence for a
-later stage once those three pass. Uncertainty is a **block bootstrap over decision windows** (never
-IID resampling of autocorrelated prices), with block length and resample count stated.
+later stage once those three pass. A gate that could not be measured (no reference leg, a window
+whose reference divergence is unknown) is reported as `null` and withholds the arm's paired money
+exactly like a failed gate: an unmeasured gate is not a passed gate. Uncertainty is a **block
+bootstrap over decision windows** (never IID resampling of autocorrelated prices), with block length
+and resample count stated. An interval is called publishable only when the drawn block reaches the
+plan-horizon-implied window count (taken from the recording's own plan span,
+`horizon_end - horizon_start`, so it needs no setting to be present; the report prints which source
+answered — `horizon_source` — and a recording that declares neither a plan nor an
+`optimizer.horizon_hours` value gets no implied-length claim at all rather than the engine's
+default), the sample spans the declared number of horizons (the manifest's `evidence_horizons`,
+5 by default, so the floor is that many times the implied count), and the included windows are
+contiguous (only interior holes count: the windows that start a new run are named as `gap_windows`,
+while the circular draw's wrap from the last window back to the first is intrinsic to the method);
+anything short of that is still reported with its reason and never called evidence. The declared
+horizon count is a floor, not a sufficiency claim: with the drawn block at one horizon the
+percentile interval rests on about that many independent blocks, so five horizons is the least a
+sample can carry and still be evidence at all — enough to stop a one-horizon window being quoted as
+if it were precise, not enough to make the interval itself precise.
 
 ## 6. Surfaces and refusal
 
 - `python -m energy_manager.app.replay` — `--store <sqlite> [--episode <json>] --arm E1..E4 --start
-  --end --step --blocks --resamples --format toon|json`.
+  --end --step --blocks --resamples --seed --expect-digest --format toon|json`. The episode manifest
+  is authoritative: an explicit `--seed`/`--blocks`/`--resamples` that disagrees with a loaded
+  manifest is refused as `manifest_mismatch` (the manifest is well formed; the *request* is out of
+  step with the frozen contract), and `--expect-digest` refuses a manifest that does not carry a
+  contract digest recorded outside the file.
 - Refusals: a live-looking source path, a source with a WAL whose data cannot be checkpointed, a
-  window with `no_vintage` or `incomplete_actuals`, a missing as-of rows for the frozen state, and
-  any façade command call.
+  window with `no_vintage` or `incomplete_actuals`, a missing as-of rows for the frozen state, an
+  arm spec or fingerprint that is not the canonical frozen contract, and any façade command call.
 - No API/UI surface in this stage: an experiment runner reachable from the add-on's HTTP API must be
   safe to call on the live instance, which is a separate decision.
 

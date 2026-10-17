@@ -12,7 +12,7 @@ import json
 import os
 import sqlite3
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -51,6 +51,9 @@ MALFORMED_JSON = "malformed_json"
 WINDOW = "window"
 NON_ANTICIPATION = "non_anticipation"
 
+#: Distinguishes "this comparand was read and is absent" from "not read yet" in the source cache.
+_UNREAD: Any = object()
+
 #: ``actuals`` columns the replay reads; the physical five must be present in every window bucket.
 RECORDED_SERIES = (
     "pv_kw",
@@ -62,6 +65,26 @@ RECORDED_SERIES = (
     "price_sell",
 )
 REQUIRED_SERIES = ("pv_kw", "load_kw", "grid_kw", "battery_kw", "soc_kwh")
+#: The required series that have no derived stand-in; ``pv_kw``/``load_kw`` are covered by
+#: :func:`_effective_base` instead.
+DIRECT_REQUIRED_SERIES = tuple(
+    name for name in REQUIRED_SERIES if name not in ("pv_kw", "load_kw")
+)
+
+#: Where a bucket's pv/load base came from: two measured columns, two derived ones, or one of each.
+BASE_MEASURED = "measured"
+BASE_DERIVED = "derived"
+BASE_MIXED = "mixed"
+#: A bucket whose derived pair failed the recording's own identity check: it has no usable base.
+BASE_REFUSED = "refused"
+#: A window that covers no recorded bucket at all.
+BASE_ABSENT = "absent"
+BASE_LABELS = (BASE_MEASURED, BASE_DERIVED, BASE_MIXED)
+
+#: The rounding tolerance for the recording's own identity
+#: ``pv_derived_kw == max(0, load_derived_kw - grid_kw + battery_kw)``: it holds by construction, so
+#: this only absorbs the rounding of a row written in stages.
+BASE_IDENTITY_TOLERANCE_KW = 1e-3
 
 #: Append-only tables are cut by ``max(id)`` right after the copy; upsert-by-key tables are
 #: compared by key between the source and the scratch copy (docs/REPLAY_HARNESS.md section 1).
@@ -94,6 +117,33 @@ DECISION_PROFILE_KINDS = (
     solar_source.BIAS_KIND,
 )
 
+#: Profile kinds whose newer row may be DROPPED instead of refusing the window, because the replay
+#: can rebuild the value from rows of the past alone: ``cost_basis.update_basis`` resets and rebuilds
+#: the ledger over its own lookback when the stored watermark is gone, and a learned capacity falls
+#: back to the configured ``capacity_kwh``.  Everything else in :data:`DECISION_PROFILE_KINDS` has no
+#: rebuild path inside a replay, so a newer row still refuses the window (`no_vintage`).
+REBUILDABLE_PROFILE_KINDS = (cost_basis_ledger.PROFILE_KIND, capacity_learning.PROFILE_KIND)
+
+#: Every table the scratch copy is cut at the window start, on that table's own time column.
+#:
+#: Production's store never holds a row newer than "now", and several production readers rely on
+#: that: ``Store.dispatch_log(limit, battery_id, since)`` has no upper bound and orders newest-first,
+#: and the cost-basis ledger feeds exactly those rows to ``update_basis`` before every solve.  The
+#: replay's copy does hold the recording's future, so the boundary is enforced in the data -- the
+#: scratch store is the recording up to ``start`` plus whatever the replay writes -- instead of
+#: trusting every call site to remember an upper bound.
+BOUNDARY_COLUMNS: dict[str, str] = {
+    "actuals": "ts",
+    "measurements": "ts",
+    "dispatch_log": "ts",
+    "events": "ts",
+    "savings_daily": "day",
+    "forecast_archive": "issued_at",
+    "forecast_cache": "fetched_at",
+    "plans": "created_at",
+    "plan_slots": "t",
+}
+
 #: Tables a recording must have; anything else is not this application's store.
 _REQUIRED_TABLES = frozenset(("plan_slots", *APPEND_ONLY_TABLES, *UPSERT_BY_KEY_TABLES))
 
@@ -104,6 +154,102 @@ class EpisodeError(RuntimeError):
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(f"{reason}: {message}")
         self.reason = reason
+
+
+@dataclass(frozen=True)
+class Truncation:
+    """What the boundary cut removed from the scratch copy, so the report can state it.
+
+    ``rows`` counts the deleted rows per table, ``dropped_profiles`` names the decision-feeding
+    profile keys whose only row was newer than the window start (their value is rebuilt from the
+    recording's past, or falls back to the configured value), and ``cut_at`` is the boundary the cut
+    used.  An empty truncation means nothing had to be removed: the recording's tables stop at or
+    before the window start.
+    """
+
+    cut_at: datetime | None = None
+    rows: Mapping[str, int] = field(default_factory=dict)
+    dropped_profiles: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def rows_removed(self) -> int:
+        return sum(int(count) for count in self.rows.values())
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "cut_at": None if self.cut_at is None else to_iso(self.cut_at),
+            "rows_removed": self.rows_removed,
+            "tables": {table: int(count) for table, count in sorted(self.rows.items())},
+            "dropped_profiles": [[kind, key] for kind, key in self.dropped_profiles],
+        }
+
+
+@dataclass(frozen=True)
+class BaseReading:
+    """The recording's own pv/load at one instant, with the label of the bucket it came from."""
+
+    load_kw: float
+    pv_kw: float
+    source: str
+
+    @property
+    def base_kw(self) -> float:
+        return self.load_kw - self.pv_kw
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"load_kw": self.load_kw, "pv_kw": self.pv_kw, "base_kw": self.base_kw,
+                "source": self.source}
+
+
+@dataclass(frozen=True)
+class BaseProvenance:
+    """Where each five-minute bucket's pv/load base came from (REPLAY_HARNESS sections 2-3).
+
+    An instance without pv/load sensors never fills ``pv_kw``/``load_kw``, and the engine's own
+    same-tick estimates (``pv_derived_kw``/``load_derived_kw``) are then the only value the planner
+    and the sampler ever saw -- as-of information, not invention.  They are still *modelled* values,
+    so every bucket is labelled and a reader can never mistake a modelled base for a measured one.
+
+    ``refused`` names the buckets whose derived pair failed the recording's own identity check
+    (:data:`BASE_IDENTITY_TOLERANCE_KW`); such a bucket has no base at all, so the plant refuses its
+    site flow rather than reconstructing one from a half-written row.  Completeness is unchanged:
+    a bucket with neither measured nor derived values still refuses the whole window at extraction.
+    """
+
+    source: Mapping[datetime, str] = field(default_factory=dict)
+    refused: tuple[datetime, ...] = ()
+
+    def at(self, moment: datetime) -> str | None:
+        """The label of the bucket covering ``moment`` (the newest bucket at or before it)."""
+        known = [bucket for bucket in self.source if bucket <= moment]
+        return self.source[max(known)] if known else None
+
+    def window(self, start: datetime, end: datetime) -> str:
+        """One label for the window: the provenance in force at ``start``.
+
+        The label is the covering bucket at ``start`` -- the newest bucket at or before it -- because
+        a bucket's base is held until the next bucket begins, so that single label describes the value
+        every tick of the window used.  It therefore reads as one bucket's own source (``mixed``
+        means that bucket's pair was half measured and half derived, not that the window contains
+        several kinds); :meth:`split` counts the buckets whose own start falls inside
+        ``[start, end)``, which is why a window can begin before the first bucket inside it.
+        ``refused`` means the covering bucket failed the identity check (no usable base) and
+        ``absent`` that no recorded bucket covers ``start`` at all.
+        """
+        label = self.at(start)
+        if label is not None:
+            return label
+        covered = any(bucket <= start for bucket in self.refused)
+        return BASE_REFUSED if covered else BASE_ABSENT
+
+    def split(self, start: datetime, end: datetime) -> dict[str, int]:
+        """Bucket counts per label in ``[start, end)``, ``refused`` included."""
+        counts = {label: 0 for label in (*BASE_LABELS, BASE_REFUSED)}
+        for bucket, label in self.source.items():
+            if start <= bucket < end:
+                counts[label] = counts.get(label, 0) + 1
+        counts[BASE_REFUSED] += sum(1 for bucket in self.refused if start <= bucket < end)
+        return counts
 
 
 @dataclass(frozen=True)
@@ -310,8 +456,10 @@ class AsOfSnapshot:
 class Episode:
     """One replay window and the frozen recording data it may read (section 1).
 
-    The scratch copy is the engine's store; every recorded value is read from the source before the
-    copy is created and is exposed afterwards only through :meth:`at` snapshots.
+    The scratch copy is the engine's store, cut at the window start (see :class:`Truncation`), so it
+    holds the recording up to the boundary and nothing from after it; every recorded value is read
+    from the source before the copy is created and is exposed afterwards only through :meth:`at`
+    snapshots.
     """
 
     def __init__(
@@ -333,6 +481,8 @@ class Episode:
         forecasts: Sequence[Mapping[str, Any]],
         warm_start: WarmStart,
         boundary: Boundary,
+        truncation: Truncation | None = None,
+        base: BaseProvenance | None = None,
         keep_scratch: bool = False,
     ) -> None:
         self.source_path = source_path
@@ -353,9 +503,13 @@ class Episode:
         self.forecasts = tuple(forecasts)
         self.warm_start = warm_start
         self.boundary = boundary
+        self.truncation = truncation if truncation is not None else Truncation()
+        self.base = base if base is not None else BaseProvenance()
         self.now = start
         self._keep_scratch = keep_scratch
         self._store: Store | None = None
+        self._source_profiles: dict[tuple[str, str], dict[str, Any] | None] = {}
+        self._source_columns: dict[str, frozenset[str] | None] = {}
 
     # -- lifecycle --------------------------------------------------------------
 
@@ -366,6 +520,66 @@ class Episode:
             store.connection  # open and migrate now: a schema failure is an episode error
             self._store = store
         return self._store
+
+    def source_profile(self, kind: str, key: str) -> Mapping[str, Any] | None:
+        """One profile row read from the **source** recording, whatever its ``updated_at``.
+
+        A comparand, never a policy input.  Gate 3 checks what the replay booked against what the
+        recording's own ledger held, and a comparand is allowed to sit after the window end because
+        no leg's decision reads it: nothing here is visible to a tick, and the source is opened
+        read-only and immutable and is never written to.  Absent rows are cached as ``None`` so a
+        missing comparand cannot be retried into existence mid-run.
+        """
+        cached = self._source_profiles.get((kind, key), _UNREAD)
+        if cached is not _UNREAD:
+            return cached
+        payload: dict[str, Any] | None = None
+        try:
+            connection = sqlite3.connect(
+                f"file:{self.source_path}?mode=ro&immutable=1", uri=True
+            )
+            try:
+                row = connection.execute(
+                    "SELECT payload_json FROM learning_profiles WHERE kind = ? AND key = ?",
+                    (kind, key),
+                ).fetchone()
+            finally:
+                connection.close()
+            if row is not None and row[0]:
+                loaded = json.loads(row[0])
+                payload = loaded if isinstance(loaded, dict) else None
+        except (sqlite3.Error, ValueError, OSError):
+            payload = None
+        self._source_profiles[(kind, key)] = payload
+        return payload
+
+    def source_columns(self, table: str) -> frozenset[str] | None:
+        """One **source** table's column names, or ``None`` when the source cannot be read.
+
+        The scratch copy is opened through :class:`~app.store.Store`, which migrates it, so the
+        copy's schema can hold columns the recording never had.  A check about what the recording
+        itself stored (for example: did this recording book a ``price_sell`` column?) has to ask
+        the source, never the copy.  An absent table is an empty set, which is a fact about the
+        recording; ``None`` means the source itself could not be read, which callers must treat as
+        a refusal rather than as "no columns".
+        """
+        cached = self._source_columns.get(table, _UNREAD)
+        if cached is not _UNREAD:
+            return cached
+        columns: frozenset[str] | None
+        try:
+            connection = sqlite3.connect(
+                f"file:{self.source_path}?mode=ro&immutable=1", uri=True
+            )
+            try:
+                rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+            finally:
+                connection.close()
+            columns = frozenset(str(row[1]) for row in rows)
+        except (sqlite3.Error, OSError):
+            columns = None
+        self._source_columns[table] = columns
+        return columns
 
     def close(self) -> None:
         """Close the scratch store and remove the copy unless ``keep_scratch`` was requested."""
@@ -382,6 +596,15 @@ class Episode:
         self.close()
 
     # -- replay clock and as-of reads ------------------------------------------
+
+    def rewind(self) -> None:
+        """Put the replay instant back at the window start so another leg can drive this recording.
+
+        Legs share one recording but each drives its own scratch copy, so a second leg has to begin
+        from the same instant as the first.  The episode holds no other mutable state -- nothing but
+        the clock -- so rewinding cannot un-see a future row or resurrect one the cut removed.
+        """
+        self.now = self.start
 
     def advance_to(self, now: datetime) -> datetime:
         """Move the replay instant forward; a replay never runs backwards or past its window."""
@@ -406,6 +629,36 @@ class Episode:
                 WINDOW, f"snapshot {to_iso(moment)} is past the window end {to_iso(self.end)}"
             )
         return AsOfSnapshot(self, moment)
+
+    def base_at(self, now: datetime) -> BaseReading | None:
+        """The recording's own pv/load base at ``now``, labelled with its provenance.
+
+        This is the sanctioned way to read the site base: it is the only accessor that knows which
+        bucket a value came from, so a plant can refuse a bucket whose derived pair failed the
+        recording's identity check instead of reconstructing a flow from a half-written row.  The
+        value is held constant across the bucket exactly as ``AsOfSnapshot.latest`` holds it, and
+        ``now`` past the window end is refused like every other as-of read.
+        """
+        moment = _aware(now)
+        if moment > self.end:
+            raise EpisodeError(
+                WINDOW, f"snapshot {to_iso(moment)} is past the window end {to_iso(self.end)}"
+            )
+        loads = [point for point in self.series.get("load_kw", ()) if point[0] <= moment]
+        pvs = {
+            point[0]: point[1]
+            for point in self.series.get("pv_kw", ())
+            if point[0] <= moment
+        }
+        for bucket, load in reversed(loads):
+            pv = pvs.get(bucket)
+            if load is None or pv is None:
+                continue
+            source = self.base.at(bucket)
+            if source is None:
+                return None  # a refused bucket: no base, and never an older one either
+            return BaseReading(load_kw=float(load), pv_kw=float(pv), source=source)
+        return None
 
     def initial_battery_states(self) -> list[BatteryState]:
         """The as-of battery view at ``start`` (the warm-start seed, section 1)."""
@@ -443,12 +696,15 @@ def open_episode(
         _check_tables(conn)
         settings_values = _freeze_settings(conn, start)
         settings = Settings(_FrozenValues(settings_values), {}, options_path="")
-        profiles = _freeze_profiles(conn, start)
+        profiles, dropped_profiles = _freeze_profiles(conn, start)
         batteries = _effective_configs(settings, profiles, start)
-        series, battery_samples = _read_series(conn, start, end, batteries)
-        plans, dispatch, forecasts = _read_recorded(conn, start, end)
+        series, battery_samples, base = _read_series(conn, start, end, batteries)
+        plans, dispatch, forecasts = _read_recorded(
+            conn, start, end, [config.id for config in batteries]
+        )
         warm_start = _warm_start(plans, forecasts, start)
         scratch_path = _backup(conn, scratch_dir)
+        truncation = _truncate(scratch_path, start, dropped_profiles=dropped_profiles)
         boundary = _read_boundary(conn, start, end)
     except BaseException:
         conn.close()
@@ -474,6 +730,8 @@ def open_episode(
         forecasts=forecasts,
         warm_start=warm_start,
         boundary=boundary,
+        truncation=truncation,
+        base=base,
         keep_scratch=keep_scratch,
     )
     try:
@@ -612,9 +870,21 @@ def _freeze_settings(conn: sqlite3.Connection, start: datetime) -> dict[str, Any
     return values
 
 
-def _freeze_profiles(conn: sqlite3.Connection, start: datetime) -> dict[tuple[str, str], Any]:
-    """Accepted decision-feeding ``learning_profiles`` payloads; newer rows are refused."""
+def _freeze_profiles(
+    conn: sqlite3.Connection, start: datetime
+) -> tuple[dict[tuple[str, str], Any], tuple[tuple[str, str], ...]]:
+    """Accepted decision-feeding ``learning_profiles`` payloads, plus the dropped ones.
+
+    A row newer than ``start`` is the recording's *end* state (the table keeps one row per key, so
+    there is no older value to fall back to).  Two kinds can still be replayed without it, because
+    the engine rebuilds them from rows the replay is allowed to see: the cost-basis ledger resets
+    and rebuilds over its own lookback when the stored watermark is gone, and a learned capacity
+    falls back to the configured ``capacity_kwh``.  Those rows are DROPPED and reported as a declared
+    approximation; every other decision-feeding kind has no rebuild path inside a replay, so a newer
+    row refuses the window rather than silently planning on a value from after it.
+    """
     accepted: dict[tuple[str, str], Any] = {}
+    dropped: list[tuple[str, str]] = []
     newer: list[str] = []
     for row in _fetch(conn, "SELECT kind, key, updated_at, payload_json FROM learning_profiles"):
         kind = str(row["kind"])
@@ -626,15 +896,77 @@ def _freeze_profiles(conn: sqlite3.Connection, start: datetime) -> dict[tuple[st
             accepted[(kind, key)] = _json_value(
                 row["payload_json"], where=f"learning_profiles[{kind}/{key}].payload_json"
             )
+        elif kind in REBUILDABLE_PROFILE_KINDS:
+            dropped.append((kind, key))
         else:
             newer.append(f"{kind}/{key}@{row['updated_at']}")
     if newer:
         raise EpisodeError(
             NO_VINTAGE,
-            f"{len(newer)} decision-feeding profile row(s) newer than {to_iso(start)}: "
-            + ", ".join(sorted(newer)[:5]),
+            f"{len(newer)} decision-feeding profile row(s) newer than {to_iso(start)} and with no "
+            "rebuild path inside a replay: " + ", ".join(sorted(newer)[:5]),
         )
-    return accepted
+    return accepted, tuple(sorted(dropped))
+
+
+def _truncate(
+    scratch_path: str,
+    start: datetime,
+    *,
+    dropped_profiles: Sequence[tuple[str, str]] = (),
+) -> Truncation:
+    """Cut every row the recording wrote after the window start out of the scratch copy.
+
+    The boundary is enforced in the data rather than by trusting each reader to pass an upper bound,
+    because production's store never holds a row newer than "now" and several production readers
+    depend on that (see :data:`BOUNDARY_COLUMNS`).  A row whose time column is NULL cannot be proven
+    to be at or before the boundary, so it is removed too; the source is untouched, so the recording
+    stays complete for the episode's own in-memory reads.
+    """
+    counts: dict[str, int] = {}
+    connection = sqlite3.connect(scratch_path, isolation_level=None)
+    try:
+        connection.row_factory = sqlite3.Row
+        present = {
+            str(row["name"])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        for table, column in BOUNDARY_COLUMNS.items():
+            if table not in present:
+                continue
+            bound = start.date().isoformat() if table == "savings_daily" else to_iso(start)
+            cursor = connection.execute(
+                f"DELETE FROM {table} WHERE {column} IS NULL OR {column} >= ?", (bound,)
+            )
+            removed = max(0, int(cursor.rowcount or 0))
+            if removed:
+                counts[table] = removed
+        for kind, key in dropped_profiles:
+            cursor = connection.execute(
+                "DELETE FROM learning_profiles WHERE kind = ? AND key = ?", (kind, key)
+            )
+            removed = max(0, int(cursor.rowcount or 0))
+            if removed:
+                counts["learning_profiles"] = counts.get("learning_profiles", 0) + removed
+        # ``plan_slots`` follows its plan: a surviving pre-window plan may reach past the boundary
+        # (its horizon started before the window), and cutting slots only by their own ``t`` would
+        # leave orphaned rows of the plans that were just removed -- which then collide with a new
+        # plan, because row ids are reused after a delete.  So every slot of a removed plan goes.
+        cursor = connection.execute(
+            "DELETE FROM plan_slots WHERE plan_id NOT IN (SELECT id FROM plans)"
+        )
+        removed = max(0, int(cursor.rowcount or 0))
+        if removed:
+            counts["plan_slots"] = counts.get("plan_slots", 0) + removed
+    except sqlite3.Error as exc:
+        raise EpisodeError(
+            NOT_SQLITE, f"cannot cut the scratch copy at the boundary: {exc}"
+        ) from exc
+    finally:
+        connection.close()
+    return Truncation(
+        cut_at=start, rows=dict(sorted(counts.items())), dropped_profiles=tuple(dropped_profiles)
+    )
 
 
 def _effective_configs(
@@ -660,6 +992,44 @@ def _effective_configs(
     return tuple(out)
 
 
+def _finite_kw(value: Any) -> float | None:
+    """One recorded number, or ``None`` when the column carries nothing usable."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if number == number and abs(number) != float("inf") else None
+
+
+def _effective_base(row: Mapping[str, Any]) -> tuple[float, float, str, bool | None] | None:
+    """One bucket's pv/load as the planner would have seen it, with its provenance label.
+
+    The measured columns win when both are present; otherwise the engine's own same-tick estimates
+    stand in and the bucket is labelled ``derived`` (both) or ``mixed`` (one of each).  The fourth
+    element is the recording's own identity check
+    ``pv_derived_kw == max(0, load_derived_kw - grid_kw + battery_kw)``: ``True``/``False`` when a
+    derived value is used and the whole derived pair is present, ``None`` when the check does not
+    apply.  ``None`` as the whole result means the bucket has no base at all.
+    """
+    pv_measured = _finite_kw(row.get("pv_kw"))
+    load_measured = _finite_kw(row.get("load_kw"))
+    pv_derived = _finite_kw(row.get("pv_derived_kw"))
+    load_derived = _finite_kw(row.get("load_derived_kw"))
+    grid = _finite_kw(row.get("grid_kw"))
+    battery = _finite_kw(row.get("battery_kw"))
+    pv = pv_measured if pv_measured is not None else pv_derived
+    load = load_measured if load_measured is not None else load_derived
+    if pv is None or load is None:
+        return None
+    if pv_measured is not None and load_measured is not None:
+        return float(pv), float(load), BASE_MEASURED, None
+    label = BASE_DERIVED if pv_measured is None and load_measured is None else BASE_MIXED
+    check: bool | None = None
+    if None not in (pv_derived, load_derived, grid, battery):
+        expected = max(0.0, float(load_derived) - float(grid) + float(battery))
+        check = abs(float(pv_derived) - expected) <= BASE_IDENTITY_TOLERANCE_KW
+    return float(pv), float(load), label, check
+
+
 def _read_series(
     conn: sqlite3.Connection,
     start: datetime,
@@ -668,11 +1038,16 @@ def _read_series(
 ) -> tuple[
     dict[str, tuple[tuple[datetime, float | None], ...]],
     dict[str, dict[str, tuple[tuple[datetime, float | None], ...]]],
+    BaseProvenance,
 ]:
-    """The recorded exogenous series and the per-battery samples of the window.
+    """The recorded exogenous series, the per-battery samples and the base's provenance.
 
     ``actuals`` is a five-minute table, so coverage is demanded per bucket: a missing row or a NULL
-    physical column is refused, because a gap would otherwise be read as zero import.
+    physical column is refused, because a gap would otherwise be read as zero import.  ``pv_kw`` and
+    ``load_kw`` may be answered by the derived columns (:func:`_effective_base`), and every bucket
+    records which of the two was used; their values are the *effective* ones, so a reader that goes
+    through :meth:`Episode.base_at` sees the same numbers the planner did.  A bucket with neither a
+    measured nor a derived base still refuses the window.
     """
     first = quarter_floor(start, ACTUALS_MINUTES)
     rows = _fetch(
@@ -681,13 +1056,29 @@ def _read_series(
         (to_iso(first), to_iso(end)),
     )
     index = {str(row["ts"]): row for row in rows}
+    effective = {
+        str(row["ts"]): _effective_base(row) for row in rows
+    }
     missing: list[str] = []
+    source: dict[datetime, str] = {}
+    refused: list[datetime] = []
     bucket = first
     while bucket < end:
         key = to_iso(bucket)
         row = index.get(key)
-        if row is None or any(row[column] is None for column in REQUIRED_SERIES):
+        base = effective.get(key)
+        # ``row.get``: a recording that predates a required column is incomplete for the same reason
+        # a NULL one is, and must refuse the window with that slug instead of raising a KeyError.
+        if row is None or base is None or any(
+            row.get(column) is None for column in DIRECT_REQUIRED_SERIES
+        ):
             missing.append(key)
+        else:
+            label, check = base[2], base[3]
+            if check is False:
+                refused.append(bucket)
+            else:
+                source[bucket] = label
         bucket += timedelta(minutes=ACTUALS_MINUTES)
     if missing:
         raise EpisodeError(
@@ -696,10 +1087,32 @@ def _read_series(
             f"first {missing[0]}",
         )
     series = {
-        name: tuple((from_iso(row["ts"]), row[name]) for row in rows)
+        name: tuple(
+            (from_iso(row["ts"]), _series_value(name, row, effective[str(row["ts"])]))
+            for row in rows
+        )
         for name in RECORDED_SERIES
     }
-    return series, _read_battery_samples(conn, first, end, batteries)
+    provenance = BaseProvenance(source=dict(source), refused=tuple(refused))
+    return series, _read_battery_samples(conn, first, end, batteries), provenance
+
+
+def _series_value(
+    name: str, row: Mapping[str, Any], base: tuple[float, float, str, bool | None] | None
+) -> Any:
+    """One series point: the effective pv/load value, or the recorded column for anything else.
+
+    A column the recording does not have (an ``actuals`` table from before ``price_sell`` existed)
+    has no point to report, exactly as the accounting's schema-aware price resolution treats it: no
+    error, and no value invented -- the recorded plan slot is the documented fallback there, and the
+    engine's own pricing never reads these columns.  A NULL value reads the same way, because a
+    series point cannot carry "column absent" separately from "value absent".
+    """
+    if name not in ("pv_kw", "load_kw"):
+        return row.get(name)
+    if base is None:
+        return None
+    return base[0] if name == "pv_kw" else base[1]
 
 
 def _sample_spacing_s(
@@ -765,7 +1178,10 @@ def _read_battery_samples(
 
 
 def _read_recorded(
-    conn: sqlite3.Connection, start: datetime, end: datetime
+    conn: sqlite3.Connection,
+    start: datetime,
+    end: datetime,
+    battery_ids: Sequence[str] = (),
 ) -> tuple[
     tuple[Plan, ...],
     tuple[dict[str, Any], ...],
@@ -776,6 +1192,11 @@ def _read_recorded(
     Plans are ordered by ``(created_at, id)`` -- the accepted as-of rule is *newest
     ``created_at``*, and the row id is only a tie-breaker; sorting by insertion order would pick an
     older plan whenever a later insert carries an earlier timestamp.
+
+    The dispatch history is ordered by ``(ts, id)`` and carries, per battery, the newest row at or
+    before the window start as well: the setpoint in force when the window opens was written before
+    it, and the recorded-policy leg must read the recording's own value rather than hold one the
+    recording never re-issued.
     """
     plan_rows: list[tuple[datetime, int, dict[str, Any]]] = []
     for row in _fetch(conn, "SELECT * FROM plans ORDER BY id"):
@@ -794,13 +1215,7 @@ def _read_recorded(
     plans = tuple(
         _plan_from_rows(row, slots.get(plan_id, [])) for _, plan_id, row in plan_rows
     )
-    dispatch = tuple(
-        _fetch(
-            conn,
-            "SELECT * FROM dispatch_log WHERE ts >= ? AND ts < ? ORDER BY id",
-            (to_iso(start), to_iso(end)),
-        )
-    )
+    dispatch = _recorded_dispatch(conn, start, end, battery_ids)
     forecasts = tuple(
         _fetch(
             conn,
@@ -810,6 +1225,40 @@ def _read_recorded(
         )
     )
     return plans, dispatch, forecasts
+
+
+def _dispatch_order(row: Mapping[str, Any]) -> tuple[datetime, int]:
+    """As-of order: a row takes effect at its own timestamp, its id only breaking ties."""
+    moment = from_iso(row.get("ts")) or datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        identifier = int(row.get("id") or 0)
+    except (TypeError, ValueError):
+        identifier = 0
+    return moment, identifier
+
+
+def _recorded_dispatch(
+    conn: sqlite3.Connection, start: datetime, end: datetime, battery_ids: Sequence[str]
+) -> tuple[dict[str, Any], ...]:
+    """The window's dispatch rows plus each battery's newest row at or before the start."""
+    in_window = tuple(
+        _fetch(
+            conn,
+            "SELECT * FROM dispatch_log WHERE ts >= ? AND ts < ? ORDER BY id",
+            (to_iso(start), to_iso(end)),
+        )
+    )
+    known = {int(row["id"]) for row in in_window if row.get("id") is not None}
+    seeds: list[dict[str, Any]] = []
+    for battery_id in sorted({str(item) for item in battery_ids if item}):
+        row = conn.execute(
+            "SELECT * FROM dispatch_log WHERE battery_id = ? AND ts <= ?"
+            " ORDER BY ts DESC, id DESC LIMIT 1",
+            (battery_id, to_iso(start)),
+        ).fetchone()
+        if row is not None and int(row["id"]) not in known:
+            seeds.append(dict(row))
+    return tuple(sorted((*seeds, *in_window), key=_dispatch_order))
 
 
 def _warm_start(

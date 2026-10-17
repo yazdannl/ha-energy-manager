@@ -88,13 +88,15 @@ class PlantFleet:
         return sum(float(power) for power in powers)
 
     def base_kw(self) -> float | None:
-        """``load - pv`` at the current instant, or ``None`` when the recording lacks it."""
-        snapshot = self.episode.at(self.episode.now)
-        load = snapshot.latest("load_kw")
-        pv = snapshot.latest("pv_kw")
-        if load is None or pv is None or load[1] is None or pv[1] is None:
-            return None
-        return float(load[1]) - float(pv[1])
+        """``load - pv`` at the current instant, or ``None`` when the recording lacks it.
+
+        The base comes from :meth:`Episode.base_at <app.replay.episode.Episode.base_at>`, which is
+        the only accessor that knows whether the values were measured or stand in from the engine's
+        own derived columns -- and which refuses a bucket whose derived pair failed the recording's
+        own identity check, so a half-written row can never become a plant's base (section 2).
+        """
+        reading = self.episode.base_at(self.episode.now)
+        return None if reading is None else reading.base_kw
 
     def grid_reconstruction_kw(self) -> float | None:
         """``base + sum(power)``: the site flow rebuilt from this arm's own battery powers.
