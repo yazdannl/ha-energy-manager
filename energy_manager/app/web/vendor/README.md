@@ -37,6 +37,39 @@ sha256sum uPlot.iife.min.js uPlot.min.css   # must match the table above
 Then prepend the licence banners and update this table. Do not switch to a CDN URL: the add-on has
 no runtime network access for the UI.
 
+## Inter (variable) 4.1
+
+| | |
+| --- | --- |
+| Project | Inter — https://rsms.me/inter/ (source: https://github.com/rsms/inter) |
+| Version | `InterVariable.woff2` downloaded 2026-10-18 from the project's own font server |
+| Licence | SIL Open Font License 1.1 — see `LICENSE.inter.txt` (the upstream `LICENSE.txt`) |
+| Source URL | `https://rsms.me/inter/font-files/InterVariable.woff2` |
+| Local file | `InterVariable.woff2` |
+
+A single variable font file covers weights 100-900, so the SPA declares one `@font-face` in
+`style.css` and never loads a remote stylesheet. `font-display: swap` keeps text visible while it
+decodes, and a missing file falls back to the platform UI font declared after it.
+
+```
+693b77d4f32ee9b8bfc995589b5fad5e99adf2832738661f5402f9978429a8e3  InterVariable.woff2
+```
+
+Size: 352240 bytes. The file is a binary `wOF2`; it is byte-identical to the upstream download
+(nothing prepended or edited).
+
+### Refresh procedure
+
+```sh
+cd /tmp
+curl -fsSLO https://rsms.me/inter/font-files/InterVariable.woff2
+sha256sum InterVariable.woff2   # must match the checksum above
+curl -fsSL -o LICENSE.inter.txt https://raw.githubusercontent.com/rsms/inter/master/LICENSE.txt
+```
+
+Then copy both files into `vendor/` and update this table. The add-on has no runtime network access
+for the UI, so the font is served locally like every other asset.
+
 ## Bootstrap 5.3.3
 
 | | |

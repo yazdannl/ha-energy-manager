@@ -28,6 +28,7 @@ from typing import Any, Callable, Mapping, Sequence
 from . import analytics
 from . import capacity as capacity_learning
 from . import cost_basis as cost_basis_ledger
+from . import feeds
 from . import full_charge
 from .control import drivers as driver_registry
 from .control.dispatcher import Dispatcher, TickOutcome
@@ -96,6 +97,15 @@ SEM_COST_BASIS = "sensor.sem_battery_cost_basis"
 SEM_BATTERY_VALUE = "sensor.sem_battery_value"
 SEM_ACTIVE = "binary_sensor.sem_autopilot_active"
 SEM_AT_FLOOR = "binary_sensor.sem_battery_at_floor"
+
+#: Chart feeds (0.28.0, SPEC 12): the compact series a Lovelace card draws without calling the
+#: add-on's ingress-only API. They are additive to the documented `sensor.sem_*` contract above.
+SEM_CHART_PLAN = "sensor.sem_chart_plan"
+SEM_CHART_PRICE = "sensor.sem_chart_price"
+SEM_CHART_SOLAR = "sensor.sem_chart_solar"
+SEM_CHART_LOAD = "sensor.sem_chart_load"
+SEM_CHART_SAVINGS = "sensor.sem_chart_savings"
+SEM_CHART_ACCURACY = "sensor.sem_chart_accuracy"
 
 PUBLISH_MIN_INTERVAL_S = 20.0
 MIN_REPLAN_GAP_S = 60.0
@@ -363,6 +373,7 @@ class Engine:
         self._savings_today: dict[str, Any] = {}
         self._savings_flushed_at: datetime | None = None
         self._savings_cache: tuple[datetime, dict[str, Any], dict[str, Any]] | None = None
+        self._chart_savings_cache: tuple[datetime, dict[str, Any]] | None = None
         self._actuals_ring: list[dict[str, Any]] = []
         self._last_sample_at: datetime | None = None
         self._last_sample_values: dict[str, Any] = {}
@@ -4252,7 +4263,7 @@ class Engine:
         cheap, expensive = state.next_cheap_window, state.next_expensive_window
         if cheap is None and expensive is None and self._price is not None:
             cheap, expensive = analytics.price_windows(self._price.slots, now)
-        return {
+        payloads = {
             SEM_AUTOPILOT_STATE: (
                 autopilot,
                 {"friendly_name": "Smart Energy Manager autopilot"},
@@ -4375,6 +4386,66 @@ class Engine:
             ),
             SEM_AT_FLOOR: ("on" if at_floor else "off", {"friendly_name": "Smart Energy Manager battery at floor"}),
         }
+        # Chart feeds (0.28.0, SPEC 12): the same series the SPA draws, republished compactly for a
+        # Lovelace card. Additive: a client that ignores them sees exactly the old payloads.
+        payloads.update(self._chart_feed_payloads(now, plan, accuracy))
+        return payloads
+
+    def _chart_feed_payloads(
+        self, now: datetime, plan: Plan | None, accuracy: Mapping[str, Any]
+    ) -> dict[str, tuple[Any, dict[str, Any]]]:
+        """The six `sensor.sem_chart_*` feeds (feeds.py, SPEC 12).
+
+        Built from the same in-memory objects the API serves, so the card can never disagree with
+        the SPA about the plan or the forecasts. The savings feed reuses one wide store read and is
+        cached for ``SAVINGS_FLUSH_S``: aggregating five ranges on every 20 s publish would be the
+        only expensive part of the state publisher.
+        """
+        summary = getattr(plan, "summary", None) if plan is not None else None
+        round_trip = getattr(summary, "round_trip_efficiency", None) if summary is not None else None
+        if round_trip is None and summary is not None:
+            eta_charge = getattr(summary, "eta_charge", None)
+            eta_discharge = getattr(summary, "eta_discharge", None)
+            if eta_charge and eta_discharge:
+                round_trip = float(eta_charge) * float(eta_discharge)
+        wear = float(getattr(summary, "wear_eur_per_kwh", 0.0) or 0.0) if summary is not None else 0.0
+        plan_state, plan_attributes = feeds.plan_feed(
+            plan, now, round_trip=round_trip, wear_eur_per_kwh=wear
+        )
+        price_state, price_attributes = feeds.forecast_feed("price", self.forecast("price"), now)
+        solar_state, solar_attributes = feeds.forecast_feed("solar", self.forecast("solar"), now)
+        load_state, load_attributes = feeds.forecast_feed("load", self.forecast("load"), now)
+        savings_state, savings_attributes = feeds.savings_feed(self.chart_savings_ranges())
+        accuracy_state, accuracy_attributes = feeds.accuracy_feed(accuracy)
+        return {
+            SEM_CHART_PLAN: (plan_state, {"friendly_name": "Smart Energy Manager plan chart", **plan_attributes}),
+            SEM_CHART_PRICE: (price_state, {"friendly_name": "Smart Energy Manager price chart", **price_attributes}),
+            SEM_CHART_SOLAR: (solar_state, {"friendly_name": "Smart Energy Manager solar chart", **solar_attributes}),
+            SEM_CHART_LOAD: (load_state, {"friendly_name": "Smart Energy Manager load chart", **load_attributes}),
+            SEM_CHART_SAVINGS: (savings_state, {"friendly_name": "Smart Energy Manager savings chart", **savings_attributes}),
+            SEM_CHART_ACCURACY: (accuracy_state, {"friendly_name": "Smart Energy Manager accuracy chart", **accuracy_attributes}),
+        }
+
+    def chart_savings_ranges(self) -> dict[str, list[Any]]:
+        """Savings buckets for every range, from one wide store read, cached like the totals."""
+        now = self._clock()
+        cache = self._chart_savings_cache
+        if cache is not None and (now - cache[0]).total_seconds() < SAVINGS_FLUSH_S:
+            return cache[1]
+        rows = self._store_call(
+            "savings_daily_range", "1970-01-01", now.date().isoformat()
+        ) or []
+        if not rows and self._savings_today:
+            rows = [dict(self._savings_today)]
+        capacity = sum(
+            float(config.capacity_kwh or 0.0) for config in self.effective_battery_configs() if config.enabled
+        )
+        ranges = {
+            key: analytics.savings_from_daily(rows, key, now, capacity_kwh=capacity)[0]
+            for key in analytics.RANGES
+        }
+        self._chart_savings_cache = (now, ranges)
+        return ranges
 
     def _pv_summary(self, now: datetime) -> tuple[float, float, float, datetime | None]:
         solar = self._solar

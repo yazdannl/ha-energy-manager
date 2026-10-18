@@ -13,7 +13,7 @@ interactions and the design rules the code must keep.
 
 ## Routes
 
-Hash routing (`app.js: splitHash()`), seven views, all rendered client-side:
+Hash routing (`app.js: splitHash()`), eight views, all rendered client-side:
 
 | Route | View | Purpose |
 | --- | --- | --- |
@@ -22,6 +22,7 @@ Hash routing (`app.js: splitHash()`), seven views, all rendered client-side:
 | `#/forecasts` | `viewForecasts` | Price / solar / load panels, per-day totals, accuracy trend, provider health |
 | `#/batteries` | `viewBatteries` | Battery cards, discovery-based add/edit wizard, bounded test discharge |
 | `#/savings` | `viewSavings` | Range totals, savings vs baseline chart, per-bucket table, baseline definition |
+| `#/cards` | `viewCards` | Downloadable Lovelace card, chart picker, copy-paste snippet, live preview, feed entity table |
 | `#/settings` | `viewSettings` | Five setup cards (Price, Meter, Solar, Load, Battery) with entity pickers, plus an **All settings** drawer holding the grouped, searchable form |
 | `#/log` | `viewLog` | Filterable dispatch/event log with requested vs applied power |
 
@@ -32,7 +33,7 @@ Unknown routes fall back to `#/dashboard`. Query options: `#/plan?hours=12|24|36
 
 `index.html` renders **four primary destinations** (Dashboard, Plan, Savings, Manage) as a row that fits
 360 px, plus one contextual sub-row that `setNav()` shows only for the current area (Plan →
-Plan/Forecasts; Manage → Batteries/Settings/Log). All seven hash routes stay real links, so every
+Plan/Forecasts; Manage → Batteries/Cards/Settings/Log). All eight hash routes stay real links, so every
 view is reachable and deep-linkable; `#nav a[aria-current="page"]` marks the active entry and the
 primary item stays marked while its sub-row is open. Keyboard users get ≥44 px targets.
 
@@ -223,6 +224,16 @@ free-text `kind` filter, row limit, manual refresh and the auto-refresh checkbox
 detail is open a poll never rebuilds the list: it shows a "New entries available" notice instead. The empty
 state explicitly says that a surprising situation with an empty log is a bug.
 
+**Cards** — the dashboard-card installer. `Download card` links to
+`GET /api/v1/web/sem-charts-card.js`, the bundle the add-on assembles from its own committed assets
+(`sem-charts-card.css`, `chart-theme.css`, the vendored uPlot, `charts.js`, `sem-charts-card.js`), and
+the panel spells out the three manual steps (`/config/www/`, a Lovelace resource, a manual card)
+because registering the resource for the user would need `map: config:rw`. A chart picker rewrites
+the YAML snippet, `Copy snippet` puts it on the clipboard, and the preview below is drawn by the same
+`charts.js` the card carries — from the same `/plan`, `/forecast`, `/savings` and `/accuracy` payloads
+the card's feed rows are built from, so the preview shows what the dashboard shows. A second panel
+lists the six `sensor.sem_chart_*` feeds for anyone writing their own card.
+
 ## Cross-cutting rules
 
 - **No colour-only meaning**: each chart legend names its series in words ("Stale price slot",
@@ -268,8 +279,13 @@ state explicitly says that a surprising situation with an empty log is a bug.
 
 ## Charts (uPlot 1.6.32)
 
-`charts.js` wraps the vendored uPlot IIFE build. Colours are read from CSS custom properties
-(`--chart-*`), so light/dark both work. Each chart is three flow siblings — `.chart-plot` (the canvas
+`charts.js` wraps the vendored uPlot IIFE build. The chart surface itself (plot box, legend, caption, hover
+tooltip) lives in `chart-theme.css`, not `style.css`, because two consumers share it: this SPA and the
+Lovelace card, whose bundle inlines the same file. `style.css` defines the tokens on `:root` here;
+the card's `sem-charts-card.css` defines them on `:host`. Colours are read from CSS custom properties
+(`--chart-*`), so light/dark both work — and when charts.js runs inside the card, where those
+properties do not exist, `options.palette` overrides them (the card passes the same values as
+`sem-charts-card.js`'s dark/light palette). Each chart is three flow siblings — `.chart-plot` (the canvas
 at a fixed pixel height), `.chart-legend` (uPlot's legend table mounted there rather than inside the
 plot box) and `.chart-caption` (one short line saying what is plotted and what each line signature
 means). Keeping the legend out of the plot box is what stopped it painting over the caption on a

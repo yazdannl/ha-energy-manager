@@ -128,13 +128,20 @@ energy_manager/
     api.py                          WP2B HTTP JSON API (frozen contract §10)
     notify.py                       WP2B HA notifications + persistent notices
     analytics.py                    WP2B savings + accuracy accounting
+    feeds.py                        WP2B compact HA chart feeds (§12.1)
     main.py                         WP2B entrypoint: bootstrap, serve
     web/index.html                  WP3
     web/app.js                      WP3
-    web/style.css                   WP3
+    web/style.css                   WP3 design layer + --chart-* tokens
+    web/chart-theme.css             WP3 chart surface, shared with the card (§13.1)
     web/charts.js                   WP3
+    web/mock.js                     WP3
+    web/sem-charts-card.js          WP3 Lovelace card class (§12.2)
+    web/sem-charts-card.css         WP3 card chrome + tokens
     web/vendor/uPlot.min.js         WP3 vendored, licence header preserved
     web/vendor/uPlot.min.css        WP3 vendored
+    web/vendor/bootstrap.min.css    WP3 vendored
+    web/vendor/InterVariable.woff2  WP3 vendored font (§13.1)
   config.yaml                       WP4 add-on manifest
   Dockerfile                        WP4
   build.yaml                        WP4
@@ -1314,6 +1321,8 @@ GET  /api/v1/accuracy?days=14  -> {pv:AccuracyReport, load:AccuracyReport, price
 GET  /api/v1/log?limit=100&level=&kind=  -> {entries:[{ts, kind, level, code, message, detail}]}
 GET  /api/v1/providers         -> {solar:[ProviderStatus], price:[ProviderStatus], load:[...]}
 GET  /api/v1/export?what=plan|actuals|savings&format=json|csv   -> file download
+GET  /api/v1/web/sem-charts-card.js  -> the Lovelace card as one self-contained JavaScript file
+                                   (a download; §12.2)
 POST /api/v1/notify/test       -> {}  (sends a test notification if enabled)
 GET  /                         -> SPA index.html (+ /app.js, /style.css, /charts.js, /vendor/*)
 ```
@@ -1482,12 +1491,65 @@ Publishing is idempotent, throttled (min 20 s between writes per entity), and sk
 HA is unreachable — never block the control loop on a state publish. `sensor.sem_*` is the documented
 contract; README lists the table.
 
+### 12.1 Chart feeds (added 0.28.0, schema 1 — frozen)
+
+The sensors above answer "what is happening"; they are one number each and cannot draw a timeline. A
+Lovelace card runs on the Home Assistant origin and cannot call this add-on's API at all (ingress is
+response-only), so the series a chart needs are mirrored onto six `sensor.sem_chart_*` feeds, in a
+compact row-major form sized to stay far below HA's ~16 KB per-state attribute limit. Every feed
+carries `schema: 1`, and a consumer that does not understand it must say so rather than plot the
+wrong column — the schema is bumped only for an incompatible row shape:
+
+```
+sensor.sem_chart_plan      slots: [t, buy, sell, soc_pct, pv_kw, load_kw, power_w, stale(0|1)]
+                           + horizon_start/end, slot_minutes, feasible, infeasible_reason,
+                             round_trip, wear_eur_per_kwh
+sensor.sem_chart_price     slots: [t, buy, sell, stale(0|1)]
+sensor.sem_chart_solar     slots: [t, pv_kw, uncertainty_pct]
+sensor.sem_chart_load      slots: [t, load_kw, p10_kw, p90_kw]
+sensor.sem_chart_savings   ranges: {day|week|month|year|all: [[t, savings_eur, cost_eur,
+                                    revenue_eur, baseline_cost_eur], …]}
+sensor.sem_chart_accuracy  days: [t, …]; pv/load/price: [mape_pct|null, …]
+```
+
+`t` is a Unix epoch in seconds (UTC); the browser renders it in local time. A null is unknown, never
+0. Money is rounded to 2 dp, prices to 4, power to whole watts, percentages to 1 dp. Slots are capped
+at 200 (50 h at the 15-minute slot, more than the 48 h horizon maximum), the savings ranges together
+at 400 rows, and forecast feeds at 36 h. The entity state names the data, not a measurement: `ready`
+plus the source for forecasts, `infeasible` for a plan the optimizer could not make feasible, `empty`
+when there is nothing to draw, and the number of scored days for accuracy. `plan_feed`,
+`forecast_feed`, `savings_feed` and `accuracy_feed` in `feeds.py` are the only writers.
+
+### 12.2 The dashboard card (added 0.28.0)
+
+The add-on ships a Lovelace card as one downloadable, self-contained file:
+`GET /api/v1/web/sem-charts-card.js` assembles, from the committed web assets, a `SEM_CARD_CSS`
+string (`sem-charts-card.css` + `chart-theme.css`), the vendored uPlot (its IIFE wrapped and assigned
+to the global the other two read), `charts.js` and the card class. The card reads the §12.1 feeds and
+nothing else, so it works over HTTPS, in the mobile app, and with the add-on stopped; the lists live
+in `api.py` as `CARD_BUNDLE_CSS`/`CARD_BUNDLE_SOURCES` and a test fails if a listed source is missing
+or names a feed the engine never publishes.
+
+Install is **manual and deliberately so**: the user saves the file to `/config/www/sem-charts-card.js`,
+registers `/local/sem-charts-card.js` as a JavaScript module, and adds a card
+(`type: custom:sem-charts-card`, `chart:` one of `plan|mini|price|solar|load|savings|accuracy`, with
+optional `entity:`, `title:`, `range:`). The add-on does **not** take `map: config:rw` to write that
+folder itself: a self-registering card is not worth a permanent write path into the user's
+configuration. `#/cards` in the UI is the installer — download link, the three steps, a snippet that
+follows the chart picker, a preview drawn by the same `charts.js`, and the feed table.
+
+The card draws outside the SPA's `:root`, so it carries its own dark/light palette; the keys are the
+frozen `--chart-*` names of §13.1 restated in JS, and a test pins them to `charts.js`'s `TOKEN` map
+and `DEFAULT_PALETTE` so the copies cannot drift. `chart-theme.css` (the chart surface only) is shared
+by both consumers for the same reason.
+
 ---
 
 ## 13. UI (`app/web/`, WP3)
 
 Single page app, no build step, no runtime CDN (assets vendored). Layers: `index.html`, `style.css`,
-`app.js` (state, routing, fetch, render), `charts.js` (uPlot wrappers). Dark-first design, respects
+`chart-theme.css` (the chart surface, shared with the Lovelace card of §12.2), `app.js` (state,
+routing, fetch, render), `charts.js` (uPlot wrappers). Dark-first design, respects
 `prefers-color-scheme`, keyboard navigable, colour-blind-safe palette (blue/green/orange, no
 red/green price encoding without a shape cue too), works from 360 px wide up to desktop, honours
 `prefers-reduced-motion`.
@@ -1545,8 +1607,15 @@ default look. Bootstrap's JavaScript is **not** vendored: interactions stay in `
 - Tokens: the colour-blind-safe palette stays; the `--chart-*` custom properties are a frozen
   interface (`charts.js` reads them through `getComputedStyle`). Dark and light are both first class
   via `data-bs-theme` plus `prefers-color-scheme`, with an explicit user override that persists.
-- Minimalist rules: one accent colour, 1px borders instead of shadows, one radius scale, an 8 px
-  spacing scale, tabular figures for numbers, no gradients, no external fonts, no images.
+- Modern surfaces (0.28.0, superseding the earlier "no gradients / no shadows / no external fonts"
+  rule): subtle token-driven gradients (`--grad-page`, `--grad-panel`, `--grad-head`, `--grad-accent`,
+  `--grad-danger`) and soft shadows (`--shadow-1`, `--shadow-2`, `--shadow-accent`) are part of the
+  design, and a **locally cached** variable UI font (`vendor/InterVariable.woff2`, SIL OFL, checksum
+  in `vendor/README.md`, declared by `@font-face` with `font-display: swap`) sits in front of the
+  platform UI stack. Gradients and shadows are decoration only: contrast still comes from
+  `--text`/`--bg`, so removing every gradient must leave the interface readable.
+- Minimalist rules that still hold: one accent colour, one radius scale, an 8 px spacing scale,
+  tabular figures for numbers, no images, and nothing fetched at runtime (vendored assets only).
 - Accessibility is unchanged and normative: keyboard reachable, visible `:focus-visible` ring,
   `prefers-reduced-motion` honoured, contrast >= 4.5:1, never colour-only, skip link kept.
 
@@ -1753,7 +1822,40 @@ than by weakening `tools/audit.sh`.
 
 ## 16. Amendment log (why the spec changed)
 
-**0.27.0 — the optimizer reaches the deployed image: the C core becomes the plan solver, optimizer v2
+**0.28.0 — the charts leave the add-on: compact feeds, a self-installed Lovelace card, and a design
+system that defines its own decoration.**
+
+*The card needed a data path, and the API could not be it.* The add-on is served behind Supervisor
+ingress, so a Lovelace card in the user's browser cannot call `/api/v1/*`, and the ingress token
+rotates — a card cannot hold one. Publishing the plan as attributes of an existing sensor was the
+cheap alternative and was rejected: a 30 h plan at 15-minute slots is ~120 slots, and a naive shape
+is ~14 KB on a single state against HA's ~16 KB attribute ceiling, before forecasts and savings. So
+§12.1 adds six `sensor.sem_chart_*` feeds carrying only what a chart draws, in row-major form with
+caps (200 slots, 400 savings rows) that keep every feed in the low single-digit KB, and a
+`schema: 1` stamp so a consumer refuses a shape it does not understand instead of plotting the wrong
+column. A null is unknown, never zero; rounding is part of the contract, not of the writer.
+
+*The card is one file, and its install is deliberately manual.* §12.2 adds
+`GET /api/v1/web/sem-charts-card.js`, which assembles the card from committed web assets (CSS string
++ vendored uPlot + `charts.js` + the card class) — one download, no second resource, nothing fetched
+at runtime. The alternative was letting the add-on write `/config/www` itself, which means adding
+`map: config:rw`: a permanent read/write path into the user's entire Home Assistant configuration, in
+exchange for saving three copy-paste steps. The spec takes the manual route, and the UI (`#/cards`) is
+built to make those steps exact rather than to hide them. Because the card runs outside the SPA's
+`:root`, it carries its own dark/light palette; the keys are §13.1's frozen `--chart-*` names restated
+in JS, pinned by test to `charts.js`'s `TOKEN` map and `DEFAULT_PALETTE`.
+
+*The chart surface and the design system were restructured, not just restyled.* The chart CSS moved
+from `style.css` into `chart-theme.css` so the SPA and the card bundle share one definition, with the
+tokens supplied by `:root` in one and `:host` in the other — a class defined twice would drift the
+moment one consumer was updated. §13.1's prohibition on gradients, shadows and non-device fonts is
+replaced, but not by "anything goes": decoration is now named tokens (`--grad-*`, `--shadow-*`) plus a
+locally cached Inter variable font, and the normative rules that remain are the ones that carry
+meaning — one accent colour, no colour-only information, contrast from `--text`/`--bg`, nothing
+fetched at runtime, `prefers-reduced-motion` honoured. Deleting every gradient must still leave a
+readable interface, which is what makes the relaxation safe to test.
+
+## 0.27.0 — the optimizer reaches the deployed image: the C core becomes the plan solver, optimizer v2
 stages 2c/2d/3 ship, and `/health` names the live backend.**
 
 *The accelerator is real and this release is where it can first be observed.* The DP over SoC is

@@ -1,13 +1,23 @@
-/* charts.js — uPlot wrappers for the Smart Energy Manager SPA.
+/* charts.js — uPlot wrappers for the Smart Energy Manager charts.
  *
- * Depends on the vendored IIFE global `uPlot` (web/vendor/uPlot.min.js, v1.6.32).
- * No network, no build step. Every public function either draws a chart into a host element or
- * writes a plain-text fallback into it; nothing throws for missing/partial data.
+ * Shared by two consumers, which is why nothing here reads the document for anything but colours:
+ *   1. the SPA in this directory (index.html loads it as `SEMCharts`), and
+ *   2. the dashboard card bundle served at /api/v1/web/sem-charts-card.js, which sets an explicit
+ *      palette with `SEMCharts.setPalette()` because it renders outside the SPA's token scope.
  *
- * ponytail: the plan timeline is drawn as two vertically aligned uPlot panels sharing one x range
+ * Depends on the vendored IIFE global `uPlot` (web/vendor/uPlot.min.js, v1.6.32). No network, no
+ * build step. Every public function either draws a chart into a host element or writes a
+ * plain-text fallback into it; nothing throws for missing/partial data.
+ *
+ * Design (SPEC 13.1, 0.28.0): a chart is the same three flow siblings it always was - a plot box,
+ * a static legend and a one-line caption - now with smooth splines, gradient area fills, a hover
+ * readout, a subtle plot tint, day separators and a "now" marker. Colour alone still never carries
+ * meaning: every dashed line and every bar keeps its text label.
+ *
+ * ponytail: the plan timeline stays two vertically aligned uPlot panels sharing one x range
  * (price+SoC, then PV/load+battery power) instead of one plot with four y scales; four axes are
- * unreadable at 360 px. Upgrade path: one plot with `scales: {y,y2,y3,y4}` if the layout ever
- * gains the width for it.
+ * unreadable at 360 px. Upgrade path: one plot with `scales: {y,y2,y3,y4}` if the layout ever gains
+ * the width for it.
  */
 (function (root) {
   "use strict";
@@ -15,6 +25,48 @@
   var registry = typeof WeakMap === "function" ? new WeakMap() : null;
   var watchers = []; // {host, draw} for re-rendering on colour-scheme change
   var BARS = null; // uPlot.paths.bars factory, created lazily
+  var SPLINE = null; // uPlot.paths.spline factory, created lazily
+  var syncSeq = 0; // one cursor-sync key per timeline so two aligned panels track together
+
+  // Fallbacks when the CSS custom properties are missing (the dashboard card passes its own set).
+  var DEFAULT_PALETTE = {
+    price: "#e0a85a",
+    sell: "#7fd1b9",
+    pv: "#4cc38a",
+    load: "#58a6ff",
+    soc: "#a78bfa",
+    charge: "#58a6ff",
+    discharge: "#e0a85a",
+    stale: "#6b7a8d",
+    grid: "#2e3a49",
+    axis: "#9fb0c3",
+    breakEven: "#e08484",
+    baseline: "#9fb0c3",
+    cost: "#e0a85a",
+    savings: "#4cc38a",
+    accent: "#58a6ff"
+  };
+
+  // palette key -> the frozen `--chart-*` custom property charts.js reads (SPEC 13.1).
+  var TOKEN = {
+    price: "--chart-price",
+    sell: "--chart-sell",
+    pv: "--chart-pv",
+    load: "--chart-load",
+    soc: "--chart-soc",
+    charge: "--chart-battery-charge",
+    discharge: "--chart-battery-discharge",
+    stale: "--chart-stale",
+    grid: "--chart-grid",
+    axis: "--chart-axis",
+    breakEven: "--chart-break-even",
+    baseline: "--chart-baseline",
+    cost: "--chart-cost",
+    savings: "--chart-savings",
+    accent: "--accent"
+  };
+
+  var activePalette = null; // set by the dashboard card so charts render outside the SPA tokens
 
   function cssVar(name, fallback) {
     try {
@@ -23,6 +75,24 @@
     } catch (err) {
       return fallback;
     }
+  }
+
+  function palette(overrides) {
+    var out = {};
+    Object.keys(DEFAULT_PALETTE).forEach(function (key) {
+      if (activePalette) out[key] = activePalette[key] || DEFAULT_PALETTE[key];
+      else out[key] = cssVar(TOKEN[key], DEFAULT_PALETTE[key]);
+    });
+    if (overrides) {
+      Object.keys(overrides).forEach(function (key) {
+        if (overrides[key]) out[key] = overrides[key];
+      });
+    }
+    return out;
+  }
+
+  function setPalette(next) {
+    activePalette = next || null;
   }
 
   function withAlpha(color, alpha) {
@@ -40,25 +110,6 @@
       });
     }
     return color;
-  }
-
-  function palette() {
-    return {
-      price: cssVar("--chart-price", "#e0a85a"),
-      sell: cssVar("--chart-sell", "#7fd1b9"),
-      pv: cssVar("--chart-pv", "#4cc38a"),
-      load: cssVar("--chart-load", "#58a6ff"),
-      soc: cssVar("--chart-soc", "#a78bfa"),
-      charge: cssVar("--chart-battery-charge", "#58a6ff"),
-      discharge: cssVar("--chart-battery-discharge", "#e0a85a"),
-      stale: cssVar("--chart-stale", "#6b7a8d"),
-      grid: cssVar("--chart-grid", "#2e3a49"),
-      axis: cssVar("--chart-axis", "#9fb0c3"),
-      breakEven: cssVar("--chart-break-even", "#e08484"),
-      baseline: cssVar("--chart-baseline", "#9fb0c3"),
-      cost: cssVar("--chart-cost", "#e0a85a"),
-      savings: cssVar("--chart-savings", "#4cc38a")
-    };
   }
 
   function ts(value) {
@@ -128,7 +179,8 @@
 
   /* uPlot builds its legend as a <table> inside the plot root. With the plot pinned to an explicit
    * pixel height that table overflowed the box and painted over the paragraph below it (the mangled
-   * chart on a phone). The plot, the legend and the caption are now three flow siblings. */
+   * chart on a phone). The plot, the legend and the caption are three flow siblings, and the hover
+   * readout lives inside the plot box so it can never push the caption around. */
   function mount(host, opts, data, height, drawAgain, ariaLabel, caption) {
     destroy(host);
     if (!root.uPlot || typeof root.uPlot !== "function") {
@@ -163,6 +215,8 @@
       show: true,
       // Static: every figure is also in the tables beside the chart (All slots for the plan), so the
       // legend never implies a pointer readout uPlot would only draw when a series supplies `values`.
+      // The hover readout is our own tooltip below, which also works where uPlot's live legend does
+      // not (touch, series without a `value` function).
       live: false,
       markers: baseLegend.markers,
       mount: function (u, legendEl) {
@@ -198,11 +252,21 @@
     return BARS;
   }
 
+  function splinePath() {
+    // undefined when the stub/uPlot has no spline factory: uPlot falls back to straight segments.
+    if (SPLINE === null) {
+      SPLINE = (root.uPlot && root.uPlot.paths && root.uPlot.paths.spline)
+        ? root.uPlot.paths.spline()
+        : undefined;
+    }
+    return SPLINE;
+  }
+
   function baseOpts(p, extra) {
     var opts = {
       scales: { x: { time: true } },
       legend: { show: true, live: false },
-      cursor: { y: false, points: { show: false } },
+      cursor: { y: false, x: true, points: { show: true, size: 5 } },
       axes: [
         {
           stroke: p.axis, font: "11px system-ui, sans-serif", size: 44,
@@ -245,7 +309,9 @@
       // A 360 px viewport cannot afford 58 px per y axis; the gutter shrinks, the units stay
       // (UI_REVIEW §3.10).
       size: narrow ? (showLabel ? 46 : 40) : 58,
-      grid: scale === "y" ? { show: true, stroke: p.grid, width: 1 } : { show: false },
+      grid: scale === "y"
+        ? { show: true, stroke: p.grid, width: 1, dash: [2, 4] }
+        : { show: false },
       ticks: { stroke: p.grid, width: 1 },
       border: { stroke: p.grid, width: 1 },
       values: function (u, vals) {
@@ -257,14 +323,37 @@
   function timeAxis(p) {
     return {
       stroke: p.axis, font: "11px system-ui, sans-serif", size: 42,
-      grid: { show: true, stroke: p.grid, width: 1 },
+      grid: { show: false },
       ticks: { stroke: p.grid, width: 1 },
       border: { stroke: p.grid, width: 1 }
     };
   }
 
-  function area(color, alpha) {
-    return { stroke: color, fill: withAlpha(color, alpha), width: 1.5, points: { show: false } };
+  // ------------------------------------------------------------------------------------
+  // Visual decorations: gradients, splines, plot tint, day/now markers and the hover readout
+  // ------------------------------------------------------------------------------------
+
+  /* A vertical gradient in plot coordinates. Tall price bars therefore read brighter than short
+   * ones, and an area fill fades into the plot so the line stays the dominant edge. */
+  function gradientFill(color, topAlpha, bottomAlpha) {
+    return function (u) {
+      try {
+        var g = u.ctx.createLinearGradient(0, u.bbox.top, 0, u.bbox.top + u.bbox.height);
+        g.addColorStop(0, withAlpha(color, topAlpha));
+        g.addColorStop(1, withAlpha(color, bottomAlpha));
+        return g;
+      } catch (err) {
+        return withAlpha(color, bottomAlpha);
+      }
+    };
+  }
+
+  function area(color, topAlpha, bottomAlpha) {
+    return {
+      stroke: color, width: 1.5, points: { show: false },
+      paths: splinePath(),
+      fill: gradientFill(color, topAlpha, bottomAlpha)
+    };
   }
 
   /* Line signatures are the non-colour identification: a solid line is a measurement/forecast, a
@@ -274,22 +363,190 @@
 
   function line(color, dashed) {
     return {
-      stroke: color, width: dashed ? 1 : 1.5, points: { show: false },
+      stroke: color, width: dashed ? 1.25 : 1.75, points: { show: false },
+      paths: splinePath(),
       dash: dashed ? DASH.long : undefined
     };
   }
 
   function lineDashed(color) { return line(color, true); }
+
+  // Thresholds (break-even, P10/P90 bounds) are not smoothed: a threshold that curves is a lie.
   function lineDotted(color) {
     return {
       stroke: color, width: 1, points: { show: false },
       dash: DASH.dotted
     };
   }
+
   function thresholdLine(color) {
     return {
       stroke: color, width: 1.5, points: { show: false },
       dash: DASH.dotted
+    };
+  }
+
+  function bars(color, topAlpha, bottomAlpha) {
+    return {
+      paths: barsPath(), stroke: color, width: 0, points: { show: false },
+      fill: gradientFill(color, topAlpha, bottomAlpha)
+    };
+  }
+
+  function nextMidnight(moment) {
+    moment.setDate(moment.getDate() + 1);
+    moment.setHours(0, 0, 0, 0);
+    return moment;
+  }
+
+  function drawDecor(u, decor) {
+    if (!u.ctx || !u.bbox) return;
+    var p = decor.palette || {};
+    var ctx = u.ctx;
+    var L = u.bbox.left, T = u.bbox.top, W = u.bbox.width, H = u.bbox.height;
+    var xs = u.scales && u.scales.x;
+    ctx.save();
+    if (xs && xs.min != null && xs.max != null && xs.max > xs.min) {
+      // Faint separator per local midnight; the time axis labels the day, the line just divides it.
+      ctx.strokeStyle = withAlpha(p.axis || "#9fb0c3", 0.22);
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 4]);
+      var cursor = new Date(xs.min * 1000);
+      nextMidnight(cursor);
+      for (var guard = 0; guard < 64 && cursor.getTime() / 1000 < xs.max; guard++) {
+        var x = u.valToPos(cursor.getTime() / 1000, "x");
+        if (x > L + 1 && x < L + W - 1) {
+          ctx.beginPath(); ctx.moveTo(x, T); ctx.lineTo(x, T + H); ctx.stroke();
+        }
+        nextMidnight(cursor);
+      }
+      if (decor.now != null) {
+        var marker = u.valToPos(decor.now, "x");
+        if (marker > L + 1 && marker < L + W - 1) {
+          ctx.setLineDash([]);
+          ctx.strokeStyle = withAlpha(p.accent || "#58a6ff", 0.85);
+          ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.moveTo(marker, T); ctx.lineTo(marker, T + H); ctx.stroke();
+        }
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawZero(u, decor) {
+    if (!u.ctx || !u.bbox) return;
+    var y = u.scales && u.scales.y;
+    if (!y || y.min == null || y.max == null || y.min > 0 || y.max < 0) return;
+    var p = decor.palette || {};
+    var ctx = u.ctx;
+    var yy = u.valToPos(0, "y");
+    ctx.save();
+    ctx.strokeStyle = withAlpha(p.axis || "#9fb0c3", 0.5);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(u.bbox.left, yy);
+    ctx.lineTo(u.bbox.left + u.bbox.width, yy);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  /* Subtle accent tint behind the grid, drawn right after the canvas is cleared. It gives the plot
+   * a surface without a bordered box (a border would eat 2 px off the canvas uPlot sizes itself). */
+  function drawTint(u, decor) {
+    if (!u.ctx || !u.bbox) return;
+    var p = decor.palette || {};
+    var ctx = u.ctx;
+    var top = u.bbox.top, height = u.bbox.height;
+    try {
+      var g = ctx.createLinearGradient(0, top, 0, top + height);
+      g.addColorStop(0, withAlpha(p.accent || "#58a6ff", 0.06));
+      g.addColorStop(1, withAlpha(p.accent || "#58a6ff", 0));
+      ctx.fillStyle = g;
+      ctx.fillRect(u.bbox.left, top, u.bbox.width, height);
+    } catch (err) { /* tint is cosmetic */ }
+  }
+
+  function fmtHoverTime(seconds, spanSeconds) {
+    var d = new Date(seconds * 1000);
+    try {
+      if (spanSeconds != null && spanSeconds <= 26 * 3600) {
+        return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      }
+      return d.toLocaleDateString([], { weekday: "short" }) + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    } catch (err) {
+      return d.toISOString();
+    }
+  }
+
+  function onCursor(u) {
+    var tip = u.__semTip;
+    if (!tip) return;
+    var idx = u.cursor && u.cursor.idx;
+    if (!tip.over || idx == null || !u.data || !u.data[0]) { tip.box.hidden = true; return; }
+    var rows = [];
+    u.series.forEach(function (s, i) {
+      if (i === 0 || s.show === false) return;
+      var value = u.data[i] ? u.data[i][idx] : null;
+      if (value == null) return;
+      var text = typeof s.value === "function" ? s.value(u, value, i, idx) : String(value);
+      var swatch = typeof s.stroke === "string" ? s.stroke : (typeof s.fill === "string" ? s.fill : "");
+      rows.push({ label: s.label || "", color: swatch, text: text });
+    });
+    if (!rows.length) { tip.box.hidden = true; return; }
+    tip.box.textContent = "";
+    var head = document.createElement("p");
+    head.className = "chart-tip-time";
+    head.textContent = fmtHoverTime(u.data[0][idx], u.scales.x ? u.scales.x.max - u.scales.x.min : null);
+    tip.box.appendChild(head);
+    rows.forEach(function (row) {
+      var el = document.createElement("p");
+      el.className = "chart-tip-row";
+      var swatch = document.createElement("span");
+      swatch.className = "chart-tip-swatch";
+      if (row.color) swatch.style.background = row.color;
+      var name = document.createElement("span");
+      name.className = "chart-tip-name";
+      name.textContent = row.label;
+      var val = document.createElement("span");
+      val.className = "chart-tip-value";
+      val.textContent = row.text;
+      el.appendChild(swatch); el.appendChild(name); el.appendChild(val);
+      tip.box.appendChild(el);
+    });
+    tip.box.hidden = false;
+    var nearRight = u.cursor.left > u.bbox.width / 2;
+    tip.box.style.left = Math.max(0, u.cursor.left) + "px";
+    tip.box.style.top = Math.max(0, u.cursor.top == null ? 6 : u.cursor.top) + "px";
+    tip.box.style.transform = nearRight ? "translate(-100%,0) translateX(-12px)" : "translate(12px,0)";
+  }
+
+  function decorPlugin(decor) {
+    return {
+      hooks: {
+        drawClear: function (u) { drawTint(u, decor); },
+        draw: function (u) { drawDecor(u, decor); if (decor.zeroLine) drawZero(u, decor); }
+      }
+    };
+  }
+
+  function tooltipPlugin() {
+    return {
+      hooks: {
+        ready: function (u) {
+          try {
+            if (!u.over || !u.over.parentNode || !document.createElement) return;
+            var box = document.createElement("div");
+            box.className = "chart-tip";
+            box.hidden = true;
+            u.over.parentNode.appendChild(box);
+            var state = { box: box, over: false };
+            u.__semTip = state;
+            u.over.addEventListener("pointerenter", function () { state.over = true; });
+            u.over.addEventListener("pointerleave", function () { state.over = false; box.hidden = true; });
+          } catch (err) { /* cosmetic */ }
+        },
+        setCursor: onCursor
+      }
     };
   }
 
@@ -303,11 +560,13 @@
     if (!chartsReady(host)) return;
     destroyTree(host);
     host.textContent = "";
-    var p = palette();
+    var p = palette(options && options.palette);
     options = options || {};
     var wear = num(options.wear) != null ? num(options.wear) : 0;
     var eff = options.efficiency;
     var showBreakEven = !!(eff && eff.round_trip > 0);
+    var now = Date.now() / 1000;
+    var syncKey = "sem-plan-" + (++syncSeq);
     var xs = [], buy = [], sell = [], soc = [], pv = [], load = [], charge = [], discharge = [], staleBuy = [], breakEven = [];
     slots.forEach(function (s) {
       xs.push(ts(s.t));
@@ -332,7 +591,7 @@
       {},
       Object.assign(line(p.price), {
         label: "Buy price", scale: "y", paths: barsPath(),
-        fill: withAlpha(p.price, 0.85), value: unitFmt(4, "EUR/kWh")
+        fill: gradientFill(p.price, 0.95, 0.45), value: unitFmt(4, "EUR/kWh")
       }),
       {
         label: "Stale price slot", scale: "y", paths: barsPath(), stroke: p.stale,
@@ -353,14 +612,16 @@
     dataA.push(soc);
 
     var narrow = narrowHost(host);
-    var opts = baseOpts(p, {
+    var optsA = baseOpts(p, {
       scales: { x: { time: true }, y: { auto: true }, soc: { auto: true } },
       axes: [timeAxis(p), axisFor("y", "EUR/kWh", 3, p, narrow, "price"), axisFor("soc", "%", 1, p, narrow, "pct")],
-      series: seriesA
+      series: seriesA,
+      cursor: { y: false, x: true, points: { show: true, size: 5 }, sync: { key: syncKey, setSeries: false } },
+      plugins: [decorPlugin({ palette: p, now: now }), tooltipPlugin()]
     });
 
     var drawA = function (el) {
-      mount(el, opts, dataA, 190, drawA,
+      mount(el, optsA, dataA, 200, drawA,
         "Plan timeline: buy and sell price, the break-even price after round-trip loss, and battery charge over the horizon.",
         "Price in EUR/kWh (left axis) and battery charge in % (right axis). The dotted line is the break-even after round-trip loss; below it, discharging loses money.");
     };
@@ -371,17 +632,19 @@
       axes: [timeAxis(p), axisFor("y", "kW", 3, p, narrow, "kw")],
       series: [
         {},
-        Object.assign(area(p.pv, 0.22), { label: "PV forecast", value: unitFmt(2, "kW") }),
-        Object.assign(area(p.load, 0.18), { label: "Load forecast", value: unitFmt(2, "kW") }),
-        { label: "Battery charging", stroke: p.charge, fill: withAlpha(p.charge, 0.85), width: 0, paths: barsPath(), points: { show: false }, value: unitFmt(2, "kW") },
-        { label: "Battery discharging", stroke: p.discharge, fill: withAlpha(p.discharge, 0.85), width: 0, paths: barsPath(), points: { show: false }, value: unitFmt(2, "kW") }
-      ]
+        Object.assign(area(p.pv, 0.34, 0.02), { label: "PV forecast", value: unitFmt(2, "kW") }),
+        Object.assign(area(p.load, 0.28, 0.02), { label: "Load forecast", value: unitFmt(2, "kW") }),
+        Object.assign(bars(p.charge, 0.9, 0.4), { label: "Battery charging", value: unitFmt(2, "kW") }),
+        Object.assign(bars(p.discharge, 0.9, 0.4), { label: "Battery discharging", value: unitFmt(2, "kW") })
+      ],
+      cursor: { y: false, x: true, points: { show: true, size: 5 }, sync: { key: syncKey, setSeries: false } },
+      plugins: [decorPlugin({ palette: p, now: now, zeroLine: true }), tooltipPlugin()]
     });
     var hostB = document.createElement("div");
     hostB.className = "chart";
     host.appendChild(hostB);
     var drawB = function (el) {
-      mount(el, optsB, [xs, pv, load, charge, discharge], 165, drawB,
+      mount(el, optsB, [xs, pv, load, charge, discharge], 175, drawB,
         "Plan timeline: PV and load forecast in kW and battery charging or discharging in kW.",
         "PV and load forecast in kW, with battery charging (+) and discharging (−) in kW.");
     };
@@ -389,11 +652,11 @@
 
   }
 
-  function miniChart(host, plan) {
+  function miniChart(host, plan, options) {
     var slots = plan && Array.isArray(plan.slots) ? plan.slots.filter(function (s) { return num(s.soc_pct) != null || num(s.soc_kwh) != null || num(s.buy) != null; }) : [];
     if (!hasRows(slots)) { fallback(host, "No 24 h data yet."); return; }
     if (!chartsReady(host)) return;
-    var p = palette();
+    var p = palette(options && options.palette);
     var xs = [], price = [], soc = [];
     slots.forEach(function (s) {
       xs.push(ts(s.t));
@@ -406,9 +669,10 @@
       axes: [timeAxis(p), axisFor("y", "EUR/kWh", 3, p, narrow, "price"), axisFor("soc", "%", 1, p, narrow, "pct")],
       series: [
         {},
-        Object.assign(line(p.price), { label: "Buy price", scale: "y", fill: withAlpha(p.price, 0.16), value: function (u, v) { return fmt(v, 4, "EUR/kWh"); } }),
-        Object.assign(line(p.soc), { label: "Charge level", scale: "soc", value: function (u, v) { return fmt(v, 1, "%"); } })
-      ]
+        Object.assign(line(p.price), { label: "Buy price", scale: "y", fill: gradientFill(p.price, 0.22, 0.02), value: function (u, v) { return fmt(v, 4, "EUR/kWh"); } }),
+        Object.assign(area(p.soc, 0.3, 0.02), { label: "Charge level", scale: "soc", value: function (u, v) { return fmt(v, 1, "%"); } })
+      ],
+      plugins: [decorPlugin({ palette: p, now: Date.now() / 1000 }), tooltipPlugin()]
     });
     var draw = function (el) {
       mount(el, opts, [xs, price, soc], 150, draw,
@@ -418,11 +682,12 @@
     draw(host);
   }
 
-  function forecastChart(host, kind, payload) {
+  function forecastChart(host, kind, payload, options) {
     var slots = payload && Array.isArray(payload.slots) ? payload.slots : [];
     if (!hasRows(slots)) { fallback(host, "No forecast slots returned."); return; }
     if (!chartsReady(host)) return;
-    var p = palette();
+    var p = palette(options && options.palette);
+    var now = Date.now() / 1000;
     var xs = slots.map(function (s) { return ts(s.t); });
     var draw, opts, data;
 
@@ -431,20 +696,21 @@
       var sell = slots.map(function (s) { return num(s.sell); });
       var stale = slots.map(function (s) { return s.stale ? num(s.buy) : null; });
       var staleAny = stale.some(function (v) { return v != null; });
-      var narrow = narrowHost(host);
+      var narrowP = narrowHost(host);
       opts = baseOpts(p, {
         scales: { x: { time: true }, y: { auto: true } },
-        axes: [timeAxis(p), axisFor("y", "EUR/kWh", 3, p, narrow, "price")],
+        axes: [timeAxis(p), axisFor("y", "EUR/kWh", 3, p, narrowP, "price")],
         series: [
           {},
-          Object.assign(line(p.price), { label: "Buy price", paths: barsPath(), fill: withAlpha(p.price, 0.8), value: function (u, v) { return fmt(v, 4, "EUR/kWh"); } }),
+          Object.assign(line(p.price), { label: "Buy price", paths: barsPath(), fill: gradientFill(p.price, 0.95, 0.4), value: function (u, v) { return fmt(v, 4, "EUR/kWh"); } }),
           { label: "Stale price slot", paths: barsPath(), stroke: p.stale, fill: withAlpha(p.stale, 0.9), width: 0, points: { show: false }, value: function (u, v) { return v == null ? "fresh" : "stale"; } },
           Object.assign(line(p.sell, true), { label: "Sell price (long dashes)", value: function (u, v) { return fmt(v, 4, "EUR/kWh"); } })
-        ]
+        ],
+        plugins: [decorPlugin({ palette: p, now: now }), tooltipPlugin()]
       });
       data = [xs, buy, stale, sell];
       draw = function (el) {
-        mount(el, opts, data, 175, draw,
+        mount(el, opts, data, 185, draw,
           "Price forecast: buy and sell price per slot, grey bars mark stale slots.",
           "Buy price per slot in EUR/kWh (bars) and the sell price (long dashes). Grey bars are stale slots.");
       };
@@ -461,18 +727,19 @@
       });
       opts = baseOpts(p, {
         scales: { x: { time: true }, y: { auto: true } },
-        axes: [timeAxis(p), axisFor("y", "kW", 3, p, narrow, "kw")],
+        axes: [timeAxis(p), axisFor("y", "kW", 3, p, narrowHost(host), "kw")],
         bands: [{ series: [2, 3], fill: withAlpha(p.pv, 0.14), dir: -1 }],
         series: [
           {},
-          Object.assign(area(p.pv, 0.22), { label: "PV forecast (solid)", value: function (u, v) { return fmt(v, 2, "kW"); } }),
+          Object.assign(area(p.pv, 0.32, 0.02), { label: "PV forecast (solid)", value: function (u, v) { return fmt(v, 2, "kW"); } }),
           Object.assign(lineDashed(p.pv), { label: "Upper uncertainty (long dashes)", stroke: withAlpha(p.pv, 0.55), value: function (u, v) { return fmt(v, 2, "kW"); } }),
           Object.assign(lineDotted(p.pv), { label: "Lower uncertainty (dotted)", stroke: withAlpha(p.pv, 0.55), value: function (u, v) { return fmt(v, 2, "kW"); } })
-        ]
+        ],
+        plugins: [decorPlugin({ palette: p, now: now, zeroLine: true }), tooltipPlugin()]
       });
       data = [xs, pv, hi, lo];
       draw = function (el) {
-        mount(el, opts, data, 175, draw,
+        mount(el, opts, data, 185, draw,
           "Solar forecast in kW with an uncertainty band around it.",
           "PV forecast in kW: the solid line is the expected output; the band is its uncertainty (long dashes = upper, dotted = lower).");
       };
@@ -482,18 +749,19 @@
       var p90 = slots.map(function (s) { return num(s.p90_kw); });
       opts = baseOpts(p, {
         scales: { x: { time: true }, y: { auto: true } },
-        axes: [timeAxis(p), axisFor("y", "kW", 3, p, narrow, "kw")],
+        axes: [timeAxis(p), axisFor("y", "kW", 3, p, narrowHost(host), "kw")],
         bands: [{ series: [2, 3], fill: withAlpha(p.load, 0.14), dir: -1 }],
         series: [
           {},
-          Object.assign(line(p.load), { label: "Load P50 (solid)", value: function (u, v) { return fmt(v, 2, "kW"); } }),
+          Object.assign(area(p.load, 0.3, 0.02), { label: "Load P50 (solid)", value: function (u, v) { return fmt(v, 2, "kW"); } }),
           Object.assign(lineDashed(p.load), { label: "Load P90 (long dashes)", stroke: withAlpha(p.load, 0.55), value: function (u, v) { return fmt(v, 2, "kW"); } }),
           Object.assign(lineDotted(p.load), { label: "Load P10 (dotted)", stroke: withAlpha(p.load, 0.55), value: function (u, v) { return fmt(v, 2, "kW"); } })
-        ]
+        ],
+        plugins: [decorPlugin({ palette: p, now: now, zeroLine: true }), tooltipPlugin()]
       });
       data = [xs, p50, p90, p10];
       draw = function (el) {
-        mount(el, opts, data, 175, draw,
+        mount(el, opts, data, 185, draw,
           "Load forecast in kW: P50 median line with a P10 to P90 band.",
           "Load forecast in kW: P50 solid, P90 long-dashed, P10 dotted.");
       };
@@ -501,10 +769,10 @@
     draw(host);
   }
 
-  function savingsChart(host, buckets) {
+  function savingsChart(host, buckets, options) {
     if (!hasRows(buckets)) { fallback(host, "No savings buckets for this range yet."); return; }
     if (!chartsReady(host)) return;
-    var p = palette();
+    var p = palette(options && options.palette);
     var xs = [], savings = [], cost = [], baseline = [], keys = [];
     var allTimed = true;
     buckets.forEach(function (b, i) {
@@ -524,7 +792,7 @@
     }
     if (!allTimed) {
       xAxis = { stroke: p.axis, font: "11px system-ui, sans-serif", size: 42,
-        grid: { show: true, stroke: p.grid, width: 1 }, ticks: { stroke: p.grid, width: 1 },
+        grid: { show: false }, ticks: { stroke: p.grid, width: 1 },
         values: function (u, vals) { return vals.map(function (v) { return keys[v] || ""; }); } };
     }
     var narrow = narrowHost(host);
@@ -533,26 +801,27 @@
       axes: [xAxis, axisFor("savings", "EUR saved", 3, p, narrow, "eur"), axisFor("cost", "EUR cost", 1, p, narrow, "eur")],
       series: [
         {},
-        { label: "Savings", scale: "savings", paths: barsPath(), stroke: p.savings, fill: withAlpha(p.savings, 0.8), width: 0, points: { show: false }, value: function (u, v) { return fmt(v, 2, "EUR"); } },
+        Object.assign(bars(p.savings, 0.95, 0.4), { label: "Savings", scale: "savings", value: function (u, v) { return fmt(v, 2, "EUR"); } }),
         Object.assign(line(p.cost), { label: "Actual net cost (solid)", scale: "cost", value: function (u, v) { return fmt(v, 2, "EUR"); } }),
         Object.assign(line(p.baseline, true), { label: "Baseline cost, no battery (long dashes)", scale: "cost", value: function (u, v) { return fmt(v, 2, "EUR"); } })
-      ]
+      ],
+      plugins: [decorPlugin({ palette: p, zeroLine: true }), tooltipPlugin()]
     });
     var draw = function (el) {
-      mount(el, opts, [xs, savings, cost, baseline], 175, draw,
+      mount(el, opts, [xs, savings, cost, baseline], 185, draw,
         "Savings per period in EUR, with actual net cost and no-battery baseline cost lines in EUR.",
         "Savings per period in EUR (left axis); actual net cost (solid) and the no-battery baseline (long-dashed) are both in EUR on the right axis.");
     };
     draw(host);
   }
 
-  function accuracyChart(host, reports) {
+  function accuracyChart(host, reports, options) {
     var kinds = ["pv", "load", "price"].filter(function (k) {
       return reports && reports[k] && Array.isArray(reports[k].series) && reports[k].series.length > 0;
     });
     if (!kinds.length) { fallback(host, "No accuracy series yet (needs at least one day of data)."); return; }
     if (!chartsReady(host)) return;
-    var p = palette();
+    var p = palette(options && options.palette);
     var pv = reports.pv, load = reports.load, price = reports.price;
     var dayIndex = {};
     var xs = [];
@@ -594,11 +863,12 @@
           label: labels[k],
           value: function (u, v) { return fmt(v, 1, "%"); }
         });
-      }))
+      })),
+      plugins: [decorPlugin({ palette: p, zeroLine: true }), tooltipPlugin()]
     });
     var data = [xs].concat(kinds.map(seriesFor));
     var draw = function (el) {
-      mount(el, opts, data, 165, draw,
+      mount(el, opts, data, 175, draw,
         "Forecast accuracy trend: mean absolute percentage error per day, in percent.",
         "Mean absolute percentage error per day (%), lower is better: PV solid, load long-dashed, price dotted.");
     };
@@ -630,6 +900,8 @@
     accuracy: accuracyChart,
     destroy: destroy,
     destroyTree: destroyTree,
-    refresh: refresh
+    refresh: refresh,
+    setPalette: setPalette,
+    palette: palette
   };
 })(typeof globalThis !== "undefined" ? globalThis : this);

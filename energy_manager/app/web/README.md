@@ -9,12 +9,16 @@ with `<script defer>` in `index.html`.
 | File | Role |
 | --- | --- |
 | `index.html` | Shell: compact topbar (theme control), four-item primary nav plus a contextual sub-row, `<main id="view">`, footer About disclosure, live region, confirm `<dialog>`, script tags |
-| `style.css` | Design layer over Bootstrap's `--bs-*` tokens: palette, spacing/radius scales, every component, motion/focus rules |
-| `app.js` | State, hash router, API client, all seven views, the quiet-refresh lifecycle (`state.refresh`/`refreshBlocked()`), confirm + pending/confirmed write handling |
+| `style.css` | Design layer over Bootstrap's `--bs-*` tokens: palette, spacing/radius scales, every component, motion/focus rules. The `--chart-*` tokens live here (the frozen interface); the chart surface itself does not |
+| `chart-theme.css` | The chart surface (plot box, legend, caption, hover tooltip) as its own sheet, because two consumers share it: this SPA links it, and the Lovelace card bundle inlines it |
+| `sem-charts-card.js` | The Lovelace card class (`custom:sem-charts-card`). Reads only the `sensor.sem_chart_*` feeds and maps each row shape back onto `SEMCharts`; shipped inside the bundle, never loaded by this SPA |
+| `sem-charts-card.css` | The card's chrome plus the design tokens `chart-theme.css` expects, defined on `:host` (the SPA gets them from `style.css` on `:root`) |
+| `app.js` | State, hash router, API client, all eight views (including the dashboard-card installer), the quiet-refresh lifecycle (`state.refresh`/`refreshBlocked()`), confirm + pending/confirmed write handling |
 | `charts.js` | uPlot wrappers (`SEMCharts.plan/mini/forecast/savings/accuracy`) with graceful fallbacks |
 | `mock.js` | Synthetic fixtures for `?mock=1`; also loadable in Node for the static test suite |
 | `vendor/bootstrap.min.css` | Vendored Bootstrap 5.3.3 CSS (MIT) - the reset, grid, utilities, form controls and design tokens. Its JavaScript is **not** vendored; interactions live in `app.js` |
 | `vendor/uPlot.min.js`, `vendor/uPlot.min.css` | Vendored uPlot 1.6.32 (MIT). See `vendor/README.md` for version, source URL, checksums and refresh steps |
+| `vendor/InterVariable.woff2`, `vendor/LICENSE.inter.txt` | Vendored Inter variable font (SIL OFL 1.1), served by `@font-face` in `style.css`. See `vendor/README.md` for the checksum |
 
 ## Running it
 
@@ -22,14 +26,28 @@ Served by the add-on at `<ingress-url>/`. To iterate without a backend, open any
 appended, e.g. `…/?mock=1#/plan?hours=24`:
 
 - every view renders from `mock.js`, with obviously fake values (`sensor.example_*`, round numbers)
-  and **no network calls at all**;
-- writes (mode, override, limits, config, batteries, test discharge) are answered by the in-memory mock so
+  and **no network calls at all**;- writes (mode, override, limits, config, batteries, test discharge) are answered by the in-memory mock so
   pending → confirmed flows are visible;
 - `mock.js` never touches the DOM or `fetch`, so it can be loaded and inspected in Node, which is how
   the pytest suite asserts the SPEC §10 payload fields.
 
 For a plain static preview (`python3 -m http.server`), `index.html` works but API calls fail unless
 `?mock=1` is set.
+
+## Dashboard card (SPEC 12)
+
+The Lovelace card runs on the Home Assistant origin, where this add-on's API is unreachable (it is
+response-only behind ingress). It therefore reads the six `sensor.sem_chart_*` entities the add-on
+publishes, and it is delivered as one file: `GET /api/v1/web/sem-charts-card.js` assembles
+`sem-charts-card.css` + `chart-theme.css` (as a `SEM_CARD_CSS` string), the vendored uPlot, `charts.js`
+and `sem-charts-card.js` into a single script (uPlot's IIFE is wrapped and assigned to the global the
+other two read). The lists live in `api.py` as `CARD_BUNDLE_CSS` / `CARD_BUNDLE_SOURCES`, and
+`tests/test_wp3_assets.py` fails if a listed source is missing or names a feed the engine does not
+publish. Install is manual - download into `/config/www/`, register `/local/sem-charts-card.js` as a
+JavaScript module, paste the snippet - because the add-on would otherwise need `map: config:rw`.
+
+The card's palettes are restated in JS (it renders outside `:root`), and a test pins them to
+charts.js's `TOKEN` map and `DEFAULT_PALETTE` so the two copies cannot drift.
 
 ## Ingress-safe URLs
 
@@ -54,7 +72,7 @@ layout/answer vocabulary `route-title`, `route-sub`, `answer-authority`, `answer
 `answer-planned`, `answer-controls`, `answer-notes`, `answer-results`, `answer-dynamic`, `card-flag`,
 `supporting`, `trust-line`, `window-list`, `log-list`, `log-message`, `settings-toolbar`,
 `settings-columns`, `settings-feedback`, `banner-safety`, `banner-actions`, `dialog-body`,
-`dialog-actions`. The type scale is `--type-11` … `--type-28`; every interactive control is
+`dialog-actions`, `chart-card-body`, `chart-card-steps`, `chart-card-snippet`. The type scale is `--type-11` … `--type-28`; every interactive control is
 ≥44 px tall. The theme
 control cycles auto -> dark -> light and persists the choice in `localStorage`.
 

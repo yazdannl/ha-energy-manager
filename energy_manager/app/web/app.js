@@ -606,6 +606,7 @@
     "/plan": viewPlan,
     "/forecasts": viewForecasts,
     "/batteries": viewBatteries,
+    "/cards": viewCards,
     "/savings": viewSavings,
     "/settings": viewSettings,
     "/log": viewLog
@@ -753,6 +754,7 @@
     "/forecasts": "plan",
     "/savings": "savings",
     "/batteries": "manage",
+    "/cards": "manage",
     "/settings": "manage",
     "/log": "manage"
   };
@@ -5929,6 +5931,158 @@
     reload(true);
     timer = root.setInterval(autoRefresh, 15000);
     return function () { root.clearInterval(timer); };
+  }
+
+  /* ---- dashboard cards (SPEC 12) ---------------------------------------------------------
+     The add-on's UI sits behind Supervisor ingress, so a Lovelace card in the browser cannot call
+     its API. The card therefore reads the six `sensor.sem_chart_*` feeds the add-on publishes, and
+     is installed by hand: the file is downloaded here, saved into /config/www and registered as a
+     Lovelace resource. A bundle the add-on could register itself would need `map: config:rw`.
+     The preview is drawn by the same charts.js the card carries, so what is shown here is what the
+     dashboard renders. ---- */
+
+  var CARD_KINDS = [
+    { id: "plan", label: "Plan timeline", title: "Plan timeline" },
+    { id: "mini", label: "Next 24 hours", title: "Next 24 hours" },
+    { id: "price", label: "Price forecast", title: "Price forecast" },
+    { id: "solar", label: "Solar forecast", title: "Solar forecast" },
+    { id: "load", label: "Load forecast", title: "Load forecast" },
+    { id: "savings", label: "Savings vs baseline", title: "Savings vs baseline", range: "day" },
+    { id: "accuracy", label: "Forecast accuracy", title: "Forecast accuracy" }
+  ];
+
+  var CARD_FEEDS = [
+    ["sensor.sem_chart_plan", "Plan timeline, ready or infeasible"],
+    ["sensor.sem_chart_price", "Price forecast (buy, sell, stale)"],
+    ["sensor.sem_chart_solar", "Solar forecast with its uncertainty"],
+    ["sensor.sem_chart_load", "Load forecast with its p10–p90 band"],
+    ["sensor.sem_chart_savings", "Savings, cost and baseline per bucket"],
+    ["sensor.sem_chart_accuracy", "Daily forecast error per kind"]
+  ];
+
+  function cardLoad(kind) {
+    if (kind === "plan" || kind === "mini") return get("/plan");
+    if (kind === "savings") return get("/savings", { range: "day" });
+    if (kind === "accuracy") return get("/accuracy", { days: 30 });
+    return get("/forecast", { kind: kind, hours: 36 });
+  }
+
+  // The card's own mapper turns a feed row back into these shapes, so the preview and the card draw
+  // the same series from the same numbers.
+  function cardDraw(host, kind, payload) {
+    var chart = el("div", { class: "chart chart-md" });
+    host.appendChild(chart);
+    if (kind === "plan") {
+      var summary = payload && payload.summary ? payload.summary : {};
+      var efficiency = planEfficiency(summary);
+      root.SEMCharts.plan(chart, payload, {
+        wear: isNum(summary.wear_eur_per_kwh) ? summary.wear_eur_per_kwh : 0,
+        efficiency: efficiency
+      });
+    } else if (kind === "mini") {
+      root.SEMCharts.mini(chart, payload);
+    } else if (kind === "savings") {
+      root.SEMCharts.savings(chart, (payload && payload.buckets) || []);
+    } else if (kind === "accuracy") {
+      root.SEMCharts.accuracy(chart, payload);
+    } else {
+      root.SEMCharts.forecast(chart, kind, payload);
+    }
+  }
+
+  function cardSnippet(kind) {
+    var lines = ["type: custom:sem-charts-card", "chart: " + kind.id, "title: " + kind.title];
+    if (kind.range) lines.push("range: " + kind.range);
+    return lines.join("\n");
+  }
+
+  function selectNode(node) {
+    if (!root.getSelection || !document.createRange) return;
+    var range = document.createRange();
+    range.selectNodeContents(node);
+    var selection = root.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
+  function copyButton(node, label) {
+    var b = button(label, "", function () {
+      var clipboard = root.navigator && root.navigator.clipboard;
+      if (clipboard && clipboard.writeText) {
+        clipboard.writeText(node.textContent).then(
+          function () { b.textContent = "Copied"; },
+          function () { b.textContent = "Select and copy"; }
+        );
+        return;
+      }
+      // The clipboard API needs a secure context, and a LAN install over plain HTTP does not have
+      // one: select the snippet instead of pretending to copy it.
+      selectNode(node);
+      b.textContent = "Press Ctrl+C";
+    });
+    return b;
+  }
+
+  function viewCards(host) {
+    routeTitle(host, "Dashboard cards", "Put these charts on a Home Assistant dashboard without exposing the add-on's own API.");
+    var kind = CARD_KINDS[0];
+    var p = panel(host, "Add a chart to a dashboard", [
+      el("a", {
+        class: "btn btn-primary",
+        href: apiPath("/web/sem-charts-card.js"),
+        download: "sem-charts-card.js",
+        text: "Download card"
+      })
+    ]);
+    var snippet = el("pre", { class: "chart-card-snippet" });
+    var preview = el("div", { class: "chart-card-body" });
+    function paintSnippet() { snippet.textContent = cardSnippet(kind); }
+    function paint() {
+      paintSnippet();
+      // This preview builds a fresh host per repaint, so release the previous chart instead of
+      // stranding its canvas (charts.js only destroys the old chart when a host is reused).
+      if (root.SEMCharts.destroyTree) root.SEMCharts.destroyTree(preview);
+      panelStatus(preview, "loading", "Loading the " + kind.label + " chart…");
+      cardLoad(kind.id).then(function (payload) {
+        if (!preview.isConnected) return; // the reader moved on while this was in flight
+        clear(preview);
+        cardDraw(preview, kind.id, payload);
+      }).catch(function (err) {
+        if (!preview.isConnected) return;
+        panelStatus(preview, "error", "Could not load the chart data: " + (err && err.message ? err.message : err), paint);
+      });
+    }
+    var select = el("select", { id: "card-chart" }, CARD_KINDS.map(function (item) {
+      return el("option", { value: item.id, text: item.label });
+    }));
+    select.addEventListener("change", function () {
+      kind = CARD_KINDS.filter(function (item) { return item.id === select.value; })[0] || CARD_KINDS[0];
+      paint();
+    });
+    p.body.appendChild(el("p", { class: "legend-note", text: "One card, seven charts. The file carries uPlot, the chart code and its styles, so the dashboard needs no other resource and the card never calls this add-on: it reads the sensor.sem_chart_* entities the add-on already publishes (SPEC 12)." }));
+    p.body.appendChild(el("ol", { class: "chart-card-steps" }, [
+      el("li", null, ["Download the card and save it in your Home Assistant config share as ", el("code", { text: "/config/www/sem-charts-card.js" }), "."]),
+      el("li", null, ["In Home Assistant open ", el("strong", { text: "Settings → Dashboards → Resources" }), ", add ", el("code", { text: "/local/sem-charts-card.js" }), " and choose ", el("strong", { text: "JavaScript module" }), "."]),
+      el("li", null, ["Edit the dashboard, choose ", el("strong", { text: "Add card → Manual" }), ", and paste the snippet below. ", el("code", { text: "entity:" }), " and ", el("code", { text: "title:" }), " are optional overrides."])
+    ]));
+    p.body.appendChild(el("div", { class: "toolbar" }, [
+      el("label", { for: "card-chart" }, [el("span", { class: "stat-label", text: "Chart" }), select]),
+      copyButton(snippet, "Copy snippet")
+    ]));
+    p.body.appendChild(snippet);
+    p.body.appendChild(el("p", { class: "legend-note", text: "Preview, drawn live from the data this card would read:" }));
+    p.body.appendChild(preview);
+    paint();
+
+    var feeds = panel(host, "Feed entities");
+    feeds.body.appendChild(table(
+      "The add-on publishes one entity per chart. They are ordinary sensors: any dashboard card, template or automation can read them.",
+      ["Entity", "What it carries"],
+      CARD_FEEDS.map(function (row) { return [el("code", { text: row[0] }), row[1]]; }),
+      { numeric: [] }
+    ));
+    feeds.body.appendChild(el("p", { class: "legend-note", text: "Every feed carries schema: 1 and refuses to draw if the shape changes; a card older or newer than the add-on says so instead of plotting the wrong column." }));
+    return null;
   }
 
   /* ==== VIEWS BELOW ==== */

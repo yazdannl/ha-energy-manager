@@ -1,7 +1,7 @@
 """WP3 (UI) mock-contract checks.
 
 mock.js must be loadable without a DOM and must expose every field that SPEC §10 documents for
-every endpoint the SPA consumes, so that ?mock=1 can render all seven views without a backend.
+every endpoint the SPA consumes, so that ?mock=1 can render all eight views without a backend.
 """
 
 from __future__ import annotations

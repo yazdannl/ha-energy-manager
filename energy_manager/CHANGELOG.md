@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.28.0
+
+- **The charts can go on your dashboard now, as a card you install yourself.** The add-on's UI is
+behind Supervisor ingress, so nothing in a browser could reach it: a Lovelace card had no data
+source, and giving it one by publishing the plan as entity attributes would have put ~14 KB on a
+single state. Six compact feeds now carry exactly the series a chart draws — plan timeline, price,
+solar, load, savings and accuracy — in a row-major form that stays far below Home Assistant's ~16 KB
+attribute limit, each stamped `schema: 1` so a card refuses a shape it does not understand instead of
+plotting the wrong column (`feeds.py`, SPEC §12.1). On top of them ships `custom:sem-charts-card`, one
+self-contained file from `GET /api/v1/web/sem-charts-card.js`: the card's CSS, the shared chart sheet,
+the vendored uPlot, `charts.js` and the card class assembled into a single download. It reads only
+those feeds, so it works over HTTPS, inside the mobile app, and even with the add-on stopped. Install
+is manual, and deliberately so — save the file to `/config/www/sem-charts-card.js`, register
+`/local/sem-charts-card.js` as a JavaScript module, paste the snippet — because the alternative was
+taking `map: config:rw`, a permanent write path into the user's configuration, to register it for
+them. A new **Cards** view (`#/cards`) is the installer: the download, the three steps, a chart picker
+that rewrites the snippet, a copy button, a live preview drawn by the same `charts.js`, and the feed
+table (SPEC §12.2).
+- **The chart surface became its own sheet, and the charts got a glow-up.** The plot box, legend,
+caption and hover readout moved from `style.css` into `chart-theme.css` because two consumers now
+share them: this SPA and the card bundle, which inlines the same file into its shadow root (the tokens
+come from `:root` here and from `:host` there). On top of that the timeline gained smooth splines,
+gradient area fills, a subtle plot tint, day separators, a "now" marker, zero lines on the power
+panels, cursor point markers, and a real hover readout with a time and one row per series — created
+inside the plot box so it can never push the legend or the caption around. The two plan panels share a
+cursor-sync key, so the price/SoC panel and the PV/load panel track the same instant. Colours are still
+read from the frozen `--chart-*` tokens for the SPA, and `options.palette` (or `setPalette()`) lets the
+card hand over the same values from outside `:root`, where a test pins the card's two palettes to
+`charts.js`'s token map and fallback so the copies cannot drift. Nothing here carries meaning by colour
+alone: every dashed line, gradient series and bar keeps its text label.
+- **The design system replaced its no-decoration rule with a defined look.** SPEC §13.1 used to forbid
+gradients, shadows and any font that was not already on the device; the revamp allows all three — as
+*tokens*, not as free-form styling. Page, panel, panel-head, accent and danger surfaces take token
+gradients (`--grad-*`), elevation comes from `--shadow-1/2/accent`, and a **locally cached** Inter
+variable font (`vendor/InterVariable.woff2`, SIL OFL 1.1, checksum in `vendor/README.md`) is declared
+by `@font-face` with `font-display: swap` in front of the platform UI stack. Nothing is fetched at
+runtime and no image is introduced; contrast is still produced by `--text`/`--bg`, so deleting every
+gradient leaves the interface readable. The rules that survived are the ones that carry meaning: one
+accent colour, one radius scale, the 8 px spacing scale, tabular figures, keyboard reach and
+`prefers-reduced-motion`.
+
 ## 0.27.0
 
 - **The optimizer's C core now solves the plan in the deployed add-on, and `/health` says which

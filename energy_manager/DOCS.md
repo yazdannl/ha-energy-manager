@@ -33,6 +33,23 @@ The full documentation lives in the [repository README](https://github.com/yazda
 5. Watch *Plan* and *Log* to see what the add-on would have done, then enable `auto` (with
    `dry_run` still on) when you trust it.
 
+## Charts on your own dashboard
+
+Open **Cards** in the add-on UI: download the card, save it as
+`/config/www/sem-charts-card.js`, add `/local/sem-charts-card.js` under
+**Settings → Dashboards → Resources** as a **JavaScript module**, then add a card of type **Manual**:
+
+```yaml
+type: custom:sem-charts-card
+chart: plan        # plan | mini | price | solar | load | savings | accuracy
+title: Plan timeline
+```
+
+The file is self-contained and reads only the `sensor.sem_chart_*` feeds the add-on publishes, so it
+needs no other resource, makes no external request, and keeps working when the add-on is stopped. The
+install is manual on purpose: writing your `www` folder for you would mean giving the add-on
+read/write access to your whole Home Assistant configuration.
+
 ## Battery efficiency and wear
 
 You enter **one** efficiency number per battery: the **round trip**, i.e. how much of the energy put
@@ -139,4 +156,6 @@ Data credits: the day-ahead price series from `api.energy-charts.info` — fetch
 `energy_charts` price source is selected — is licensed **CC BY 4.0**, provided by
 **Fraunhofer ISE (Energy-Charts.info)** and sourced from **Bundesnetzagentur | SMARD.de**. The
 bundled uPlot chart library is vendored (no CDN) under the **MIT** licence; its licence text is at
-`app/web/vendor/LICENSE.uPlot.txt`.
+`app/web/vendor/LICENSE.uPlot.txt`. The vendored Inter variable font is under the **SIL Open Font
+License 1.1** (`app/web/vendor/LICENSE.inter.txt`), and Bootstrap's vendored CSS under **MIT**
+(`app/web/vendor/LICENSE.bootstrap.txt`).

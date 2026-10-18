@@ -1,0 +1,41 @@
+/* sem-charts-card.css — the Lovelace card's chrome plus the design tokens chart-theme.css uses.
+ *
+ * The SPA defines those tokens on `:root` in style.css; a card renders in its own shadow root
+ * outside the SPA entirely, so this file defines the same names on `:host` (dark by default, light
+ * when the card sets `data-theme="light"` from the active HA theme). Nothing here reads --chart-*:
+ * the card hands charts.js an explicit palette object instead.
+ */
+
+:host {
+  display: block;
+  --panel: #1a222d;
+  --border: #2e3a49;
+  --text: #e7edf4;
+  --text-muted: #9fb0c3;
+  --text-dim: #8ba0b8;
+  --accent: #58a6ff;
+  --radius-sm: 6px;
+  --radius-pill: 999px;
+  --sp-1: 0.25rem;
+  --sp-2: 0.5rem;
+  --sp-3: 1rem;
+  --type-12: 0.75rem;
+  --grad-panel: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0) 62%);
+  --shadow-2: 0 2px 4px rgba(0, 0, 0, 0.35), 0 20px 44px -26px rgba(0, 0, 0, 0.9);
+}
+
+:host([data-theme="light"]) {
+  --panel: #ffffff;
+  --border: #ccd7e4;
+  --text: #16202b;
+  --text-muted: #4c5c70;
+  --text-dim: #59697d;
+  --accent: #1c62c4;
+  --grad-panel: linear-gradient(180deg, #ffffff, #f4f8fd);
+  --shadow-2: 0 2px 4px rgba(21, 34, 50, 0.08), 0 20px 44px -26px rgba(21, 34, 50, 0.45);
+}
+
+.card-shell { display: block; padding: var(--sp-3); }
+.card-title { margin: 0 0 var(--sp-2); font-size: 1rem; font-weight: 600; color: var(--text); }
+.card-empty { margin: 0; color: var(--text-muted); font-size: 0.85rem; }
+.card-meta { margin: var(--sp-1) 0 0; color: var(--text-muted); font-size: 0.75rem; }

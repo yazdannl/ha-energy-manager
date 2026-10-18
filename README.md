@@ -50,7 +50,9 @@ no MQTT, no cloud account, and no YAML to install by hand.
   slug, visible in the log, so "why didn't it charge?" always has an answer.
 - **Shows the money.** Savings are accounted against a do-nothing baseline (defined below) and
   reported per day, week, month, year and all time, with forecast accuracy for PV, load and price.
-- **Mirrors its state into Home Assistant** as `sensor.sem_*` entities you can chart and automate.
+- **Mirrors its state into Home Assistant** as `sensor.sem_*` entities you can chart and automate,
+  and ships a Lovelace card (`custom:sem-charts-card`) that draws the plan timeline, every forecast,
+  savings and forecast accuracy on any dashboard.
 
 ## Requirements
 
@@ -284,6 +286,46 @@ They are written with the Home Assistant state API (`POST /api/states/<entity_id
 carry no `unique_id`: they are not part of the entity registry and **disappear after a Home
 Assistant restart until the add-on republishes them** on its next tick. That is expected, and
 automations that use them should tolerate a short gap after a restart.
+
+### Chart feeds (`sensor.sem_chart_*`)
+
+One number per entity cannot draw a timeline, and a Lovelace card cannot call the add-on's API (it
+is served behind ingress). Six compact feeds carry the series a chart actually needs:
+
+| Entity | What it carries |
+| --- | --- |
+| `sensor.sem_chart_plan` | Plan timeline slots: time, buy/sell price, SoC %, PV kW, load kW, battery power, stale flag — plus horizon, slot length, feasibility, round trip and wear |
+| `sensor.sem_chart_price` | Price forecast slots: time, buy, sell, stale |
+| `sensor.sem_chart_solar` | Solar forecast slots: time, kW, uncertainty % |
+| `sensor.sem_chart_load` | Load forecast slots: time, kW, p10, p90 |
+| `sensor.sem_chart_savings` | Savings buckets per range (day/week/month/year/all): time, savings, cost, revenue, baseline cost |
+| `sensor.sem_chart_accuracy` | One day axis plus a MAPE column per forecast kind |
+
+Each carries `schema: 1`, uses Unix seconds and rounds money to 2 dp / price to 4 dp / power to whole
+watts, and is capped (200 slots, 400 savings rows) to stay far below Home Assistant's attribute
+limit. A null means unknown, never zero.
+
+## Dashboard card
+
+**Cards** in the add-on UI (`#/cards`) is the whole installer: download the card, then
+
+1. save it as `/config/www/sem-charts-card.js` on your Home Assistant config share,
+2. add `/local/sem-charts-card.js` in **Settings → Dashboards → Resources** as a **JavaScript module**,
+3. add a card of type **Manual** and paste:
+
+```yaml
+type: custom:sem-charts-card
+chart: plan        # plan | mini | price | solar | load | savings | accuracy
+title: Plan timeline
+# range: day      # savings only: day | week | month | year | all
+# entity: sensor.sem_chart_plan   # to point at your own feed
+```
+
+The file is self-contained (it carries uPlot, the chart code and the styles), so no other resource is
+needed and nothing is fetched from the internet. It reads only the feeds above, which means it keeps
+working over HTTPS, in the mobile app, and while the add-on itself is stopped. The install is manual
+on purpose: writing into your `www` folder would require giving the add-on read/write access to your
+entire Home Assistant configuration.
 
 ## Safety model
 

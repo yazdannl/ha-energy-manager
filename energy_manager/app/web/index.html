@@ -9,6 +9,7 @@
 <link rel="stylesheet" href="vendor/bootstrap.min.css">
 <link rel="stylesheet" href="vendor/uPlot.min.css">
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="chart-theme.css">
 </head>
 <body>
 <a class="skip-link" href="#view">Skip to content</a>
@@ -27,8 +28,9 @@
 </header>
 
 <!-- Four primary destinations fit a 360 px row without sideways navigation (UI_REVIEW §3.4). The
-     secondary row is contextual: Plan/Forecasts under Plan, Batteries/Settings/Log under Manage.
-     app.js shows the group that belongs to the current route; every hash route stays a real link. -->
+     secondary row is contextual: Plan/Forecasts under Plan, Batteries/Cards/Settings/Log under
+     Manage. app.js shows the group that belongs to the current route; every hash route stays a
+     real link. -->
 <nav id="nav" aria-label="Views">
   <ul class="nav-primary">
     <li><a href="#/dashboard">Dashboard</a></li>
@@ -40,6 +42,7 @@
     <li data-sub="plan"><a href="#/plan">Plan</a></li>
     <li data-sub="plan"><a href="#/forecasts">Forecasts</a></li>
     <li data-sub="manage"><a href="#/batteries">Batteries</a></li>
+    <li data-sub="manage"><a href="#/cards">Cards</a></li>
     <li data-sub="manage"><a href="#/settings">Settings</a></li>
     <li data-sub="manage"><a href="#/log">Log</a></li>
   </ul>

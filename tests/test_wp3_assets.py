@@ -22,7 +22,7 @@ WEB = ROOT / "energy_manager" / "app" / "web"
 VENDOR = WEB / "vendor"
 NODE = shutil.which("node")
 
-VIEWS = ["dashboard", "plan", "forecasts", "batteries", "savings", "settings", "log"]
+VIEWS = ["dashboard", "plan", "forecasts", "batteries", "cards", "savings", "settings", "log"]
 
 REQUIRED_FILES = [
     "index.html",
@@ -30,13 +30,18 @@ REQUIRED_FILES = [
     "charts.js",
     "mock.js",
     "style.css",
+    "chart-theme.css",
+    "sem-charts-card.js",
+    "sem-charts-card.css",
     "README.md",
     "vendor/uPlot.min.js",
     "vendor/uPlot.min.css",
     "vendor/bootstrap.min.css",
+    "vendor/InterVariable.woff2",
     "vendor/README.md",
     "vendor/LICENSE.uPlot.txt",
     "vendor/LICENSE.bootstrap.txt",
+    "vendor/LICENSE.inter.txt",
 ]
 
 
@@ -174,6 +179,9 @@ def test_no_inline_event_handler_assignment_in_app():
 
 
 def test_hash_routes_are_registered_and_resolve():
+    # The route list is injected from VIEWS: a hard-coded copy here would pass while a route was
+    # missing from the router or the other way round, which is the thing this test exists to catch.
+    routes = json.dumps(["/" + view for view in VIEWS])
     script = """
     const fs = require("fs");
     globalThis.location = { pathname: "/api/hassio_ingress/example/", search: "", hash: "" };
@@ -182,9 +190,7 @@ def test_hash_routes_are_registered_and_resolve():
     console.log(JSON.stringify({
       routes: Object.keys(A.ROUTES),
       types: Object.keys(A.ROUTES).map(function (r) { return typeof A.ROUTES[r]; }),
-      resolved: A.ROUTES && Object.keys(A.ROUTES) ? [
-        "/dashboard", "/plan", "/forecasts", "/batteries", "/savings", "/settings", "/log"
-      ].map(function (r) { return A.normalizeRoute(r); }) : [],
+      resolved: __ROUTES__.map(function (r) { return A.normalizeRoute(r); }),
       fallback: A.normalizeRoute("/nope"),
       empty: A.normalizeRoute(""),
       ingressPath: A.apiPath("/status", {}),
@@ -193,7 +199,7 @@ def test_hash_routes_are_registered_and_resolve():
       noHash: A.splitHash(""),
       mocked: A.isMock
     }));
-    """
+    """.replace("__ROUTES__", routes)
     data = json.loads(run_node_script(script))
     assert data["routes"] == ["/" + view for view in VIEWS]
     assert set(data["types"]) == {"function"}
@@ -479,6 +485,31 @@ def test_style_is_dark_first_responsive_and_motion_aware():
     assert "minmax(" in css, "cards must reflow on narrow screens"
     assert "color-scheme: dark" in css, "dark-first design"
     assert "@import" not in css and "url(http" not in css, "no external fonts or stylesheets"
+
+
+def test_vendored_inter_font_matches_its_recorded_identity():
+    """The UI font is served locally, so the README is the record of what was vendored.
+
+    SPEC 13.1 (0.28.0) allows a locally cached webfont; this keeps the binary, the licence and the
+    recorded sha256 in step, exactly like Bootstrap. The file is binary, so the PII tripwire skips
+    it - the identity check is what proves it is the official build.
+    """
+    font = (VENDOR / "InterVariable.woff2").read_bytes()
+    assert font[:4] == b"wOF2", "not a WOFF2 font"
+    assert len(font) > 100_000, f"InterVariable.woff2 looks truncated: {len(font)} bytes"
+
+    record = read(VENDOR / "README.md")
+    digest = hashlib.sha256(font).hexdigest()
+    assert digest in record, f"vendor/README.md does not record the font's sha256 ({digest})"
+    assert "InterVariable" in record and "rsms.me/inter/font-files" in record
+    assert "OFL" in record or "Open Font License" in record
+
+    licence = read(VENDOR / "LICENSE.inter.txt")
+    assert "SIL Open Font License" in licence and "The Inter Project Authors" in licence
+
+    css = read(WEB / "style.css")
+    assert '@font-face' in css and 'Inter var' in css and 'vendor/InterVariable.woff2' in css
+    assert 'font-display: swap' in css, "a local font must not block text rendering"
 
 
 def test_vendored_uplot_keeps_licence_and_version():
@@ -1180,3 +1211,335 @@ def test_setup_card_keys_are_the_primary_surface():
     # derived reads the meter, so there is no measured-PV entity to pick; the other sources have one
     assert "solar.measured_entity" not in data["dayAhead"]
     assert "solar.measured_entity" in data["entity"] and "solar.measured_entity" in data["zonneplan"]
+
+
+# --------------------------------------------------------------------------------------------
+# Lovelace card (SPEC 12)
+# --------------------------------------------------------------------------------------------
+
+CHART_FEED_ENTITIES = [
+    "sensor.sem_chart_plan",
+    "sensor.sem_chart_price",
+    "sensor.sem_chart_solar",
+    "sensor.sem_chart_load",
+    "sensor.sem_chart_savings",
+    "sensor.sem_chart_accuracy",
+]
+
+
+def test_the_card_only_reads_feeds_the_engine_actually_publishes():
+    """A typo in an entity id would leave the user with a permanently empty card.
+
+    The card is installed by hand on a dashboard, so nothing else would catch it: the add-on's own
+    tests never load the card, and the failure appears only in the browser.
+    """
+    source = read(WEB / "sem-charts-card.js")
+    engine = read(ROOT / "energy_manager" / "app" / "engine.py")
+    published = set(re.findall(r'"(sensor\.sem_chart_[a-z_]+)"', engine))
+    referenced = set(re.findall(r'"(sensor\.sem_chart_[a-z_]+)"', source))
+    assert referenced, "the card references no chart feed entity"
+    assert referenced <= published, f"card reads feeds the engine never publishes: {sorted(referenced - published)}"
+    assert set(CHART_FEED_ENTITIES) <= published, "the engine no longer publishes a documented feed"
+
+
+def _js_color_object(text: str, declaration: str) -> dict[str, str]:
+    match = re.search(re.escape(declaration) + r"\s*=\s*\{([^}]*)\}", text)
+    assert match, f"{declaration} not found"
+    return dict(re.findall(r"(\w+):\s*\"([^\"]+)\"", match.group(1)))
+
+
+def test_the_card_palette_keeps_the_frozen_chart_token_names():
+    """SPEC 13.1 freezes the --chart-* names; the card restates them in JS, so the three must agree.
+
+    charts.js reads its colours from CSS custom properties and accepts an override object from the
+    card. Two hand-written copies of the same colour set (the dark palette here and charts.js's
+    fallback) drift silently, so the card is pinned to both the token map and the fallback values.
+    """
+    css = read(WEB / "style.css")
+    charts = read(WEB / "charts.js")
+    card = read(WEB / "sem-charts-card.js")
+    tokens = _js_color_object(charts, "var TOKEN")
+    fallback = _js_color_object(charts, "var DEFAULT_PALETTE")
+    assert tokens and fallback, "charts.js must still expose a token map and a fallback palette"
+    for name in tokens.values():
+        assert f"{name}:" in css, f"charts.js reads {name}, which style.css no longer defines"
+
+    palettes = {
+        name: dict(re.findall(r"(\w+):\s*\"([^\"]+)\"", body))
+        for name, body in re.findall(r"(dark|light): \{(.*?)\}", card, re.S)
+    }
+    assert set(palettes) == {"dark", "light"}, "the card must define both palettes"
+    for name, colors in palettes.items():
+        assert set(colors) == set(tokens), f"the {name} palette keys do not match charts.js's token map: {sorted(set(colors) ^ set(tokens))}"
+    for key, value in fallback.items():
+        assert palettes["dark"][key] == value, f"the card's dark {key} drifted from charts.js's fallback"
+    assert palettes["dark"] != palettes["light"], "the light palette must actually differ"
+
+
+CARD_HARNESS = r"""
+const calls = [];
+const CHART_FNS = ["plan", "mini", "forecast", "savings", "accuracy"];
+let uid = 0;
+globalThis.SEM_CARD_CSS = "";
+globalThis.SEMCharts = new Proxy({}, {
+  get: (_target, name) => (...args) => calls.push([String(name), args])
+});
+class FakeNode {
+  constructor(tag) { this.tagName = tag; this.uid = ++uid; this.className = ""; this._text = ""; this.children = []; this.attrs = {}; }
+  // Setting textContent replaces the children, exactly like the real DOM: _message() and _render()
+  // clear the body with it, and a stub that ignored that would hide a double render.
+  set textContent(value) { this._text = value; this.children = []; }
+  get textContent() { return this.children.length ? this.children.map((child) => child.textContent).join(" ") : this._text; }
+  appendChild(child) { this.children.push(child); return child; }
+  setAttribute(key, value) { this.attrs[key] = value; }
+}
+globalThis.document = { createElement: (tag) => new FakeNode(tag) };
+globalThis.HTMLElement = class {
+  constructor() { this.attrs = {}; }
+  attachShadow() { return { appendChild: () => {} }; }
+  setAttribute(key, value) { this.attrs[key] = value; }
+};
+globalThis.customElements = {
+  defined: {},
+  get: () => undefined,
+  define: (name, klass) => { globalThis.customElements.defined[name] = klass; }
+};
+globalThis.customCards = [];
+require("./sem-charts-card.js");
+const Card = globalThis.customElements.defined["sem-charts-card"];
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value, (_k, item) => item instanceof Date ? item.toISOString() : item));
+}
+function opts(options) {
+  return options ? { wear: options.wear, roundTrip: options.efficiency && options.efficiency.round_trip, hasPalette: !!options.palette, price: options.palette && options.palette.price } : null;
+}
+function summary([fn, args]) {
+  // forecast() takes the kind as a second positional argument, so its data and options shift.
+  if (fn === "forecast") return { fn, kind: args[1], host: args[0].uid, data: clone(args[2]), options: opts(args[3]) };
+  return { fn, host: args[0].uid, data: clone(args[1]), options: opts(args[2]) };
+}
+// The card is expected to reuse one host element; destroying that host's chart is a separate call
+// (charts.destroyTree) and must not be mistaken for a draw.
+function chartCalls() {
+  return calls.splice(0).filter(([fn]) => CHART_FNS.includes(fn)).map(summary);
+}
+function destroyCalls() {
+  return calls.splice(0).filter(([fn]) => fn === "destroyTree").length;
+}
+function passes() {
+  return calls.splice(0).filter(([fn]) => CHART_FNS.includes(fn) || fn === "destroyTree");
+}
+
+function feed(entity, attributes, updated) {
+  const states = {};
+  states[entity] = { state: "ready", last_updated: updated || "2026-10-18T12:00:00+00:00", attributes };
+  return { states, themes: { darkMode: true } };
+}
+
+const results = {};
+const scenarios = {
+  plan: ["sensor.sem_chart_plan", { schema: 1, slots: [[1700000000, 0.1145, 0.0912, 55.5, 1.234, 0.876, 421, 1]], round_trip: 0.85, wear_eur_per_kwh: 0.02 }],
+  mini: ["sensor.sem_chart_plan", { schema: 1, slots: [[1700000000, 0.1145, 0.0912, 55.5, 1.234, 0.876, 421, 0]] }],
+  price: ["sensor.sem_chart_price", { schema: 1, slots: [[1700000000, 0.1145, 0.0912, 1]] }],
+  solar: ["sensor.sem_chart_solar", { schema: 1, slots: [[1700000000, 1.234, 12.5]] }],
+  load: ["sensor.sem_chart_load", { schema: 1, slots: [[1700000000, 0.876, 0.5, 1.4]] }],
+  savings: ["sensor.sem_chart_savings", { schema: 1, ranges: { day: [[1700000000, 1.25, 2.5, 0.4, 3.75]], week: [[1700086400, 4.5, 9.0, 1.1, 13.5]] } }],
+  accuracy: ["sensor.sem_chart_accuracy", { schema: 1, days: [1700000000, 1700086400], pv: [12.5, null], load: [8.25, 9.5], price: [null, 15.75] }]
+};
+for (const [name, [entity, attributes]] of Object.entries(scenarios)) {
+  const card = new Card();
+  card.setConfig(name === "savings" ? { chart: name, range: "week" } : { chart: name });
+  card.hass = feed(entity, attributes);
+  const first = chartCalls();
+  const firstMessage = card._body.textContent;
+  // The same feed republished (a new plan, a refreshed forecast): the card must redraw the chart it
+  // already has, not build a second one on a fresh element and strand the first.
+  card.hass = feed(entity, attributes, "2026-10-18T12:20:00+00:00");
+  const redraw = chartCalls();
+  // Then the feed disappears (the add-on stops, the entity is renamed): the chart must be released
+  // rather than left drawing behind the message.
+  card.hass = { states: {}, themes: { darkMode: true } };
+  results[name] = {
+    calls: first,
+    firstMessage: firstMessage,
+    redraw: redraw,
+    released: name === "plan" ? { destroys: destroyCalls(), message: card._body.textContent } : null,
+    message: card._body.textContent,
+    theme: card.attrs["data-theme"]
+  };
+}
+const missing = new Card();
+missing.setConfig({ chart: "plan" });
+missing.hass = { states: {}, themes: { darkMode: false } };
+results.missing = { calls: [], message: missing._body.textContent, theme: missing.attrs["data-theme"] };
+const wrongSchema = new Card();
+wrongSchema.setConfig({ chart: "solar" });
+wrongSchema.hass = feed("sensor.sem_chart_solar", { schema: 2, slots: [] });
+results.wrongSchema = { calls: [], message: wrongSchema._body.textContent, theme: wrongSchema.attrs["data-theme"] };
+console.log(JSON.stringify(results));
+"""
+
+
+def test_the_card_maps_every_feed_row_into_the_chart_api():
+    """Drive the card against real feed payloads and assert the chart call it makes.
+
+    The card is the one part of the add-on that runs outside this repo's Python and JS tests, so the
+    row adapters (frozen row shapes from feeds.py -> charts.js series objects) are exercised here.
+    """
+    data = json.loads(run_node_script(CARD_HARNESS))
+    plan = data["plan"]
+    assert [entry["fn"] for entry in plan["calls"]] == ["plan"]
+    call = plan["calls"][0]
+    assert call["host"] == plan["redraw"][0]["host"], "the card must redraw on the chart it already has"
+    assert all(entry["host"] == call["host"] for entry in plan["redraw"])
+    assert plan["released"]["destroys"] >= 1, "a card that loses its feed must release the chart"
+    assert "not found" in plan["released"]["message"]
+    assert call["data"]["slots"] == [
+        {
+            "t": "2023-11-14T22:13:20.000Z",
+            "buy": 0.1145,
+            "sell": 0.0912,
+            "soc_pct": 55.5,
+            "pv_kw": 1.234,
+            "load_kw": 0.876,
+            "power_w": 421,
+            "price_stale": True,
+        }
+    ]
+    assert call["options"]["wear"] == 0.02
+    assert call["options"]["roundTrip"] == 0.85
+    assert call["options"]["hasPalette"] is True
+    assert plan["theme"] == "dark" and "Source: sensor.sem_chart_plan" in plan["firstMessage"]
+
+    assert data["mini"]["calls"][0]["fn"] == "mini"
+    assert data["price"]["calls"][0]["fn"] == "forecast"
+    assert [data[name]["calls"][0]["kind"] for name in ("price", "solar", "load")] == ["price", "solar", "load"]
+    assert data["price"]["calls"][0]["data"]["slots"] == [
+        {"t": "2023-11-14T22:13:20.000Z", "buy": 0.1145, "sell": 0.0912, "stale": True}
+    ]
+    assert data["solar"]["calls"][0]["data"]["slots"] == [
+        {"t": "2023-11-14T22:13:20.000Z", "pv_kw": 1.234, "uncertainty_pct": 12.5}
+    ]
+    assert data["load"]["calls"][0]["data"]["slots"] == [
+        {"t": "2023-11-14T22:13:20.000Z", "load_kw": 0.876, "p10_kw": 0.5, "p90_kw": 1.4}
+    ]
+    # range=week picks the weekly buckets, and the bucket key stays the epoch the SPA uses
+    savings = data["savings"]["calls"][0]
+    assert savings["fn"] == "savings" and len(savings["data"]) == 1
+    assert savings["data"][0] == {
+        "key": "1700086400",
+        "start": "2023-11-15T22:13:20.000Z",
+        "savings_eur": 4.5,
+        "cost_eur": 9.0,
+        "revenue_eur": 1.1,
+        "baseline_cost_eur": 13.5,
+    }
+    accuracy = data["accuracy"]["calls"][0]
+    assert accuracy["fn"] == "accuracy"
+    assert accuracy["data"]["pv"]["series"] == [
+        {"day": "2023-11-14T22:13:20.000Z", "mape_pct": 12.5},
+        {"day": "2023-11-15T22:13:20.000Z", "mape_pct": None},
+    ]
+    assert [entry["mape_pct"] for entry in accuracy["data"]["price"]["series"]] == [None, 15.75]
+
+    # A card on a dashboard whose add-on is stopped, or whose feed is a newer schema, must explain
+    # itself instead of drawing an empty plot.
+    assert data["missing"]["calls"] == [] and "not found" in data["missing"]["message"]
+    assert data["missing"]["theme"] == "light"
+    assert data["wrongSchema"]["calls"] == [] and "schema" in data["wrongSchema"]["message"]
+
+
+def test_the_card_types_no_html_and_reaches_no_remote_asset():
+    """The card is injected into a user's dashboard: it must build DOM, never parse HTML."""
+    source = strip_js_comments(read(WEB / "sem-charts-card.js"))
+    for forbidden in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function("):
+        assert forbidden not in source, f"sem-charts-card.js uses {forbidden}"
+    assert "fetch(" not in source and "XMLHttpRequest" not in source
+    assert "http://" not in source and "https://" not in source
+
+
+def test_the_card_bundle_has_no_duplicate_or_missing_source():
+    """The served bundle is an assembly of committed files; keep the two lists in one place."""
+    import sys as _sys
+
+    _sys.path.insert(0, str(ROOT / "energy_manager"))
+    from app.api import CARD_BUNDLE_CSS, CARD_BUNDLE_SOURCES  # noqa: E402
+
+    for name in CARD_BUNDLE_CSS + CARD_BUNDLE_SOURCES:
+        assert (WEB / name).is_file(), f"bundle source {name} is missing"
+    assert "charts.js" in CARD_BUNDLE_SOURCES and "sem-charts-card.js" in CARD_BUNDLE_SOURCES
+
+
+BUNDLE_LOADER = r"""
+/* Load the served card bundle the way a browser would, with the DOM stubs that cannot exist in node.
+   The bundle is an ES-module download whose uPlot source is an IIFE: if the wrapper or the global it
+   assigns ever broke, the card would silently render nothing on a dashboard. */
+const path = process.argv[2];
+globalThis.window = globalThis;
+globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.dispatchEvent = () => {};
+globalThis.CustomEvent = class { constructor(type) { this.type = type; } };
+globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
+globalThis.cancelAnimationFrame = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.getComputedStyle = () => ({ getPropertyValue: () => "" });
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+function fakeElement() {
+  return {
+    style: {},
+    classList: { add() {}, remove() {} },
+    appendChild() {}, setAttribute() {}, getContext: () => null,
+    addEventListener() {}, removeEventListener() {},
+    getBoundingClientRect: () => ({ width: 320, height: 180, top: 0, left: 0 })
+  };
+}
+globalThis.document = {
+  createElement: fakeElement, documentElement: {}, body: fakeElement(),
+  addEventListener() {}, removeEventListener() {}, visibilityState: "visible"
+};
+globalThis.HTMLElement = class { attachShadow() { return { appendChild() {} }; } };
+globalThis.customElements = { get: () => undefined, define() {} };
+globalThis.customCards = [];
+require(path);
+console.log(JSON.stringify({
+  charts: typeof globalThis.SEMCharts,
+  plan: typeof (globalThis.SEMCharts && globalThis.SEMCharts.plan),
+  uplot: typeof globalThis.uPlot,
+  cssBytes: (globalThis.SEM_CARD_CSS || "").length,
+  styleTag: /sem-charts-card|chart-tip/.test(globalThis.SEM_CARD_CSS || "")
+}));
+"""
+
+
+def test_the_served_bundle_runs_and_registers_its_globals(tmp_path):
+    """Assemble the bundle through the real API method, then execute it with DOM stubs.
+
+    Every other check on the card looks at the text of the files. This one is the only place the
+    assembled artifact is executed, which is where a broken uPlot wrapper or an unescaped CSS string
+    would actually show up.
+    """
+    if NODE is None:
+        pytest.skip("node is not installed")
+    import sys as _sys
+
+    _sys.path.insert(0, str(ROOT / "energy_manager"))
+    from app.api import ApiServer  # noqa: E402
+
+    server = ApiServer.__new__(ApiServer)  # _card_bundle only needs web_root
+    server.web_root = str(WEB)
+    status, headers, body = server._card_bundle()
+    assert status == 200 and headers["Content-Type"].startswith("text/javascript")
+    bundle = tmp_path / "sem-charts-card.bundle.js"
+    bundle.write_bytes(body)
+    loader = tmp_path / "load_bundle.js"
+    loader.write_text(BUNDLE_LOADER, encoding="utf-8")
+    proc = subprocess.run([NODE, str(loader), str(bundle)], capture_output=True, text=True, cwd=str(tmp_path))
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert result["charts"] == "object" and result["plan"] == "function", result
+    assert result["uplot"] == "function", "the wrapped uPlot build did not reach globalThis"
+    assert result["cssBytes"] > 4000 and result["styleTag"], result

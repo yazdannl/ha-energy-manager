@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -285,7 +286,9 @@ def test_every_documented_route_answers(wired):
         ("GET", "/"),
         ("GET", "/app.js"),
         ("GET", "/style.css"),
+        ("GET", "/chart-theme.css"),
         ("GET", "/charts.js"),
+        ("GET", "/api/v1/web/sem-charts-card.js"),
     ]
     payloads = {
         "/api/v1/mode": {"dry_run": True},
@@ -735,13 +738,47 @@ def test_notify_test_route(wired):
     assert status == 200 and isinstance(body, dict) and isinstance(body.get("sent"), bool)
 
 
+def test_the_card_bundle_is_one_downloadable_self_contained_file(wired):
+    """The Lovelace card ships as a single file: CSS, uPlot, charts.js and the card inlined.
+
+    The card runs on the Home Assistant origin, so it cannot load any of this by URL; a bundle that
+    silently dropped uPlot or the palette tokens would only fail in the user's browser.
+    """
+    status, headers, body = wired.request("GET", "/api/v1/web/sem-charts-card.js")
+    assert status == 200
+    assert headers.get("Content-Type", "").startswith("text/javascript")
+    assert headers.get("Cache-Control") == "no-cache"
+    assert "sem-charts-card.js" in headers.get("Content-Disposition", "")
+    text = body.decode("utf-8")
+    for needle in (
+        "SEM_CARD_CSS",
+        "var uPlot",
+        "global.uPlot = uPlot",
+        "SEMCharts",
+        'customElements.define("sem-charts-card"',
+        ".chart-tip",
+        ":host([data-theme=",
+        ".card-meta",
+    ):
+        assert needle in text, f"bundle lacks {needle}"
+    # Only uPlot's licence comment may name a URL; nothing may be loaded at runtime.
+    remote = [
+        url
+        for url in re.findall(r"https?://[^\"' )]+", text)
+        if not url.startswith("https://github.com/leeoniya/uPlot")
+    ]
+    assert remote == [], f"bundle references remote resources: {remote}"
+    assert "fetch(" not in text and "import(" not in text
+    note(f"card bundle: {len(body)} bytes, self-contained, no remote URL")
+
+
 def test_static_serving_and_traversal(wired):
     status, headers, body = wired.request("GET", "/")
     assert status == 200
     assert headers.get("Content-Type", "").startswith("text/html")
     assert headers.get("Cache-Control") == "no-cache"
     assert b"<html" in body.lower()
-    for asset in ("/app.js", "/style.css", "/charts.js", "/mock.js"):
+    for asset in ("/app.js", "/style.css", "/chart-theme.css", "/charts.js", "/mock.js", "/sem-charts-card.js"):
         status, headers, body = wired.request("GET", asset)
         assert status == 200, asset
         assert body, asset

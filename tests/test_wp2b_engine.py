@@ -42,6 +42,13 @@ PUBLISHED_ENTITIES = {
     "sensor.sem_battery_value",
     "binary_sensor.sem_autopilot_active",
     "binary_sensor.sem_battery_at_floor",
+    # Chart feeds (0.28.0, SPEC 12).
+    "sensor.sem_chart_plan",
+    "sensor.sem_chart_price",
+    "sensor.sem_chart_solar",
+    "sensor.sem_chart_load",
+    "sensor.sem_chart_savings",
+    "sensor.sem_chart_accuracy",
 }
 
 

@@ -118,7 +118,7 @@ function classTokens(text) {
 
   /* ---------- 1. every view renders ---------- */
   console.log("1. every view renders from mock data");
-  const routes = ["/dashboard", "/plan", "/forecasts", "/batteries", "/savings", "/settings", "/log"];
+  const routes = ["/dashboard", "/plan", "/forecasts", "/batteries", "/cards", "/savings", "/settings", "/log"];
   for (const route of routes) {
     let error = null;
     await goto(route).catch((err) => (error = err));
@@ -132,6 +132,54 @@ function classTokens(text) {
       check(`${route} has no undefined/NaN text`, !/\bundefined\b|\bNaN\b/.test(text), (text.match(/\bundefined\b|\bNaN\b/) || [])[0]);
     }
   }
+
+  /* ---------- 1z. the dashboard-card installer (SPEC 12) ---------- */
+  // The card is installed by hand from these three pieces of text: a download, a resource URL and a
+  // card snippet. A typo here leaves the user with a dashboard tile that never appears.
+  console.log("\n1z. cards view: download, resource and snippet");
+  await goto("/cards");
+  const cardsView = view();
+  const cardsText = allText(cardsView);
+  const download = cardsView.querySelectorAll("a").find((a) => a.getAttribute("download"));
+  check(
+    "the download link serves the card bundle as sem-charts-card.js",
+    !!download
+      && /\/api\/v1\/web\/sem-charts-card\.js$/.test(download.getAttribute("href"))
+      && download.getAttribute("download") === "sem-charts-card.js",
+    download ? download.getAttribute("href") : "no download link",
+  );
+  check(
+    "the steps name the config path and the Lovelace resource URL",
+    /\/config\/www\/sem-charts-card\.js/.test(cardsText) && /\/local\/sem-charts-card\.js/.test(cardsText),
+    cardsText.slice(0, 200),
+  );
+  const snippetNode = cardsView.querySelectorAll(".chart-card-snippet")[0];
+  check(
+    "the snippet is a manual card with the plan chart selected",
+    !!snippetNode
+      && /^type: custom:sem-charts-card$/m.test(snippetNode.textContent)
+      && /^chart: plan$/m.test(snippetNode.textContent),
+    snippetNode ? snippetNode.textContent : "no snippet",
+  );
+  const chartOptions = cardsView.querySelectorAll("#card-chart option").map((option) => option.value);
+  check(
+    "the chart picker offers all seven cards",
+    ["plan", "mini", "price", "solar", "load", "savings", "accuracy"].every((id) => chartOptions.includes(id)),
+    chartOptions.join(","),
+  );
+  check(
+    "every feed entity is documented in the view",
+    ["plan", "price", "solar", "load", "savings", "accuracy"].every((kind) => cardsText.includes("sensor.sem_chart_" + kind)),
+  );
+  const cardPicker = cardsView.querySelectorAll("#card-chart")[0];
+  cardPicker.value = "savings";
+  cardPicker.dispatchEvent({ type: "change" });
+  await sleep(120);
+  check(
+    "choosing another chart rewrites the snippet with its range",
+    /^chart: savings$/m.test(snippetNode.textContent) && /^range: day$/m.test(snippetNode.textContent),
+    snippetNode.textContent,
+  );
 
   /* ---------- 1a. learned battery capacity on the Batteries card (SPEC 5) ---------- */
   console.log("\n1a. batteries card: effective vs learned capacity");
@@ -843,12 +891,15 @@ function classTokens(text) {
   /* ---------- 3. style integrity ---------- */
   console.log("\n3. style integrity");
   const styleCss = fs.readFileSync(path.join(WEB, "style.css"), "utf8");
+  // The chart surface ships in its own sheet because the Lovelace card bundle inlines the same file.
+  const chartCssPath = path.join(WEB, "chart-theme.css");
+  const chartCss = fs.existsSync(chartCssPath) ? fs.readFileSync(chartCssPath, "utf8") : "";
   const bootstrapPath = path.join(WEB, "vendor", "bootstrap.min.css");
   const hasBootstrap = fs.existsSync(bootstrapPath);
   const bootstrapCss = hasBootstrap ? fs.readFileSync(bootstrapPath, "utf8") : "";
   check("bootstrap.min.css is vendored", hasBootstrap);
   const defined = new Set();
-  [styleCss, bootstrapCss].forEach((css) => {
+  [styleCss, chartCss, bootstrapCss].forEach((css) => {
     const re = /\.(-?[_a-zA-Z][\w-]*)/g;
     let m;
     while ((m = re.exec(css))) defined.add(m[1]);
@@ -858,7 +909,7 @@ function classTokens(text) {
     if (node.className) node.className.split(/\s+/).filter(Boolean).forEach((c) => emitted.add(c));
   });
   const undefinedClasses = [...emitted].filter((c) => !defined.has(c)).sort();
-  check("every emitted class is defined in style.css or bootstrap.min.css", undefinedClasses.length === 0, undefinedClasses.slice(0, 12).join(", "));
+  check("every emitted class is defined in style.css, chart-theme.css or bootstrap.min.css", undefinedClasses.length === 0, undefinedClasses.slice(0, 12).join(", "));
 
   const chartVars = ["--chart-price", "--chart-sell", "--chart-pv", "--chart-load", "--chart-soc", "--chart-grid"];
   const lostVars = chartVars.filter((v) => !styleCss.includes(v));
@@ -946,6 +997,7 @@ function classTokens(text) {
   const bootIdx = refs.indexOf("vendor/bootstrap.min.css");
   const styleIdx = refs.indexOf("style.css");
   check("bootstrap is loaded before style.css", bootIdx >= 0 && styleIdx > bootIdx, `bootstrap=${bootIdx} style=${styleIdx}`);
+  check("the shared chart sheet is loaded", refs.indexOf("chart-theme.css") > styleIdx, refs.join(", "));
   check("index.html still declares data-bs-theme", /data-bs-theme="(dark|light)"/.test(index));
 
   console.log(`\n${passed} passed, ${failures.length} failed`);

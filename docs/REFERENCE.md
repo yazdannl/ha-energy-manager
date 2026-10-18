@@ -60,7 +60,7 @@ Single-page app in `energy_manager/app/web/` (`index.html`, `app.js`, `charts.js
 | Top bar — connection | `#conn-status`, live region: `Connecting…` / `HA connected` / `HA unreachable` (mode and dry run are answered on the Dashboard, not repeated here) |
 | Top bar — theme button | `Theme: dark` / `Theme: light`; sets `data-bs-theme` on `<html>`, persisted in localStorage, and calls `SEMCharts.refresh()` |
 | Nav — primary | Four links: Dashboard (`#/dashboard`), Plan, Savings, Manage (`#/batteries`); ≥44 px tall |
-| Nav — contextual sub-row | Shown only for the current area: Plan → Plan, Forecasts; Manage → Batteries, Settings, Log; all seven routes stay real links (`aria-current` marks the exact route, the area entry stays marked) |
+| Nav — contextual sub-row | Shown only for the current area: Plan → Plan, Forecasts; Manage → Batteries, Cards, Settings, Log; all eight routes stay real links (`aria-current` marks the exact route, the area entry stays marked) |
 | Main | `#view`, `tabindex="-1"`; every view renders one `h1.route-title` + `.route-sub` via `routeTitle()` |
 | Footer | `Times: local` plus an About disclosure (`#help-toggle`/`#help`): units, ISO-8601 timestamps and the build line |
 | Live region | `#live`, `role="status"`, used by `performWrite()` to announce pending/confirmed writes |
@@ -75,6 +75,7 @@ Single-page app in `energy_manager/app/web/` (`index.html`, `app.js`, `charts.js
 | `#/forecasts` | `viewForecasts` | — |
 | `#/batteries` | `viewBatteries` | — |
 | `#/savings` | `viewSavings` | `?range=day\|week\|month\|year\|all` |
+| `#/cards` | `viewCards` | — |
 | `#/settings` | `viewSettings` | — |
 | `#/log` | `viewLog` | — |
 
@@ -428,7 +429,21 @@ Panel: **Decision log**.
 | Rows | message-first `.log-list`: the message, then badges (level, mode/dry-run context), local time + relative age (`just now` under 5 s), kind, code, `requested → applied` power and a collapsed JSON detail, newest first |
 | While reading | an open detail is never rebuilt by a poll; a `New entries available` notice appears instead |
 
-### 2.10 Cross-cutting UI rules
+### 2.10 Cards
+
+Panels: **Add a chart to a dashboard**, **Feed entities**.
+
+| Item | Detail |
+| --- | --- |
+| `Download card` | `GET /api/v1/web/sem-charts-card.js` as a download, saved as `sem-charts-card.js` |
+| Steps | save to `/config/www/sem-charts-card.js`; add `/local/sem-charts-card.js` under Settings → Dashboards → Resources as a JavaScript module; add a Manual card |
+| Chart picker | `plan`, `mini`, `price`, `solar`, `load`, `savings` (range `day`), `accuracy` |
+| `Copy snippet` | `navigator.clipboard` where available (HTTPS/localhost); otherwise selects the snippet and says `Press Ctrl+C` |
+| Snippet | `type: custom:sem-charts-card`, `chart:`, `title:` and — for savings — `range:`; `entity:`/`title:` are optional overrides |
+| Preview | drawn by the SPA's own `charts.js` from the same `/plan`, `/forecast`, `/savings`, `/accuracy` payloads the card's feed rows come from |
+| Feed table | the six `sensor.sem_chart_*` entities and what each carries (§5.1) |
+
+### 2.11 Cross-cutting UI rules
 
 - **No colour-only meaning**: badges carry text, stale slots carry a `stale` badge plus dashed
   borders, alerts write the level out, and every chart series has a stable line signature named in
@@ -1826,6 +1841,26 @@ blocks the control loop. Unchanged state and attributes are not rewritten.
 
 No `unique_id` is created, so the mirrors are not in the entity registry and disappear on an HA
 restart until the add-on republishes them on its next tick — documented behaviour, not a bug.
+
+### 5.1 Chart feeds (additive 0.28.0, schema 1)
+
+The compact series feeds a dashboard card draws from (`feeds.py`). Every feed carries `schema: 1`,
+uses Unix seconds, writes `null` for unknown (never 0), and rounds money to 2 dp, prices to 4 dp,
+power to whole watts and percentages to 1 dp. Caps: 200 slots, 400 savings rows, 36 h of forecast.
+
+| Entity | State | Payload / attributes |
+| --- | --- | --- |
+| `sensor.sem_chart_plan` | `ready` \| `infeasible` \| `empty` | `slots: [t, buy, sell, soc_pct, pv_kw, load_kw, power_w, stale]`, `horizon_start`/`horizon_end`, `slot_minutes`, `feasible`, `infeasible_reason`, `round_trip`, `wear_eur_per_kwh` |
+| `sensor.sem_chart_price` | source \| `empty` | `slots: [t, buy, sell, stale]` |
+| `sensor.sem_chart_solar` | source \| `empty` | `slots: [t, pv_kw, uncertainty_pct]` |
+| `sensor.sem_chart_load` | source \| `empty` | `slots: [t, load_kw, p10_kw, p90_kw]` |
+| `sensor.sem_chart_savings` | `ready` \| `empty` | `ranges: {day\|week\|month\|year\|all: [[t, savings_eur, cost_eur, revenue_eur, baseline_cost_eur], …]}` |
+| `sensor.sem_chart_accuracy` | scored days \| `empty` | `days: [t, …]`, `pv`/`load`/`price`: `[mape_pct\|null, …]` |
+
+A consumer that does not understand the schema must refuse to draw instead of reading the wrong
+column. The card (`custom:sem-charts-card`) does exactly that, and is delivered as one file by
+`GET /api/v1/web/sem-charts-card.js` (CSS + vendored uPlot + `charts.js` + the card class); the
+install is manual — download into `/config/www/`, register the resource, paste the snippet.
 
 ---
 

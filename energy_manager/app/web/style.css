@@ -1,8 +1,18 @@
 /* Smart Energy Manager SPA — the design layer over vendored Bootstrap 5.3.3.
-   No build step, no external fonts, no images, no gradients.
-   Palette is colour-blind safe (blue/green/orange/purple) and never colour-only:
-   every colour cue is duplicated by a text label, a border style or a shape.
+   No build step and no runtime network: the UI font (Inter), Bootstrap and uPlot are all vendored
+   under vendor/ and served by the add-on itself. SPEC 13.1 (0.28.0) allows gradients, soft shadows
+   and a locally cached webfont; contrast still comes from --text/--bg, so a gradient is never what
+   makes text readable. The palette is colour-blind safe (blue/green/orange/purple) and never
+   colour-only: every colour cue is duplicated by a text label, a border style or a shape.
    The --chart-* properties are a frozen interface: charts.js reads them through getComputedStyle. */
+
+@font-face {
+  font-family: "Inter var";
+  src: url("vendor/InterVariable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
 
 /* ---------- tokens: dark palette (default, dark-first) ---------- */
 
@@ -51,6 +61,17 @@
   --chart-load-accuracy: #58a6ff;
   --chart-price-accuracy: #e0a85a;
 
+  /* modern surfaces (SPEC 13.1, 0.28.0): gradients and soft shadows are design, not decoration that
+     carries meaning, so they are free to change without touching an accessibility rule. */
+  --grad-page: radial-gradient(1100px 520px at 10% -12%, rgba(var(--accent-rgb), 0.10), transparent 62%);
+  --grad-panel: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0) 62%);
+  --grad-head: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0));
+  --grad-accent: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 70%, #7cc0ff));
+  --grad-danger: linear-gradient(135deg, var(--danger), color-mix(in srgb, var(--danger) 72%, #ff9d6b));
+  --shadow-1: 0 1px 1px rgba(0, 0, 0, 0.3), 0 10px 26px -20px rgba(0, 0, 0, 0.85);
+  --shadow-2: 0 2px 4px rgba(0, 0, 0, 0.35), 0 20px 44px -26px rgba(0, 0, 0, 0.9);
+  --shadow-accent: 0 10px 26px -14px rgba(var(--accent-rgb), 0.7);
+
   /* one radius scale, an 8 px spacing scale */
   --radius: 10px;
   --radius-sm: 6px;
@@ -62,7 +83,7 @@
   --sp-4: 1.5rem;   /* 24 px                        */
   --sp-5: 2rem;     /* 32 px                        */
 
-  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-sans: "Inter var", "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
@@ -111,6 +132,15 @@
   --chart-pv-accuracy: #1f7a4d;
   --chart-load-accuracy: #1c62c4;
   --chart-price-accuracy: #9c6414;
+
+  --grad-page: radial-gradient(1100px 520px at 10% -12%, rgba(var(--accent-rgb), 0.10), transparent 62%);
+  --grad-panel: linear-gradient(180deg, #ffffff, #f4f8fd);
+  --grad-head: linear-gradient(180deg, rgba(var(--accent-rgb), 0.06), rgba(var(--accent-rgb), 0));
+  --grad-accent: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 78%, #3f8ff0));
+  --grad-danger: linear-gradient(135deg, var(--danger), color-mix(in srgb, var(--danger) 78%, #ff8a5c));
+  --shadow-1: 0 1px 1px rgba(21, 34, 50, 0.06), 0 10px 24px -18px rgba(21, 34, 50, 0.35);
+  --shadow-2: 0 2px 4px rgba(21, 34, 50, 0.08), 0 20px 44px -26px rgba(21, 34, 50, 0.45);
+  --shadow-accent: 0 10px 24px -14px rgba(var(--accent-rgb), 0.55);
 }
 
 /* ---------- tokens: light palette when the user has not chosen a theme ---------- */
@@ -161,6 +191,15 @@
     --chart-pv-accuracy: #1f7a4d;
     --chart-load-accuracy: #1c62c4;
     --chart-price-accuracy: #9c6414;
+
+    --grad-page: radial-gradient(1100px 520px at 10% -12%, rgba(var(--accent-rgb), 0.10), transparent 62%);
+    --grad-panel: linear-gradient(180deg, #ffffff, #f4f8fd);
+    --grad-head: linear-gradient(180deg, rgba(var(--accent-rgb), 0.06), rgba(var(--accent-rgb), 0));
+    --grad-accent: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 78%, #3f8ff0));
+    --grad-danger: linear-gradient(135deg, var(--danger), color-mix(in srgb, var(--danger) 78%, #ff8a5c));
+    --shadow-1: 0 1px 1px rgba(21, 34, 50, 0.06), 0 10px 24px -18px rgba(21, 34, 50, 0.35);
+    --shadow-2: 0 2px 4px rgba(21, 34, 50, 0.08), 0 20px 44px -26px rgba(21, 34, 50, 0.45);
+    --shadow-accent: 0 10px 24px -14px rgba(var(--accent-rgb), 0.55);
   }
 }
 
@@ -226,9 +265,14 @@ html { -webkit-text-size-adjust: 100%; }
 
 body {
   margin: 0;
-  background: var(--bg);
+  background-color: var(--bg);
+  background-image: var(--grad-page);
+  background-repeat: no-repeat;
+  background-size: 100% 720px;
   color: var(--text);
   font: 15px/1.5 var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 h1, h2, h3, h4 { line-height: 1.25; margin: 0 0 var(--sp-2); }
@@ -271,7 +315,8 @@ a { color: var(--accent); }
   align-items: center;
   justify-content: space-between;
   padding: var(--sp-2) var(--sp-3);
-  background: var(--bg-alt);
+  background-image: var(--grad-head);
+  background-color: var(--bg-alt);
   border-bottom: 1px solid var(--border);
 }
 .brand { margin: 0; display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: baseline; }
@@ -291,7 +336,7 @@ a { color: var(--accent); }
 .conn.warn { border-color: var(--warn); }
 .conn.err { border-color: var(--danger); }
 
-#nav { background: var(--bg-alt); border-bottom: 1px solid var(--border); }
+#nav { background-color: var(--bg-alt); background-image: var(--grad-head); border-bottom: 1px solid var(--border); }
 #nav ul {
   display: flex;
   flex-wrap: nowrap;
@@ -316,10 +361,11 @@ a { color: var(--accent); }
 }
 #nav a:hover { background: var(--panel); color: var(--text); }
 #nav a[aria-current="page"] {
-  background: var(--accent);
+  background: var(--grad-accent);
   border-color: var(--accent);
   color: var(--accent-ink);
   font-weight: 600;
+  box-shadow: var(--shadow-accent);
 }
 
 main {
@@ -359,10 +405,12 @@ main:focus { outline: none; }
 /* ---------- panels & cards ---------- */
 
 .panel {
-  background: var(--panel);
+  background-color: var(--panel);
+  background-image: var(--grad-panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
+  box-shadow: var(--shadow-1);
 }
 .panel-head {
   display: flex;
@@ -371,6 +419,7 @@ main:focus { outline: none; }
   align-items: center;
   justify-content: space-between;
   padding: var(--sp-2) var(--sp-3);
+  background-image: var(--grad-head);
   border-bottom: 1px solid var(--border);
 }
 .panel-head h2 { margin: 0; }
@@ -393,13 +442,15 @@ main:focus { outline: none; }
 }
 .card, .now-card {
   display: block;
-  background: var(--panel);
+  background-color: var(--panel);
+  background-image: var(--grad-panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: var(--sp-2) var(--sp-3);
   min-width: 0;
   height: auto;
   word-wrap: break-word;
+  box-shadow: var(--shadow-1);
 }
 /* Metric cards are separators and type, not containers: the panel around them is already the one
    surface (UI_REVIEW §3.8). Cards outside a panel keep their border. */
@@ -407,6 +458,7 @@ main:focus { outline: none; }
   background: transparent;
   border: 0;
   border-radius: 0;
+  box-shadow: none;
   padding-left: 0;
   padding-right: 0;
 }
@@ -455,9 +507,10 @@ main:focus { outline: none; }
 button.chip, a.chip { cursor: pointer; color: var(--text); text-decoration: none; }
 button.chip:hover, a.chip:hover { border-color: var(--accent); }
 .chip[aria-pressed="true"], .chip[aria-current="true"] {
-  background: var(--accent);
+  background: var(--grad-accent);
   border-color: var(--accent);
   color: var(--accent-ink);
+  box-shadow: var(--shadow-accent);
 }
 .badge-ok { border-color: var(--ok); color: var(--ok); }
 .badge-warn { border-color: var(--warn); color: var(--warn); }
@@ -540,18 +593,19 @@ button.chip:hover, a.chip:hover { border-color: var(--accent); }
   vertical-align: middle;
   -webkit-user-select: none;
   user-select: none;
-  box-shadow: none;
-  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  box-shadow: var(--shadow-1);
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease,
+    box-shadow 0.15s ease;
 }
-.btn:hover { background: var(--panel); border-color: var(--accent); color: var(--text); }
-.btn:active { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn:hover { background: var(--panel); border-color: var(--accent); color: var(--text); box-shadow: var(--shadow-2); }
+.btn:active { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); box-shadow: none; }
 .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; box-shadow: none; }
-.btn[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
-.btn-primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
-.btn-primary:hover { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn[aria-pressed="true"] { background: var(--grad-accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; box-shadow: var(--shadow-accent); }
+.btn-primary { background: var(--grad-accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; box-shadow: var(--shadow-accent); }
+.btn-primary:hover { background: var(--grad-accent); border-color: var(--accent); color: var(--accent-ink); }
 .btn-danger { border-color: var(--danger); color: var(--danger); }
 .btn-danger:hover { border-color: var(--danger); color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
-.btn-danger.btn-primary, .btn-danger[aria-pressed="true"] { background: var(--danger); color: var(--danger-ink); }
+.btn-danger.btn-primary, .btn-danger[aria-pressed="true"] { background: var(--grad-danger); color: var(--danger-ink); }
 /* The theme button keeps its label in a span app.js rewrites (auto/dark/light). */
 .theme-state {
   display: inline-flex;
@@ -562,7 +616,7 @@ button.chip:hover, a.chip:hover { border-color: var(--accent); }
 
 .btn-ghost { background: transparent; border-color: transparent; color: var(--text-muted); }
 .btn-ghost:hover { background: var(--panel); border-color: var(--border); color: var(--text); }
-.btn:disabled, .btn[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; border-color: var(--border); background: var(--panel-2); color: var(--text); }
+.btn:disabled, .btn[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; border-color: var(--border); background: var(--panel-2); color: var(--text); box-shadow: none; }
 .btn.pending { border-style: dashed; }
 .btn[aria-busy="true"]::after { content: " …"; }
 
@@ -744,7 +798,7 @@ input[type="checkbox"], input[type="radio"] { width: auto; }
 .segmented [aria-current="true"],
 .segmented .is-active,
 .segmented input:checked + label {
-  background: var(--accent);
+  background: var(--grad-accent);
   color: var(--accent-ink);
   font-weight: 600;
 }
@@ -787,7 +841,7 @@ input[type="checkbox"], input[type="radio"] { width: auto; }
   background: var(--text-dim);
   transition: left 0.15s ease, background-color 0.15s ease;
 }
-.switch input[type="checkbox"]:checked { background: var(--accent); border-color: var(--accent); }
+.switch input[type="checkbox"]:checked { background: var(--grad-accent); border-color: var(--accent); }
 .switch input[type="checkbox"]:checked::after { left: calc(100% - 1rem - 2px); background: var(--accent-ink); }
 .switch input[type="checkbox"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
@@ -845,16 +899,9 @@ tbody tr:hover { background: var(--panel-2); }
 .log-filters { display: flex; flex-wrap: wrap; gap: var(--sp-2) var(--sp-3); align-items: flex-end; }
 
 /* ---------- charts ---------- */
-
-.chart { width: 100%; min-width: 0; }
-.chart-sm { min-height: 150px; }
-.chart-md { min-height: 190px; }
-.chart-fallback { color: var(--text-muted); font-size: 0.85rem; }
+/* The chart surface itself lives in chart-theme.css, which the Lovelace card bundle also inlines so
+   both consumers draw an identical chart. It is linked from index.html right after this file. */
 .legend-note { color: var(--text-muted); font-size: 0.78rem; }
-.chart-figure { margin: 0; display: grid; gap: var(--sp-1); min-width: 0; }
-
-/* uPlot needs to be told what to do at 360 px too */
-.uplot { max-width: 100%; }
 
 /* ---------- dialogs ---------- */
 
@@ -1299,58 +1346,23 @@ td, th { padding: var(--sp-2); }
   #nav .nav-primary a { min-height: 2.75rem; }
 }
 
-/* ---------- charts: plot, legend and caption are three flow siblings ---------- */
-/* uPlot's legend table used to share the plot's fixed pixel height, so it overflowed the chart box
-   and painted over the paragraph underneath (unreadable on a phone). The legend and the caption now
-   occupy their own rows, wrap as normal text and can never overlap the chart or the text below. */
-
-.chart-plot { position: relative; width: 100%; min-width: 0; }
-.chart-plot .uplot { max-width: 100%; }
-
-.chart-legend { margin-top: var(--sp-1); display: grid; gap: 2px; }
-.chart-legend:empty { display: none; }
-.chart-legend .u-legend {
-  font-size: var(--type-12);
-  line-height: 1.35;
-  text-align: left;
+/* ---------- cards inside panels ---------- */
+/* The chart surface (plot, legend, caption, hover readout) lives in chart-theme.css, shared with
+   the Lovelace card bundle. Everything below is card chrome only. */
+.chart-card-body { display: grid; gap: var(--sp-1); min-width: 0; }
+.chart-card-steps { margin: 0; padding-left: var(--sp-3); display: grid; gap: var(--sp-2); }
+.chart-card-steps code,
+.chart-card-snippet {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.chart-card-steps code { padding: 0 0.3rem; overflow-wrap: anywhere; }
+.chart-card-snippet {
   margin: 0;
-  width: 100%;
+  padding: var(--sp-2);
+  overflow-x: auto;
+  white-space: pre;
 }
-/* One wrapping row of entries, not one full-width row per series: five series then cost a
-   single line or two instead of five. */
-.chart-legend .u-legend tbody,
-.chart-legend .u-legend thead {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 2px var(--sp-3);
-}
-.chart-legend .u-legend tr {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-}
-.chart-legend .u-legend th {
-  font-weight: 500;
-  color: var(--text-muted);
-  text-align: left;
-  padding: 0;
-  margin: 0;
-  white-space: nowrap;
-}
-.chart-legend .u-legend .u-marker {
-  width: 0.7em;
-  height: 0.7em;
-  margin-right: 4px;
-  border-radius: 2px;
-}
-
-/* One short line per chart: what is plotted, on which axis, and what the signature means. */
-.chart-caption {
-  margin: var(--sp-1) 0 0;
-  color: var(--text-muted);
-  font-size: var(--type-12);
-  line-height: 1.4;
-  max-width: 70ch;
-}
-.chart-md { min-height: 0; }
-.chart-sm { min-height: 0; }
