@@ -1603,7 +1603,15 @@ default look. Bootstrap's JavaScript is **not** vendored: interactions stay in `
   `settings-rail`, `settings-group`, `disclosure`, `save-bar`, `segmented`, `switch`, `unit-input`,
   and - for the setup cards and their entity pickers - `setup-cards`, `setup-card`, `setup-list`,
   `picker`, `picker-current`, `picker-search`, `picker-results`, `picker-row`, `picker-text`,
-  `picker-name`, `picker-meta` and `all-settings`.
+  `picker-name`, `picker-meta` and `all-settings`. The 0.29.0 action layer adds one family:
+  `window-ribbon*`, `window-legend*`, `window--<tint>`, `window-icon`, `window-power`, `window-soc*`
+  and `fact-icon`.
+- Icons (0.29.0) are **inline SVG drawn by `app.js`**, never an image file, an icon font or anything
+  fetched: one 24×24 grid stroked with `currentColor`, so an icon takes the colour of the text it
+  sits in and prints in monochrome. An icon carries a shape, never a meaning on its own - the action
+  or fact it belongs to is written out beside it - and each action's tint is carried by one
+  `--tint` custom property so a card, its tile, its charge track and its ribbon segment cannot drift
+  apart. Raise a glyph's fidelity by redrawing its path data in `ICONS`, never by adding a dependency.
 - Tokens: the colour-blind-safe palette stays; the `--chart-*` custom properties are a frozen
   interface (`charts.js` reads them through `getComputedStyle`). Dark and light are both first class
   via `data-bs-theme` plus `prefers-color-scheme`, with an explicit user override that persists.
@@ -1821,6 +1829,15 @@ than by weakening `tools/audit.sh`.
 ---
 
 ## 16. Amendment log (why the spec changed)
+
+**0.29.0 — the action layer gets a shape: inline icons, a charge gauge and the horizon ribbon.** No
+requirement changed; §13.1 gained a vocabulary for a panel that used to be text only. *Icons are drawn,
+not fetched.* The panel needed to say "charge, not discharge" before a reader parses the words, and the
+SPEC forbids images and runtime fetches, so §13.1 now names inline SVG on a 24×24 grid as the icon
+layer: stroked with `currentColor`, sized in `rem`, one `--tint` per action so the card, its tile, its
+charge gauge and its ribbon segment cannot drift apart. *A glyph never replaces a word*: the rule the
+UI already lived by - never colour-only - now covers shape, so every icon is accompanied by the action
+or fact it stands for, and the ribbon is a `role="img"` whose label reads the windows out loud.
 
 **0.28.1 — the sync key is per chart family, not per draw.** No requirement changed; this is a defect
 fix in `charts.js`. uPlot's sync registry (`dt`) maps a key to a hub and never deletes the entry, so a

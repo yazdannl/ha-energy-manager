@@ -106,12 +106,18 @@ last setpoint if the stop were skipped. The banner states this explicitly and no
 `/status` (3 s, max 60 s) until `last_plan_at` changes. Warnings panel (infeasible plan, stale
 prices, sources), timeline chart, summary (cost, baseline, saving, charged/discharged, cycles,
 arbitrage, per-battery shares, and the aggregate **round trip** the plan assumed), slot table with
-action, reason and a `stale price` badge. The **Next actions** list states each window's own data:
+action, reason and a `stale price` badge. The **Next actions** panel states each window's own data:
 the buy/sell prices and spread, the break-even and the margin over it, the planned kWh in/out, the
 SoC path and the floor it defends, the planned grid flow and what it costs or earns, the price
 provider's age and the window's rank in the horizon — plus what actually happened (applied vs
 requested, clamped/dry-run/advisory, measured vs planned, or why nothing was dispatched). It reads
 `GET /plan/execution` beside `/plan`; both are optional, so the rows state less rather than failing.
+Its action layer is inline SVG only (no image, no icon font, nothing fetched): the horizon totals
+behind a list glyph, a `.window-ribbon` placing every window across the plan with day ticks, a now
+marker and a legend naming each action, one card per window tinted by its action with an action glyph
+on a tile, a charge gauge whose fill is the level the window ends on and whose ticks are where it
+started and the floor it defends, and a glyph per fact. Every one of those cues is repeated in words
+beside it, so nothing is carried by colour or shape alone.
 The view installs `state.refresh`, so returning to the tab re-reads the plan, its execution join and
 the provider freshness in place — it keeps no timer of its own. The price chart draws the **break-even line**
 (`buy / round_trip + wear`, from the aggregate the plan assumed) across the

@@ -1167,29 +1167,170 @@ h1.route-title:focus { outline: none; }
 .panel-quiet .panel-head { border-bottom: 0; padding-bottom: var(--sp-1); }
 .panel-quiet .panel-body { padding: var(--sp-1) 0 0; }
 
-/* ---------- next actions (vertical window list) ---------- */
+/* ---------- next actions (horizon ribbon + one card per window) ----------
 
-.window-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-2); }
-.window-list li {
-  display: grid;
-  gap: var(--sp-1);
-  padding-left: var(--sp-3);
+   The panel has three layers: the horizon's own totals, the ribbon that shows where the windows sit
+   across the plan, and one card per window. Every colour cue is doubled by a shape and a word -- the
+   action tile's icon, the segment's position in time, and the sentence beside each of them -- so a
+   reader who cannot see the tint still gets the whole story (SPEC 13.1). */
+
+.icon { display: block; width: 1.15rem; height: 1.15rem; flex: none; }
+.icon-xs { width: 0.95rem; height: 0.95rem; }
+
+/* One tint per action, carried as a custom property so the card's border, its tile, its charge track
+   and its ribbon segment all draw the same colour. Unknown actions fall to the neutral --idle. */
+.window--charge { --tint: var(--chart-battery-charge); }
+.window--discharge { --tint: var(--chart-battery-discharge); }
+.window--pv { --tint: var(--chart-pv); }
+.window--export { --tint: var(--chart-sell); }
+.window--self { --tint: var(--chart-load); }
+.window--reserve { --tint: var(--purple); }
+.window--idle { --tint: var(--text-dim); }
+
+.window-summary-block {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: flex-start;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
   border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--panel);
+  background-image: var(--grad-panel);
 }
-.window-time { font-weight: 650; font-variant-numeric: tabular-nums; font-size: var(--type-13); display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-2); align-items: baseline; }
-.window-action { margin: 0; font-size: var(--type-15); }
-.window-reason { margin: 0; color: var(--text-muted); font-size: var(--type-13); }
+.window-summary-icon {
+  display: grid; place-items: center; flex: none;
+  width: 1.85rem; height: 1.85rem;
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
 /* The horizon's own totals above the list: the windows' sum, not another headline. */
 .window-summary { margin: 0; font-size: var(--type-13); }
-/* Per-window facts reuse .stat-row/.stat-label/.stat-value; only the density is local. */
+
+/* The horizon at a glance: a track, the windows on it, the day ticks, the now marker and the key. */
+.window-ribbon { display: grid; gap: var(--sp-1); margin: var(--sp-2) 0 var(--sp-3); }
+.window-ribbon-track {
+  position: relative;
+  height: 1.45rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--panel-2);
+  background-image: var(--grad-panel);
+  overflow: hidden;
+}
+.window-ribbon-seg {
+  position: absolute;
+  top: 0.2rem; bottom: 0.2rem;
+  min-width: 2px;
+  border-radius: 4px;
+  background: var(--tint);
+  opacity: 0.9;
+}
+/* A stale segment is hatched as well as faded: the row's own badge names the reason in words. */
+.window-ribbon-seg.is-stale {
+  opacity: 0.55;
+  background-image: repeating-linear-gradient(135deg, rgba(0, 0, 0, 0.38) 0 3px, transparent 3px 6px);
+}
+.window-ribbon-day { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--text-dim); opacity: 0.45; }
+.window-ribbon-now {
+  position: absolute;
+  top: -1px; bottom: -1px;
+  width: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 70%, transparent);
+}
+.window-ribbon-axis {
+  display: flex; justify-content: space-between; margin: 0;
+  font-size: var(--type-11); color: var(--text-dim); font-variant-numeric: tabular-nums;
+}
+.window-ribbon-legend { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-3); font-size: var(--type-12); color: var(--text-muted); }
+.window-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.window-legend-swatch {
+  display: grid; place-items: center;
+  width: 1.3rem; height: 1.3rem;
+  border-radius: 5px;
+  color: var(--tint);
+  background: color-mix(in srgb, var(--tint) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tint) 32%, transparent);
+}
+
+.window-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-2); }
+.window {
+  display: grid;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--tint);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  background-image: var(--grad-panel);
+  box-shadow: var(--shadow-1);
+}
+/* A stale row keeps the tint's position but breaks its edge, so the flag is visible as a shape too. */
+.window[data-stale="true"] { border-left-style: dashed; }
+.window.is-current { box-shadow: var(--shadow-1), inset 0 0 0 1px color-mix(in srgb, var(--tint) 45%, transparent); }
+
+.window-head { display: flex; gap: var(--sp-2); align-items: flex-start; }
+.window-icon {
+  display: grid; place-items: center; flex: none;
+  width: 2.3rem; height: 2.3rem;
+  border-radius: var(--radius-sm);
+  color: var(--tint);
+  background: color-mix(in srgb, var(--tint) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tint) 30%, transparent);
+}
+.window-headline { display: grid; gap: 2px; min-width: 0; }
+.window-action {
+  margin: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-1) var(--sp-2);
+  font-size: var(--type-15); font-weight: 600;
+}
+.window-action-text { color: var(--text); }
+/* The action names the direction, so the number beside it is unsigned: "Discharge · 700 W", never
+   "Discharge · -700 W discharge" (UI_REVIEW follow-up). */
+.window-power { color: var(--tint); font-size: var(--type-13); font-weight: 650; font-variant-numeric: tabular-nums; }
+.window-time {
+  margin: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-1) var(--sp-2);
+  font-size: var(--type-13); color: var(--text-muted); font-variant-numeric: tabular-nums;
+}
+.window-slot-count { color: var(--text-dim); font-size: var(--type-12); }
+.now-dot {
+  display: inline-block; width: 0.4rem; height: 0.4rem; margin-right: 0.3rem;
+  border-radius: 50%; background: currentColor;
+  animation: now-pulse 2.4s ease-in-out infinite;
+}
+@keyframes now-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+@media (prefers-reduced-motion: reduce) { .now-dot { animation: none; } }
+
+/* The charge graphic: the track is the whole battery, the fill is the level the window ends on, the
+   lighter tick is where it started and the bright one is the floor the plan defends. The sentence
+   below repeats all three in numbers. */
+.window-soc { display: grid; gap: 4px; }
+.window-soc-track {
+  position: relative; display: block; height: 0.5rem;
+  border: 1px solid var(--border); border-radius: var(--radius-pill);
+  background: var(--panel); overflow: hidden;
+}
+.window-soc-fill { position: absolute; top: 0; bottom: 0; left: 0; background: var(--tint); opacity: 0.8; }
+/* Rising and falling differ by more than the fill: the leading edge is shaded. */
+.window-soc-fill.is-rising { background-image: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.28)); }
+.window-soc-fill.is-falling { background-image: linear-gradient(90deg, rgba(0, 0, 0, 0.28), transparent); }
+.window-soc-from { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--text); opacity: 0.45; }
+.window-soc-floor { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--text); opacity: 0.85; }
+.window-soc-label { margin: 0; font-size: var(--type-11); color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+.window-reason { margin: 0; color: var(--text-muted); font-size: var(--type-13); }
+/* Per-window facts reuse .stat-row/.stat-label/.stat-value; only the density and the glyph are local. */
 .window-facts { gap: var(--sp-1) var(--sp-3); }
 .window-facts li { min-width: 9rem; }
 .window-facts .stat-label { font-size: var(--type-11); }
 .window-facts .stat-value { font-size: var(--type-13); }
+.fact-icon { display: inline-grid; place-items: center; margin-right: 5px; color: var(--tint); vertical-align: -2px; }
 .window-context { margin: 0; color: var(--text-muted); font-size: var(--type-12); font-variant-numeric: tabular-nums; }
 /* Dispatched/measured evidence reads as a result line, not as another muted hint. */
 .window-status { margin: 0; font-size: var(--type-13); }
 .window-price { margin: 0; color: var(--text-muted); font-size: var(--type-11); }
+.window-flag { margin: 0; }
 
 /* ---------- log: message first ---------- */
 

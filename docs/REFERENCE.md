@@ -186,17 +186,31 @@ When `plan.maintenance.active` is true, a `maintenance plan` badge precedes the 
 the sentence `Maintenance plan: a due/overdue full charge for <ids> — the optimiser targets <x> %
 before the deadline, in the cheapest slots, so the BMS can balance the cells.`
 
-**Next actions** — a vertical `.window-list` of the contiguous action windows, so a 360 px screen
-never splits the time/action/reason relationship. One summary line above the list adds the windows
-up (`6 windows · 1.60 kWh out · 0.40 kWh in · costs 0.31 EUR on the grid · measured so far …`), then
-each window states, in this order:
+**Next actions** — a `.window-list` of the contiguous action windows, one card each, so a 360 px screen
+never splits the time/action/reason relationship. The panel reads top to bottom as: the horizon's own
+totals, the ribbon that places the windows across the horizon, then the cards.
+
+The totals sit in `.window-summary-block` behind a `list` glyph and keep stating the sums in words
+(`6 windows · 1.60 kWh out · 0.40 kWh in · costs 0.31 EUR on the grid · measured so far …`) — never a
+plan figure dressed up as a measurement.
+
+`.window-ribbon` is the panel's graphic: one `.window-ribbon-seg` per window placed by time (inline
+`left`/`width` percentages off `planHorizonBounds(slots, minutes)`), a hatched segment for a stale
+window, `.window-ribbon-day` hairlines at local midnight, an accented `.window-ribbon-now` marker, and
+a `.window-ribbon-legend` naming every action that occurs. The track is a `role="img"` whose
+`aria-label` reads the whole horizon out loud, and each segment repeats the window's own words in its
+`title` — the graphic is never the only place that information exists.
+
+Each `.window` card is tinted by its action (`window--charge`, `window--discharge`, `window--pv`,
+`window--export`, `window--self`, `window--reserve`, `window--idle`) through a single `--tint`, and it
+states, in this order:
 
 | Line | Content |
 | --- | --- |
-| Time | `06:45 PM – 07:15 PM (2 slots)` — the range ends when the window's last slot ends; a `now` badge marks the window containing the current time |
-| Action | `Discharge · 800 W` — the action word names the direction, so the power is unsigned |
+| Head (`.window-head`) | `.window-icon` — the action's inline glyph on its tinted tile; `.window-action` — `Discharge 700 W`, the action word names the direction so the power is unsigned; a `now` badge with a pulsing dot marks the window containing the current time; `.window-time` — `06:45 PM – 07:15 PM` and the slot count |
+| Charge gauge (`.window-soc`) | The whole battery as a track: the fill is the level the window ends on, the lighter tick is where it started, the bright tick is the floor the plan defends. `.window-soc-label` repeats it in words (`SoC 55 % → 20 % · floor 10 %`), so the bar is never the only source |
 | Reason | `because: Peak discharge` (the frozen slug, rendered in words) |
-| Facts (`.window-facts`, `label`/`value` pairs) | `Buy → sell` (`20.0 ct/kWh → 30.0 ct/kWh (+10.0 ct/kWh)`), `Break-even` (`buy / round_trip + wear`, with the margin above it or `efficiency not reported`), `Battery` (planned kWh in/out for the window), `SoC` (first slot's SoC → last slot's SoC, plus the SoC floor a reserve hold defends), `Grid cost` (planned import/export kWh from `load − pv + power` and what that costs or earns at the slot's own tariff) |
+| Facts (`.window-facts`, `label`/`value` pairs, one `.fact-icon` each) | `Buy → sell` (`20.0 ct/kWh → 30.0 ct/kWh (+10.0 ct/kWh)`), `Break-even` (`buy / round_trip + wear`, with the margin above it or `efficiency not reported`), `Battery` (planned kWh in/out for the window), `SoC` (first slot's SoC → last slot's SoC, plus the SoC floor a reserve hold defends), `Grid cost` (planned import/export kWh from `load − pv + power` and what that costs or earns at the slot's own tariff) |
 | Context | `PV 0.50 kW · load 0.80 kW (0.50 kW–1.10 kW band)` — the slot's forecast and the load band the optimiser saw |
 | Status | what actually happened: `applied 400 W of 800 W requested (clamped: Power clamped to limits) · battery_1 −400 W · last attempt 12 min ago`, `not written: the mode is not auto`, `dry run: simulated …`, `measured −0.70 kW vs −0.80 kW planned, 1 sample over 15 of 60 min`, `not reached yet, starts in …`, or `not dispatchable: this slot has no fresh price, so the dispatcher refuses it (stale_input)` |
 | Price provenance | `price from zonneplan_entity · updated 4 min ago · rank 1 of 36 by buy price (most expensive)`, or `no fresh price for this slot: the optimiser treats it as flat, and it is never dispatched` |

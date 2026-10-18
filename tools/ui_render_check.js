@@ -607,6 +607,90 @@ function classTokens(text) {
     && /(applied|not written|measured|not dispatchable|no dispatch recorded)/.test(byClass(view(), "window-status").map((n) => n.textContent).join(" | ")),
     byClass(view(), "window-status").map((n) => n.textContent).join(" | ").slice(0, 160));
 
+  /* ---------- 1c2. next actions: the icon and graphic layer (SPEC 13.1) ---------- */
+  // Every visual cue in this panel has to survive being read aloud or seen without colour: a shape on
+  // every action and fact, a place on the horizon for every window, and the same words beside both.
+  console.log("\n1c2. next actions: action icons, charge graphic and the horizon ribbon");
+  const iconCount = (node) => node.querySelectorAll("svg").length;
+  const cards = byClass(view(), "window");
+  check("the panel opens with the horizon totals beside an icon",
+    byClass(view(), "window-summary-block").length === 1
+    && byClass(view(), "window-summary-icon").length === 1
+    && iconCount(byClass(view(), "window-summary-icon")[0]) === 1,
+    `${byClass(view(), "window-summary-icon").length} summary icons`);
+  check("every window is one card with an action tile and a charge graphic",
+    cards.length === mockWindows.length
+    && byClass(view(), "window-icon").length === mockWindows.length
+    && byClass(view(), "window-icon").every((node) => iconCount(node) === 1)
+    && byClass(view(), "window-soc-track").length === mockWindows.length,
+    `${cards.length} cards, ${byClass(view(), "window-icon").length} tiles, ${byClass(view(), "window-soc-track").length} tracks`);
+  check("every window card carries a fact glyph per fact",
+    byClass(view(), "window-facts").every((list) => list.querySelectorAll(".fact-icon").length === list.querySelectorAll("li").length)
+    && byClass(view(), "fact-icon").every((node) => iconCount(node) === 1),
+    `${byClass(view(), "fact-icon").length} fact glyphs`);
+  check("the charge graphic fills to the level and marks the floor",
+    byClass(view(), "window-soc-track").every((track) => {
+      const fill = track.querySelector(".window-soc-fill");
+      if (!fill) return false;
+      const width = parseFloat(fill.style.width);
+      return width > 0 && width <= 100.5;
+    })
+    && byClass(view(), "window-soc-floor").length === mockWindows.length
+    && byClass(view(), "window-soc-floor").every((tick) => {
+      const left = parseFloat(tick.style.left);
+      return left >= 0 && left <= 100;
+    }),
+    byClass(view(), "window-soc-fill").map((n) => n.style.width).join(" ").slice(0, 120));
+  check("the horizon ribbon has a segment per window, a now marker and day ticks",
+    byClass(view(), "window-ribbon-track").length === 1
+    && byClass(view(), "window-ribbon-seg").length === mockWindows.length
+    && byClass(view(), "window-ribbon-now").length === 1
+    && byClass(view(), "window-ribbon-day").length >= 1,
+    `${byClass(view(), "window-ribbon-seg").length} segments, ${byClass(view(), "window-ribbon-day").length} day ticks`);
+  check("every ribbon segment sits inside the track it is placed on",
+    byClass(view(), "window-ribbon-seg").every((seg) => {
+      const left = parseFloat(seg.style.left);
+      const width = parseFloat(seg.style.width);
+      return left >= 0 && width > 0 && left + width <= 100.5;
+    }),
+    byClass(view(), "window-ribbon-seg").map((n) => `${n.style.left}+${n.style.width}`).join(" ").slice(0, 140));
+  const legendText = byClass(view(), "window-ribbon-legend").map((n) => n.textContent).join(" | ");
+  const windowActions = new Set(mockWindows.map((win) => A.actionText(win.action)));
+  check("the ribbon legend names every action the window list uses",
+    byClass(view(), "window-ribbon-legend").length === 1
+    && [...windowActions].every((label) => legendText.includes(label))
+    && byClass(view(), "window-legend-swatch").length === windowActions.size,
+    `legend "${legendText.slice(0, 120)}" for ${[...windowActions].join(", ")}`);
+  check("the ribbon describes itself for a reader who cannot see it",
+    /The plan's next actions across its horizon:/.test(byClass(view(), "window-ribbon-track")[0].getAttribute("aria-label") || ""),
+    byClass(view(), "window-ribbon-track")[0].getAttribute("aria-label"));
+  check("the charge graphic repeats its numbers as text",
+    byClass(view(), "window-soc-label").every((node) => /SoC \d+ % → \d+ %/.test(node.textContent))
+    && byClass(view(), "window-soc-label").length === mockWindows.length,
+    byClass(view(), "window-soc-label").map((n) => n.textContent).join(" | ").slice(0, 120));
+  check("every window card is tinted by its own action, not by a fixed colour",
+    cards.filter((card, i) => card.className.includes(A.actionClass(mockWindows[i].action))).length === mockWindows.length,
+    cards.map((c) => c.className).join(" | ").slice(0, 160));
+  check("an unknown action still draws a glyph and a neutral tint",
+    A.actionIcon("invented_action") === "bolt" && A.actionClass("invented_action") === "window--idle"
+    && A.factIcon("invented fact") === "bolt");
+  check("the horizon geometry is derived from the plan, not assumed",
+    (() => {
+      const bounds = A.planHorizonBounds(livePlanFixture.slots, livePlanFixture.slot_minutes);
+      if (!bounds || !(bounds.spanMs > 0)) return false;
+      const first = A.windowRail({ startMs: bounds.startMs, endMs: bounds.startMs + bounds.spanMs / 2 }, bounds);
+      const late = A.windowRail({ startMs: bounds.endMs, endMs: bounds.endMs + 1000 }, bounds);
+      return first.left === 0 && Math.abs(first.width - 50) < 0.001 && late.left === 100 && A.planHorizonBounds([], 15) === null;
+    })());
+  check("the charge track keeps a single-slot window meaningful and names no floor it was not given",
+    A.socTrack({ socStart: 40, socEnd: 40 }, 10).fill === 40
+    && A.socTrack({ socStart: 40, socEnd: 40 }, 10).floor === 10
+    && A.socTrack({ socStart: 40, socEnd: 40 }, 10).moved === false
+    && A.socTrack({ socStart: 55, socEnd: 20 }, null).floor === null
+    && A.socTrack({ socStart: 55, socEnd: 20 }, 10).moved === true
+    && A.socTrack({ socStart: null, socEnd: 20 }, 10) === null
+    && A.socTrack({ socStart: 55, socEnd: 20 }, 10).rising === false);
+
   /* ---------- 1d. savings: measured battery flows only (0.13.0) ---------- */
   console.log("\n1d. savings measured battery flows");
   await goto("/savings");

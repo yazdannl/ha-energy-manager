@@ -97,7 +97,8 @@ no MQTT, no cloud account, and no YAML to install by hand.
   charge/discharge bars, plus a per-slot table with the reason for every slot and the plan summary.
   The price chart marks the break-even sale price for the round trip the plan assumed, so a sell price
   that looks like a profit but does not cover the conversion loss is visibly below the line; such a
-  slot stays idle and says `efficiency_loss`. **Next actions** lists the coming action windows with
+  slot stays idle and says `efficiency_loss`. **Next actions** draws the coming action windows — a
+  ribbon placing each one on the plan's horizon, an action glyph and a charge gauge per window — with
   the data behind each one: the buy and sell price, the break-even and the margin above it, the kWh
   in and out, the SoC path and the floor a reserve hold defends, the planned grid flow and what it
   costs or earns — and what actually happened, from the measured 5-minute rows and the dispatch log

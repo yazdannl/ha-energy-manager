@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.29.0
+
+- **Next actions now shows the plan instead of only describing it.** The panel was a stack of sentences
+  about each action window; it is now the horizon's totals, a ribbon that places every window across
+  the plan (day ticks, a hatched segment for a stale window, a now marker, a legend naming each
+  action), and one card per window with an action tile, a charge gauge and a glyph per fact. The
+  figures are unchanged and still stated in words beside every graphic: the glyph, the tint, the
+  ribbon and the gauge are additional ways in, never the only way in. The graphic comes from the plan
+  the view already has (`planHorizonBounds`, `windowRail`, `socTrack`), so it disappears rather than
+  guesses when the payload carries no SoC path or no second slot.
+- **The icon layer is inline SVG.** Eleven glyphs (charge, discharge, hold, PV charge, export, self
+  consumption, reserve, price, break-even, battery, grid) are drawn in `app.js` on one 24x24 grid,
+  stroked with `currentColor`, and tinted through a single `--tint` per action so a card, its tile,
+  its gauge and its ribbon segment cannot drift apart. No image, no icon font, nothing fetched; an
+  unknown action still gets a bolt and a neutral tint (SPEC 13.1).
+- `tools/ui_dom_shim.js` gained `createElementNS`, and `tools/ui_render_check.js` now renders the
+  panel and asserts the layer: one tile and one gauge per card, a glyph per fact, a segment per window
+  placed inside the track it is on, a legend that names every action present, an aria-label that reads
+  the horizon out loud, and the geometry helpers' own edge cases (no slots, a level window, a window
+  with no reported floor).
+
 ## 0.28.1
 
 - **One cursor-sync key per chart family instead of one per draw.** uPlot's sync registry keeps a hub

@@ -70,6 +70,168 @@
     return el("span", { class: "badge" + (kind ? " badge-" + kind : ""), text: text });
   }
 
+  /* ------------------------------------------------------------------ inline icons
+   * SPEC 13.1 keeps the UI free of images and of anything fetched at runtime, so every glyph here is
+   * drawn as inline SVG: one 24x24 grid, stroked with currentColor at 1.7, no glyph that can only be
+   * told apart by colour. An icon names a shape; the action or fact it belongs to is always spelled
+   * out in the text beside it, so a monochrome or read-aloud rendering loses nothing (SPEC 13.1).
+   */
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
+  var ICONS = {
+    // Battery, arrow in: energy going into the battery.
+    charge: ["M3 9h12v6H3Z", "M17.5 11v2", "M9 10.4v3.2", "M7.4 12l1.6 1.6 1.6-1.6"],
+    // Battery, arrow out: energy coming out of it.
+    discharge: ["M3 9h12v6H3Z", "M17.5 11v2", "M9 13.6v-3.2", "M7.4 12l1.6-1.6 1.6 1.6"],
+    // Battery, two bars: nothing moves.
+    hold: ["M3 9h12v6H3Z", "M17.5 11v2", "M7.7 10.6v2.8", "M10.3 10.6v2.8"],
+    // Sun plus a down arrow: PV surplus charging.
+    pv_charge: [
+      "M12 13a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z",
+      "M12 2.4v1.6", "M5.4 9.5H7", "M16.9 9.5h1.7",
+      "M7.4 4.9 8.5 6", "M16.6 4.9 15.5 6",
+      "M12 16.4v4.7", "M10.2 18.6 12 20.4l1.8-1.8"
+    ],
+    // Arrow up out of a tray: exporting to the grid.
+    export: ["M12 16.6V5.2", "M8.2 9 12 5.2 15.8 9", "M4.6 14.6V18a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-3.4"],
+    // A house: the load served from the battery instead of the grid.
+    self_consumption: ["M4 11 12 4.2 20 11", "M6.5 10v9.6h11V10", "M10 19.6V15h4v4.6"],
+    // A shield over a line: the floor this window defends.
+    reserve: ["M12 3.6 5.5 6.1v5.6c0 3.9 2.7 7.2 6.5 8.7 3.8-1.5 6.5-4.8 6.5-8.7V6.1Z", "M8.6 12.4h6.8"],
+    // Coin: the price a window buys and sells at.
+    price: ["M12 20.5a8.5 8.5 0 1 0 0-17 8.5 8.5 0 0 0 0 17Z", "M14.8 9.7a3.3 3.3 0 1 0 0 4.6", "M7.7 11.2h5.1", "M7.7 13h5.1"],
+    // A flagged threshold above a dashed baseline: the break-even a sale has to clear.
+    breakeven: [
+      { d: "M3.5 17.6h17", dash: "2 2" },
+      "M13.6 17.6V9.2", "M13.6 9.2h5.6l-1.8 2.3 1.8 2.3h-5.6"
+    ],
+    // Battery with the level it holds.
+    battery: ["M3 9h12v6H3Z", "M17.5 11v2", { d: "M4.6 10.2h3.2v3.6H4.6Z", fill: true }],
+    // Plug: the grid the window imports from or exports to.
+    grid: ["M9 3v3.8", "M15 3v3.8", "M6.4 6.8h11.2v4.6a5.6 5.6 0 0 1-11.2 0Z", "M12 17v3.6"],
+    // Three lines: the horizon the windows were planned across.
+    list: ["M4 7h16", "M4 12h16", "M4 17h16"],
+    // Fallback for an action this UI does not know yet.
+    bolt: [{ d: "M13.2 2.5 5.6 13.1h5.3l-1 8.4L18.4 11h-5.3Z", fill: true }]
+  };
+
+  /** Build one inline icon. Unknown names fall back to a bolt, so a new engine action still shows a
+   *  glyph instead of a gap. `cls` adds a size/colour class; the glyph itself never carries meaning. */
+  function icon(name, cls) {
+    var parts = ICONS[name] || ICONS.bolt;
+    var svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("class", "icon" + (cls ? " " + cls : ""));
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "1.7");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    parts.forEach(function (part) {
+      var shape = typeof part === "string" ? { d: part } : part;
+      var path = document.createElementNS(SVG_NS, "path");
+      path.setAttribute("d", shape.d);
+      if (shape.fill) path.setAttribute("fill", "currentColor");
+      if (shape.dash) path.setAttribute("stroke-dasharray", shape.dash);
+      svg.appendChild(path);
+    });
+    return svg;
+  }
+
+  // One shape per action the engine can put in a slot. The fallback keeps an unknown action visible.
+  var ACTION_ICON = {
+    charge: "charge",
+    discharge: "discharge",
+    hold: "hold",
+    pv_charge: "pv_charge",
+    export: "export",
+    self_consumption: "self_consumption",
+    reserve: "reserve"
+  };
+
+  function actionIcon(action) { return ACTION_ICON[action] || "bolt"; }
+
+  // The tint a row and its ribbon segment are drawn in; unknown actions share the neutral one.
+  var ACTION_TINT = { charge: "charge", discharge: "discharge", pv_charge: "pv", export: "export", self_consumption: "self", reserve: "reserve" };
+
+  function actionClass(action) { return "window--" + (ACTION_TINT[action] || "idle"); }
+
+  // Facts carry a glyph as well as a label, never a colour-only cue: the label spells the meaning out.
+  var FACT_ICON = {
+    "Buy → sell": "price",
+    "Break-even": "breakeven",
+    "Battery": "battery",
+    "SoC": "battery",
+    "Grid cost": "grid"
+  };
+
+  function factIcon(label) { return FACT_ICON[label] || "bolt"; }
+
+  function clampPct(value) { return Math.max(0, Math.min(100, isNum(value) ? value : 0)); }
+
+  /** The horizon the plan spans, in ms. A plan with fewer than two slots has no span, so callers
+   *  leave the graphic out rather than drawing an arbitrary bar. */
+  function planHorizonBounds(slots, minutes) {
+    var times = (slots || []).map(function (slot) { return parseDate(slot.t); })
+      .filter(function (d) { return d instanceof Date && isFinite(d.getTime()); })
+      .map(function (d) { return d.getTime(); });
+    if (times.length < 2) return null;
+    var step = (isNum(minutes) && minutes > 0 ? minutes : 15) * 60000;
+    var startMs = Math.min.apply(null, times);
+    var endMs = Math.max.apply(null, times) + step;
+    if (!(endMs > startMs)) return null;
+    return { startMs: startMs, endMs: endMs, spanMs: endMs - startMs };
+  }
+
+  /** Where a timestamp sits on the horizon, as a percentage. Null when there is nothing to place it on. */
+  function horizonPct(ms, bounds) {
+    if (!bounds || !isNum(ms)) return null;
+    return clampPct((100 * (ms - bounds.startMs)) / bounds.spanMs);
+  }
+
+  /** One window's span on the horizon, in percent. A single-slot window keeps at least 1% so it stays
+   *  visible instead of collapsing to a hairline. */
+  function windowRail(win, bounds) {
+    if (!bounds || !win || !isNum(win.startMs) || !isNum(win.endMs)) return null;
+    var left = horizonPct(win.startMs, bounds);
+    var right = horizonPct(win.endMs, bounds);
+    if (left === null || right === null) return null;
+    return { left: left, width: Math.max(1, right - left) };
+  }
+
+  /** The charge a window operates in, as percentages of the battery: the level it ends on, where it
+   *  started and the floor it defends. A gauge rather than a delta bar, so a single-slot window still
+   *  shows where in the battery it acts. Null when the plan reported no SoC path at all. */
+  function socTrack(win, floorPct) {
+    if (!win || !isNum(win.socStart) || !isNum(win.socEnd)) return null;
+    var from = clampPct(win.socStart);
+    var end = clampPct(win.socEnd);
+    return {
+      fill: Math.max(0.8, end),
+      from: from,
+      floor: isNum(floorPct) ? clampPct(floorPct) : null,
+      rising: end >= from,
+      moved: Math.abs(end - from) >= 0.5
+    };
+  }
+
+  /** Local midnights inside the horizon: the ribbon's day ticks, so a 36 h plan reads as two days. */
+  function horizonDayTicks(bounds) {
+    var ticks = [];
+    if (!bounds) return ticks;
+    var cursor = new Date(bounds.startMs);
+    cursor.setHours(0, 0, 0, 0);
+    cursor.setDate(cursor.getDate() + 1);
+    while (cursor.getTime() < bounds.endMs && ticks.length < 6) {
+      ticks.push({ pct: horizonPct(cursor.getTime(), bounds) });
+      cursor.setDate(cursor.getDate() + 1);
+      cursor.setHours(0, 0, 0, 0);
+    }
+    return ticks;
+  }
+
   // Numeric columns are declared metadata, never a blanket "everything after the first
   // column": prose columns (messages, reasons, names) must stay left-aligned (UI_REVIEW §3.11).
   // opts = {rowAttrs, numeric}; numeric = null (default) = every column after the first.
@@ -2165,10 +2327,10 @@
     return parts.join(" · ");
   }
 
-  // Phone-first action windows: one vertical row per window with time, action, signed power,
-  // reason, the prices behind the decision, the energy and SoC it moves, and what was actually
-  // dispatched and measured -- so a 360 px screen never splits the time/action/reason
-  // relationship (UI_REVIEW §3.4, SPEC 10 plan execution).
+  // Phone-first action windows: one card per window with an action tile, the times and the power, a
+  // charge graphic for the SoC path it moves through, then the reason and the figures behind the
+  // decision -- so a 360 px screen never splits the time/action/reason relationship (UI_REVIEW §3.4,
+  // SPEC 10 plan execution).
   function renderPlanWindows(body, plan, execution, ctx) {
     var windows = planActionWindows(plan, execution);
     if (!windows.length) {
@@ -2179,43 +2341,164 @@
     ctx.minutes = planSlotMinutes(plan);
     ctx.buyValues = ctx.buyValues || (plan.slots || []).map(function (slot) { return slot.buy; });
     ctx.nowMs = Date.now();
-    body.appendChild(el("p", { class: "window-summary", text: windowSummary(windows, ctx) }));
+    ctx.horizon = ctx.horizon || planHorizonBounds(plan.slots, ctx.minutes);
+    body.appendChild(windowsSummary(windows, ctx));
+    var ribbon = windowsRibbon(windows, ctx);
+    if (ribbon) body.appendChild(ribbon);
     var list = el("ul", { class: "window-list" });
-    windows.forEach(function (win) {
-      // The action names the direction, so the number beside it is unsigned: "Discharge · 700 W",
-      // never "Discharge · -700 W discharge" (UI_REVIEW follow-up).
-      var power = isNum(win.power_w) ? fmtPower(Math.abs(win.power_w)) : "power unknown";
-      var when = win.startMs != null && win.endMs != null && win.endMs > win.startMs
-        ? fmtTime(win.start) + " – " + fmtTime(new Date(win.endMs).toISOString())
-        : fmtTime(win.start);
-      var current = isNum(ctx.nowMs) && isNum(win.startMs) && isNum(win.endMs) &&
-        ctx.nowMs >= win.startMs && ctx.nowMs < win.endMs;
-      var band = isNum(win.bandLow) && isNum(win.bandHigh)
-        ? " (" + fmtKw(win.bandLow) + "–" + fmtKw(win.bandHigh) + " band)"
-        : "";
-      list.appendChild(el("li", { dataset: { stale: win.stale ? "true" : "false" } }, [
-        el("p", { class: "window-time" }, [
-          when, " (", win.slots, win.slots === 1 ? " slot)" : " slots)",
-          current ? el("span", { class: "badge badge-info", text: "now" }) : null
-        ]),
-        el("p", { class: "window-action" }, [actionText(win.action), " · ", el("span", { class: "num", text: power })]),
-        el("p", { class: "window-reason" }, ["because: ", reasonText(win.reason)]),
-        el("ul", { class: "stat-row window-facts" }, windowFacts(win, ctx).map(function (fact) {
-          return el("li", null, [
-            el("span", { class: "stat-label", text: fact.label }),
-            el("span", { class: "stat-value", text: fact.value })
-          ]);
-        })),
-        el("p", { class: "window-context" }, [
-          "PV " + fmtKw(win.pv_kw) + " · load " + fmtKw(win.load_kw) + band
-        ]),
-        el("p", { class: "window-status" }, [windowStatusText(win, ctx)]),
-        el("p", { class: "window-price" }, [windowPriceText(win, ctx)]),
-        win.stale ? badge("stale price", "stale") : null
-      ]));
-    });
+    windows.forEach(function (win) { list.appendChild(windowCard(win, ctx)); });
     body.appendChild(list);
     body.appendChild(el("p", { class: "legend-note", text: "Windows merge only while the action, reason, power and staleness stay the same, so every change is visible; each slot's full figures are in All slots. A stale slot has no fresh price, so the dispatcher refuses it rather than acting on a flat price." }));
+  }
+
+  // The panel's headline: the icon states that this is the horizon's own answer, and the sentence
+  // keeps stating the totals in words (never a plan figure dressed up as a measurement).
+  function windowsSummary(windows, ctx) {
+    return el("div", { class: "window-summary-block" }, [
+      el("span", { class: "window-summary-icon" }, [icon("list")]),
+      el("p", { class: "window-summary", text: windowSummary(windows, ctx) })
+    ]);
+  }
+
+  // The horizon at a glance: one segment per window placed by time, with the day ticks and the now
+  // marker, then a legend naming every action that occurs. It is the panel's graphic and the key to
+  // the row tints below it; the rows themselves still state every figure in text.
+  function windowsRibbon(windows, ctx) {
+    var bounds = ctx.horizon;
+    if (!bounds) return null;
+    var track = el("div", { class: "window-ribbon-track", role: "img", "aria-label": windowRibbonLabel(windows, ctx) });
+    windows.forEach(function (win) {
+      var rail = windowRail(win, bounds);
+      if (!rail) return;
+      var seg = el("span", {
+        class: "window-ribbon-seg " + actionClass(win.action) + (win.stale ? " is-stale" : ""),
+        title: windowRibbonSegment(win)
+      });
+      seg.style.left = rail.left.toFixed(2) + "%";
+      seg.style.width = rail.width.toFixed(2) + "%";
+      track.appendChild(seg);
+    });
+    horizonDayTicks(bounds).forEach(function (tick) {
+      var mark = el("span", { class: "window-ribbon-day" });
+      mark.style.left = tick.pct.toFixed(2) + "%";
+      track.appendChild(mark);
+    });
+    var nowPct = horizonPct(ctx.nowMs, bounds);
+    if (nowPct !== null) {
+      var nowMark = el("span", { class: "window-ribbon-now" });
+      nowMark.style.left = nowPct.toFixed(2) + "%";
+      track.appendChild(nowMark);
+    }
+    var seen = {};
+    var legend = el("div", { class: "window-ribbon-legend" });
+    windows.forEach(function (win) {
+      var key = win.action || "unknown";
+      if (seen[key]) return;
+      seen[key] = true;
+      legend.appendChild(el("span", { class: "window-legend-item " + actionClass(key) }, [
+        el("span", { class: "window-legend-swatch" }, [icon(actionIcon(key), "icon-xs")]),
+        el("span", { text: actionText(key) })
+      ]));
+    });
+    return el("div", { class: "window-ribbon" }, [
+      track,
+      el("p", { class: "window-ribbon-axis" }, [
+        el("span", { text: fmtTime(new Date(bounds.startMs).toISOString()) }),
+        el("span", { text: fmtTime(new Date(bounds.endMs).toISOString()) })
+      ]),
+      legend
+    ]);
+  }
+
+  // What the ribbon segment says when a pointer rests on it, and what a screen reader hears instead
+  // of the graphic: the same words the rows carry.
+  function windowRibbonSegment(win) {
+    var power = isNum(win.power_w) ? fmtPower(Math.abs(win.power_w)) : "power unknown";
+    var when = isNum(win.startMs) && isNum(win.endMs)
+      ? fmtTime(win.start) + " – " + fmtTime(new Date(win.endMs).toISOString())
+      : fmtTime(win.start);
+    return when + ": " + actionText(win.action) + " " + power + (win.stale ? " (stale price)" : "");
+  }
+
+  function windowRibbonLabel(windows, ctx) {
+    var parts = windows.map(function (win) {
+      var power = isNum(win.power_w) ? " " + fmtPower(Math.abs(win.power_w)) : "";
+      return fmtTime(win.start) + " " + actionText(win.action).toLowerCase() + power;
+    });
+    return "The plan's next actions across its horizon: " + parts.join("; ") + ".";
+  }
+
+  // One window as a card: which action, when, how hard, what it does to the charge, why, and what it
+  // is worth. The action tile and the charge track are the graphics; every figure they show is also
+  // written out beside them.
+  function windowCard(win, ctx) {
+    var current = isNum(ctx.nowMs) && isNum(win.startMs) && isNum(win.endMs) &&
+      ctx.nowMs >= win.startMs && ctx.nowMs < win.endMs;
+    var power = isNum(win.power_w) ? fmtPower(Math.abs(win.power_w)) : "power unknown";
+    var when = isNum(win.startMs) && isNum(win.endMs) && win.endMs > win.startMs
+      ? fmtTime(win.start) + " – " + fmtTime(new Date(win.endMs).toISOString())
+      : fmtTime(win.start);
+    var track = socTrack(win, ctx.floorPct);
+    return el("li", { class: "window " + actionClass(win.action) + (current ? " is-current" : ""), dataset: { stale: win.stale ? "true" : "false" } }, [
+      el("div", { class: "window-head" }, [
+        el("span", { class: "window-icon" }, [icon(actionIcon(win.action))]),
+        el("div", { class: "window-headline" }, [
+          el("p", { class: "window-action" }, [
+            el("span", { class: "window-action-text", text: actionText(win.action) }),
+            el("span", { class: "window-power num", text: power }),
+            current ? el("span", { class: "badge badge-info" }, [el("span", { class: "now-dot" }), "now"]) : null
+          ]),
+          el("p", { class: "window-time" }, [
+            when,
+            el("span", { class: "window-slot-count", text: win.slots + (win.slots === 1 ? " slot" : " slots") })
+          ])
+        ])
+      ]),
+      track ? windowSocGraphic(track, win, ctx.floorPct) : null,
+      el("p", { class: "window-reason" }, ["because: ", reasonText(win.reason)]),
+      el("ul", { class: "stat-row window-facts" }, windowFacts(win, ctx).map(function (fact) {
+        return el("li", null, [
+          el("span", { class: "fact-icon" }, [icon(factIcon(fact.label), "icon-xs")]),
+          el("span", { class: "stat-label", text: fact.label }),
+          el("span", { class: "stat-value", text: fact.value })
+        ]);
+      })),
+      el("p", { class: "window-context" }, [
+        "PV " + fmtKw(win.pv_kw) + " · load " + fmtKw(win.load_kw) + (isNum(win.bandLow) && isNum(win.bandHigh)
+          ? " (" + fmtKw(win.bandLow) + "–" + fmtKw(win.bandHigh) + " band)"
+          : "")
+      ]),
+      el("p", { class: "window-status" }, [windowStatusText(win, ctx)]),
+      el("p", { class: "window-price" }, [windowPriceText(win, ctx)]),
+      win.stale ? el("p", { class: "window-flag" }, [badge("stale price", "stale")]) : null
+    ]);
+  }
+
+  // The charge graphic: the track is the whole battery, the fill is the level this window ends on, the
+  // lighter tick is where it started and the bright one is the floor the plan defends. The sentence
+  // below repeats all three in numbers, because a bar alone is not readable out loud.
+  function windowSocGraphic(track, win, floorPct) {
+    var bar = el("span", { class: "window-soc-track" });
+    var fill = el("span", { class: "window-soc-fill" + (track.rising ? " is-rising" : " is-falling") });
+    fill.style.width = track.fill.toFixed(1) + "%";
+    bar.appendChild(fill);
+    if (track.moved) {
+      var from = el("span", { class: "window-soc-from" });
+      from.style.left = track.from.toFixed(1) + "%";
+      bar.appendChild(from);
+    }
+    if (track.floor !== null) {
+      var floor = el("span", { class: "window-soc-floor" });
+      floor.style.left = track.floor.toFixed(1) + "%";
+      bar.appendChild(floor);
+    }
+    return el("div", { class: "window-soc" }, [
+      bar,
+      el("p", { class: "window-soc-label" }, [
+        "SoC " + fmtPct(win.socStart, 0) + " → " + fmtPct(win.socEnd, 0),
+        track.floor !== null ? " · floor " + fmtPct(isNum(floorPct) ? floorPct : null, 0) : ""
+      ])
+    ]);
   }
 
   // Everything the window rows state about a time slot, gathered once: the efficiency and wear the
@@ -6129,6 +6412,14 @@
     windowPriceText: windowPriceText,
     windowSummary: windowSummary,
     planWindowContext: planWindowContext,
+    actionIcon: actionIcon,
+    factIcon: factIcon,
+    actionClass: actionClass,
+    planHorizonBounds: planHorizonBounds,
+    windowRail: windowRail,
+    horizonPct: horizonPct,
+    horizonDayTicks: horizonDayTicks,
+    socTrack: socTrack,
     costBasisView: costBasisView,
     costBasisBreakdown: costBasisBreakdown,
     batteryPriceRowText: batteryPriceRowText,

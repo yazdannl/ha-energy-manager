@@ -70,7 +70,8 @@ vocabulary `setup-cards`, `setup-card`, `setup-list`, `picker`, `picker-current`
 `picker-results`, `picker-row`, `picker-text`, `picker-name`, `picker-meta`, `all-settings`, plus the
 layout/answer vocabulary `route-title`, `route-sub`, `answer-authority`, `answer-measured`,
 `answer-planned`, `answer-controls`, `answer-notes`, `answer-results`, `answer-dynamic`, `card-flag`,
-`supporting`, `trust-line`, `window-list`, `log-list`, `log-message`, `settings-toolbar`,
+`supporting`, `trust-line`, `window-list`, `window-ribbon*`, `window-legend*`, `window--<tint>`,
+`window-icon`, `window-power`, `window-soc*`, `fact-icon`, `icon`, `log-list`, `log-message`, `settings-toolbar`,
 `settings-columns`, `settings-feedback`, `banner-safety`, `banner-actions`, `dialog-body`,
 `dialog-actions`, `chart-card-body`, `chart-card-steps`, `chart-card-snippet`. The type scale is `--type-11` … `--type-28`; every interactive control is
 ≥44 px tall. The theme

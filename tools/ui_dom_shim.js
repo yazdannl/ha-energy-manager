@@ -397,6 +397,14 @@ function makeDom() {
       el.ownerDocument = document;
       return el;
     },
+    // Inline SVG (the icon layer) needs the namespaced factory; the shim keeps the namespace on the
+    // node so a test can tell a drawn glyph from an HTML element with the same tag name.
+    createElementNS: (ns, tag) => {
+      const el = new Element(tag);
+      el.namespaceURI = ns;
+      el.ownerDocument = document;
+      return el;
+    },
     createTextNode: (text) => new Text(text),
     getElementById: (id) => {
       // Faithful to the DOM: ids created at runtime are found too, not only the shell nodes.
