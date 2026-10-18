@@ -15,6 +15,8 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "energy_manager"))
 
 from app.api import ApiServer, default_settings  # noqa: E402
@@ -401,6 +403,15 @@ def test_health_and_status_shapes():
     app = server()
     status, _headers, _content, body = call(app, "GET", "/api/v1/health")
     assert status == 200 and body["status"] == "ok" and body["version"] == "0.1.0"
+    # Additive (0.27.0): the health payload names the optimizer's numeric backend, because the
+    # accelerator is optional and fails open, so nothing else outside the container can tell
+    # which code path is live.  The digest is reported only when the accelerator really is live.
+    core = body["optimizer_core"]
+    assert core["backend"] in ("c", "python")
+    assert (core["build_sha"] is not None) == (core["backend"] == "c")
+    assert isinstance(core["reason"], str) or core["reason"] is None
+    if core["backend"] == "python":
+        assert core["reason"], "a backend that is not the accelerator must say why"
 
     status, _headers, _content, body = call(app, "GET", "/api/v1/status")
     assert status == 200
@@ -1249,3 +1260,46 @@ def test_config_payload_without_a_grid_accessor_still_answers():
     status, _headers, _content, body = call(app, "GET", "/api/v1/config")
     assert status == 200
     assert body["grid"] == {}
+
+
+def test_health_reports_the_backend_the_optimizer_module_reports():
+    """The health field must follow the optimizer's state, not be a constant.
+
+    Checking only the response shape would pass just as happily against a hard-coded
+    ``{"backend": "python", "build_sha": None, "reason": ...}``, which would silently remove the one
+    guarantee this field exists for -- being able to ask a deployed container whether the compiled
+    accelerator is actually live.
+    """
+    from app.optimize import _fast
+
+    app = server()
+    try:
+        # The state TRANSITIONS are the assertion that matters, because they cannot be satisfied by
+        # a constant, and they do not depend on this test and the API importing the same module
+        # object (the package is importable as both ``app`` and ``energy_manager.app``, so a test
+        # that imports the other name sees a second ``_fast`` and compares the wrong instance).
+        _fast.reset()
+        live = call(app, "GET", "/api/v1/health")[3]["optimizer_core"]
+        assert live["backend"] in ("c", "python")
+        assert (live["build_sha"] is not None) == (live["backend"] == "c")
+        assert live["reason"] is None or live["backend"] == "python"
+
+        _fast.disable("a verification mismatch")
+        if _fast._core is None:
+            # Without the extension the accelerator is unavailable for a more fundamental reason --
+            # it is not built -- which ``status()`` reports ahead of any disable, so the disable and
+            # reset transitions are not observable in this configuration (the CI and plain-checkout
+            # path).  The shape of the field is still asserted above, and the transitions are
+            # exercised whenever the extension is built.
+            pytest.skip("the extension is not built in this checkout")
+        off = call(app, "GET", "/api/v1/health")[3]["optimizer_core"]
+        assert off["backend"] == "python" and off["build_sha"] is None
+        assert off["reason"] == "a verification mismatch"
+        assert off == _fast.status()
+
+        _fast.reset()
+        back = call(app, "GET", "/api/v1/health")[3]["optimizer_core"]
+        assert back == live, "a reset must put the endpoint back where it started"
+        assert back == _fast.status()
+    finally:
+        _fast.reset()

@@ -2238,3 +2238,34 @@ def test_terminal_row_benchmark(capsys):
                 f"{len(raw_timings)}/{len(validated_timings)})"
             )
         assert raw_ms < 20.0, f"the C core must solve {name} in < 20 ms (got {raw_ms:.2f} ms)"
+
+
+def test_the_core_reports_which_backend_is_live():
+    """Additive (0.27.0): ``_fast.status()`` is what ``/health`` publishes.
+
+    The accelerator is optional and fails open, so "python" is a legitimate answer -- but it has to
+    be a *reported* one, including why, because a deployed image cannot otherwise be asked whether
+    the compiled core is live.  Each state is exercised with the real toggles rather than stubs, so
+    a change to ``disable``/``reset`` that stopped recording the reason would fail here.
+    """
+    _fast.reset()
+    live = _fast.status()
+    assert live["backend"] in ("c", "python")
+    assert (live["build_sha"] is not None) == (live["backend"] == "c")
+    if live["backend"] == "python":
+        # No extension in this checkout: the reason must say so rather than being empty.
+        assert live["reason"]
+    else:
+        assert live["reason"] is None
+
+    if _fast._core is None:
+        pytest.skip("the extension is not built in this checkout")
+
+    _fast.disable("a verification mismatch")
+    off = _fast.status()
+    assert off == {"backend": "python", "build_sha": None, "reason": "a verification mismatch"}
+    assert _fast.available() is False
+
+    _fast.reset()
+    back = _fast.status()
+    assert back["backend"] == "c" and back["reason"] is None and back["build_sha"]

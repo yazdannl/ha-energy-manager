@@ -1257,7 +1257,8 @@ application/json`, all timestamps ISO-8601 with offset. Errors: `{"error": {"cod
 degraded but not broken.
 
 ```
-GET  /api/v1/health            -> {status:"ok", version, uptime_s, commit}
+GET  /api/v1/health            -> {status:"ok", version, uptime_s, commit,
+                                   optimizer_core:{backend, build_sha, reason}}
 GET  /api/v1/status            -> SystemState (§6) serialised
 GET  /api/v1/plan?hours=36     -> {generated_at, horizon_start, horizon_end, feasible,
                                    summary:{…, eta_charge, eta_discharge, round_trip_efficiency,
@@ -1751,6 +1752,49 @@ than by weakening `tools/audit.sh`.
 ---
 
 ## 16. Amendment log (why the spec changed)
+
+**0.27.0 — the optimizer reaches the deployed image: the C core becomes the plan solver, optimizer v2
+stages 2c/2d/3 ship, and `/health` names the live backend.**
+
+*The accelerator is real and this release is where it can first be observed.* The DP over SoC is
+solved by the same standard-library Python everywhere, but a CPython extension (`optimize/_core.c`,
+built at image build from the same source, `-ffp-contract=off` so its arithmetic is bit-identical to
+the reference) solves it in ~17 ms instead of ~2 s, and since 0.26.0 it also takes optimizer v2
+stage 3's **continuation row** as an optional seventh argument: the row is the terminal condition
+(`value[n]` seeded verbatim, exactly as `dp._backward_sweep`), the path objective's terminal term
+becomes `cycle_cost + interp(row, grid, e_now)` with neither salvage nor a second target penalty
+(`dp._row_with_penalty` already baked the penalty into the supplied row), and `e_target` still drives
+the last slot's exact-power action and `terminal_error_kwh`. Validation grew with it: the row's length
+and finiteness, entry-for-entry **strict** equality of `value[n]` against the row (a verbatim copy, so
+tolerance equality would accept an altered boundary), a recomputed objective without salvage or
+penalty, and the **whole** last-slot Bellman row rather than a sample. A row the core cannot use is
+**declined** before the call — the solve falls back to the reference with the accelerator still
+enabled — and only a row the core received and mishandled disables it.
+
+*The accelerator's contract is a bound, not a proof, and §10/§14 now say so.* Per solve the loader
+checks structure, feasibility, one-step decision consistency against the returned rows, the terminal
+boundary and sampled backward consistency, with a periodic full Python-vs-C differential (first solve
+after load, then every 20th by default, `set_check_interval`) as the backstop. That is **self-
+consistency, not interior optimality**: a wrong value at an unsampled interior cell is not caught on
+the solve that used it, and the differential catches the divergence after the fact, never
+retroactively. The earlier claim that a wrong core result "can never reach a plan" was withdrawn
+from the header, the loader docstring and `docs/OPTIMIZER_C_CORE.md`.
+
+*`/health` reports the optimizer backend currently enabled.* The extension is optional and fail-open
+at build and import time, so a deployed image could not previously be asked whether the compiled
+core was live at all. `optimizer_core.backend` is `"c"` only while the extension is loaded, not
+stale and not disabled; `"python"` is the safe state and also what a plain checkout reports, in which
+case `reason` says why (not built, a stale build refused at load, or a verification failure), and
+`build_sha` names the source digest the loaded extension was compiled from. This is the switch
+state, not proof of which backend executed any particular solve.
+
+*Also shipping, documented in the entries below and in `docs/OPTIMIZER_V2.md` /
+`docs/REPLAY_HARNESS.md`:* stage 2c's replay runner and arms E1–E4 (paired counterfactuals, gate-
+withheld accounting, horizon-aware block bootstrap, no publishable interval below five contiguous
+plan horizons), stage 2d's append-only as-of history (schema v5, described below) and stage 3's
+terminal-value vector (default `salvage`, per-plan eligibility, refusals reported rather than
+guessed). Stage 3 is **dormant on the current contract and says so**: with sell = buy and the
+cost-basis floor enabled the floor always binds, so the vector refuses and the plan uses salvage.
 
 **As-of history for the replay's decision inputs (schema v5).** A replay window is only faithful if
 the settings and decision-feeding profiles in force at its start are still readable, and the live

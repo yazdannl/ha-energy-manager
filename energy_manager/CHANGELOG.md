@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.27.0
+
+- **The optimizer's C core now solves the plan in the deployed add-on, and `/health` says which
+backend is live.** The DP over SoC is solved in ~17 ms by a CPython extension built from the same
+source as the Python reference (`-ffp-contract=off`, so its arithmetic is bit-identical), and it now
+also takes optimizer v2 stage 3's continuation row as an optional seventh argument — the row *is* the
+terminal condition, the objective's terminal term is that row interpolated at the reached energy with
+no salvage and no second target penalty, and `e_target` still drives the last slot's exact-power
+action. Validation grew with it: the row's length and finiteness, entry-for-entry **strict** equality
+of the terminal value row, a recomputed objective, and the whole last-slot Bellman row instead of a
+sample; a row the core cannot use is declined before the call and the solve falls back to Python with
+the accelerator still enabled, while only a row the core received and mishandled disables it. The
+accelerator's runtime contract is now stated as what it is, in the core header, the loader, the core
+note and the tests: structure, feasibility, one-step decision consistency, the terminal boundary and
+sampled backward consistency, with the periodic full differential as a backstop — **self-consistency,
+not interior optimality**, and the differential catches divergence after the fact, never
+retroactively. The old claim that a wrong core result "can never reach a plan" is withdrawn. Because
+the extension is optional and fails open at build and import time, a deployed image could not be asked
+whether it was live at all: `/api/v1/health` now carries `optimizer_core` with `backend` (`c` or
+`python`), the `build_sha` the loaded extension was compiled from, and a `reason` when the reference
+is what solves (not built, a stale build refused at load, or a verification failure).
+- **The replay harness ships: arms E1–E4, paired counterfactuals, and a gate that withholds.** A run
+replays one recorded window through a real engine on a virtual clock (never starting the engine's
+threads), freezes its tolerances before executing, and reports paired per-window deltas with
+autocorrelation-aware intervals — but only once three gates pass: plant fidelity, decision fidelity
+and accounting fidelity. Windows that exceed a declared plant ceiling, refuse a price, or lack an
+as-of vintage have their delta **withheld** rather than published, a failing gate exits non-zero, and
+`--help` says exit 0 means no gate failed and not that money was published. An interval needs a
+contiguous sample spanning five plan horizons (~6.2 days) before it is evidence; below that the run
+labels itself `illustrative_interval` and says the sample is shorter than a plan horizon.
+- **A live window can now be captured: append-only as-of history (schema v5).** A replay is only
+faithful if the settings and decision-feeding profiles in force at its start are still readable, and
+the running add-on re-stamps exactly those rows on every applied command and mode change, so no
+multi-day recording could ever be replayed from its start. `settings_history` and
+`learning_profiles_history` are written inside the existing choke points, in the same transaction,
+appending only when the value actually changes, with deletes recorded as tombstones the readers treat
+as deleted-as-of; the current tables keep their exact upsert semantics. The migration seeds existing
+rows at their last-write instant, which is the honest limit: a window starting before a decision
+key's newest write still refuses, so a usable week-long window generally needs further uptime from
+here rather than recovering what was never recorded.
+- **Optimizer v2 stage 3, the terminal-value vector — default off and dormant on today's contract.**
+The DP used to price the energy left at the horizon with a scalar salvage row, which cannot see what
+the next horizon does with the same pack. It can now use a *continuation row* derived from a synthetic
+tail instead, so the plan stops dumping energy it will refill an hour later. It ships disabled
+(`optimizer.terminal_mode` defaults to `salvage`), every plan reports why it was used or refused, and
+with the current sell = buy contract the cost-basis sell floor always binds, so the vector refuses by
+design and plans continue to use salvage.
+
 ## 0.26.0
 
 - **The plan is solved in C, validated per solve, with the Python reference kept.** The DP over SoC is
