@@ -7,7 +7,9 @@ Three layers, in increasing distance from the maths:
 * ``dp`` wiring -- a vector row must reproduce the *concatenated* DP (horizon + tail solved as one
   long problem) exactly, mode-off must stay bit-for-bit salvage, and every disabled path must fall
   back to the salvage row with a stable reason.
-* the guards -- the C core must never see a terminal row, and the fetcher's ``slots`` must not move.
+* the guards -- the C core may only use a terminal row through the validated path (it is handed
+  the row, must return it entry for entry, and must report the objective that interpolates it),
+  and the fetcher's ``slots`` must not move.
 """
 
 from __future__ import annotations
@@ -131,6 +133,12 @@ def sell_pricing(rule=None, *, ambiguous=False, unsupported=False, evidence=None
 # --------------------------------------------------------------------------------------
 # Tail construction
 # --------------------------------------------------------------------------------------
+
+
+requires_core = pytest.mark.skipif(
+    _fast._core is None,
+    reason=f"no usable C core in this checkout ({_fast._import_error or 'not compiled'})",
+)
 
 
 def test_tail_slots_prefers_published_prices_and_repeats_the_window():
@@ -1589,7 +1597,8 @@ class _Recorder:
         return None
 
 
-def test_a_terminal_row_never_reaches_the_c_core(monkeypatch):
+def test_a_terminal_row_reaches_the_validated_c_core(monkeypatch):
+    """The row is handed to the core, which validates it before any plan can use the result."""
     recorder = _Recorder()
     monkeypatch.setattr(_fast, "_core", recorder)
     monkeypatch.setattr(_fast, "_disabled", False)
@@ -1606,7 +1615,13 @@ def test_a_terminal_row_never_reaches_the_c_core(monkeypatch):
     assert _fast.solve(window, agg, start, opts, dp.TARGET_HARD_PENALTY, None, 0.1, minutes) is None
     assert len(recorder.calls) == 1
 
+    # A row now reaches the extension as the optional seventh argument; the stub still returns
+    # ``None``, so the reference solves it -- exactly as it did before the row was accelerated.
     monkeypatch.setattr(_fast, "_disabled", False)
+    # The row must be aligned to the grid the core rebuilds (a misaligned row is *declined*, which
+    # the next test covers), so it is built over the same ``_main_grid`` the solve uses.
+    grid = dp._main_grid(agg, opts, len(window), dp._anchors(start, agg, None)).points
+    row = [0.05 * index for index in range(len(grid))]
     assert (
         _fast.solve(
             window,
@@ -1617,11 +1632,97 @@ def test_a_terminal_row_never_reaches_the_c_core(monkeypatch):
             None,
             0.1,
             minutes,
-            terminal_row=[0.0] * 4,
+            terminal_row=row,
         )
         is None
     )
-    assert len(recorder.calls) == 1, "a terminal row must never be handed to the C core"
+    assert len(recorder.calls) == 2, "a terminal row must reach the core"
+    assert recorder.calls[1][6] == row, "the row is passed verbatim as the seventh argument"
+
+
+def test_the_reference_solves_a_row_the_core_declines(monkeypatch):
+    """A row the core cannot use is a decline: the reference solves it, the core stays enabled."""
+    recorder = _Recorder()
+    monkeypatch.setattr(_fast, "_core", recorder)
+    monkeypatch.setattr(_fast, "_disabled", False)
+    monkeypatch.setattr(_fast, "_checks_done", 0)
+    monkeypatch.setattr(_fast, "_solve_count", 0)
+    agg = agg_for()
+    opts = options()
+    window = make_slots(4, 60)
+    minutes = [60.0] * 4
+    bad = [0.0, float("nan"), 0.0, 0.0]
+    assert (
+        _fast.solve(
+            window,
+            agg,
+            1.2,
+            opts,
+            dp.TARGET_HARD_PENALTY,
+            None,
+            0.1,
+            minutes,
+            terminal_row=bad,
+        )
+        is None
+    )
+    assert recorder.calls == [], "a non-finite row must not be handed to the core at all"
+    assert _fast.available(), "a caller-supplied row must never disable the accelerator"
+
+
+@requires_core
+def test_the_accelerated_vector_plan_equals_the_python_one(monkeypatch):
+    """With the core enabled the row-mode plan must come *from the core* and equal the reference.
+
+    Comparing final plans cannot prove that (a core result rejected by validation falls back to
+    Python and still matches), so the periodic differential is switched off, the Python oracle is
+    spied on and must not run during the accelerated solve, and the accelerator must still be
+    enabled afterwards -- i.e. the result came back accepted, not through the fallback.
+    """
+    agg = agg_for()
+    opts = options(terminal_mode="vector", terminal_tail_hours=6.0)
+    # A flat window keeps the 24 h tail numerically stable (the vector has to be eligible before a
+    # row can be supplied at all); this test is about the row's mechanics, not the tail's shape.
+    window = make_slots(6, 60, pv=0.0, load=0.5, buy=0.20, sell=0.05)
+    verdict = plan_for(window, agg=agg, opts=opts)
+    assert verdict.ok is True
+
+    calls = {"n": 0}
+    real_solve = _fast._core.solve
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        assert args[6] is not None, "the terminal row must reach the core"
+        return real_solve(*args, **kwargs)
+
+    fallbacks = {"n": 0}
+    real_oracle = dp._solve_once_numeric
+
+    def counting_oracle(*args, **kwargs):
+        fallbacks["n"] += 1
+        return real_oracle(*args, **kwargs)
+
+    monkeypatch.setattr(_fast._core, "solve", counting)
+    monkeypatch.setattr(dp, "_solve_once_numeric", counting_oracle)
+    monkeypatch.setattr(_fast, "_CHECK_INTERVAL", 0)  # isolate the per-solve contract
+    _fast.reset()
+    accelerated = _solve(window, opts, agg=agg, terminal=verdict)
+    assert calls["n"] >= 1, "the vector plan must use the C core"
+    assert fallbacks["n"] == 0, "the accelerated solve must not fall back to the Python reference"
+    assert _fast.available(), "the core result must have been accepted, not rejected"
+
+    monkeypatch.setattr(_fast, "_disabled", True)
+    reference = _solve(window, opts, agg=agg, terminal=verdict)
+    assert fallbacks["n"] >= 1, "the core-less plan is the oracle, so the spy must have seen it"
+    assert [slot.power_w for slot in accelerated.slots] == [
+        slot.power_w for slot in reference.slots
+    ]
+    assert [slot.soc_kwh for slot in accelerated.slots] == [
+        slot.soc_kwh for slot in reference.slots
+    ]
+    assert accelerated.summary.objective_eur == reference.summary.objective_eur
+    assert accelerated.terminal == reference.terminal
+    assert accelerated.feasible == reference.feasible
 
 
 def test_the_reference_produces_the_plan_when_a_row_is_supplied(monkeypatch):
@@ -1638,7 +1739,7 @@ def test_the_reference_produces_the_plan_when_a_row_is_supplied(monkeypatch):
     verdict = plan_for(window, agg=agg, opts=opts)
     assert verdict.ok is True
     plan = _solve(window, opts, agg=agg, terminal=verdict)
-    assert recorder.calls == []
+    assert len(recorder.calls) == 1, "the row now reaches the core (which declined it here)"
     assert plan.terminal["ok"] is True
 
     grid = dp._main_grid(agg, opts, len(window), dp._anchors(1.2, agg, None)).points

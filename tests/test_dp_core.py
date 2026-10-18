@@ -7,8 +7,10 @@ Three layers are covered:
   exactly over the edge cases of the cost model.  The autouse fixture turns the periodic full
   cross-check off so each test's comparison is explicit; the cross-check itself has its own tests.
 * **Runtime verification**: tampered, malformed, oversized or numerically pathological extension
-  output must be rejected and fall back to the Python reference without raising and without ever
-  reaching a plan.
+  output must be rejected and fall back to the Python reference without raising: per-solve
+  wherever a check covers it, and by the periodic full differential otherwise.  The per-solve
+  contract is self-consistency, not interior optimality -- see
+  ``test_an_unsampled_interior_value_is_only_caught_by_the_periodic_differential``.
 * **Budget**: 120 slots, <= 400 states, ``power_steps`` 24 -- the C sweep must stay under 20 ms.
 
 All numbers here are obviously synthetic.  No instance data.
@@ -130,7 +132,7 @@ def _scenario(
     return Scenario(slots, agg, opts, start_kwh, e_target, target_penalty, salvage, minutes)
 
 
-def _python_ref(sc: Scenario):
+def _python_ref(sc: Scenario, terminal_row: list[float] | None = None):
     return dp._solve_once_numeric(
         sc.slots,
         sc.agg,
@@ -140,13 +142,22 @@ def _python_ref(sc: Scenario):
         sc.e_target,
         sc.salvage,
         sc.minutes,
+        terminal_row=terminal_row,
     )
 
 
-def _c_result(sc: Scenario):
+def _c_result(sc: Scenario, terminal_row: list[float] | None = None):
     _fast.reset()
     result = _fast.solve(
-        sc.slots, sc.agg, sc.start_kwh, sc.opts, sc.target_penalty, sc.e_target, sc.salvage, sc.minutes
+        sc.slots,
+        sc.agg,
+        sc.start_kwh,
+        sc.opts,
+        sc.target_penalty,
+        sc.e_target,
+        sc.salvage,
+        sc.minutes,
+        terminal_row=terminal_row,
     )
     assert result is not None, "the C core must accept a valid scenario"
     return result
@@ -156,9 +167,9 @@ def _flatten(windows) -> list[float]:
     return [value for window in windows for value in window]
 
 
-def _assert_same(sc: Scenario) -> None:
-    reference = _python_ref(sc)
-    fast = _c_result(sc)
+def _assert_same(sc: Scenario, terminal_row: list[float] | None = None) -> None:
+    reference = _python_ref(sc, terminal_row)
+    fast = _c_result(sc, terminal_row)
     assert fast.iterations == reference.iterations
     assert fast.states == reference.states
     assert fast.effective_step_kwh == pytest.approx(reference.effective_step_kwh, abs=1e-15)
@@ -169,6 +180,51 @@ def _assert_same(sc: Scenario) -> None:
     assert fast.powers == pytest.approx(reference.powers, abs=1e-12)
     assert fast.energies == pytest.approx(reference.energies, abs=1e-12)
     assert _flatten(fast.windows) == pytest.approx(_flatten(reference.windows), abs=1e-12)
+
+
+def _row_grid(sc: Scenario) -> list[float]:
+    """The grid the core will rebuild for this scenario (the row must be aligned to it)."""
+    grid, _step = _fast._reference_grid(dp, sc.slots, sc.agg, sc.opts, sc.start_kwh, sc.e_target)
+    return grid
+
+
+def _tail_row(sc: Scenario, length: int = 4, penalty: float | None = None) -> list[float]:
+    """A genuine stage-3 continuation row: a short tail swept on the *same* grid.
+
+    Built with the reference ``_backward_sweep`` from the salvage row, exactly what
+    ``terminal_value.continuation_row`` does for a plan, and then given the target penalty
+    (``_row_with_penalty``) when the scenario has a target -- the row the core must consume
+    already contains that penalty, so it must never be added again anywhere.
+    """
+    grid = _row_grid(sc)
+    tail = [
+        dp.SlotInput(
+            t=sc.slots[-1].t + timedelta(minutes=sc.opts.slot_minutes * (i + 1)),
+            pv_kw=0.5,
+            load_kw=0.6,
+            buy=0.22,
+            sell=0.06,
+        )
+        for i in range(length)
+    ]
+    minutes = [float(sc.opts.slot_minutes)] * length
+    salvage_row = dp._salvage_terminal_row(grid, sc.salvage, 0.0, None)
+    value, _argmin, _iterations = dp._backward_sweep(
+        grid, tail, minutes, sc.agg, sc.opts, salvage_row
+    )
+    row = list(value[0])
+    if sc.e_target is not None:
+        row = dp._row_with_penalty(
+            row, grid, sc.e_target, sc.target_penalty if penalty is None else penalty
+        )
+    return row
+
+
+def _shaped_row(sc: Scenario) -> list[float]:
+    """A row whose minimum is in the middle of the SoC range (not a salvage-like straight line)."""
+    grid = _row_grid(sc)
+    middle = len(grid) // 2
+    return [0.4 * abs(index - middle) + 0.05 * (index % 3) for index in range(len(grid))]
 
 
 def _path_objective(powers: list[float], sc: Scenario) -> tuple[float, float, float]:
@@ -294,7 +350,7 @@ def test_refuse_battery_export_combines_with_the_cost_basis_sell_floor():
 
 @requires_core
 def test_a_core_ignoring_the_refusal_option_is_rejected(monkeypatch):
-    """An old core (no refusal branch) can never dispatch: the validator rebuilds the bound (D1)."""
+    """An old core (no refusal branch) is rejected on the solve itself: the validator rebuilds the bound (D1)."""
     scenario = _scenario(
         pv=[0.0, 3.0, 0.0, 4.0],
         load=[1.2, 0.4, 1.5, 0.2],
@@ -426,6 +482,93 @@ def test_coarsened_grid(monkeypatch):
 
 
 @requires_core
+def test_terminal_row_interpolation_at_a_coarsened_grid_anchor():
+    """Anchor/interpolation regression: the row must be read at the exact grid entry the sweep
+    evaluates, on a coarsened grid whose inverse-step index hint is inexact.
+
+    The row is built as two plateaus (equal adjacent values) with the jump pinned to the grid entry
+    slot 0's 0 kW action lands on, so the sweep's evaluation energy *is* a grid coordinate.  The
+    mirrored variants prove that entry is load-bearing for the plan, so an interpolation that reads
+    the wrong *region* of the row is visible in the differential rather than merely
+    self-consistent.
+
+    What this does **not** pin: the ``<=``/``<`` comparison of the upward bracket walk.  At a
+    unique knot both neighbouring brackets return the knot's value (the interpolation is
+    continuous), so switching that comparison would not change this plan.  ``span <= 0`` is
+    likewise untouched here, and unreachable from any builder output: see
+    ``test_the_state_grid_builder_cannot_produce_duplicate_coordinates``, whose strict-monotonicity
+    assertion is the actual evidence for that branch being dead.
+    """
+    scenario = _scenario(
+        pv=[0.0, 0.0, 5.0, 0.0],
+        load=[0.0, 0.4, 0.4, 0.6],
+        buy=[0.50, 0.06, 0.05, 0.42],
+        sell=[0.02] * 4,
+        capacity_kwh=40.0,
+        soc_step_kwh=0.005,
+        power_steps=8,
+        start_kwh=20.0,
+    )
+    grid = _row_grid(scenario)
+    assert len(grid) < 400, "the 400-state ceiling must have coarsened the grid"
+    assert grid[1] - grid[0] > scenario.opts.soc_step_kwh, "the lattice really was coarsened"
+    start = min(range(len(grid)), key=lambda index: abs(grid[index] - scenario.start_kwh))
+    assert grid[start] == scenario.start_kwh, "the start anchor is an exact grid entry"
+    lo, hi = _fast._reference_bounds(
+        dp, scenario.slots[0], scenario.agg, scenario.opts, scenario.start_kwh, 1.0
+    )
+    assert lo <= 0.0 <= hi, "slot 0 must offer the 0 kW action that lands exactly on the anchor"
+    above = [0.0] * start + [10.0] * (len(grid) - start)
+    below = [10.0] * start + [0.0] * (len(grid) - start)
+    _assert_same(scenario, [0.0] * len(grid))
+    _assert_same(scenario, above)
+    _assert_same(scenario, below)
+    assert above[start] != above[start - 1] and below[start] != below[start - 1]
+    assert _python_ref(scenario, above).powers != _python_ref(scenario, below).powers, (
+        "the plateau edge at the evaluated entry must move the plan"
+    )
+
+
+def test_the_state_grid_builder_cannot_produce_duplicate_coordinates():
+    """``span <= 0`` in the interpolation is a guarded-but-dead branch: the builder cannot emit a
+    duplicate grid coordinate.
+
+    ``_build_grid`` lays a lattice ``e_min + i * step`` with ``step >= 1e-4`` and at most
+    ``MAX_STATES - 3`` intervals, which is strictly increasing as doubles; ``e_max`` is appended
+    only when the last point is more than ``EPS_KWH`` below it; and an anchor is appended only when
+    it is more than 1e-6 from every point already present (``_core.c::build_grid`` repeats that
+    guard, and the returned grid must match this builder entry for entry anyway).  A flat piecewise
+    interpolation over a strictly increasing grid cannot see a zero-width bracket, so the fallback
+    only becomes live if a future builder change lets coordinates collide -- which this pins.
+    """
+    agg = dp.BatteryAggregate.from_configs([_battery()], 0.0)
+    step = 0.05
+    knot = agg.e_min_kwh + 8 * step
+    dropped = knot + 5e-7  # inside the 1e-6 duplicate guard
+    kept = knot + 1.1e-6  # just outside it
+    anchors = [
+        agg.e_min_kwh,
+        agg.e_max_kwh,
+        knot,
+        dropped,
+        kept,
+        knot - 1.1e-6,
+        agg.e_max_kwh - 5e-10,  # just below the ``e_max`` append threshold
+        agg.e_max_kwh + 1.0,  # clamps onto the last point
+        agg.e_min_kwh - 1.0,  # clamps onto the first point
+    ]
+    for requested_step in (step, 1e-4):  # the plain lattice and the 400-state coarsening path
+        grid, _effective = dp._build_grid(agg, requested_step, anchors)
+        assert all(low < high for low, high in zip(grid, grid[1:])), "duplicate grid coordinate"
+        assert kept in grid, "an anchor just outside the guard must be kept"
+        assert dropped not in grid, "an anchor inside the guard must be dropped"
+    degenerate = dp.BatteryAggregate.from_configs([_battery(min_soc_pct=100.0)], 0.0)
+    assert degenerate.e_min_kwh == degenerate.e_max_kwh
+    grid, _effective = dp._build_grid(degenerate, step, anchors)
+    assert grid == [degenerate.e_max_kwh], "a zero-span battery keeps its single state"
+
+
+@requires_core
 def test_ties_resolve_to_the_lowest_power():
     # Zero prices and zero wear make every action cost the same; both cores must keep the lowest
     # power (the first action in the ascending action list).
@@ -454,6 +597,117 @@ def test_ties_resolve_to_the_lowest_power():
         allow_export=False,
     )
     _assert_same(degenerate)
+
+
+# --------------------------------------------------------------------------------------------
+# Optimizer v2 stage 3: the continuation-value row over the same grid
+# --------------------------------------------------------------------------------------------
+
+
+@requires_core
+def test_terminal_row_matches_the_reference():
+    """The row IS the terminal condition: value[n] = row, then the ordinary interp on slot n-1."""
+    scenario = _scenario(
+        pv=[0.0, 4.0, 0.0, 0.0],
+        load=[0.6, 0.3, 1.0, 0.5],
+        buy=[0.45, 0.08, 0.42, 0.10],
+        sell=[0.20, 0.20, 0.20, 0.20],
+    )
+    _assert_same(scenario)
+    _assert_same(scenario, _tail_row(scenario))
+    _assert_same(scenario, _shaped_row(scenario))
+    # The row must actually reach the sweep: a row whose minimum is mid-range is not a salvage
+    # line, so a core that ignored it would keep the salvage schedule.
+    assert _c_result(scenario, _shaped_row(scenario)).powers != _c_result(scenario).powers
+
+
+@requires_core
+def test_terminal_row_carries_the_penalty_and_is_not_penalised_twice():
+    """``_row_with_penalty`` bakes the target penalty in; the core must not add it again."""
+    # One slot, so the target is unreachable: the penalty term is non-zero, and a second penalty
+    # added on top would move both the objective and the schedule.
+    unreachable = _scenario(
+        pv=[0.0],
+        load=[0.5],
+        buy=[0.20],
+        sell=[0.05],
+        start_kwh=3.0,
+        e_target=7.5,
+    )
+    for penalty in (dp.TARGET_HARD_PENALTY, dp.TARGET_SOFT_PENALTY):
+        row = _tail_row(unreachable, penalty=penalty)
+        reference = _python_ref(unreachable, row)
+        assert reference.terminal_error_kwh > 0.0, "the penalty term must be non-zero here"
+        _assert_same(unreachable, row)
+        # And a row without that penalty is a different scenario (the core reads the row as given).
+        assert _python_ref(unreachable, _tail_row(unreachable, penalty=0.0)).objective_eur != (
+            reference.objective_eur
+        )
+
+
+@requires_core
+@pytest.mark.parametrize("e_target", [99.0, -5.0])
+def test_terminal_row_with_an_out_of_range_target(e_target):
+    """The grid anchor clamps the target; the row and the penalty keep the raw value."""
+    scenario = _scenario(
+        pv=[0.0, 0.0],
+        load=[0.5, 0.5],
+        buy=[0.30, 0.10],
+        sell=[0.05, 0.05],
+        start_kwh=3.0,
+        e_target=e_target,
+    )
+    row = _tail_row(scenario)
+    _assert_same(scenario, row)
+    assert _python_ref(scenario, row).terminal_error_kwh > 0.0
+
+
+@requires_core
+def test_randomized_terminal_row_differential():
+    rng = random.Random(20261018)
+    for _ in range(25):
+        n = rng.randint(3, 10)
+        slot_minutes = rng.choice([15, 30, 60])
+        buy = [round(rng.uniform(-0.05, 0.60), 4) for _ in range(n)]
+        sell = [
+            None if rng.random() < 0.1 else round(value + rng.uniform(-0.25, 0.25), 4)
+            for value in buy
+        ]
+        pv = [round(rng.uniform(-0.5, 6.0), 3) for _ in range(n)]
+        load = [round(rng.uniform(0.0, 2.0), 3) for _ in range(n)]
+        minutes = [float(slot_minutes)] * n
+        if rng.random() < 0.3:
+            minutes[0] = float(rng.randint(1, slot_minutes))
+        e_target = None
+        if rng.random() < 0.4:
+            # In range and outside it: an out-of-range target only clamps the grid anchor.
+            e_target = round(rng.uniform(-2.0, 12.0), 3)
+        scenario = _scenario(
+            pv=pv,
+            load=load,
+            buy=buy,
+            sell=sell,
+            slot_minutes=slot_minutes,
+            minutes=minutes,
+            start_kwh=round(rng.uniform(0.5, 9.0), 3),
+            capacity_kwh=10.0,
+            e_target=e_target,
+            target_penalty=rng.choice([dp.TARGET_HARD_PENALTY, dp.TARGET_SOFT_PENALTY]),
+            soc_step_kwh=rng.choice([0.02, 0.05, 0.2, 0.5]),
+            power_steps=rng.choice([1, 2, 5, 24]),
+            wear_eur_per_kwh=rng.choice([0.0, 0.02, 0.1]),
+            allow_grid_charge=rng.random() < 0.8,
+            allow_export=rng.random() < 0.7,
+            max_import_kw=rng.choice([0.0, 0.5, 1.5]),
+            max_export_kw=rng.choice([0.0, 0.4]),
+            min_spread_eur_per_kwh=rng.choice([0.0, 0.01]),
+            pv_charge_preference=rng.choice(["auto", "prefer_pv", "avoid_pv"]),
+            sell_floor_eur_per_kwh=rng.choice([None, 0.1, 0.35]),
+        )
+        row = _shaped_row(scenario) if rng.random() < 0.5 else _tail_row(
+            scenario, rng.choice([2, 4])
+        )
+        _assert_same(scenario, row)
 
 
 @requires_core
@@ -495,6 +749,265 @@ def test_randomized_differential():
             sell_floor_eur_per_kwh=rng.choice([None, 0.1, 0.35]),
         )
         _assert_same(scenario)
+
+
+@requires_core
+def test_the_core_ignoring_the_terminal_row_is_rejected(monkeypatch):
+    """A core that computes the salvage plan but returns the row is rejected on the solve itself:
+    the reported objective must interpolate the row, not the salvage term."""
+    scenario = _fallback_scenario()
+    row = _shaped_row(scenario)
+    real_solve = _fast._core.solve
+    # The row is dropped at the call: the returned value[n] is the salvage row, not the one the
+    # caller supplied, which validation compares entry for entry.
+    monkeypatch.setattr(_fast._core, "solve", lambda *args, **kwargs: real_solve(*args[:6]))
+    _fast.reset()
+    assert (
+        _fast.solve(
+            scenario.slots,
+            scenario.agg,
+            scenario.start_kwh,
+            scenario.opts,
+            scenario.target_penalty,
+            scenario.e_target,
+            scenario.salvage,
+            scenario.minutes,
+            terminal_row=row,
+        )
+        is None
+    )
+    assert not _fast.available(), "an ignored terminal row must disable the core for the process"
+    # The wired path still returns exactly the reference plan for the same row.
+    reference = _python_ref(scenario, row)
+    fallback = dp._solve_once(
+        scenario.slots,
+        scenario.agg,
+        scenario.start_kwh,
+        scenario.opts,
+        scenario.target_penalty,
+        scenario.e_target,
+        scenario.salvage,
+        minutes_of=scenario.minutes,
+        terminal_row=row,
+    )
+    assert [slot.power_w for slot in fallback.slots] == pytest.approx(
+        [power * 1000.0 for power in reference.powers], abs=1e-9
+    )
+
+
+@requires_core
+def test_a_modified_terminal_row_is_rejected(monkeypatch):
+    """The returned terminal row is verified entry for entry, not by sample."""
+    scenario = _fallback_scenario()
+    row = _shaped_row(scenario)
+    real_solve = _fast._core.solve
+
+    def modified(result):
+        out = dict(result)
+        states = int(out["states"])
+        buffer = array.array("d")
+        buffer.frombytes(out["value"])
+        offset = len(buffer) - states
+        for k in range(states):
+            buffer[offset + k] = -0.123 * k  # a row the caller never supplied
+        out["value"] = buffer.tobytes()
+        return out
+
+    monkeypatch.setattr(
+        _fast._core, "solve", lambda *args, **kwargs: modified(real_solve(*args, **kwargs))
+    )
+    _fast.reset()
+    assert (
+        _fast.solve(
+            scenario.slots,
+            scenario.agg,
+            scenario.start_kwh,
+            scenario.opts,
+            scenario.target_penalty,
+            scenario.e_target,
+            scenario.salvage,
+            scenario.minutes,
+            terminal_row=row,
+        )
+        is None
+    )
+    assert not _fast.available()
+
+
+@requires_core
+def test_a_one_ulp_terminal_row_change_is_rejected(monkeypatch, caplog):
+    """The core copies the row into ``value[n]`` verbatim, so the row check is exact equality.
+
+    A single ULP is far below ``_VALUE_ABS_TOL``; a tolerance comparison would accept it, and the
+    substituted entry is exactly the kind of silent row change the stage-3 contract exists to
+    catch.  The failure must come from the row check itself, before any Bellman comparison.
+    """
+    scenario = _fallback_scenario()
+    row = _tail_row(scenario)
+
+    def one_ulp(result):
+        result = dict(result)
+        values = array.array("d")
+        values.frombytes(bytes(result["value"]))
+        offset = len(scenario.slots) * int(result["states"]) + len(row) // 2
+        values[offset] = math.nextafter(values[offset], math.inf)
+        return {**result, "value": values.tobytes()}
+
+    _patch_core_output(monkeypatch, one_ulp)
+    with caplog.at_level(logging.WARNING, logger="app.optimize._fast"):
+        assert (
+            _fast.solve(
+                scenario.slots,
+                scenario.agg,
+                scenario.start_kwh,
+                scenario.opts,
+                scenario.target_penalty,
+                scenario.e_target,
+                scenario.salvage,
+                scenario.minutes,
+                terminal_row=row,
+            )
+            is None
+        ), "a one-ULP terminal row change must not pass as the supplied row"
+    assert "terminal value row does not match the supplied row" in _disable_reason(caplog)
+    assert not _fast.available()
+
+
+@requires_core
+def test_a_salvage_objective_with_a_terminal_row_is_rejected(monkeypatch):
+    """With a row the objective's terminal term is the interpolated row, not the salvage term."""
+    scenario = _fallback_scenario()
+    row = _shaped_row(scenario)
+    salvage_objective = _python_ref(scenario).objective_eur
+    row_objective = _python_ref(scenario, row).objective_eur
+    assert abs(salvage_objective - row_objective) > 1e-6, "the row must move the objective here"
+
+    real_solve = _fast._core.solve
+
+    def rowless_objective(*args, **kwargs):
+        out = dict(real_solve(*args, **kwargs))
+        out["objective_eur"] = real_solve(*args[:6])["objective_eur"]  # the salvage objective
+        return out
+
+    monkeypatch.setattr(_fast._core, "solve", rowless_objective)
+    _fast.reset()
+    assert (
+        _fast.solve(
+            scenario.slots,
+            scenario.agg,
+            scenario.start_kwh,
+            scenario.opts,
+            scenario.target_penalty,
+            scenario.e_target,
+            scenario.salvage,
+            scenario.minutes,
+            terminal_row=row,
+        )
+        is None
+    )
+    assert not _fast.available()
+
+
+@requires_core
+def test_an_unusable_terminal_row_is_declined_without_disabling_the_core():
+    """A row the core cannot interpret is a *decline*: the reference solves it, then the core is
+    still available.  Disabling the accelerator for the rest of the process because one caller
+    passed a bad row would be a plan-level regression for every later solve."""
+    scenario = _fallback_scenario()
+    row = _shaped_row(scenario)
+    non_finite = list(row)
+    non_finite[0] = float("nan")
+    for bad in (non_finite, row[:-1], row + [0.0], "not a row", object()):
+        assert (
+            _fast.solve(
+                scenario.slots,
+                scenario.agg,
+                scenario.start_kwh,
+                scenario.opts,
+                scenario.target_penalty,
+                scenario.e_target,
+                scenario.salvage,
+                scenario.minutes,
+                terminal_row=bad,
+            )
+            is None
+        )
+        assert _fast.available(), "a caller-supplied row must never disable the accelerator"
+    # The accelerator is not merely enabled: it still serves a valid row afterwards.
+    assert _c_result(scenario, row).powers == _python_ref(scenario, row).powers
+
+
+@requires_core
+def test_a_terminal_row_that_overflows_the_conversion_is_declined(monkeypatch):
+    """An int too large for ``float()`` raises ``OverflowError``, not ``ValueError``: that is the
+    same *decline* as any other unusable row, never a core fault.
+
+    ``_prepare_terminal_row`` runs before the extension, so the conversion guard must treat
+    ``OverflowError`` as part of "not a sequence of floats": the extension is not called, the
+    accelerator stays available, and the Python reference owns the scenario -- including the
+    reference's own ``OverflowError`` from ``float(entry)``, which is the pre-acceleration
+    behaviour unchanged.
+    """
+    scenario = _fallback_scenario()
+    row = _tail_row(scenario)
+    huge = 10**400  # float(huge) overflows a double
+    core_calls = _count_core_calls(monkeypatch)
+    for bad in (huge, [huge] * len(row), [row[0], huge] + row[2:]):
+        _fast.reset()
+        assert (
+            _fast.solve(
+                scenario.slots,
+                scenario.agg,
+                scenario.start_kwh,
+                scenario.opts,
+                scenario.target_penalty,
+                scenario.e_target,
+                scenario.salvage,
+                scenario.minutes,
+                terminal_row=bad,
+            )
+            is None
+        )
+        assert _fast.available(), "an unconvertible row must never disable the accelerator"
+    assert core_calls["n"] == 0, "the row guard must decline before the extension is called"
+    reference_calls = _count_reference_calls(monkeypatch)
+    with pytest.raises(OverflowError):
+        _python_ref(scenario, [row[0], huge] + row[2:])
+    assert reference_calls["n"] == 1, "the reference is what owns an unconvertible row"
+
+
+@requires_core
+def test_the_cross_check_oracle_is_given_the_terminal_row(monkeypatch):
+    """The periodic differential must compare against the *row* model, not the salvage one.
+
+    Without forwarding, the oracle would solve the salvage scenario and every comparison would
+    report a mismatch, disabling the core on the first row solve."""
+    scenario = _fallback_scenario()
+    row = _shaped_row(scenario)
+    seen: list[Any] = []
+    real_reference = dp._solve_once_numeric
+
+    def recording(*args, **kwargs):
+        seen.append(kwargs.get("terminal_row"))
+        return real_reference(*args, **kwargs)
+
+    monkeypatch.setattr(dp, "_solve_once_numeric", recording)
+    _fast.reset()
+    _fast.set_check_interval(1)  # cross-check on the very first solve
+    result = _fast.solve(
+        scenario.slots,
+        scenario.agg,
+        scenario.start_kwh,
+        scenario.opts,
+        scenario.target_penalty,
+        scenario.e_target,
+        scenario.salvage,
+        scenario.minutes,
+        terminal_row=row,
+    )
+    assert seen == [row], "the oracle must receive the supplied row verbatim"
+    assert result is not None
+    assert _fast.available(), "a correct row solve must survive the cross-check"
 
 
 @requires_core
@@ -567,7 +1080,7 @@ def test_maintenance_target_plan_unchanged_by_the_core():
 
 
 # --------------------------------------------------------------------------------------------
-# Runtime verification: tampered output must never reach a plan
+# Runtime verification: tampered output must be rejected and fall back to the reference
 # --------------------------------------------------------------------------------------------
 
 
@@ -821,6 +1334,19 @@ def _count_reference_calls(monkeypatch) -> dict:
     return calls
 
 
+def _count_core_calls(monkeypatch) -> dict:
+    """Record whether the extension was called (a declined row must never reach it)."""
+    calls = {"n": 0}
+    real = _fast._core.solve
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_fast._core, "solve", counting)
+    return calls
+
+
 def _disable_reason(caplog) -> str:
     return " ".join(record.getMessage() for record in caplog.records)
 
@@ -850,6 +1376,211 @@ def _last_slot_actions(scenario: Scenario, result) -> list[float]:
         dp, scenario.slots[-1], scenario.agg, scenario.opts, result["energies"][-1], dt
     )
     return dp._actions(lo, hi, scenario.opts.power_steps, None)
+
+
+def _interior_row_scenario() -> Scenario:
+    """16 slots, so ``_sample_indices(16, 5)`` leaves two consecutive rows out of the sample."""
+    return _scenario(
+        pv=[0.0, 3.0, 0.0, 0.0, 2.0, 0.0, 0.0, 4.0, 0.0, 0.0, 1.5, 0.0, 0.0, 3.5, 0.0, 2.0],
+        load=[0.6, 0.3, 1.0, 0.5, 0.4, 0.9, 0.7, 0.3, 0.5, 0.8, 0.4, 0.6, 1.1, 0.3, 0.5, 0.4],
+        buy=[0.45, 0.08, 0.42, 0.10, 0.05, 0.40, 0.12, 0.38, 0.44, 0.09, 0.41, 0.11, 0.06, 0.39, 0.13, 0.37],
+        sell=[0.20] * 16,
+        soc_step_kwh=0.05,
+        power_steps=8,
+        start_kwh=3.0,
+    )
+
+
+def _diverge_path(
+    scenario: Scenario, grid: list[float], rows: list[list[float]], terminal_row: list[float]
+):
+    """The forward reconstruction of a core whose own ``V_next`` rows are the ones it reports.
+
+    ``dp._solve_once_numeric`` reuses the sweep's stored argmin when the state snaps to a grid
+    point; a core with a wrong interior value instead chooses from its wrong rows, exactly what
+    this mirrors.  The per-solve validation recomputes each accepted action the same way, so the
+    resulting plan is *self-consistent* by construction -- that is the point of the tamper.
+    """
+    n = len(scenario.slots)
+    e_now = dp.clamp(scenario.start_kwh, scenario.agg.e_min_kwh, scenario.agg.e_max_kwh)
+    energies: list[float] = []
+    powers: list[float] = []
+    windows: list[float] = []
+    objective = 0.0
+    cycle = 0.0
+    for i, slot in enumerate(scenario.slots):
+        dt = scenario.minutes[i] / 60.0
+        lo, hi = _fast._reference_bounds(dp, slot, scenario.agg, scenario.opts, e_now, dt)
+        state = e_now
+        action_lo, action_hi = lo, hi
+        for point in grid:
+            if abs(point - e_now) <= _fast._ENERGY_TOL:
+                state = point
+                action_lo, action_hi = _fast._reference_bounds(
+                    dp, slot, scenario.agg, scenario.opts, state, dt
+                )
+                break
+        extra = (
+            dp.exact_power_kw(state, scenario.e_target, dt, scenario.agg)
+            if i == n - 1 and scenario.e_target is not None
+            else None
+        )
+        best_cost = math.inf
+        best_power = None
+        for action in dp._actions(action_lo, action_hi, scenario.opts.power_steps, extra):
+            e_next = dp.next_energy_kwh(state, action, dt, scenario.agg)
+            total = dp.slot_cost_eur(action, slot, dt, scenario.opts)
+            total += dp.wear_cost_eur(
+                scenario.opts.wear_eur_per_kwh, scenario.agg.eta_discharge, state, e_next
+            )
+            total += dp._interp(rows[i + 1], grid, e_next)
+            if total < best_cost:
+                best_cost, best_power = total, action
+        power = dp.clamp(best_power, lo, hi)
+        energies.append(e_now)
+        powers.append(power)
+        soc_lo, soc_hi = dp.soc_window_kw(e_now, scenario.agg, dt)
+        grid_lo, grid_hi = dp.grid_window_kw(slot, scenario.agg, scenario.opts)
+        windows.extend((soc_lo, soc_hi, grid_lo, grid_hi))
+        e_next = dp.next_energy_kwh(e_now, power, dt, scenario.agg)
+        objective += dp.slot_cost_eur(power, slot, dt, scenario.opts)
+        cycle += dp.wear_cost_eur(
+            scenario.opts.wear_eur_per_kwh, scenario.agg.eta_discharge, e_now, e_next
+        )
+        e_now = dp.clamp(e_next, scenario.agg.e_min_kwh, scenario.agg.e_max_kwh)
+    objective += cycle + dp._interp(terminal_row, grid, e_now)
+    terminal = abs(e_now - scenario.e_target) if scenario.e_target is not None else 0.0
+    return energies, powers, windows, objective, cycle, terminal
+
+
+def _interior_tamper(scenario: Scenario, grid: list[float], terminal_row: list[float]):
+    """A core whose value is wrong at one unobserved interior cell, reporting a consistent plan.
+
+    The cell's row *and* the row that reads it are outside the Bellman sample, so no sampled
+    check touches either; the one-step validation resolves each accepted action against the same
+    returned ``V_next``.  The tamper finds the runner-up action at one path state, drops that
+    endpoint's continuation value by just over the cost gap so the runner-up wins, and rebuilds
+    the plan the wrong value implies.
+    """
+    n = len(scenario.slots)
+    sampled_rows = _fast._sample_indices(n, 5)
+    row_index = next(
+        i for i in range(1, n - 1) if i not in sampled_rows and i - 1 not in sampled_rows
+    )
+    captured: dict = {"row_index": row_index, "powers": None}
+
+    def corrupt(result):
+        result = dict(result)
+        states = int(result["states"])
+        buffer = array.array("d")
+        buffer.frombytes(bytes(result["value"]))
+        rows = [list(buffer[i * states : (i + 1) * states]) for i in range(n + 1)]
+        slot_index = row_index - 1
+        e_now = float(result["energies"][slot_index])
+        dt = scenario.minutes[slot_index] / 60.0
+        lo, hi = _fast._reference_bounds(
+            dp, scenario.slots[slot_index], scenario.agg, scenario.opts, e_now, dt
+        )
+        costs = []
+        for action in dp._actions(lo, hi, scenario.opts.power_steps, None):
+            e_next = dp.next_energy_kwh(e_now, action, dt, scenario.agg)
+            total = dp.slot_cost_eur(action, scenario.slots[slot_index], dt, scenario.opts)
+            total += dp.wear_cost_eur(
+                scenario.opts.wear_eur_per_kwh, scenario.agg.eta_discharge, e_now, e_next
+            )
+            total += dp._interp(rows[row_index], grid, e_next)
+            costs.append((total, action, e_next))
+        costs.sort(key=lambda item: item[0])
+        gap = costs[1][0] - costs[0][0]
+        cell = costs[1][2]
+        probe = list(rows[row_index])
+        base = dp._interp(probe, grid, cell)
+        weight = 0.0
+        column = 0
+        for k in range(states):
+            probe[k] += 1.0
+            change = abs(dp._interp(probe, grid, cell) - base)
+            probe[k] -= 1.0
+            if change > weight:
+                weight, column = change, k
+        assert weight > 0.0, "the corrupted cell must be observable at the runner-up's energy"
+        rows[row_index][column] -= (gap + 0.05) / weight
+        energies, powers, windows, objective, cycle, terminal = _diverge_path(
+            scenario, grid, rows, terminal_row
+        )
+        captured["powers"] = powers
+        captured["column"] = column
+        out = array.array("d")
+        for row in rows:
+            out.extend(row)
+        return {
+            **result,
+            "value": out.tobytes(),
+            "energies": energies,
+            "powers": powers,
+            "windows": windows,
+            "objective_eur": objective,
+            "cycle_cost_eur": cycle,
+            "terminal_error_kwh": terminal,
+        }
+
+    return corrupt, captured
+
+
+@requires_core
+def test_an_unsampled_interior_value_is_only_caught_by_the_periodic_differential(
+    monkeypatch, caplog
+):
+    """The honest bound of the per-solve contract, pinned: an unobserved interior cell can move an
+    accepted action on a solve that nothing rejects, and only the periodic full differential
+    catches the resulting plan afterwards.
+
+    This is deliberate, not aspirational: the one-step check re-derives each accepted action from
+    the same returned ``V_next`` and the objective from the path that value produced, so a wrong
+    cell that only moves decisions the path takes still looks self-consistent.  ``0`` disables the
+    periodic check (as the other per-solve tests do); ``1`` runs it on the next solve.
+    """
+    scenario = _interior_row_scenario()
+    grid = _row_grid(scenario)
+    row = _tail_row(scenario)
+    corrupt, captured = _interior_tamper(scenario, grid, row)
+    _patch_core_output(monkeypatch, corrupt)
+    _fast.set_check_interval(0)
+    accepted = _fast.solve(
+        scenario.slots,
+        scenario.agg,
+        scenario.start_kwh,
+        scenario.opts,
+        scenario.target_penalty,
+        scenario.e_target,
+        scenario.salvage,
+        scenario.minutes,
+        terminal_row=row,
+    )
+    reference = _python_ref(scenario, row)
+    assert accepted is not None, "the per-solve checks must not see an unobserved interior cell"
+    assert captured["powers"] != reference.powers, "the corrupted cell must move an action"
+    assert accepted.powers != reference.powers, "the accepted plan is the tampered one"
+    assert _fast.available(), "nothing on that solve rejected the tampered result"
+    _fast.reset()
+    _fast.set_check_interval(1)
+    with caplog.at_level(logging.WARNING, logger="app.optimize._fast"):
+        assert (
+            _fast.solve(
+                scenario.slots,
+                scenario.agg,
+                scenario.start_kwh,
+                scenario.opts,
+                scenario.target_penalty,
+                scenario.e_target,
+                scenario.salvage,
+                scenario.minutes,
+                terminal_row=row,
+            )
+            is None
+        ), "the periodic differential must catch the divergence"
+    assert "differential self-check mismatch" in _disable_reason(caplog), _disable_reason(caplog)
+    assert not _fast.available()
 
 
 @requires_core
@@ -1404,3 +2135,106 @@ def test_120_slot_core_benchmark(capsys):
             f"(validated {validated_ms:.2f} ms, best of {len(raw_timings)}/{len(validated_timings)})"
         )
     assert raw_ms < 20.0, f"the C core must solve 120 slots in < 20 ms (got {raw_ms:.2f} ms)"
+
+
+@requires_core
+def test_terminal_row_benchmark(capsys):
+    """Stage-3 shapes: a row-mode solve must keep the C sweep's budget.
+
+    Shape A is the live-like stage-3 measurement: 120 slots of 15 minutes over <= 400 states with
+    a 60-minute tail, whose continuation row comes from a real tail sweep.  Shape B is the same
+    120-slot breadth (the same series, every entry kept) on 60-minute slots -- the coarse-slot
+    workload, not a 30-slot slice of it.  Shape C adds a terminal target, whose hard-then-soft
+    retry runs this same shape a second time per plan (the budget reserves both main sweeps).
+    Python (the reference that ran when the row bypassed the core) is timed once per shape; the
+    raw sweep and the validated solve are reported separately, as in the non-row gate above.
+    """
+    live_like = _benchmark_scenario()
+    hourly = _scenario(
+        pv=[slot.pv_kw for slot in live_like.slots],
+        load=[slot.load_kw for slot in live_like.slots],
+        buy=[slot.buy for slot in live_like.slots],
+        sell=[slot.sell for slot in live_like.slots],
+        slot_minutes=60,
+        start_kwh=5.0,
+        capacity_kwh=10.0,
+        soc_step_kwh=0.02,
+        power_steps=24,
+        wear_eur_per_kwh=0.02,
+    )
+    targeted = _scenario(
+        pv=[slot.pv_kw for slot in live_like.slots],
+        load=[slot.load_kw for slot in live_like.slots],
+        buy=[slot.buy for slot in live_like.slots],
+        sell=[slot.sell for slot in live_like.slots],
+        slot_minutes=15,
+        start_kwh=5.0,
+        capacity_kwh=10.0,
+        soc_step_kwh=0.02,
+        power_steps=24,
+        wear_eur_per_kwh=0.02,
+        e_target=9.0,
+    )
+    shapes = (
+        ("live-like 120x15min + 60min tail", live_like),
+        ("120x60min", hourly),
+        ("terminal target", targeted),
+    )
+    for name, scenario in shapes:
+        _fast.reset()
+        _fast.set_check_interval(0)
+        # 60 minutes of tail, in the shape's own slot length.
+        row = _tail_row(scenario, length=max(1, int(60 // scenario.opts.slot_minutes)))
+        start = _perf_counter()
+        reference = _python_ref(scenario, row)  # what the row mode cost before the core used rows
+        python_ms = (_perf_counter() - start) * 1000.0
+        config = _fast._config(
+            dp, scenario.agg, scenario.opts, scenario.start_kwh, scenario.e_target,
+            scenario.salvage, scenario.target_penalty,
+        )
+        args = (
+            [float(slot.pv_kw) for slot in scenario.slots],
+            [float(slot.load_kw) for slot in scenario.slots],
+            [float(slot.buy) for slot in scenario.slots],
+            [float(slot.sell or 0.0) for slot in scenario.slots],
+            [float(value) for value in scenario.minutes],
+            config,
+            row,
+        )
+        raw_timings = []
+        for _ in range(3):
+            start = _perf_counter()
+            raw = _fast._core.solve(*args)
+            raw_timings.append((_perf_counter() - start) * 1000.0)
+        assert len(raw["grid"]) <= 400
+        validated_timings = []
+        for _ in range(2):
+            _fast.reset()
+            _fast.set_check_interval(0)
+            start = _perf_counter()
+            result = _fast.solve(
+                scenario.slots,
+                scenario.agg,
+                scenario.start_kwh,
+                scenario.opts,
+                scenario.target_penalty,
+                scenario.e_target,
+                scenario.salvage,
+                scenario.minutes,
+                terminal_row=row,
+            )
+            validated_timings.append((_perf_counter() - start) * 1000.0)
+            assert result is not None
+        assert result.states == reference.states
+        assert result.objective_eur == pytest.approx(reference.objective_eur, abs=1e-9)
+        assert result.powers == pytest.approx(reference.powers, abs=1e-12)
+        raw_ms = min(raw_timings)
+        validated_ms = min(validated_timings)
+        with capsys.disabled():
+            print(
+                f"\n[dp-core terminal-row benchmark] {name} / {result.states} states / "
+                f"power_steps 24: Python {python_ms:.1f} ms vs C sweep {raw_ms:.2f} ms "
+                f"(validated {validated_ms:.2f} ms, best of "
+                f"{len(raw_timings)}/{len(validated_timings)})"
+            )
+        assert raw_ms < 20.0, f"the C core must solve {name} in < 20 ms (got {raw_ms:.2f} ms)"
