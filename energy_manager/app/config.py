@@ -203,6 +203,12 @@ DEFAULTS: dict[str, Any] = {
     # never called; shadow = settle and record a plan diff (learning profile + journal) while
     # dispatching v1 unchanged; on = dispatch the plan built from the settlement.
     "optimizer.feed_in_wiring": "off",
+    #: Optimizer v2 stage 3 (docs/OPTIMIZER_V2.md section 4). ``salvage`` is today's terminal row;
+    #: ``vector`` is the tail continuation value, enabled only under the structural sufficiency
+    #: condition.
+    "optimizer.terminal_mode": "salvage",
+    "optimizer.terminal_tail_hours": 24.0,
+    "optimizer.terminal_tail_minutes": 60.0,
     # -- cost basis and the sell floor (SPEC 5, 0.18.0) ------------------------------------
     # The ledger is derived from the applied dispatch log and the measured flows, so the floor
     # refuses a discharge/export below what the energy actually in the pack cost. Default on: with
@@ -281,6 +287,11 @@ _FEED_IN_MODE_CHOICES = ("derived", "explicit", "buy_minus_fee", "saldering", "t
 #: ``shadow`` settles and records a plan diff while dispatching v1 unchanged; ``on`` dispatches the
 #: plan built from the settlement.
 _FEED_IN_WIRING_CHOICES = ("off", "shadow", "on")
+#: Optimizer v2 stage 3 (docs/OPTIMIZER_V2.md section 4): how the DP values stored energy at the
+#: end of the horizon. ``salvage`` is the pre-stage-3 behaviour; ``vector`` replaces it with the
+#: constrained tail solve's continuation value, and only when the structural sufficiency condition
+#: holds -- otherwise that plan falls back to ``salvage`` and reports why.
+_TERMINAL_MODE_CHOICES = ("salvage", "vector")
 _PRICE_CONTRACT_CHOICES = ("dynamic_quarter_hourly", "dynamic_hourly", "fixed_single", "fixed_day_night")
 _PRICE_UNIT_CHOICES = ("auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh")
 _SOLAR_SOURCE_CHOICES = ("forecast_solar", "capacity", "derived", "learned")
@@ -470,6 +481,9 @@ SETTINGS_META: dict[str, _Meta] = {
     "optimizer.sell_floor_enabled": _Meta("bool", "optimizer", "Sell floor", "Refuse a discharge or export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at). Off, or before a basis exists, behaves exactly as before."),
     "optimizer.sell_floor_margin_eur_per_kwh": _Meta("float", "optimizer", "Sell floor margin", "Require this much above the break-even before a sale is allowed.", minimum=0.0, maximum=1.0, advanced=True),
     "optimizer.feed_in_wiring": _Meta("choice", "optimizer", "Feed-in wiring", "How the optimizer consumes the contract-correct feed-in settlement (price.feed_in_mode). off = today's behaviour; the settlement is never called. shadow = settle and record a plan diff against the v1 schedule (learning profile feed_in_shadow + journal) while dispatching v1 unchanged. on = dispatch the plan built from the settlement: the contract's per-slot price replaces the derived one and, when the battery-sourced export leg is refused, only battery-sourced export is blocked while forced PV surplus is still priced at the settlement's justified floor. An unpriceable contract (derived, or no justified floor) never re-prices with the v1 formula: planning fails safe by holding, and the independent safety layer (cell-voltage emergency charge, watchdog) covers an unsafe hold. Requires price.feed_in_mode to be a supported contract before turning it on.", _FEED_IN_WIRING_CHOICES),
+    "optimizer.terminal_mode": _Meta("choice", "optimizer", "Terminal value", "How the plan values the energy still in the pack at the end of the horizon. salvage = a stored kWh is worth the median buy price discounted by the discharge efficiency (today's behaviour). vector = a constrained tail solve over the price feed's tail and a periodic profile beyond it, used only when the omitted state provably cannot change the tail's optimal value (the cost-basis sell floor is off or never binds on any reachable path, and the contract's marginal credit rate is exogenous over the tail). Otherwise the plan uses salvage and reports the reason. Off by default: it is an experiment until the replay harness shows a net benefit.", _TERMINAL_MODE_CHOICES),
+    "optimizer.terminal_tail_hours": _Meta("float", "optimizer", "Terminal tail hours", "Length of the terminal tail solve before the stability test extends it, in hours. Rounded up to whole 24 h profile periods, so the compared lengths end at the same time of day. Only used by optimizer.terminal_mode = vector.", minimum=6.0, maximum=96.0, advanced=True),
+    "optimizer.terminal_tail_minutes": _Meta("float", "optimizer", "Terminal tail resolution", "Resolution of the terminal tail solve, in minutes. The plan's own 15-minute window is aggregated into these slots (mean price, mean pv/load, summed duration) while the sufficiency checks and the contract settlement stay at the plan's native resolution. Coarser tails are cheaper and can understate a spike shorter than one tail slot. Only used by optimizer.terminal_mode = vector.", minimum=15.0, maximum=240.0, advanced=True),
     "optimizer.target_soc_pct_end": _Meta("float", "optimizer", "End SoC target %", "Unset = no hard terminal target.", minimum=0.0, maximum=100.0, nullable=True, advanced=True),
     "control.tick_seconds": _Meta("int", "control", "Tick seconds", "", minimum=5, maximum=3600, advanced=True),
     "control.replan_minutes": _Meta("int", "control", "Replan minutes", "", minimum=1, maximum=1440, advanced=True),

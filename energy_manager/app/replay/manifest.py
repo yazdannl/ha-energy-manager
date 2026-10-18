@@ -39,9 +39,11 @@ from .episode import Episode
 #: an older version is refused by name rather than reinterpreted under this contract.
 #: Bumped whenever the frozen content layout changes (v2: content-hashed boundary rows; v3: the
 #: window-start valuation is its own fingerprint component; v4: every row list is hashed in content
-#: order, never in the reader's arrival order), because a digest computed under the old layout must
-#: refuse loudly as an unsupported version, not silently as an unrelated drift.
-MANIFEST_VERSION = "replay-manifest/4"
+#: order, never in the reader's arrival order; v5: E3 pairs the terminal vector against salvage, so
+#: an older single-leg E3 must refuse rather than run a different experiment), because a digest
+#: computed under the old layout must refuse loudly as an unsupported version, not silently as an
+#: unrelated drift.
+MANIFEST_VERSION = "replay-manifest/5"
 
 #: Stable, machine-readable refusal slugs (docs/REPLAY_HARNESS.md section 6).
 MANIFEST_INVALID = "manifest_invalid"
@@ -63,14 +65,7 @@ POLICIES = ("production", "recorded")
 #: echo them verbatim: evidence is never overstated as VSS or as a shipped comparison.
 #: Limitation slugs the report echoes: one per part of the design that does not exist yet.
 SAA_NOT_SHIPPED = "saa_not_shipped"
-TERMINAL_VECTOR_NOT_SHIPPED = "terminal_vector_not_shipped"
 LIMITATIONS: tuple[dict[str, Any], ...] = (
-    {
-        "slug": TERMINAL_VECTOR_NOT_SHIPPED,
-        "arms": ["E3"],
-        "text": "The stage-3 terminal vector does not exist; E3 pairs the accounting with and "
-        "without the terminal-inventory term at the declared valuation instead.",
-    },
     {
         "slug": SAA_NOT_SHIPPED,
         "arms": ["E4"],
@@ -140,7 +135,9 @@ class ArmSpec:
     changes: str
     holds: tuple[str, ...]
     legs: tuple[LegSpec, ...]
-    #: True when the arm's second leg is an accounting pair on the same trajectory (E3).
+    #: True when the arm's pair *is* the terminal-treatment pair (E3): its report must read the
+    #: extended-horizon delta, because a passing vector changes the schedule and with it the energy
+    #: left in the pack at the window end.
     terminal_pair: bool = False
 
 
@@ -215,13 +212,38 @@ def arm_spec(names: Sequence[str], contract: Mapping[str, Any] | None = None) ->
                     name="E3",
                     changes="terminal_treatment",
                     holds=(
+                        # Both legs run the SAME simulated plant and policy, so the only lever in the
+                        # pair is how the plan's horizon end is priced.
                         "plant",
+                        "plant_physics",
                         "vintages",
                         "policy",
                         "settlement_prices",
                         "actuator_limits",
+                        # One declared valuation for both legs: the terminal-inventory terms are only
+                        # comparable when both packs are valued at the same price.
+                        "valuation",
                     ),
-                    legs=(_leg("replay", "recorded", "production"),),
+                    legs=(
+                        # E1's own leg: the gate reference this arm's report is judged against, so
+                        # gates 1-3 are measured here instead of borrowed from another arm's run.
+                        _leg("replay", "recorded", "production"),
+                        # The pair (docs/OPTIMIZER_V2.md 3.1: "E3 -- terminal error: salvage vs.
+                        # terminal vector").  The baseline is first, so a positive delta is the
+                        # vector's own extended-horizon gain.
+                        _leg(
+                            "salvage",
+                            "simulated",
+                            "production",
+                            patch=(("optimizer.terminal_mode", "salvage"),),
+                        ),
+                        _leg(
+                            "vector",
+                            "simulated",
+                            "production",
+                            patch=(("optimizer.terminal_mode", "vector"),),
+                        ),
+                    ),
                     terminal_pair=True,
                 )
             )

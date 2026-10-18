@@ -331,6 +331,58 @@ def max_reachable_export_kwh(slot_count: int, limits: FeedInLimits | None) -> fl
     return total
 
 
+def max_reachable_import_kwh(
+    slot_count: int,
+    limits: FeedInLimits | None,
+    *,
+    max_charge_kw: float | None,
+    import_limit_kw: float | None = None,
+) -> float | None:
+    """Bound on the cumulative metered import over the horizon, or ``None`` when it is unknown.
+
+    ``Σ min(import limit, max(0, load - pv) + max_charge_power) · dt``: the house's own draw imports
+    at most its net load, a grid recharge adds at most the battery's charge capability, and the
+    connection's import cap bounds their sum.  This is the import-side twin of
+    :func:`max_reachable_export_kwh`, and it exists because the *billing* state is reachable from
+    both sides: a period allowance the household is currently drawing down can be restored by
+    importing during the horizon, so an interval bounded on the export side alone would test one
+    end of the reachable range and call the other one unreachable.  ``None`` means the inputs do not
+    justify a finite bound (PV/load not supplied for every slot, or any supplied value missing,
+    malformed or non-finite); the caller must treat that as "every billing state is reachable" and
+    refuse.  A non-finite capability is unknown, never zero, and a zero ``import_limit_kw`` is a
+    real cap (the caller maps the config's "0 = unlimited" to ``None`` itself).
+    """
+    if limits is None or slot_count <= 0:
+        return None
+    pv = list(limits.pv_kw)
+    load = list(limits.load_kw)
+    if len(pv) != slot_count or len(load) != slot_count:
+        return None
+    hours = _finite(limits.slot_hours)
+    if hours is None or hours <= 0.0:
+        return None
+    charge = _finite(max_charge_kw)
+    if charge is None or charge < 0.0:
+        return None
+    limit: float | None = None
+    if import_limit_kw is not None:
+        limit = _finite(import_limit_kw)
+        if limit is None or limit < 0.0:
+            return None
+    total = 0.0
+    for pv_raw, load_raw in zip(pv, load):
+        pv_kw = _finite(pv_raw)
+        load_kw = _finite(load_raw)
+        if pv_kw is None or load_kw is None or pv_kw < 0.0 or load_kw < 0.0:
+            return None
+        # A negative sample is malformed, not zero load: it would understate reachable imports.
+        capacity = max(0.0, load_kw - pv_kw) + charge
+        if limit is not None:
+            capacity = min(limit, capacity)
+        total += capacity * hours
+    return total
+
+
 def _normalise_tiers(tiers: Sequence[Any]) -> list[tuple[float, float]] | None:
     """Validate a tier table, or return ``None`` when it is malformed.
 

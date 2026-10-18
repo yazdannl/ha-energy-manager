@@ -332,7 +332,15 @@
         feed_in_mode: null,
         feed_in_export_allowed: null,
         feed_in_reason: null,
-        feed_in_floor_eur_per_kwh: null
+        feed_in_floor_eur_per_kwh: null,
+        // Stage 3 (additive): the demo plan runs the default salvage mode, so the terminal verdict is
+        // the "mode off" shape -- the mode key present, every measured field null.
+        terminal_mode: "salvage",
+        terminal_ok: null,
+        terminal_reason: null,
+        terminal_tail_hours: null,
+        terminal_stability_span_eur: null,
+        terminal_stability_tolerance_eur: null
       },
       maintenance: MOCK_MAINTENANCE,
       feed_in: null,
@@ -631,6 +639,9 @@
     ["optimizer.sell_floor_margin_eur_per_kwh", "float", 0.0, "Sell floor margin", "Require this much above the break-even before a sale is allowed.", "optimizer", null],
     ["optimizer.feed_in_wiring", "str", "off", "Feed-in wiring", "How the optimizer consumes the contract-correct feed-in settlement (price.feed_in_mode). off = today's behaviour and the settlement is never called; shadow = settle and record a plan diff while v1 stays dispatched; on = dispatch the settlement plan. An unpriceable contract never re-prices with the derived formula: planning holds instead.", "optimizer", ["off", "shadow", "on"]],
     ["optimizer.target_soc_pct_end", "float", null, "End SoC target %", "Unset = no hard terminal target.", "optimizer", null],
+    ["optimizer.terminal_mode", "str", "salvage", "Terminal value", "How the plan values the energy still in the pack at the end of the horizon. salvage = a stored kWh is worth the median buy price discounted by the discharge efficiency (today's behaviour). vector = a constrained tail solve over the price feed's tail and a periodic profile beyond it, used only when the omitted state provably cannot change the tail's optimal value (the cost-basis sell floor is off or never binds on any reachable path, and the contract's marginal credit rate is exogenous over the tail). Otherwise the plan uses salvage and reports the reason. Off by default: it is an experiment until the replay harness shows a net benefit.", "optimizer", ["salvage", "vector"]],
+    ["optimizer.terminal_tail_hours", "float", 24.0, "Terminal tail hours", "Length of the terminal tail solve before the stability test extends it, in hours. Rounded up to whole 24 h profile periods, so the compared lengths end at the same time of day. Only used by optimizer.terminal_mode = vector.", "optimizer", null],
+    ["optimizer.terminal_tail_minutes", "float", 60.0, "Terminal tail resolution", "Resolution of the terminal tail solve, in minutes. The plan's own 15-minute window is aggregated into these slots (mean price, mean pv/load, summed duration) while the sufficiency checks and the contract settlement stay at the plan's native resolution. Coarser tails are cheaper and can understate a spike shorter than one tail slot. Only used by optimizer.terminal_mode = vector.", "optimizer", null],
 
     ["control.tick_seconds", "int", 30, "Tick seconds", "", "control", null],
     ["control.replan_minutes", "int", 15, "Replan minutes", "", "control", null],
@@ -770,7 +781,8 @@
     "optimizer.power_steps",
     "optimizer.salvage_multiplier", "optimizer.slot_minutes", "optimizer.soc_step_kwh",
     "optimizer.sell_floor_margin_eur_per_kwh",
-    "optimizer.target_soc_pct_end", "price.bzn", "price.contract",
+    "optimizer.target_soc_pct_end", "optimizer.terminal_tail_hours",
+    "optimizer.terminal_tail_minutes", "price.bzn", "price.contract",
     "price.energy_tax_eur_per_kwh", "price.entity", "price.feed_in_entity",
     "price.feed_in_eur_per_kwh", "price.feed_in_tax_inclusive", "price.fixed_day_price_entity",
     "price.fixed_day_start_hour", "price.fixed_night_price_entity",

@@ -581,10 +581,18 @@ def solve(
     e_target: float | None,
     salvage: float,
     minutes: Sequence[float],
+    terminal_row: Sequence[float] | None = None,
 ) -> CoreResult | None:
-    """Run the C core, verify it, or return ``None`` (the Python reference then runs)."""
+    """Run the C core, verify it, or return ``None`` (the Python reference then runs).
+
+    ``terminal_row`` is the optimizer v2 stage 3 continuation-value row over the state grid
+    (docs/OPTIMIZER_V2.md section 4).  The core does not mirror it, and a terminal row the core
+    silently ignored would be wrong in exactly the way an ignored refusal flag was, so a supplied
+    row routes the whole solve to the Python reference *before* the extension is called.  The row
+    is only ever present while ``optimizer.terminal_mode = vector``, which ships default-off.
+    """
     global _solve_count, _checks_done
-    if not available():
+    if terminal_row is not None or not available():
         return None
     from . import dp  # local import: dp imports this module at load time
 

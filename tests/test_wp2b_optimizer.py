@@ -807,6 +807,25 @@ def test_optimizer_options_default_the_horizon_to_the_shipped_setting():
     assert DEFAULTS["optimizer.horizon_hours"] == dp.OptimizerOptions().horizon_hours
 
 
+def test_the_terminal_tail_resolution_defaults_agree():
+    """SPEC 16: the tail solve's resolution is 60 min in the optimiser and in the shipped config.
+
+    The plan grid stays at ``optimizer.slot_minutes``; only the tail *solve* is coarsened, and only
+    to this declared value -- never on its own to fit a budget.
+    """
+    from app.config import DEFAULTS
+
+    assert dp.OptimizerOptions().terminal_tail_minutes == 60.0
+    assert dp.OptimizerOptions.from_settings({}).terminal_tail_minutes == 60.0
+    assert dp.OptimizerOptions.from_settings(
+        {"optimizer.terminal_tail_minutes": 30}
+    ).terminal_tail_minutes == 30.0
+    assert (
+        DEFAULTS["optimizer.terminal_tail_minutes"]
+        == dp.OptimizerOptions().terminal_tail_minutes
+    )
+
+
 def test_the_plan_grid_defaults_to_the_price_resolution():
     """SPEC 3/4: the plan grid defaults to 60 min, and every copy of that default agrees.
 

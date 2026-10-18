@@ -494,6 +494,7 @@ def test_plan_route_works_with_no_plan():
     assert status == 200
     assert body["feasible"] is False and body["slots"] == [] and body["summary"]["saved_eur"] == 0.0
     assert body["feed_in"] is None
+    assert body["terminal"] is None
 
 
 def test_plan_and_summary_expose_the_feed_in_decision():
@@ -524,6 +525,50 @@ def test_plan_and_summary_expose_the_feed_in_decision():
     assert plan_dict(plan, NOW)["feed_in"]["reason"] == Reason.UNPRICED_EXPORT
     # A summary restored from an older store has no feed-in keys: they read null, never a guess.
     assert plan_summary_dict(PlanSummary())["feed_in_reason"] is None
+
+
+def test_plan_and_summary_expose_the_terminal_verdict():
+    from app.api import plan_dict, plan_summary_dict
+
+    summary = PlanSummary()
+    summary.terminal_mode = "vector"
+    summary.terminal_ok = False
+    summary.terminal_reason = "floor_binds"
+    summary.terminal_tail_hours = 24.0
+    summary.terminal_stability_span_eur = 1e-15
+    summary.terminal_stability_tolerance_eur = 0.0045
+    payload = plan_summary_dict(summary)
+    assert payload["terminal_mode"] == "vector"
+    assert payload["terminal_ok"] is False
+    assert payload["terminal_reason"] == "floor_binds"
+    assert payload["terminal_tail_hours"] == 24.0
+    assert payload["terminal_stability_span_eur"] == 1e-15
+    assert payload["terminal_stability_tolerance_eur"] == 0.0045
+    plan = Plan(
+        generated_at=NOW,
+        horizon_start=NOW,
+        horizon_end=NOW + timedelta(hours=1),
+        slot_minutes=60,
+    )
+    plan.terminal = {
+        "mode": "vector",
+        "ok": False,
+        "reason": "floor_binds",
+        "detail": {"floor": "binds"},
+    }
+    assert plan_dict(plan, NOW)["terminal"]["reason"] == "floor_binds"
+    assert plan_dict(plan, NOW)["terminal"]["detail"] == {"floor": "binds"}
+    # The mode-off plan carries no block, and a summary restored from an older store has no
+    # terminal keys: both read null, never a guess.
+    other = Plan(
+        generated_at=NOW,
+        horizon_start=NOW,
+        horizon_end=NOW + timedelta(hours=1),
+        slot_minutes=60,
+    )
+    assert plan_dict(other, NOW)["terminal"] is None
+    assert plan_summary_dict(PlanSummary())["terminal_mode"] is None
+    assert plan_summary_dict(PlanSummary())["terminal_ok"] is None
 
 
 def test_recompute_route():

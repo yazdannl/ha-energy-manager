@@ -878,7 +878,7 @@ class Runner:
         if vintage is None:
             return None
         points, sources, issued = vintage
-        return PriceForecast(
+        forecast = PriceForecast(
             slots=[
                 PriceSlot(t=moment, buy=float(value[0]), sell=float(value[1]), source="replay")
                 for moment, value in sorted(points.items())
@@ -886,6 +886,17 @@ class Runner:
             generated_at=issued,
             source="replay:" + "+".join(sources),
         )
+        # Stage-3 R6: the vintage is deliberately left **unprovenanced**, exactly like any other
+        # caller-built forecast.  Provenance is a fact only whoever resolved the tariff can record;
+        # matching prices cannot establish it (0.16/0.22 buys with 0.14/0.20 sells fit the derived
+        # rule *and* are equally two explicit rates), so a model-fit classification stamped here would
+        # be an inference wearing the name of a declaration -- and it would skip the both-readings
+        # comparison the tail prices under.  Recording the contract model for a replay is a separate,
+        # deferred question; until then an unprovenanced vintage takes the engine's own two-step path:
+        # one supported model must fit the window, and the tail is priced under both readings.  E3 is
+        # unaffected (its tail is entirely window-filled, so the readings coincide), while a vintage
+        # that later gains published tail entries falls under the comparison instead of being trusted.
+        return forecast
 
     def solar_source(self, now: datetime) -> SolarForecast | None:
         vintage = self._vintage(now, "solar")

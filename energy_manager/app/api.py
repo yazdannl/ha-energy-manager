@@ -305,6 +305,18 @@ def plan_summary_dict(summary: PlanSummary) -> dict[str, Any]:
     payload["feed_in_export_allowed"] = getattr(summary, "feed_in_export_allowed", None)
     payload["feed_in_reason"] = getattr(summary, "feed_in_reason", None)
     payload["feed_in_floor_eur_per_kwh"] = getattr(summary, "feed_in_floor_eur_per_kwh", None)
+    # Additive (stage 3): the terminal-value mode, its per-plan verdict and the measured numerical
+    # stability of the continuation row (docs/OPTIMIZER_V2.md section 4).  ``terminal_mode`` is
+    # reported even when the mode is off, so eligibility is visible per plan; the rest are null
+    # then, and a summary restored from the store (declared fields only) yields null as well.
+    payload["terminal_mode"] = getattr(summary, "terminal_mode", None)
+    payload["terminal_ok"] = getattr(summary, "terminal_ok", None)
+    payload["terminal_reason"] = getattr(summary, "terminal_reason", None)
+    payload["terminal_tail_hours"] = getattr(summary, "terminal_tail_hours", None)
+    payload["terminal_stability_span_eur"] = getattr(summary, "terminal_stability_span_eur", None)
+    payload["terminal_stability_tolerance_eur"] = getattr(
+        summary, "terminal_stability_tolerance_eur", None
+    )
     return payload
 
 
@@ -320,6 +332,7 @@ def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dic
             "summary": plan_summary_dict(PlanSummary()),
             "maintenance": None,
             "feed_in": None,
+            "terminal": None,
             "slots": [],
             "batteries": [],
         }
@@ -344,6 +357,10 @@ def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dic
         # Additive (stage 1b): the same feed-in block as ``summary.feed_in_*`` plus the settlement
         # notes and, in shadow mode, the recorded v1-vs-v2 plan diff.
         "feed_in": getattr(plan, "feed_in", None),
+        # Additive (stage 3): the prepared tail, the sufficiency verdict (``ok``, ``reason``,
+        # ``detail``) and the measured stability.  Absent when the mode is off -- the summary still
+        # reports ``terminal_mode`` there, so a client can tell "off" from "refused".
+        "terminal": getattr(plan, "terminal", None),
         "slots": [
             {
                 "t": to_iso(slot.t),

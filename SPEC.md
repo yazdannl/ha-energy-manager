@@ -1712,6 +1712,191 @@ than by weakening `tools/audit.sh`.
 
 ## 16. Amendment log (why the spec changed)
 
+**Optimizer v2 stage 3 — the terminal-value vector, default off (no version bump).** The DP ends a plan
+by pricing the energy left in the pack with a scalar salvage row (`-salvage * e`, plus the optional
+terminal-target penalty). That number cannot see what the *next* horizon will do with the same pack, so
+the plan can be wrong at its own edge: it dumps energy it will refill an hour later, or hoards energy
+the next horizon will have to dump. Stage 3 replaces the scalar row with a **continuation row**: the
+same value iteration, run over a synthetic tail, whose value at the horizon-end energy becomes the
+terminal row. The mode is off by default (`optimizer.terminal_mode = salvage`), in which case the plan
+is the pre-stage-3 schedule bit-for-bit; `optimizer.terminal_tail_hours` (advanced, 6-96, default 24,
+rounded **up** to whole 24 h profile periods) and `optimizer.terminal_tail_minutes` (advanced, 15-240,
+default 60) are the two new advanced keys, and the mode key is essential like the other kill switches.
+
+- **Three windows, named so they cannot be confused.** The *planning/accounting* window is the horizon
+  the plan owns (`slots`), unchanged byte-for-byte by this stage. The *available published-price*
+  window is what the fetcher published: `PriceForecast.slots` plus the new additive
+  `PriceForecast.tail_slots`, which carries the provider's own entries past the planning horizon. The
+  *synthetic extension* is the phase-aligned tail `optimize/terminal.py` builds from those two: prices
+  from `tail_slots` where published, else a time-of-day repeat of the fetched window, and PV/load
+  **always** a time-of-day repeat of the fetched window. The same materialised slots feed the tail
+  solve and every sufficiency check, so a check can never test different physics than the solve. A
+  **published** tail entry carries its own buy price, so its *sell* price is priced by the rule that
+  actually priced the fetched window — read from the forecast's own `feed_in_source` provenance
+  (`derived`/`unavailable` derive from each slot's own buy and energy tax; `entity`/`flat` keep the one
+  explicit rate the window's slots carry), never from the settlement mode or the tail's call site — so
+  the continuation row can never optimise against a different contract than the plan; a wired
+  settlement replaces the tail's sells anyway. A window that carries **no** provenance is not guessed
+  either, and exactly two things happen. First it must fit at least one supported model — *derived*
+  (every priced slot satisfies `sell = buy - fee`) or *flat* (every priced slot shares one finite rate);
+  if it fits **neither** (a variable explicit tariff, or garbage), no reading of it can be justified and
+  the vector is refused (`tail_pricing_unsupported`, naming both model verdicts and the first slot that
+  fits neither); clock-time repetition does not resolve a variable explicit tariff, so that case needs
+  authoritative tail pricing or provenance rather than a fallback. Second, fitting a model does not
+  identify the contract — 0.16/0.22 buys with 0.14/0.20 sells fit the derived rule exactly and are
+  equally an entity publishing those two rates — so the model matrix never picks a rule: the tail is
+  priced under **both** readings (each published entry derived from its own buy, versus the clock-time
+  reference rate the materialisation already uses), any disagreement refuses the vector
+  (`tail_pricing_ambiguous`, naming the first differing slot, how many differ and both prices), and it
+  proceeds only when the two agree everywhere, where the choice cannot matter. Both refusals are scoped
+  to the case where no wired settlement prices the entire tail: a settlement replaces every tail sell
+  from the contract itself, so the materialised rate is not the plan's contract and refusing there would
+  disable the vector for the very escape hatch the design provides. Only a caller-built or replayed
+  forecast can reach either refusal (the fetch path always records its provenance, and the stage-3 live
+  default is off), and a wired settlement is only an escape hatch while it really prices: a settlement
+  that refuses, short-changes or leaves any tail slot non-finite refuses the vector
+  (`contract_unpriceable` / `billing_state_reachable`) rather than letting one slot keep the
+  materialised, guessed rate. A replay vintage is **deliberately unprovenanced**, exactly like any
+  other caller-built forecast — the runner stamps no model on it, because a recorded window's own
+  prices cannot establish one and configuration cannot either (a configured entity may have been
+  unavailable when the window was recorded, in which case production priced those sells from the
+  derived rule) — so it takes this same two-step path: E3 proceeds because its tail is entirely
+  window-filled and the two readings coincide there, while a vintage whose tail gained published
+  entries is compared instead of trusted. Recording a contract model as data is a separate, deferred
+  question.
+
+  **Residual limitation of the unprovenanced path.** Agreement between the two readings proves
+  agreement between *those two extrapolations* of the window, not correctness for an arbitrary explicit
+  tariff whose future rates are unknown: a window that looks flat may precede a tariff change the tail
+  extrapolates by clock time, and a window that looks derived may precede one whose rates are set by
+  something other than its buy prices. The comparison only refuses the cases where the two realise
+  *differently*; a contract that is neither of the two models and agrees with both on the fetched window
+  and on the tail would pass. Removing that residual requires authoritative tail pricing — contract
+  wiring, or provenance recorded by whoever resolved the tariff at fetch time — not a better inference.
+- **Two resolutions: native for the checks and the contract, declared for the tail solve.** The
+  sufficiency checks (basis bound, billing state, floor) and the contract settlement run at the plan's
+  **native** resolution, over the planning window and the published tail, because a floor or a tariff
+  tier binds per native slot and a coarse mean must not hide a native slot the sweep would refuse. The
+  tail *solve* runs at `optimizer.terminal_tail_minutes` (default 60, i.e. a 15-minute plan aggregates
+  four native slots into one tail slot). This is the one place an approximation enters: the coarse
+  tail's buy/sell are the mean of the sub-slots (price is linear in the slot, so the coarse tail prices
+  identically) and its PV/load are meaned too, so the energy over the coarse `dt` is consistent, but a
+  spike shorter than one tail slot can be understated and the stability result is a statement about the
+  tail resolution, **not** a claim about the 15-minute optimum. Buckets restart at every period
+  boundary, so the phase alignment stays exact even when the period is not a multiple of the ratio, and
+  the duration pattern repeats with the period (`sum(minutes)` is still exactly the native tail's span).
+  The *period* is the synthetic profile's own day (24 h), and the extension increment is a whole number
+  of them: `L`, `2L` and `3L` must end at the same time of day, or the stability spans measure the price
+  profile's daily shape instead of the tail's stability (a 30 h plan horizon would put the compared
+  lengths six and twelve hours apart). A request shorter than one period is rounded **up** to one. The
+  invariant this needs is that the plan's native slot **divides** the period: a resolution that does
+  not (a 50-minute slot is 28.8 slots per day) refuses the vector (`tail_misaligned`) rather than
+  silently comparing lengths that drift against the profile.
+- **The tail solves on the main *state* grid, never its own.** It is discretised exactly like the
+  planning horizon (the same state grid, built once per solve), because a continuation value on a
+  different grid is not a continuation value of the plan being optimised. The state grid is never
+  coarsened; the tail's *slots* are coarsened only by the declared `optimizer.terminal_tail_minutes`,
+  never on the fly to fit a budget. A tail that does not fit the iteration budget is refused
+  (`tail_too_long`), never silently re-discretised.
+- **Structural sufficiency, checked before the row may be used.** (a) *Basis bound:* the reachable
+  horizon-end basis is the convex hull of `{basis_now}` and the **planning window's** charge prices
+  (charging during the horizon raises the basis the tail inherits), propagated through the tail as a
+  **running** per-slot bound `max_i(max(basis_i, buy_hi) / rt_i + wear_i + margin)` — a charge price
+  raises the bound only for the slots after it. Every battery in the fleet must be able to state its own
+  bound: an entry with no basis, a non-positive or non-finite round-trip efficiency or a non-finite wear
+  rate refuses the vector (`basis_unavailable`, with the offending indexes in `basis_unprovable`) instead
+  of being silently dropped from the max — an unknown pack can acquire a basis by charging inside the
+  tail, or hold a past one above every price in this window, and then enters the fleet mean with its own
+  efficiency and wear. (b) *Billing state:* the tail is settled from **every** reachable horizon-end
+  billing state — both endpoints and every threshold strictly inside the reachable interval — not from
+  one pessimistic endpoint. The saldering allowance interval spans **both** reachable totals,
+  `[import_now - (export_now + max_export), (import_now + max_import) - export_now]`, because imports
+  grow too and a net-exporting household can become net-importing and *restore* the allowance, with the
+  tail's own reachable export as the exhaustion threshold; the tiered volume interval is
+  `[volume, volume + max_export]` with every tier boundary inside it sampled. If either reachable bound
+  cannot be proven, the vector is refused. Any refusal, or any difference in the priced tail between
+  candidates, disables the vector (`billing_state_reachable`), because a continuation value that is not
+  a function of stored energy is not a valid terminal row. (c) The contract must be priceable at all,
+  the tail must exist, and a discharge must not be restricted anywhere in the tail: when the cost-basis
+  sell floor can bind in any
+  tail slot (export leg: `sell < bound`; house leg: a load deficit bought below the bound), the vector
+  is refused with `floor_binds`.
+- **Disabled path and reason slugs.** `tail_unavailable`, `floor_binds`, `basis_unavailable`,
+  `billing_state_reachable`, `contract_unpriceable`, `tail_too_long`, `tail_unstable`,
+  `tail_misaligned`, `tail_pricing_ambiguous`, `tail_pricing_unsupported`. A refused vector
+  always falls back to the salvage row, so a refusal costs eligibility, never correctness. The mode is
+  reported per plan — `summary.terminal_mode` and `plan.terminal` are additive and read through
+  `getattr` (the stage-1b `feed_in` precedent), so a client can tell "mode off" from "vector refused,
+  and why"; a summary restored from the store keeps only its declared fields and reads null there.
+- **Numerical stability, not a convergence guarantee.** The continuation row is accepted only when the
+  **offset-invariant span** `max_e(V_2L(e) - V_L(e)) - min_e(V_2L(e) - V_L(e))` stays inside the
+  tolerance, measured in **EUR** and derived from the 1e-3 EUR/kWh bound by converting it over the
+  state span (`e_max - e_min`) — a value function is only determined up to an additive constant, so a
+  level difference is meaningless and only the spread is compared. Agreement is required at three
+  phase-aligned lengths, `L`, `2L` and a third `3L` that is not a doubling; the compared lengths are
+  whole synthetic-profile periods apart, so the comparison is never between different phases of the day.
+  Stable periodic tails measure spans of 1e-15 to 1e-7 EUR. This is *evidence of numerical stability at
+  the tested lengths and at the tail resolution*, not a proof of convergence: a one-slot-per-period
+  opportunity (a single cheap or expensive slot per day) makes the tail's value genuinely state-dependent
+  and is refused (`tail_unstable`), while a block-shaped one passes, and the difference is documented in
+  the module's own tests.
+- **Whole-solve budget, and Python-only latency.** The budget covers the main sweep plus all three tail
+  sweeps on the main state grid (`(main + L + 2L + 3L) * states * actions` against `MAX_ITERATIONS`), not
+  the tail alone, and it is reported on every plan (even one the sufficiency checks already refused), so
+  "would this mode be budget-reachable at all?" is answerable from the plan itself. A terminal target
+  reserves a **second** main sweep: an unreachable `optimizer.target_soc_pct_end` retries the main sweep
+  with the exact-power action, so `main` is counted twice whenever a target is configured — decided
+  before any tail is built, because a shape that fits with one sweep and overflows with two must be
+  refused rather than run. On the live-like 120-slot / 15-minute shape (10 kWh pack, `power_steps` 24,
+  191 states, 4966 state-action pairs) the tail's own 15-minute resolution needs 3,456,336 iterations
+  against the 2 M budget, so it is refused (`tail_too_long`); at the declared 60-minute tail resolution
+  the same shape needs 1,311,024 (34.4% headroom, 4.7% with the second main sweep reserved) and is
+  **budget-reachable** — the refusal it then gets on the live contract is the floor, a different and
+  separately reported reason. The terminal-enabled solve costs nothing extra when a check refuses it
+  (the row is never computed: 18.3 ms vs 18.7 ms salvage, 0.98x, and no tail sweep runs). Where the
+  vector does pass, the multiple depends on the accelerator, and both numbers are stated: on the
+  reference sweep alone (Python for both legs, 5-run medians) that shape costs 962.1 ms -> 2071.2 ms
+  (**2.15x**) and a 30-hourly-slot shape with the same 24 h tail 232.0 ms -> 1390.6 ms (**5.99x**,
+  matching its 5.8x iteration ratio) — the multiple grows with the tail's share of the sweeps; with the
+  C core available the salvage leg runs in 5.9-18.5 ms while the terminal-enabled plan still pays the
+  Python price (1434.6-2031.8 ms, **109-242x**), which is the accelerator gap, not the tail. The cost is
+  structural, not incidental: **a supplied terminal row
+  bypasses the C core by construction** (`_fast.solve` returns `None` before the extension is called: a row the
+  core does not mirror would be silently ignored, exactly like the older ignored `refuse_battery_export`
+  flag). Terminal-enabled plans therefore **do not meet the stage-1a accelerator target**. That is
+  acceptable only because the mode is default-off and benefit-gated, and it is the reason the budget is
+  checked before any tail sweep: a later C implementation must validate the terminal row, the path
+  objective and the row's own config parse in the core, keep the source-digest gate honest, and re-run
+  the Python-vs-C differential with a row supplied.
+- **`objective_eur` is no longer cross-mode comparable.** In vector mode the objective is the horizon's
+  money **plus a continuation value that carries the tail's own optimal cost as a constant** (measured
+  on one 30-slot problem: -1.5338 salvage vs -2.5089 vector), and the vector's schedule differs, so the
+  two numbers answer different questions. `cost_estimate_eur` and `saved_eur` keep their exact
+  pre-stage-3 formula over the plan's own slots — no continuation term is added to them — and move only
+  because the schedule moves. Compare modes by replayed extended-horizon accounting, never by
+  `objective_eur`.
+- **Stage 4 must recompute the row per scenario.** The continuation row is a function of that scenario's
+  own prices, PV/load and tail; one row shared across candidate scenarios would compare plans against
+  different futures. Stage 3 is the single deterministic path; the scenario fan-out owns the
+  recomputation.
+- **Honesty about the benefit gate.** On a contract where the sell floor can bind anywhere in the tail
+  (today's live shape: floor ~0.37 against sales at ~0.05) the mode is ineligible and will be disabled
+  on essentially every plan with the *floor* reason (`floor_binds`); the budget refusal (`tail_too_long`)
+  is a separate, distinguishable case that the declared tail resolution keeps off the live shape's path
+  — at the live shape's own 15-minute tail resolution the budget would refuse first, which is exactly
+  why the resolution is a declared key rather than an implicit coarsening. So the mode ships **default
+  off** with eligibility reported per plan, and gate 8.5's requirement of a credible out-of-sample net
+  benefit is **not satisfied yet** by this stage. What ships is the mechanism, the structural
+  sufficiency checks, the fail-closed disabled path and the reporting; the evidence that the vector
+  earns its keep needs a contract (or a ledger/floor configuration) whose tail discharges are
+  unrestricted. The replay harness now carries the paired vector-vs-salvage arm (E3) that measures this
+  on a recording — the pair is disclosed on extended-horizon accounting at one declared valuation, and
+  its identity label compares the two legs' booked flows slot by slot (a trajectory, not totals, so a
+  charge moved between priced slots is not mistaken for "the same schedule") — but its available
+  windows are shorter than one plan horizon, so it reports a **point
+  estimate under the harness's own `illustrative_interval` / underpowered marking** and must not be
+  read as a publishable gain until a long-enough recording exists.
+
 **Optimizer v2 stage 1b — contract-correct feed-in accounting, pricing only (no version bump).** The
 DP prices export at `slot.sell`, and a 0.10 EUR/kWh marginal export error moves more money than the
 whole search this stage prepares for (docs/OPTIMIZER_V2.md section 1), so the settlement function has
@@ -1817,7 +2002,10 @@ live store path is refused.
 differential and the `<20 ms` budget asserted; a real 21-minute recording replayed end to end with
 all three gates passing and the recorded ledger reproduced to 0.000161 EUR/kWh. The harness's own
 honest limits are stated in its report and in `docs/REPLAY_HARNESS.md`: arm E3's terminal-*vector*
-side and arm E4's SAA/candidate policies are labelled `not_shipped` until stage 3, and an interval is
+side and arm E4's SAA/candidate policies are labelled `not_shipped` until stage 3 (the stage-3
+amendment above retires E3's label -- its pair is now `salvage` vs the shipped vector, and the
+not-shipped disclosure is gone from the manifest -- while E4's SAA is still not shipped), and an
+interval is
 only evidence once the episode spans at least one plan horizon (the 21-minute window is labelled
 `illustrative_interval`).
 

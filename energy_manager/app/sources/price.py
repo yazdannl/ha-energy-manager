@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import bisect
 import logging
+import math
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, Sequence
 from zoneinfo import ZoneInfo
 
 from ..models import (
@@ -186,6 +187,193 @@ def _fees(settings: Any) -> tuple[float, float]:
     return number("price.import_fee_eur_per_kwh"), number("price.export_fee_eur_per_kwh")
 
 
+def derived_sell_rule(settings: Any) -> Callable[[float, float], float]:
+    """The derived feed-in price as a function of one slot's own buy price and energy tax.
+
+    ``_build_forecast``'s derived branch applies exactly this rule to every slot it builds, so a
+    caller that materialises *more* slots -- the stage-3 tail, whose published provider entries
+    carry their own buy price -- prices them the same way instead of reusing another slot's sell
+    price.  The rule takes the already-resolved tax *component* in EUR/kWh (``0.0`` when the source
+    publishes none), because that is the quantity the fetch loop has.
+    """
+    export_fee = _fees(settings)[1]
+    refund = bool(settings.get("price.feed_in_energy_tax_refund", True))
+
+    def derive(buy: float, component: float) -> float:
+        return float(buy) - export_fee - (0.0 if refund else float(component))
+
+    return derive
+
+
+#: ``forecast.feed_in_source`` values that mean the fetched window's ``sell`` prices are the
+#: contract's own explicit rate (one resolved entity or flat tariff) rather than a per-slot
+#: derivation from each slot's buy price.
+EXPLICIT_FEED_IN_SOURCES = ("entity", "flat")
+
+#: ... and the values that mean the window's slots carry the *derived* price: ``derived`` when no
+#: explicit source is configured, ``unavailable`` when a configured one failed and the slots fell
+#: back to the derived price.
+DERIVED_FEED_IN_SOURCES = ("derived", "unavailable")
+
+
+#: Tolerance for matching a window slot's ``sell`` against a pricing model, EUR/kWh.
+_SELL_MODEL_EPS = 1e-9
+
+
+class TailSellPricing(NamedTuple):
+    """Which pricing model the fetched window's ``sell`` prices came from (see
+    :func:`tail_sell_pricing`).
+
+    ``rule`` is the derivation to reuse on the tail's published entries, or ``None`` to keep the
+    window's own clock-time rate.  ``ambiguous`` is set when the window carries **no** provenance, so
+    which supported model priced it is unidentified: both candidate readings of the tail are then
+    computed and compared, and any disagreement refuses the vector.  ``unsupported`` is set when the
+    window fits **neither** supported model: no reading of it can be justified and the vector must
+    refuse.  ``evidence`` records what was checked (``rule`` is unused when ``unsupported``).
+    """
+
+    rule: Callable[[float, float], float] | None
+    ambiguous: bool
+    unsupported: bool
+    evidence: dict[str, Any]
+
+
+def _finite_float(value: Any) -> float | None:
+    """A finite float, else ``None`` (never a fabricated zero)."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _slot_evidence(index: int, slot: Any, sell: float | None, derived: float | None) -> dict[str, Any]:
+    moment = getattr(slot, "t", None)
+    return {
+        "slot": index,
+        "t": moment.isoformat() if hasattr(moment, "isoformat") else None,
+        "buy": _finite_float(getattr(slot, "buy", None)),
+        "sell_eur_per_kwh": sell,
+        "derived_eur_per_kwh": derived,
+    }
+
+
+def _derived_value(derive: Callable[[float, float], float], slot: Any) -> float | None:
+    """``derive(buy, tax)`` for one slot, exactly as the tail materialisation would compute it."""
+    try:
+        buy = float(getattr(slot, "buy", None))
+        tax = float(getattr(slot, "energy_tax", 0.0) or 0.0)
+        value = float(derive(buy, tax))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _window_sell_models(forecast: Any, derive: Callable[[float, float], float]) -> dict[str, Any]:
+    """Which of the two supported models the window's own *priced* slots are consistent with.
+
+    *derived*: every priced slot satisfies ``sell = buy - fee`` (minus the energy tax unless the
+    tariff is tax-inclusive).  *flat*: every priced slot shares one finite rate.  An unpriced slot
+    (``sell is None``, which means unknown and never a zero rate) carries no evidence either way; a
+    non-finite one fits neither model.
+
+    Returns the evidence for the decision: both verdicts, the first slot that breaks each model, the
+    flat rate the window would have, and the first slot that fits *neither* model.
+    """
+    flat_rate: float | None = None
+    derived_break: dict[str, Any] | None = None
+    flat_break: dict[str, Any] | None = None
+    unexplained: dict[str, Any] | None = None
+    priced = 0
+    for index, slot in enumerate(getattr(forecast, "slots", None) or ()):
+        raw = getattr(slot, "sell", None)
+        if raw is None:
+            continue
+        priced += 1
+        sell = _finite_float(raw)
+        derived = _derived_value(derive, slot) if sell is not None else None
+        if sell is None:
+            # A non-finite rate is garbage: it fits neither model, and *this* slot is the evidence for
+            # each failure field that is still empty (never an earlier slot's evidence).
+            broken = _slot_evidence(index, slot, None, None)
+            if derived_break is None:
+                derived_break = broken
+            if flat_break is None:
+                flat_break = broken
+            if unexplained is None:
+                unexplained = broken
+            continue
+        if flat_rate is None:
+            flat_rate = sell
+        flat_ok = abs(sell - flat_rate) <= _SELL_MODEL_EPS
+        derived_ok = derived is not None and abs(sell - derived) <= _SELL_MODEL_EPS
+        if not derived_ok and derived_break is None:
+            derived_break = _slot_evidence(index, slot, sell, derived)
+        if not flat_ok and flat_break is None:
+            flat_break = _slot_evidence(index, slot, sell, None)
+        if not derived_ok and not flat_ok and unexplained is None:
+            unexplained = _slot_evidence(index, slot, sell, derived)
+    return {
+        "priced_slots": priced,
+        "derived_fits": derived_break is None,
+        "flat_fits": flat_break is None,
+        "flat_rate_eur_per_kwh": flat_rate,
+        "derived_first_break": derived_break,
+        "flat_first_break": flat_break,
+        "first_unexplained_slot": unexplained,
+    }
+
+
+def tail_sell_pricing(forecast: Any, settings: Any) -> TailSellPricing:
+    """Which pricing model the **fetched window**'s ``sell`` prices came from, for the stage-3 tail.
+
+    A published tail entry carries its own buy price, so its sell price must come from the same rule
+    the window's slots went through, or the continuation row optimises against a different contract
+    than the plan: on a derived contract ``sell = buy - fee`` follows *each slot's own* buy, while an
+    explicit flat contract pays one rate that the tail keeps (the window slot at the same clock time
+    carries it, which is what :func:`optimize.terminal.tail_slots` reuses when ``rule`` is ``None``).
+    Returning the derived rule unconditionally would re-price the tail of an explicit contract;
+    returning ``None`` unconditionally would do the reverse.
+
+    Three models are supported, and the forecast's own provenance is authoritative when it is there:
+
+    * ``feed_in_source`` in ``entity``/``flat`` -- one explicit rate really priced the window, so the
+      tail keeps that rate (``rule is None``).
+    * ``feed_in_source`` in ``derived``/``unavailable`` -- the slots carry the derived price
+      (``unavailable`` *did* fall back to it), so each published tail entry derives from its own buy.
+    * no provenance at all -- a caller-built or replayed forecast.  Exactly two things happen:
+
+      1. the window must fit at least one supported model.  If it fits neither -- a variable explicit
+         tariff, or garbage -- no reading of it can be justified, so the vector refuses
+         (``unsupported``), and clock-time repetition does not resolve a variable explicit tariff;
+      2. even when it fits one, the *window* fitting a model does not identify the contract: 0.16
+         and 0.22 buys with 0.14 and 0.20 sells fit the derived rule exactly and are equally an
+         entity publishing those two rates, so a later tail buy of 0.30 would be priced 0.28 by the
+         derived reading and 0.14 by the explicit one.  The matrix therefore never picks a rule: the
+         tail is priced under **both** candidate readings -- each published entry derived from its
+         own buy, versus the clock-time reference rate the materialisation already uses -- and any
+         disagreement refuses (``ambiguous``).  It proceeds only when the two agree everywhere,
+         where the choice cannot matter.
+
+    Those window sells are what the sweep prices the plan's own slots at either way, so reusing them
+    is consistency with the plan's input, not trust: the settlement's separate rule -- never hand an
+    unprovenanced window to the contract as an authoritative explicit tariff -- answers a different
+    question.
+    """
+    derive = derived_sell_rule(settings)
+    provenance = getattr(forecast, "feed_in_source", None)
+    if provenance in EXPLICIT_FEED_IN_SOURCES:
+        return TailSellPricing(None, False, False, {"provenance": provenance, "models": ["flat"]})
+    if provenance in DERIVED_FEED_IN_SOURCES:
+        return TailSellPricing(
+            derive, False, False, {"provenance": provenance, "models": ["derived"]}
+        )
+    evidence = _window_sell_models(forecast, derive)
+    if not (evidence["derived_fits"] or evidence["flat_fits"]):
+        return TailSellPricing(derive, False, True, evidence)
+    return TailSellPricing(derive, True, False, evidence)
+
+
 def _normalise_pairs(
     pairs: Iterable[tuple[datetime, Any]],
     *,
@@ -316,8 +504,75 @@ def _build_forecast(
         source=source,
         stale=bool(future) and all(slot.stale for slot in future),
         notes=list(notes),
+        tail_slots=_tail_slots(
+            table,
+            times,
+            slots,
+            source=source,
+            end=end,
+            hours=_terminal_tail_hours(settings),
+        ),
     )
     return forecast
+
+
+def _terminal_tail_hours(settings: Any) -> float:
+    """``optimizer.terminal_tail_hours``: the stage-3 tail length, 0 when unusable (no tail)."""
+    try:
+        value = float(settings.get("optimizer.terminal_tail_hours", 24.0))
+    except (TypeError, ValueError):
+        return 24.0
+    if value != value:  # NaN
+        return 24.0
+    return 0.0 if value <= 0.0 else min(value, 96.0)
+
+
+def _tail_slots(
+    table: dict[datetime, tuple[float, float]],
+    times: Sequence[datetime],
+    window: Sequence[PriceSlot],
+    *,
+    source: str,
+    end: datetime,
+    hours: float,
+) -> list[PriceSlot]:
+    """The stage-3 tail: provider entries past the plan horizon, then a periodic profile.
+
+    Additive, and read only by ``optimize/terminal.py`` (docs/OPTIMIZER_V2.md section 4).  The plan
+    horizon and the fetched window are the same window -- ``optimizer.horizon_hours`` sizes both --
+    so section 4's "beyond the fetched window" is exactly this: the real prices the provider
+    already published past the horizon, and the fetched window repeated by time-of-day beyond the
+    last real entry.  ``slots`` is never touched, so the live path, the feed-in settlement and the
+    saldering period volumes cannot move.
+    """
+    if hours <= 0.0 or not window:
+        return []
+    profile: dict[tuple[int, int], PriceSlot] = {}
+    for slot in window:
+        profile.setdefault((slot.t.hour, slot.t.minute), slot)
+    tail: list[PriceSlot] = []
+    for slot_time in slot_range(end, end + timedelta(hours=hours), SLOT_MINUTES):
+        position = bisect.bisect_right(times, slot_time)
+        if position and times[position - 1] == slot_time:
+            buy, slot_tax = table[slot_time]
+            stale = False
+        else:
+            # Beyond the last real entry: the same clock time from the fetched window (the last
+            # fetched slot when the horizon is shorter than a day and that clock time never occurs).
+            reference = profile.get((slot_time.hour, slot_time.minute), window[-1])
+            buy, slot_tax = reference.buy, reference.energy_tax
+            stale = True
+        tail.append(
+            PriceSlot(
+                t=slot_time,
+                buy=buy,
+                sell=0.0,
+                source=source,
+                stale=stale,
+                energy_tax=slot_tax,
+            )
+        )
+    return tail
 
 
 def _apply_coverage(
@@ -438,12 +693,13 @@ def _apply_feed_in(
     # when the contract does not pay it back. The component is per-slot where the provider publishes
     # a tax-excluded price and otherwise the configured wholesale adder (0.0 when unknown).
     refund = bool(settings.get("price.feed_in_energy_tax_refund", True))
+    derive = derived_sell_rule(settings)
     taxed = 0
     for slot in forecast.slots:
         component = float(getattr(slot, "energy_tax", 0.0) or 0.0)
         if not refund and component:
             taxed += 1
-        slot.sell = slot.buy - export_fee - (0.0 if refund else component)
+        slot.sell = derive(slot.buy, component)
     detail = f"derived feed-in price: buy price minus feed-in cost {export_fee:.4f} EUR/kWh"
     if not refund:
         if taxed:

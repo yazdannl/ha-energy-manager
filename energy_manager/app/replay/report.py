@@ -48,13 +48,16 @@ from .manifest import SAA_NOT_SHIPPED, Manifest, PlantCeiling, Tolerances
 from .runner import LegResult
 from .statistics import EPISODE_EVIDENCE_REQUIREMENT, gap_windows, plan_horizon_windows
 
-REPORT_SCHEMA = "replay-report/1"
+#: Bumped when the report's own shape changes (v2: E3 pairs the terminal vector against salvage,
+#: so its ``terminal_pair`` block is a two-leg extended-horizon disclosure rather than one leg's
+#: accounting pair).  A stored report of an older shape must not be read as this one.
+REPORT_SCHEMA = "replay-report/2"
 
 #: The only keys allowed to differ between two runs of the same manifest (the determinism rule).
 VOLATILE_KEYS = ("runtime_s", "generated_at")
 
 #: Evidence labels: an arm that ran exactly as declared, or a labelled substitute for one that does
-#: not exist yet (E3's terminal vector, E4's expected-cost SAA).  Never silently the same thing.
+#: not exist yet (E4's expected-cost SAA).  Never silently the same thing.
 DECLARED = "declared"
 EMPIRICAL = "empirical"
 EMPIRICAL_ARMS = ("E3", "E4")
@@ -117,6 +120,22 @@ ANCHOR_LEG_IS_THE_FIDELITY_REFERENCE = "anchor_leg_is_the_fidelity_reference"
 REFERENCE_LEG_NOTE = (
     "the pair is a declared same-plant comparison, and the pair's own gates 1-3 remain not "
     "applicable because neither paired leg has a recorded counterpart"
+)
+
+#: E3's comparison is the *extended-horizon* delta: a passing vector changes the schedule, so the
+#: horizon-only delta excludes the terminal-inventory term the two schedules produce.
+TERMINAL_PAIR_IS_EXTENDED_HORIZON = "terminal_pair_is_extended_horizon"
+TERMINAL_PAIR_NOTE = (
+    "E3's comparison is delta_with_terminal_eur: the terminal treatment changes the schedule, so "
+    "the horizon-only delta_eur is not its effect -- read the paired terminal terms, valued at the "
+    "one declared valuation both legs ran under"
+)
+#: ... and the pair is only a terminal *measurement* where the mode engaged.
+TERMINAL_PAIR_SAME_SCHEDULE = "terminal_pair_same_schedule"
+TERMINAL_PAIR_SAME_SCHEDULE_NOTE = (
+    "both legs' schedules are identical, so the vector either never engaged (a refused plan falls "
+    "back to salvage) or was decision-neutral on this recording; a zero here is not a measured "
+    "terminal effect"
 )
 
 #: A bootstrap whose interval is not evidence because the episode is shorter than one plan horizon.
@@ -1072,9 +1091,11 @@ def _reference_attribution(legs: Sequence[LegRun]) -> dict[str, Any]:
 def pair_arm(arm: Any, legs: Sequence[LegRun]) -> PairedDelta | None:
     """The arm's paired delta, oriented so a positive number means the declared side wins.
 
-    E2 pairs the declared contract model against the recorded one; E4 pairs the production policy
-    against the recorded policy; E1 (fidelity) and E3 (a within-leg terminal pair) have no paired
-    delta of their own and say so instead of inventing one.
+    E2 pairs the declared contract model against the recorded one; E3 pairs the terminal vector
+    against salvage; E4 pairs the production policy against the recorded policy; E1 (fidelity) has
+    no paired delta of its own and says so instead of inventing one.  E3's pair is read on
+    ``delta_with_terminal_eur`` -- its schedules differ, so the horizon-only delta is not the
+    terminal treatment's effect.
     """
     from .accounting import paired_delta
 
@@ -1088,37 +1109,127 @@ def pair_arm(arm: Any, legs: Sequence[LegRun]) -> PairedDelta | None:
 def pair_legs(arm: Any, legs: Sequence[LegRun]) -> tuple[LegRun, LegRun] | None:
     """Which two legs an arm pairs, by name and shape -- never the fidelity reference leg.
 
-    An arm may carry extra legs (E2's and E4's recorded-plant reference leg, E4's posture
+    An arm may carry extra legs (E2's and E4's recorded-plant reference leg, E3's, E4's posture
     cross-check); the pair is the declared same-plant comparison, so its members are selected here
     once and both the delta and the report's ``paired.legs`` read it from this function.
     """
     name = str(getattr(arm, "name", "")).upper()
     if name == "E2" and len(legs) >= 2:
         return legs[0], legs[1]
+    if name == "E3":
+        # By name, not by position: E3 also drives E1's leg as its gate reference, and the terminal
+        # treatment must be compared on the two legs that differ in nothing else.
+        by_name = {str(leg.result.name): leg for leg in legs}
+        salvage, vector = by_name.get("salvage"), by_name.get("vector")
+        if salvage is not None and vector is not None:
+            return salvage, vector
+        return None
     if name == "E4" and len(legs) >= 2:
         return legs[1], legs[0]
     return None
 
 
-def terminal_pair(leg: LegRun) -> dict[str, Any] | None:
-    """E3's degraded comparison: the same leg's profit with and without the terminal term."""
-    account = leg.account
-    if account.profit_with_terminal_eur is None:
+def terminal_pair(pair: tuple[LegRun, LegRun] | None) -> dict[str, Any] | None:
+    """E3's extended-horizon disclosure: both legs' terminal-inventory terms at the declared value.
+
+    The pair's money is ``paired.delta_with_terminal_eur``; this block is the arithmetic behind it,
+    per leg, plus whether the two legs really were valued at the same price (a delta between two
+    valuations is not the terminal treatment's effect) and whether their schedules moved at all (a
+    refused vector falls back to salvage, and then the pair is an identity, not a measurement).
+    """
+    if pair is None:
         return None
+    salvage, vector = pair
+    left, right = salvage.account, vector.account
+    if left.terminal_adjustment_eur is None or right.terminal_adjustment_eur is None:
+        return None
+    agree = (
+        left.valuation_eur_per_kwh is not None
+        and right.valuation_eur_per_kwh is not None
+        and math.isclose(
+            float(left.valuation_eur_per_kwh), float(right.valuation_eur_per_kwh), abs_tol=1e-9
+        )
+    )
+    moved = _schedule_moved(left, right)
     return {
-        "valuation": account.valuation_eur_per_kwh,
-        "valuation_source": account.valuation_source,
+        "valuation_eur_per_kwh": _round(right.valuation_eur_per_kwh, 6),
+        "valuation_source": right.valuation_source,
         "valuation_packs": {
-            "frozen": list(account.valuation_frozen),
-            "derived": list(account.valuation_derived),
-            "missing": list(account.valuation_missing),
+            "frozen": list(right.valuation_frozen),
+            "derived": list(right.valuation_derived),
+            "missing": list(right.valuation_missing),
         },
-        "terminal_adjustment_eur": account.terminal_adjustment_eur,
-        "profit_without_terminal_eur": account.profit_eur,
-        "profit_with_terminal_eur": account.profit_with_terminal_eur,
-        "sensitivity_valuation_eur_per_kwh": account.sensitivity_valuation_eur_per_kwh,
-        "sensitivity_terminal_adjustment_eur": account.sensitivity_terminal_adjustment_eur,
+        "valuations_agree": agree,
+        "schedule_moved": moved,
+        "salvage_terminal_adjustment_eur": _round(left.terminal_adjustment_eur, 4),
+        "vector_terminal_adjustment_eur": _round(right.terminal_adjustment_eur, 4),
+        "terminal_delta_eur": _round(right.terminal_adjustment_eur - left.terminal_adjustment_eur, 4),
+        "salvage_profit_eur": _round(left.profit_eur, 4),
+        "salvage_profit_with_terminal_eur": _round(left.profit_with_terminal_eur, 4),
+        "vector_profit_eur": _round(right.profit_eur, 4),
+        "vector_profit_with_terminal_eur": _round(right.profit_with_terminal_eur, 4),
+        "sensitivity_valuation_eur_per_kwh": _round(right.sensitivity_valuation_eur_per_kwh, 6),
+        "sensitivity_terminal_delta_eur": _round(
+            None
+            if left.sensitivity_terminal_adjustment_eur is None
+            or right.sensitivity_terminal_adjustment_eur is None
+            else right.sensitivity_terminal_adjustment_eur - left.sensitivity_terminal_adjustment_eur,
+            4,
+        ),
     }
+
+
+def _schedule_fingerprint(account: Any) -> tuple[Any, ...] | None:
+    """A time-resolved fingerprint of a leg's booked flows, or ``None`` when a flow is unknown.
+
+    Per window, per booked segment: its start/end and its rate and energies.  The schedule is the
+    *trajectory*, not the total -- charging and discharging can move between differently priced
+    slots with the import/export/energy totals unchanged, and a totals comparison would call that
+    "the same schedule".  The flows are compared **exactly** (no rounding: the fingerprint is a
+    disclosure of identity, and a rounded comparison is not collision-free where exactness is
+    free).  ``None`` means the leg has no comparable trajectory (a withheld window, or a window with
+    no measured segment), which is not the same as "identical".
+    """
+    windows = getattr(account, "windows", None)
+    if not windows:
+        return None
+    out: list[Any] = []
+    for window in windows:
+        segments = getattr(window, "segments", None)
+        if getattr(window, "withheld", False) or not segments:
+            return None
+        for segment in segments:
+            grid_kw = _finite(getattr(segment, "grid_kw", None))
+            import_kwh = _finite(getattr(segment, "import_kwh", None))
+            export_kwh = _finite(getattr(segment, "export_kwh", None))
+            if grid_kw is None or import_kwh is None or export_kwh is None:
+                return None
+            out.append(
+                (
+                    getattr(segment, "start", None),
+                    getattr(segment, "end", None),
+                    grid_kw,
+                    import_kwh,
+                    export_kwh,
+                )
+            )
+    return tuple(out)
+
+
+def _schedule_moved(left: Any, right: Any) -> bool | None:
+    """Whether the two legs' booked flows differ slot by slot, or ``None`` when one is unknown.
+
+    Totals are not enough: equal import/export/energy totals can hide a charge moved from one priced
+    slot to another, and the pair would then be labelled an identity and a real comparison dismissed
+    (see :func:`_schedule_fingerprint`).  ``None`` is not ``False``: a leg whose windows were
+    withheld or unmeasured has no trajectory to compare, and an unknown schedule difference must not
+    read as "the mode did nothing".
+    """
+    left_fingerprint = _schedule_fingerprint(left)
+    right_fingerprint = _schedule_fingerprint(right)
+    if left_fingerprint is None or right_fingerprint is None:
+        return None
+    return left_fingerprint != right_fingerprint
 
 
 # ---------------------------------------------------------------------------------------- sections
@@ -1401,7 +1512,8 @@ def _accounting_section(
         if paired is None
         else _paired_dict(paired, pair_legs(arm, legs)),
         "bootstrap": None if bootstrap is None else _bootstrap_dict(bootstrap),
-        "terminal_pair": None if name != "E3" else terminal_pair(legs[0]),        "withheld_by_gate": withheld_by_gate,
+        "terminal_pair": None if name != "E3" else terminal_pair(pair_legs(arm, legs)),
+        "withheld_by_gate": withheld_by_gate,
         # The declared contract's own verdict travels with the delta it produced, so a number that
         # mixes a tariff effect with a refusal to price export cannot be read as a tariff error.
         "contract": _contract_state(legs),
@@ -1409,6 +1521,7 @@ def _accounting_section(
     }
     _label_null_by_construction(section)
     _label_anchor_leg(section, legs)
+    _label_terminal_pair(section)
     _label_interval_evidence(section)
     return section
 
@@ -1443,6 +1556,28 @@ def _label_anchor_leg(section: dict[str, Any], legs: Sequence[LegRun]) -> None:
             "text": f"the reference leg {anchor[0].result.name!r} is the gate reference; {REFERENCE_LEG_NOTE}",
         }
     )
+
+
+def _label_terminal_pair(section: dict[str, Any]) -> None:
+    """E3: say which number the arm's comparison is, and when it is an identity instead.
+
+    Two labels, because two different things can make this pair look like a result: the horizon-only
+    delta (which is *not* the terminal treatment's effect when the schedules differ) and a pair whose
+    schedules never moved at all (a refused vector falls back to salvage, so the delta is zero by
+    construction rather than by measurement).
+    """
+    block = section.get("terminal_pair")
+    if not isinstance(block, dict):
+        return
+    section["notes"].append(
+        {"code": TERMINAL_PAIR_IS_EXTENDED_HORIZON, "text": TERMINAL_PAIR_NOTE}
+    )
+    section["evidence_labels"] = [*section["evidence_labels"], TERMINAL_PAIR_IS_EXTENDED_HORIZON]
+    if block.get("schedule_moved") is False:
+        section["notes"].append(
+            {"code": TERMINAL_PAIR_SAME_SCHEDULE, "text": TERMINAL_PAIR_SAME_SCHEDULE_NOTE}
+        )
+        section["evidence_labels"] = [*section["evidence_labels"], TERMINAL_PAIR_SAME_SCHEDULE]
 
 
 def _label_interval_evidence(section: dict[str, Any]) -> None:
