@@ -763,6 +763,21 @@ def status_dict(
     }
 
 
+def optimizer_core_status() -> dict[str, Any]:
+    """Additive (0.27.0): the optimizer's numeric backend, for ``/health``.
+
+    The accelerator is optional by design and fails open at build and import time, so ``"python"``
+    is a legitimate answer rather than an error -- but it is a different code path, and which one
+    is live is not otherwise observable from outside the container.  The import is local because
+    the API must not depend on the optimizer package to serve a request.
+    """
+    try:
+        from .optimize import _fast
+    except Exception as exc:  # pragma: no cover - the optimizer is always packaged
+        return {"backend": "python", "build_sha": None, "reason": f"{type(exc).__name__}: {exc}"}
+    return _fast.status()
+
+
 # ---------------------------------------------------------------------------------------------
 # The server
 # ---------------------------------------------------------------------------------------------
@@ -894,6 +909,11 @@ class ApiServer:
                     "version": state.version or self.version,
                     "uptime_s": round(state.uptime_s, 1),
                     "commit": state.commit,
+                    # Additive (0.27.0): which optimizer backend actually solves.  The accelerator
+                    # is fail-open at build and import time, so without this a deployed image
+                    # cannot be asked whether the compiled core is live -- and a stale build is
+                    # refused at load, which is a state worth seeing rather than inferring.
+                    "optimizer_core": optimizer_core_status(),
                 }
             )
 

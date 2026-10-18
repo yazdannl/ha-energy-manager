@@ -165,6 +165,8 @@ _CHECK_INTERVAL = _DEFAULT_CHECK_INTERVAL
 
 #: Set for the rest of the process once the core fails a call or any verification.
 _disabled = False
+#: Why it was disabled, kept so a deploy can be told rather than only a log line.
+_disabled_reason: str | None = None
 _warned = False
 _solve_count = 0
 _checks_done = 0
@@ -207,6 +209,31 @@ def available() -> bool:
     return _core is not None and not _disabled
 
 
+def status() -> dict[str, Any]:
+    """Additive (0.27.0): which numeric backend is live, so a deploy can be verified.
+
+    ``backend`` is ``"c"`` only while the extension is loaded, not stale and not disabled; it is
+    ``"python"`` whenever the reference is what actually solves, which is the safe state and also
+    what a plain checkout without a compiled extension reports.  ``build_sha`` is the digest the
+    loaded extension was compiled from (``None`` when there is no extension), and ``reason`` says
+    why the accelerator is unavailable, including a stale build or a verification failure -- a
+    deploy that ships an accelerator it cannot prove is live is exactly the gap this closes.
+    """
+    if available():
+        return {"backend": "c", "build_sha": _build_sha() or None, "reason": None}
+    if _core is None:
+        reason = _import_error or "the C core is not built"
+    else:
+        reason = _disabled_reason or "disabled"
+    return {"backend": "python", "build_sha": None, "reason": str(reason)}
+
+
+def _build_sha() -> str | None:
+    """The digest the loaded extension was compiled from, when it exposes one."""
+    value = getattr(_core, "build_sha", None)
+    return str(value) if value else None
+
+
 def set_check_interval(interval: int) -> None:
     """Set the full differential cross-check cadence (0 disables it) and reset the counters."""
     global _CHECK_INTERVAL, _solve_count, _checks_done
@@ -217,17 +244,20 @@ def set_check_interval(interval: int) -> None:
 
 def reset() -> None:
     """Re-enable the accelerator after a failure (tests only)."""
-    global _disabled, _warned, _solve_count, _checks_done
+    global _disabled, _warned, _disabled_reason, _solve_count, _checks_done
     _disabled = False
     _warned = False
+    _disabled_reason = None
     _solve_count = 0
     _checks_done = 0
 
 
 def disable(reason: str) -> None:
     """Disable the accelerator for the rest of the process, warning once."""
-    global _disabled, _warned
+    global _disabled, _warned, _disabled_reason
     _disabled = True
+    if _disabled_reason is None:
+        _disabled_reason = str(reason)
     if not _warned:
         _warned = True
         log.warning("optimizer: C core disabled (%s); falling back to the Python reference", reason)
