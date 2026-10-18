@@ -1822,6 +1822,13 @@ than by weakening `tools/audit.sh`.
 
 ## 16. Amendment log (why the spec changed)
 
+**0.28.1 — the sync key is per chart family, not per draw.** No requirement changed; this is a defect
+fix in `charts.js`. uPlot's sync registry (`dt`) maps a key to a hub and never deletes the entry, so a
+key minted per draw left one empty hub behind per redraw — and a Lovelace card redraws whenever the
+add-on publishes (~20 s), for as long as the tab stays open. §13's chart layer therefore uses a single
+`SYNC_KEY` for the plan timeline, which is also uPlot's documented idiom: every plan timeline on a
+page shares one crosshair, which is what aligned timelines want.
+
 **0.28.0 — the charts leave the add-on: compact feeds, a self-installed Lovelace card, and a design
 system that defines its own decoration.**
 

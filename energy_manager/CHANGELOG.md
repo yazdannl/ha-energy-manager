@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.28.1
+
+- **One cursor-sync key per chart family instead of one per draw.** uPlot's sync registry keeps a hub
+object per key for the life of the page and never removes it (the vendored accessor only ever
+creates), so minting a key each time the plan timeline was drawn retained an empty hub per redraw —
+about one every 20 s on a dashboard whose card redraws whenever the add-on publishes. `charts.js` now
+uses a single `SYNC_KEY`, which is also uPlot's own idiom: two plan timelines on one page share a
+crosshair, which is what aligned timelines want. `tests/test_wp3_assets.py` gained the first harness
+that actually executes `charts.js` (a fake uPlot records what it is constructed with) and pins two
+panels per draw, three slots per panel, the 200/175 px panels, the gradient fill and the reused key
+across redraws.
+
 ## 0.28.0
 
 - **The charts can go on your dashboard now, as a card you install yourself.** The add-on's UI is

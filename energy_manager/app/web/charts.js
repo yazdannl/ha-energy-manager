@@ -26,7 +26,12 @@
   var watchers = []; // {host, draw} for re-rendering on colour-scheme change
   var BARS = null; // uPlot.paths.bars factory, created lazily
   var SPLINE = null; // uPlot.paths.spline factory, created lazily
-  var syncSeq = 0; // one cursor-sync key per timeline so two aligned panels track together
+  // uPlot's sync registry never forgets a key (its `dt` accessor only ever creates, never deletes),
+  // so every distinct key a page has ever mounted keeps a hub object alive for the life of that page.
+  // A key per draw would therefore grow for as long as the page is open - and the Lovelace card
+  // redraws every time the add-on publishes. One key per chart family is also uPlot's own idiom: two
+  // plan timelines on one page then share a crosshair, which is what aligned timelines want anyway.
+  var SYNC_KEY = "sem-plan"; // the two plan panels (price/SoC and PV/load/battery) track together
 
   // Fallbacks when the CSS custom properties are missing (the dashboard card passes its own set).
   var DEFAULT_PALETTE = {
@@ -566,7 +571,6 @@
     var eff = options.efficiency;
     var showBreakEven = !!(eff && eff.round_trip > 0);
     var now = Date.now() / 1000;
-    var syncKey = "sem-plan-" + (++syncSeq);
     var xs = [], buy = [], sell = [], soc = [], pv = [], load = [], charge = [], discharge = [], staleBuy = [], breakEven = [];
     slots.forEach(function (s) {
       xs.push(ts(s.t));
@@ -616,7 +620,7 @@
       scales: { x: { time: true }, y: { auto: true }, soc: { auto: true } },
       axes: [timeAxis(p), axisFor("y", "EUR/kWh", 3, p, narrow, "price"), axisFor("soc", "%", 1, p, narrow, "pct")],
       series: seriesA,
-      cursor: { y: false, x: true, points: { show: true, size: 5 }, sync: { key: syncKey, setSeries: false } },
+      cursor: { y: false, x: true, points: { show: true, size: 5 }, sync: { key: SYNC_KEY, setSeries: false } },
       plugins: [decorPlugin({ palette: p, now: now }), tooltipPlugin()]
     });
 
@@ -637,7 +641,7 @@
         Object.assign(bars(p.charge, 0.9, 0.4), { label: "Battery charging", value: unitFmt(2, "kW") }),
         Object.assign(bars(p.discharge, 0.9, 0.4), { label: "Battery discharging", value: unitFmt(2, "kW") })
       ],
-      cursor: { y: false, x: true, points: { show: true, size: 5 }, sync: { key: syncKey, setSeries: false } },
+      cursor: { y: false, x: true, points: { show: true, size: 5 }, sync: { key: SYNC_KEY, setSeries: false } },
       plugins: [decorPlugin({ palette: p, now: now, zeroLine: true }), tooltipPlugin()]
     });
     var hostB = document.createElement("div");

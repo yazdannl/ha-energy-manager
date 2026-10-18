@@ -1450,6 +1450,24 @@ def test_the_card_maps_every_feed_row_into_the_chart_api():
     assert data["wrongSchema"]["calls"] == [] and "schema" in data["wrongSchema"]["message"]
 
 
+def test_the_plan_timeline_reuses_one_cursor_sync_key():
+    """Two aligned panels, drawn again and again, must not mint a sync key per draw.
+
+    uPlot's sync registry keeps a hub per key for the life of the page, and the card redraws the plan
+    every time the add-on publishes (~20 s), so a fresh key per draw retains an empty hub per redraw
+    for as long as the dashboard tab is open.
+    """
+    data = json.loads(run_node_script(CHARTS_HARNESS))
+    assert data["panelsPerDraw"] == [2, 2], data
+    assert data["firstKeys"] == data["secondKeys"] == ["sem-plan"], data
+    assert data["slotsPerPanel"] == [3, 3], data
+    assert data["heights"] == [200, 175], data
+    # Panel A: an empty x series, buy, stale, sell, break-even and SoC. Panel B: an empty x series
+    # plus PV, load, charging and discharging.
+    assert data["seriesPerPanel"] == [6, 5], data
+    assert data["gradientFills"] >= 1, "the price bars lost their gradient fill"
+
+
 def test_the_card_types_no_html_and_reaches_no_remote_asset():
     """The card is injected into a user's dashboard: it must build DOM, never parse HTML."""
     source = strip_js_comments(read(WEB / "sem-charts-card.js"))
@@ -1469,6 +1487,73 @@ def test_the_card_bundle_has_no_duplicate_or_missing_source():
     for name in CARD_BUNDLE_CSS + CARD_BUNDLE_SOURCES:
         assert (WEB / name).is_file(), f"bundle source {name} is missing"
     assert "charts.js" in CARD_BUNDLE_SOURCES and "sem-charts-card.js" in CARD_BUNDLE_SOURCES
+
+
+CHARTS_HARNESS = r"""
+/* charts.js only ever runs in a browser, so a fake uPlot is the only way to execute its option
+   building at all. What this harness is really for: the cursor-sync key. uPlot's sync registry keeps
+   a hub per key for the life of the page (its accessor only ever creates), so a key minted per draw
+   would retain one empty hub per redraw - and the dashboard card redraws every time the add-on
+   publishes. One key per chart family is also what gives two aligned timelines a shared crosshair. */
+const mounts = [];
+globalThis.window = globalThis;
+globalThis.devicePixelRatio = 1;
+globalThis.requestAnimationFrame = () => 0;
+globalThis.cancelAnimationFrame = () => {};
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.getComputedStyle = () => ({ getPropertyValue: () => "" });
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+function fakeNode(tag) {
+  return {
+    tagName: tag, className: "", style: {}, textContent: "", children: [], attrs: {}, hidden: false,
+    clientWidth: 640,
+    classList: { add() {}, remove() {} },
+    setAttribute(key, value) { this.attrs[key] = value; },
+    appendChild(child) { this.children.push(child); return child; },
+    addEventListener() {}, removeEventListener() {},
+    contains: () => false,
+    getContext: () => null,
+    getBoundingClientRect: () => ({ width: 640, height: 200, top: 0, left: 0 })
+  };
+}
+globalThis.document = { createElement: fakeNode, documentElement: fakeNode("html"), body: fakeNode("body") };
+globalThis.uPlot = function (opts, data, el) {
+  mounts.push({
+    sync: opts.cursor && opts.cursor.sync ? opts.cursor.sync.key : null,
+    series: opts.series.length,
+    slots: data[0].length,
+    height: opts.height,
+    gradientFill: typeof opts.series[1].fill
+  });
+  this.destroy = function () {};
+  this.setSize = function () {};
+};
+globalThis.uPlot.paths = { bars: () => () => {}, spline: () => () => {} };
+require("./charts.js");
+
+const slot = (t, power) => ({
+  t: new Date(t * 1000).toISOString(), buy: 0.11, sell: 0.09, soc_pct: 55, pv_kw: 1.2, load_kw: 0.6,
+  power_w: power, price_stale: false
+});
+const plan = { slots: [slot(1700000000, 300), slot(1700000900, -200), slot(1700001800, 0)] };
+const host = fakeNode("div");
+const options = { wear: 0.02, efficiency: { round_trip: 0.85 } };
+globalThis.SEMCharts.plan(host, plan, options);
+const first = mounts.splice(0);
+globalThis.SEMCharts.plan(host, plan, options);
+const second = mounts.splice(0);
+const keys = (list) => [...new Set(list.map((entry) => entry.sync))];
+console.log(JSON.stringify({
+  panelsPerDraw: [first.length, second.length],
+  firstKeys: keys(first),
+  secondKeys: keys(second),
+  seriesPerPanel: first.map((entry) => entry.series),
+  slotsPerPanel: first.map((entry) => entry.slots),
+  heights: first.map((entry) => entry.height),
+  gradientFills: first.filter((entry) => entry.gradientFill === "function").length
+}));
+"""
 
 
 BUNDLE_LOADER = r"""
