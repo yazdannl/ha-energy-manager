@@ -1,6 +1,6 @@
 /* SoC dynamic program core (SPEC 8.2 / docs/OPTIMIZER_V2.md section 6).
  *
- * One entry point: solve(pv, load, buy, sell, minutes, config) -> dict.
+ * One entry point: solve(pv, load, buy, sell, minutes, config[, terminal_row]) -> dict.
  *
  * A drop-in accelerator for ``app.optimize.dp._solve_once``: it reproduces the reference value
  * iteration and path reconstruction over flat double arrays, releases the GIL for the numeric
@@ -8,11 +8,24 @@
  * of native doubles) so ``_fast.py`` can verify the decision and the sampled backward sweep.
  * Slot classification (``_classify``) and ``PlanSlot`` construction stay in Python.
  *
+ * The optional seventh argument is optimizer v2 stage 3's continuation row over the same state
+ * grid (docs/OPTIMIZER_V2.md section 4): when present it *is* the terminal condition (``value[n]
+ * = terminal_row``, exactly ``dp._backward_sweep``'s terminal row) and the reported objective's
+ * terminal term is ``interp(terminal_row, grid, e_now)`` instead of the salvage term -- with
+ * neither salvage nor the target penalty added again, because ``dp._row_with_penalty`` already
+ * baked the penalty into the row the caller supplies.  ``e_target`` still drives the last slot's
+ * exact-power action and ``terminal_error_kwh``.  A row is used as given: its entries are copied
+ * verbatim and interpolated through the same ``_interp`` as every value row.
+ *
  * The sweep touches no Python object.  The Python loader (``_fast.py``) validates every result
- * before a plan may use it; a wrong answer here can never reach a plan.  This file must therefore
- * never rely on that validation for memory safety: dimensions are capped and every size
- * computation is checked, and numeric domains are validated here so no integer cast ever sees a
- * non-finite ratio.
+ * before a plan may use it: structure, feasibility, one-step decision consistency against the
+ * returned value rows, the terminal boundary and a sampled backward Bellman pass, with the
+ * periodic full differential against the Python reference as the backstop.  That contract is
+ * self-consistency, not interior optimality -- a wrong value at an unsampled interior cell is not
+ * caught on the solve that used it -- so this file must never treat that validation as a
+ * correctness proof, and must never rely on it for memory safety: dimensions are capped and every
+ * size computation is checked, and numeric domains are validated here so no integer cast ever sees
+ * a non-finite ratio.
  *
  * Floating-point note: the order of every expression mirrors ``dp.py`` and the Dockerfile builds
  * with ``-ffp-contract=off``, so the differential suite can compare at tight tolerances rather
@@ -401,12 +414,18 @@ static double choose_power(const Config *c, const SlotCtx *ctx, const double *gr
  * GIL is released around it; every buffer arrives pre-sized and every capacity was checked. */
 static int run_solve(const Config *c, const double *pv, const double *load, const double *buy,
                      const double *sell, const double *minutes, int n, const double *grid, int m,
-                     double inv_step, double *value, double *argmin, double *actions,
-                     long actions_capacity, double *energies, double *powers, double *windows,
-                     long *iterations_out, double *terminal_error_out, double *cycle_cost_out,
-                     double *objective_out, double *internal_out) {
+                     double inv_step, const double *terminal_row, double *value, double *argmin,
+                     double *actions, long actions_capacity, double *energies, double *powers,
+                     double *windows, long *iterations_out, double *terminal_error_out,
+                     double *cycle_cost_out, double *objective_out, double *internal_out) {
+    /* Terminal condition: the caller's stage-3 row verbatim when one was supplied (the row
+     * already carries the target penalty), otherwise the pre-stage-3 salvage row. */
     double *terminal = value + (size_t)n * (size_t)m;
     for (int k = 0; k < m; k++) {
+        if (terminal_row != NULL) {
+            terminal[k] = terminal_row[k];
+            continue;
+        }
         double v = -c->salvage * grid[k];
         if (c->has_target) v += c->target_penalty * fabs(grid[k] - c->e_target);
         terminal[k] = v;
@@ -482,10 +501,17 @@ static int run_solve(const Config *c, const double *pv, const double *load, cons
         objective += slot_cost(c, &ctx, dt, p);
         e_now = clampd(e_next, c->e_min_kwh, c->e_max_kwh);
     }
-    objective += cycle_cost - c->salvage * e_now;
+    if (terminal_row != NULL) {
+        /* Stage 3: the row *is* the continuation value, so the path objective's terminal term is
+         * the same interpolated row the last slot's sweep used -- no salvage and no penalty (the
+         * penalty is already inside the supplied row). */
+        objective += cycle_cost + interp(terminal_row, grid, m, inv_step, e_now);
+    } else {
+        objective += cycle_cost - c->salvage * e_now;
+    }
     double terminal_error = 0.0;
     if (c->has_target) {
-        objective += c->target_penalty * fabs(e_now - c->e_target);
+        if (terminal_row == NULL) objective += c->target_penalty * fabs(e_now - c->e_target);
         terminal_error = fabs(e_now - c->e_target);
     }
 
@@ -752,10 +778,13 @@ static int dict_set_long(PyObject *dict, const char *key, long value) {
 static PyObject *core_solve(PyObject *self, PyObject *args) {
     (void)self;
     PyObject *pv_obj, *load_obj, *buy_obj, *sell_obj, *minutes_obj, *config_obj;
-    if (!PyArg_ParseTuple(args, "OOOOOO:solve", &pv_obj, &load_obj, &buy_obj, &sell_obj,
-                          &minutes_obj, &config_obj)) {
+    PyObject *terminal_row_obj = Py_None;
+    if (!PyArg_ParseTuple(args, "OOOOOO|O:solve", &pv_obj, &load_obj, &buy_obj, &sell_obj,
+                          &minutes_obj, &config_obj, &terminal_row_obj)) {
         return NULL;
     }
+    /* Declared before any ``goto fail`` so the cleanup label always sees NULL or a real buffer. */
+    double *terminal_row = NULL;
 
     Config c;
     if (parse_config(config_obj, &c) < 0) return NULL;
@@ -821,6 +850,23 @@ static PyObject *core_solve(PyObject *self, PyObject *args) {
         goto fail;
     }
 
+    /* Stage-3 continuation row: converted over the same grid the sweep uses.  A row of the wrong
+     * length cannot be interpreted, so it is refused here (the loader then falls back to the
+     * Python reference) rather than being read out of bounds or silently ignored. */
+    if (terminal_row_obj != Py_None) {
+        Py_ssize_t n_row = 0;
+        terminal_row = to_doubles(terminal_row_obj, &n_row, "terminal_row");
+        if (!terminal_row) {
+            free(grid);
+            goto fail;
+        }
+        if (n_row != (Py_ssize_t)m) {
+            PyErr_Format(PyExc_ValueError,
+                         "terminal_row has %zd entries but the state grid has %d", n_row, m);
+            free(grid);
+            goto fail;  /* the fail label frees terminal_row */
+        }
+    }
     size_t slots = (size_t)n;
     size_t rows = slots + 1;
     size_t states = (size_t)m;
@@ -863,9 +909,9 @@ static PyObject *core_solve(PyObject *self, PyObject *args) {
     int status;
     double inv_step = 1.0 / step;
     Py_BEGIN_ALLOW_THREADS
-    status = run_solve(&c, pv, load, buy, sell, minutes, n, grid, m, inv_step, value, argmin,
-                       actions, (long)actions_capacity, energies, powers, windows, &iterations,
-                       &terminal_error, &cycle_cost, &objective, &internal);
+    status = run_solve(&c, pv, load, buy, sell, minutes, n, grid, m, inv_step, terminal_row, value,
+                       argmin, actions, (long)actions_capacity, energies, powers, windows,
+                       &iterations, &terminal_error, &cycle_cost, &objective, &internal);
     Py_END_ALLOW_THREADS
     if (status != 0) {
         if (!PyErr_Occurred()) PyErr_SetString(PyExc_RuntimeError, "core sweep failed");
@@ -876,7 +922,7 @@ static PyObject *core_solve(PyObject *self, PyObject *args) {
         free(energies);
         free(powers);
         free(windows);
-        goto fail;
+        goto fail;  /* the fail label frees terminal_row */
     }
 
     PyObject *result = PyDict_New();
@@ -900,7 +946,7 @@ static PyObject *core_solve(PyObject *self, PyObject *args) {
         free(energies);
         free(powers);
         free(windows);
-        goto fail;
+        goto fail;  /* the fail label frees terminal_row */
     }
     int ok = 0;
     for (size_t i = 0; i < slots && ok == 0; i++) {
@@ -938,6 +984,8 @@ static PyObject *core_solve(PyObject *self, PyObject *args) {
     free(energies);
     free(powers);
     free(windows);
+    free(terminal_row);
+    terminal_row = NULL;  /* the ``fail`` label below must not free it a second time */
 
     if (ok == 0) {
         ok |= PyDict_SetItemString(result, "energies", energies_list);
@@ -975,12 +1023,14 @@ fail:
     free(buy);
     free(sell);
     free(minutes);
+    free(terminal_row);
     return NULL;
 }
 
 static PyMethodDef core_methods[] = {
     {"solve", core_solve, METH_VARARGS,
-     "Run the SoC Bellman sweep + path reconstruction for one scenario over flat arrays."},
+     "Run the SoC Bellman sweep + path reconstruction for one scenario over flat arrays; an "
+     "optional seventh argument is the stage-3 terminal-value row over the same grid."},
     {NULL, NULL, 0, NULL},
 };
 

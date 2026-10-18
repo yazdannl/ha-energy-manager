@@ -19,19 +19,37 @@ runtime contract, stated honestly:
 * the whole value-function buffer must be finite, non-finite operands and accumulators fail closed
   before any tolerance comparison, and the last slot's terminal values and a sample of ``V_i[k]``
   entries are recomputed from ``V_next`` (backward Bellman) and compared;
+* when an optimizer v2 stage-3 continuation row is supplied, its structure, length and finiteness
+  are checked, the returned terminal row must equal it entry for entry (never a substituted
+  salvage row), the reported objective must interpolate that row -- no salvage and no second
+  target penalty -- and the *whole* last slot's row, not a sample, must be the reference one-step
+  Bellman value over it, so the sweep provably consumed the row at the boundary;
 * the reported cycle cost equals the wear accumulated independently over the returned path.
 
 **Periodically** (full equivalence with the unchanged Python reference): on the first solve after
 load and every ``_CHECK_INTERVAL`` solves (default 20, ``0`` = off), ``dp._solve_once_numeric`` is
-run and powers, energies, objective, iterations and step are compared; any mismatch disables the
-core permanently.
+run -- with the supplied row forwarded verbatim -- and powers, energies, objective, iterations and
+step are compared; any mismatch disables the core permanently.  A solve that falls through to the
+reference because the core *declined* (an unusable row, before the call, or a rejected result)
+is a fallback, not a mismatch.
 
-The bound this implies: between cross-checks the guarantee is *feasibility + one-step decision
-consistency + sampled backward consistency*, not a full re-derivation of the value function; the
-periodic full differential bounds the residual risk.  Any failure at any point disables the
+The bound this implies, stated as a limit and not hidden behind the list above: between
+cross-checks the guarantee is *feasibility + one-step decision consistency + sampled backward
+consistency*, never *optimality of the returned path*.  An incorrect value at an **unsampled
+interior cell** -- a row and a state outside the Bellman sample, and, with a stage-3 row, outside
+the fully checked last slot -- is **not** detected by the per-solve checks: the one-step check
+resolves that action against the same returned ``V_next``, so a wrong cell that only moves a
+decision the path takes still looks self-consistent, and the objective is then recomputed from
+the (wrong) path it produced.  Detection of that case belongs to the periodic full differential,
+which compares the resulting powers/objective against the Python reference -- and it therefore
+does not retroactively validate the solves in between.  The row-mode last-slot check, the
+symbolic grid and the sampled Bellman check establish the *boundary* the sweep consumes; they do
+not turn a bad interior value into a caught one.  Any failure at any point disables the
 extension for the process (one warning) and :func:`solve` returns ``None`` so the Python reference
-runs.  An extension that returns wrong results therefore cannot reach a plan without the
-verification above catching it (or the periodic cross-check doing so).
+runs.  The checks bound the risk rather than prove correctness: a wrong extension result reaches a
+plan only while every per-solve check above happens to miss it -- interior optimality is exactly
+that gap -- and the periodic full differential then catches the divergence after the fact, never
+retroactively for the solves in between.
 
 No third-party dependency: the extension is imported by name and everything else is the standard
 library.
@@ -307,6 +325,53 @@ def _reference_bounds(dp: Any, slot: Any, agg: Any, opts: Any, e: float, dt: flo
     return lo, hi
 
 
+#: Returned by :func:`_prepare_terminal_row` when a caller-supplied row cannot be used.
+_ROW_UNUSABLE = object()
+
+
+def _decline_terminal_row(reason: str) -> Any:
+    """Log a declined row once and return the sentinel; the extension is not called."""
+    log.warning("optimizer: %s; the Python reference solves this scenario", reason)
+    return _ROW_UNUSABLE
+
+
+def _prepare_terminal_row(
+    dp: Any,
+    slots: Sequence[Any],
+    agg: Any,
+    opts: Any,
+    start_kwh: float,
+    e_target: float | None,
+    terminal_row: Sequence[float],
+) -> Any:
+    """The stage-3 row as plain floats, or :data:`_ROW_UNUSABLE` when it cannot be interpreted.
+
+    This guard runs *before* the extension is called, so a row the core could not use is a
+    **decline**, not a core fault: the Python reference then solves the scenario exactly as it did
+    before this path was accelerated, and the accelerator stays available for later solves.  The
+    alternative -- letting the extension raise and treating that as a broken build -- would
+    disable the accelerator for the rest of the process because one caller passed a bad row.  The
+    reference is never *worse* than an accelerated run here: it consumes the same row (it may
+    itself produce non-finite numbers for a non-finite row, which is the caller's data, not the
+    accelerator's behaviour), and the plan is the same one the pre-acceleration code produced.
+
+    The row is checked against the grid the core will rebuild (``_reference_grid``) because the
+    row and the DP must be aligned index by index; a mismatch is refused rather than guessed.
+    """
+    try:
+        row = [float(value) for value in terminal_row]
+    except (TypeError, ValueError, OverflowError) as exc:
+        return _decline_terminal_row(f"the terminal row is not a sequence of floats ({exc})")
+    if not all(map(math.isfinite, row)):
+        return _decline_terminal_row("the terminal row has non-finite entries")
+    grid, _step = _reference_grid(dp, slots, agg, opts, start_kwh, e_target)
+    if len(row) != len(grid):
+        return _decline_terminal_row(
+            f"the terminal row has {len(row)} entries for a {len(grid)}-state grid"
+        )
+    return row
+
+
 def _validated(
     raw: Any,
     slots: Sequence[Any],
@@ -318,8 +383,16 @@ def _validated(
     target_penalty: float,
     minutes: Sequence[float],
     dp: Any,
+    terminal_row: Sequence[float] | None = None,
 ) -> CoreResult:
-    """Verify every number and the decision itself; raise ``ValueError`` on any doubt."""
+    """Verify every number and the decision itself; raise ``ValueError`` on any doubt.
+
+    ``terminal_row`` is the stage-3 continuation row handed to the extension (``None`` for the
+    salvage model).  With a row the checks that describe the *salvage* terminal model are replaced
+    by their row equivalents: the returned terminal row must equal the supplied row entry for
+    entry, the objective's terminal term is the interpolation of that row, and the whole last
+    slot's row is recomputed as the reference one-step Bellman value over it.
+    """
     n = len(slots)
     if not isinstance(raw, dict):
         raise ValueError("result is not a dict")
@@ -336,7 +409,7 @@ def _validated(
         objective = float(raw["objective_eur"])
         internal = float(raw["internal_objective_eur"])
         states = int(raw["states"])
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"malformed result: {exc}") from exc
     if not isinstance(value_buffer, (bytes, bytearray, memoryview)):
         raise ValueError("value function is not a buffer")
@@ -371,13 +444,32 @@ def _validated(
     if not all(map(math.isfinite, value)):
         raise ValueError("value function buffer contains non-finite entries")
 
-    # Terminal row: recomputed in full from the reference terminal value.  Non-finite operands fail
-    # closed: ``abs(nan - expected) > tol`` is False, so ``nan`` would otherwise evade the check.
+    # Terminal row: with a stage-3 row the core must have seeded ``value[n]`` with exactly that
+    # row, entry for entry; without one the row is recomputed from the reference terminal value.
+    # Non-finite operands fail closed: ``abs(nan - expected) > tol`` is False, so ``nan`` would
+    # otherwise evade the check.  The objective below interpolates this same ``row`` object.
+    row: list[float] = []
+    if terminal_row is not None:
+        row = [float(entry) for entry in terminal_row]
+        if len(row) != states:
+            raise ValueError("terminal row length does not match the state grid")
+        for expected in row:
+            if not math.isfinite(expected):
+                raise ValueError("terminal row is not finite")
     for k in range(states):
+        got = value[n * states + k]
+        if terminal_row is not None:
+            expected = row[k]
+            # The core copies the row into the value buffer verbatim (no arithmetic at all), so a
+            # correct build reproduces every entry bit for bit; this is an equality check, not a
+            # tolerance check -- a one-ulp change is exactly the kind of silent substitution the
+            # row contract exists to catch and must not slip under ``_VALUE_ABS_TOL``.
+            if got != expected:
+                raise ValueError("terminal value row does not match the supplied row")
+            continue
         expected = -salvage * grid[k]
         if e_target is not None:
             expected += target_penalty * abs(grid[k] - e_target)
-        got = value[n * states + k]
         if not (math.isfinite(got) and math.isfinite(expected)):
             raise ValueError("terminal value row is not finite")
         if abs(got - expected) > _tol(_VALUE_ABS_TOL, _VALUE_REL_TOL, expected):
@@ -474,7 +566,14 @@ def _validated(
         if e_next_p < e_min - tol_kwh or e_next_p > e_max + tol_kwh:
             raise ValueError("transition leaves [e_min, e_max]")
         e_now = clamp(e_next_p, e_min, e_max)
-    objective_recomputed += wear_total - salvage * e_now
+    if terminal_row is not None:
+        # Stage 3: the row *is* the continuation value and already carries the target penalty
+        # (``dp._row_with_penalty`` baked it in before the call), so the terminal term is the same
+        # interpolated row the sweep's last slot used -- no salvage, no second penalty.  The
+        # grouping mirrors ``dp._solve_once_numeric``'s explicit-row branch operation for operation.
+        objective_recomputed += wear_total + interp(row, grid, e_now)
+    else:
+        objective_recomputed += wear_total - salvage * e_now
     if not math.isfinite(objective_recomputed):
         raise ValueError("objective accumulation is not finite")
     if abs(cycle - wear_total) > _tol(_OBJECTIVE_ABS_TOL, _OBJECTIVE_REL_TOL, wear_total):
@@ -482,9 +581,10 @@ def _validated(
     expected_terminal = 0.0
     if e_target is not None:
         expected_terminal = abs(e_now - e_target)
-        objective_recomputed = _apply_terminal_penalty(
-            objective_recomputed, target_penalty, e_now, e_target
-        )
+        if terminal_row is None:
+            objective_recomputed = _apply_terminal_penalty(
+                objective_recomputed, target_penalty, e_now, e_target
+            )
     tolerance = _OBJECTIVE_ABS_TOL + _OBJECTIVE_REL_TOL * abs(objective_recomputed)
     if abs(objective_recomputed - objective) > tolerance:
         raise ValueError("objective does not match the reconstructed path")
@@ -492,11 +592,19 @@ def _validated(
         raise ValueError("terminal error does not match the reconstructed path")
 
     # Sampled backward consistency: V_i[k] must be the reference one-step Bellman value of V_next.
+    # With a stage-3 row the last slot's row is the whole point of the solve -- it is the only place
+    # the supplied row binds the sweep -- so every state of it is recomputed, not a sample; the
+    # rest of the value function keeps the sample (the periodic full differential bounds the tail).
     for i in _sample_indices(n, 5):
         dt = minutes[i] / 60.0
         slot = slots[i]
         next_row = value[(i + 1) * states : (i + 2) * states]
-        for k in _sample_indices(states, 5):
+        states_to_check = (
+            range(states)
+            if terminal_row is not None and i == n - 1
+            else _sample_indices(states, 5)
+        )
+        for k in states_to_check:
             e = grid[k]
             bounds_lo, bounds_hi = _reference_bounds(dp, slot, agg, opts, e, dt)
             if i == n - 1 and e_target is not None:
@@ -542,11 +650,24 @@ def _differential_mismatch(
     salvage: float,
     minutes: Sequence[float],
     result: CoreResult,
+    terminal_row: Sequence[float] | None = None,
 ) -> str | None:
-    """Run the unchanged Python reference and report the first divergence, or ``None``."""
+    """Run the unchanged Python reference and report the first divergence, or ``None``.
+
+    ``terminal_row`` is forwarded verbatim: without it the oracle would solve the salvage model
+    and every row solve would falsely report a mismatch (and then disable the core).
+    """
     try:
         reference = dp._solve_once_numeric(
-            slots, agg, start_kwh, opts, target_penalty, e_target, salvage, minutes
+            slots,
+            agg,
+            start_kwh,
+            opts,
+            target_penalty,
+            e_target,
+            salvage,
+            minutes,
+            terminal_row=terminal_row,
         )
     except Exception as exc:  # noqa: BLE001 - the oracle must never fail where the core succeeded
         return f"reference raised {type(exc).__name__}: {exc}"
@@ -586,15 +707,25 @@ def solve(
     """Run the C core, verify it, or return ``None`` (the Python reference then runs).
 
     ``terminal_row`` is the optimizer v2 stage 3 continuation-value row over the state grid
-    (docs/OPTIMIZER_V2.md section 4).  The core does not mirror it, and a terminal row the core
-    silently ignored would be wrong in exactly the way an ignored refusal flag was, so a supplied
-    row routes the whole solve to the Python reference *before* the extension is called.  The row
-    is only ever present while ``optimizer.terminal_mode = vector``, which ships default-off.
+    (docs/OPTIMIZER_V2.md section 4); the extension takes it as an optional seventh argument and
+    seeds ``value[n]`` with it, and the validation in :func:`_validated` then proves the boundary
+    was consumed.  A row that cannot be used at all (not a sequence of finite floats, or a length
+    that does not match the grid the core will rebuild) is a **decline**: ``None`` is returned
+    without touching the extension or disabling it, and the Python reference solves the scenario
+    exactly as it did before this path was accelerated.  The row is only ever present while
+    ``optimizer.terminal_mode = vector``, which ships default-off.
     """
     global _solve_count, _checks_done
-    if terminal_row is not None or not available():
+    if not available():
         return None
     from . import dp  # local import: dp imports this module at load time
+
+    prepared_row: list[float] | None = None
+    if terminal_row is not None:
+        prepared = _prepare_terminal_row(dp, slots, agg, opts, start_kwh, e_target, terminal_row)
+        if prepared is _ROW_UNUSABLE:
+            return None
+        prepared_row = prepared
 
     config = _config(dp, agg, opts, start_kwh, e_target, salvage, target_penalty)
     try:
@@ -605,13 +736,24 @@ def solve(
             [float(slot.sell or 0.0) for slot in slots],
             [float(value) for value in minutes],
             config,
+            prepared_row,
         )
     except Exception as exc:  # noqa: BLE001 - a broken call is a fallback, not a plan failure
         disable(f"call raised {type(exc).__name__}: {exc}")
         return None
     try:
         result = _validated(
-            raw, slots, agg, opts, start_kwh, e_target, salvage, target_penalty, minutes, dp
+            raw,
+            slots,
+            agg,
+            opts,
+            start_kwh,
+            e_target,
+            salvage,
+            target_penalty,
+            minutes,
+            dp,
+            terminal_row=prepared_row,
         )
     except Exception as exc:  # noqa: BLE001 - reject wrong output and fall back
         disable(f"validation rejected the result: {exc}")
@@ -621,7 +763,17 @@ def solve(
     if _CHECK_INTERVAL > 0 and (_checks_done == 0 or _solve_count % _CHECK_INTERVAL == 0):
         _checks_done += 1
         mismatch = _differential_mismatch(
-            dp, slots, agg, start_kwh, opts, target_penalty, e_target, salvage, minutes, result
+            dp,
+            slots,
+            agg,
+            start_kwh,
+            opts,
+            target_penalty,
+            e_target,
+            salvage,
+            minutes,
+            result,
+            terminal_row=prepared_row,
         )
         if mismatch:
             disable(f"differential self-check mismatch: {mismatch}")

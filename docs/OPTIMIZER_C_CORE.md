@@ -33,8 +33,13 @@ for the process permanently.
 
 **Bound:** between cross-checks the guarantee is feasibility + strict decision consistency +
 self-consistency + sampled backward consistency (whole value buffer finite), not a full
-re-derivation of the value function; the periodic full differential bounds the residual risk, and
-every layer above falls back to the Python reference rather than shipping an unverified number.
+re-derivation of the value function and **not** interior optimality: a wrong value at an unsampled
+interior cell (a row and a state outside the sample, and outside the row-mode last slot) is not
+detected on the solve that used it, because the one-step check resolves the action against the
+same returned rows -- the periodic full differential catches the resulting divergence afterwards,
+never retroactively for the solves in between.  The periodic full differential bounds the residual
+risk, and every layer above falls back to the Python reference rather than shipping an unverified
+number.
 
 The core also refuses memory-unsafe or numerically pathological inputs itself (dimension caps,
 checked size arithmetic, explicit rejection of non-finite spans/ratios/efficiencies before any
