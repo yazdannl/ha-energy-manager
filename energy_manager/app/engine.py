@@ -1500,6 +1500,41 @@ class Engine:
             entries, margin_eur_per_kwh=self._sell_floor_margin_eur_per_kwh()
         )
 
+    def _terminal_request(self, configs: Sequence[BatteryConfig] | None = None) -> Any:
+        """The stage-3 ledger facts for the terminal-value sufficiency check (docs/OPTIMIZER_V2.md 4).
+
+        ``None`` unless ``optimizer.terminal_mode`` is ``vector``: the mode is a kill switch, so the
+        DP never sees a vector row and the plan stays the pre-stage-3 schedule bit-for-bit.  The
+        basis of every enabled battery is the same ledger value the sell floor is built from, and
+        the wear is the same resolved number the DP charges, so the sufficiency bound and the floor
+        cannot disagree about what the energy in the pack cost.
+
+        A battery without a ledger still contributes an entry with ``basis_eur_per_kwh=None``: the
+        check then refuses the vector (``basis_unavailable``) instead of assuming a basis.
+        """
+        mode = dp.normalize_terminal_mode(self._settings.get("optimizer.terminal_mode", "salvage"))
+        if mode != "vector":
+            return None
+        wear_override = self._cost_basis_wear_eur_per_kwh()
+        entries: list[Any] = []
+        for config in configs if configs is not None else self.battery_configs():
+            if not config.enabled:
+                continue
+            status = self.battery_cost_basis(config.id)
+            entries.append(
+                dp.terminal_value.BasisEntry(
+                    basis_eur_per_kwh=status.get("cost_basis_eur_per_kwh"),
+                    round_trip_efficiency=float(config.round_trip_efficiency),
+                    wear_eur_per_kwh=(
+                        float(config.wear_eur_per_kwh) if wear_override is None else wear_override
+                    ),
+                )
+            )
+        return dp.terminal_value.TerminalRequest(
+            margin_eur_per_kwh=self._sell_floor_margin_eur_per_kwh(),
+            basis=tuple(entries),
+        )
+
     def cost_basis_block(self) -> dict[str, Any]:
         """Per-battery ledger plus the fleet values for /status (SPEC 10, additive 0.18.0)."""
         enabled = self._sell_floor_enabled()
@@ -3181,6 +3216,8 @@ class Engine:
                 log.warning("feed-in shadow request failed; v2 skipped: %s", exc)
                 feed_in_request = None
 
+        terminal_request = self._terminal_request(configs)
+
         def solve(feed_in_arg: Any | None) -> Plan:
             return dp.solve_from_forecasts(
                 price,
@@ -3195,6 +3232,7 @@ class Engine:
                 maintenance=maintenance,
                 sell_floor_eur_per_kwh=sell_floor,
                 feed_in=feed_in_arg,
+                terminal=terminal_request,
             )
 
         try:

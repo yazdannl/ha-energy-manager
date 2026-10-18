@@ -145,7 +145,6 @@ def test_build_freezes_the_window_the_arms_and_the_fingerprint(tmp_path: Path) -
     assert manifest.valuation["headline"] == "cost_basis_window_start"
     assert manifest.valuation["sensitivity"] == "ledger_booked"
     assert [item["slug"] for item in manifest.limitations] == [
-        "terminal_vector_not_shipped",
         "saa_not_shipped",
         "toon_subset",
         "forecast_archive_truncated",
@@ -555,6 +554,28 @@ def test_write_then_load_round_trips_the_contract(tmp_path: Path) -> None:
     assert loaded.tolerances == written.tolerances
     assert loaded.fingerprint == written.fingerprint
     assert loaded.arm("E3").terminal_pair is True
+
+
+def test_e3_freezes_the_terminal_pair_and_retires_its_limitation(tmp_path: Path) -> None:
+    """E3 is ``salvage`` vs the terminal vector, and the not-shipped disclosure is gone.
+
+    The pair is the two legs that differ only in ``optimizer.terminal_mode``, in baseline-first
+    order; E1's own leg travels along as the gate reference, so E3's report can be judged by its own
+    gates instead of borrowing another arm's run.
+    """
+    with an_episode(tmp_path) as episode:
+        manifest = build_manifest(episode, arms=["E3"])
+    spec = manifest.arm("E3")
+    assert spec.changes == "terminal_treatment"
+    assert spec.terminal_pair is True
+    assert [leg.name for leg in spec.legs] == ["replay", "salvage", "vector"]
+    assert [leg.plant for leg in spec.legs] == ["recorded", "simulated", "simulated"]
+    assert spec.legs[0].patch_dict() == {}, "the reference leg is E1's, unpatched"
+    assert spec.legs[1].patch_dict() == {"optimizer.terminal_mode": "salvage"}
+    assert spec.legs[2].patch_dict() == {"optimizer.terminal_mode": "vector"}
+    assert "valuation" in spec.holds, "both legs must be valued at the one declared price"
+    slugs = [item["slug"] for item in manifest.limitations]
+    assert "terminal_vector_not_shipped" not in slugs
 
 
 def test_load_refuses_drifted_frozen_state(tmp_path: Path) -> None:

@@ -19,9 +19,11 @@ sys.path.insert(0, str(ROOT / "energy_manager"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.engine import MIN_REPLAN_GAP_S, Engine  # noqa: E402
-from app.models import to_iso  # noqa: E402
+from app.models import PriceForecast, PriceSlot, to_iso  # noqa: E402
+from app.optimize import terminal as tv  # noqa: E402
 from app.replay.episode import open_episode  # noqa: E402
 from app.replay.plant import RECORDED, SIMULATED  # noqa: E402
+from app.sources import price as price_source  # noqa: E402
 from app.replay.runner import (  # noqa: E402
     FACADE_COMMAND,
     MEASUREMENT_WRITE_FAILED,
@@ -33,6 +35,13 @@ from app.replay.runner import (  # noqa: E402
     RunnerError,
 )
 from test_replay_manifest import BATTERY, START, recording  # noqa: E402
+from test_terminal_value import (  # noqa: E402
+    agg_for,
+    make_slots,
+    options,
+    plan_for,
+    request,
+)
 
 WINDOW_MINUTES = 20
 WINDOW_S = WINDOW_MINUTES * 60
@@ -185,6 +194,68 @@ def test_the_run_writes_the_arms_own_flows_into_the_scratch_store(tmp_path: Path
     assert all(row["pv_kw"] == pytest.approx(1.0) for row in rows)
     assert all(row["load_kw"] == pytest.approx(1.2) for row in rows)
     assert all(row["price_buy"] == pytest.approx(0.25) for row in rows)
+
+
+def test_a_replay_vintage_carries_no_inferred_provenance(tmp_path: Path) -> None:
+    """R6: provenance is a fact whoever resolved the tariff records, never a model-fit inference.
+
+    Matching recorded prices cannot establish a contract (0.16/0.22 buys with 0.14/0.20 sells *are*
+    ``buy - fee`` and are equally two explicit rates), so the runner stamps **nothing** -- the vintage
+    stays unprovenanced, exactly like any other caller-built forecast, and takes the engine's two-step
+    path: one supported model must fit the window, and the tail is priced under both readings.  No arm
+    name, settings patch or recorded price shape can promote that fit into a declaration.
+    """
+    for extra in (
+        {},
+        {"price.export_fee_eur_per_kwh": 0.20},  # would make the recorded sells derived-shaped
+        {"price.export_fee_eur_per_kwh": 0.10},  # would leave them one flat rate
+        {"price.feed_in_eur_per_kwh": 0.09},     # an explicit contract in the settings
+        {"price.feed_in_entity": "sensor.example_feed_in"},
+    ):
+        with a_window(tmp_path, settings_extra=extra) as episode:
+            vintage = Runner(episode, name="E3.vector", plant=RECORDED).price_source(episode.start)
+        assert vintage is not None, extra
+        assert getattr(vintage, "feed_in_source", None) is None, extra
+        assert [slot.sell for slot in vintage.slots] == [0.05] * len(vintage.slots), extra
+        assert all(slot.buy == pytest.approx(0.25) for slot in vintage.slots), extra
+
+
+def test_a_replay_vintage_with_published_tail_entries_refuses_on_a_disagreement() -> None:
+    """R6: the case the deleted stamp would have skipped -- both readings, then refuse.
+
+    The reviewer's coincidence: buys 0.16/0.22 with sells 0.14/0.20 satisfy ``buy - 0.02`` exactly and
+    are equally an entity publishing those two rates.  A published 0.30 tail buy must therefore not be
+    turned into 0.28 by a derived-only fit; it is compared against the clock-time reference (0.14) and
+    the vector refuses.  E3 itself is unaffected: its tail is entirely window-filled, so the two
+    readings coincide and the arm still proceeds.
+    """
+    settings = {"price.export_fee_eur_per_kwh": 0.02}
+    window = make_slots(2, 60, buy=[0.16, 0.22], sell=[0.14, 0.20])
+    start = window[-1].t + timedelta(minutes=60)
+    vintage = PriceForecast(
+        source="replay",
+        slots=[PriceSlot(t=slot.t, buy=slot.buy, sell=slot.sell, source="replay") for slot in window],
+        # Published tail entries gained after the recording; hour 0 of the tail is its 23rd slot.
+        tail_slots=[PriceSlot(t=start + timedelta(hours=22), buy=0.30, sell=0.0, source="replay")],
+    )
+    assert getattr(vintage, "feed_in_source", None) is None
+    pricing = price_source.tail_sell_pricing(vintage, settings)
+    assert pricing.ambiguous is True and pricing.unsupported is False
+    assert pricing.evidence["derived_fits"] is True and pricing.evidence["flat_fits"] is False
+    verdict = plan_for(
+        window,
+        agg=agg_for(),
+        opts=options(terminal_mode="vector", terminal_tail_hours=24.0),
+        tail_price=vintage.tail_slots,
+        req=request(),
+        start=start,
+        sell_pricing=pricing,
+    )
+    assert verdict.reason == tv.REASON_TAIL_PRICING_AMBIGUOUS
+    conflict = verdict.detail["tail_pricing_ambiguous"]
+    assert conflict["derived_eur_per_kwh"] == pytest.approx(0.28)
+    assert conflict["window_rate_eur_per_kwh"] == pytest.approx(0.14)
+    assert "no feed-in provenance" in verdict.detail["sell_provenance"]
 
 
 def test_a_missing_vintage_refuses_the_leg(tmp_path: Path) -> None:

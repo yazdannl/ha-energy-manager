@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import pytest
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -19,7 +20,13 @@ from app import engine as engine_module  # noqa: E402
 from app.control.dispatcher import TickOutcome  # noqa: E402
 from app.engine import Engine  # noqa: E402
 from app.grid import GridMapping  # noqa: E402
-from app.main import _FakeHA, _FakeStore, _selfcheck_settings, _selfcheck_sources  # noqa: E402
+from app.main import (  # noqa: E402
+    EXAMPLE_BATTERY,
+    _FakeHA,
+    _FakeStore,
+    _selfcheck_settings,
+    _selfcheck_sources,
+)
 from app.models import BatteryConfig, BatteryState, Mode, ProviderStatus, Reason, from_iso  # noqa: E402
 
 PUBLISHED_ENTITIES = {
@@ -2247,3 +2254,98 @@ def test_explain_load_no_history():
 def test_explain_unknown_kind():
     engine, _store, _ha, _clock, _settings = build_engine()
     assert engine.explain_forecast("nope")["reason"] == "unknown"
+
+
+# ------------------------------------------------------------------------------ terminal value
+
+
+def _ledger(store, basis=0.33):
+    store.profile_put("battery_cost_basis", EXAMPLE_BATTERY.id,
+                      {"basis_eur_per_kwh": basis, "energy_kwh": 4.0})
+
+
+def test_terminal_request_reads_the_live_ledger_basis():
+    """The request's bound and the engine's floor are the same arithmetic on the same ledger."""
+    engine, store, _ha, _clock, settings = build_engine()
+    settings.set("optimizer.terminal_mode", "vector")
+    _ledger(store)
+    request = engine._terminal_request()
+    assert request.margin_eur_per_kwh == 0.0
+    assert len(request.basis) == 1
+    entry = request.basis[0]
+    assert entry.basis_eur_per_kwh == pytest.approx(0.33)
+    assert entry.round_trip_efficiency == pytest.approx(EXAMPLE_BATTERY.round_trip_efficiency)
+    assert entry.wear_eur_per_kwh == pytest.approx(EXAMPLE_BATTERY.wear_eur_per_kwh)
+    floor = engine.fleet_sell_floor()
+    assert entry.basis_eur_per_kwh / entry.round_trip_efficiency + entry.wear_eur_per_kwh == (
+        pytest.approx(floor)
+    )
+    # No ledger at all: the entry stays, with an unknown basis (never an assumed one).
+    engine._basis_cache.clear()
+    store.learning.clear()
+    assert engine._terminal_request().basis[0].basis_eur_per_kwh is None
+
+
+def test_terminal_vector_reads_the_live_ledger_basis():
+    """Stage 3 wiring: the check sees the same ledger the sell floor is built from.
+
+    The selfcheck contract sells at 0.05 with a floor near 0.37, so a discharge can be restricted
+    anywhere in the tail: the vector is refused with ``floor_binds`` (not ``basis_unavailable``,
+    which is what an unbuilt request says) and the plan stays the salvage schedule.
+    """
+    engine, store, _ha, _clock, settings = build_engine()
+    settings.set("optimizer.terminal_mode", "vector")
+    settings.set("optimizer.terminal_tail_hours", 12.0)
+    settings.set("optimizer.terminal_tail_minutes", 60.0)
+    settings.set("optimizer.slot_minutes", 15)
+    settings.set("optimizer.horizon_hours", 12)
+    _ledger(store)
+    plan = engine.plan_now("test")
+    assert plan.terminal["mode"] == "vector"
+    assert plan.terminal["ok"] is False
+    assert plan.terminal["reason"] == "floor_binds"
+    assert plan.terminal["detail"]["floor_binds"]["leg"] == "export"
+    assert plan.summary.terminal_mode == "vector"
+    # 12 h requested, rounded up to one whole 24 h synthetic-profile period (F4: the extension
+    # increment must be a whole number of profile days, so L/2L/3L end at the same daily phase).
+    assert plan.summary.terminal_tail_hours == 24.0
+    assert plan.summary.terminal_ok is False
+    # The tail resolution is a live setting too: 15-minute plan slots, 60-minute tail slots, so the
+    # tail solve folds four native slots into one while the floor check stays native.
+    detail = plan.terminal["detail"]
+    assert detail["tail_ratio"] == 4
+    assert detail["tail_minutes"] == 60.0 and detail["check_minutes"] == 15.0
+    assert detail["native_tail_slots"] == 4 * detail["tail_slots"]
+
+
+def test_terminal_vector_with_an_incomplete_ledger_refuses_on_the_basis_first():
+    """One battery with a basis and one without: the bound cannot be established for the fleet.
+
+    ``basis_unavailable`` (a data gap) wins over ``floor_binds`` (a fact about the contract), and
+    deliberately so: skipping the unknown battery would report the known one's bound and approve the
+    vector, but the unknown battery may charge during the tail -- or hold a past basis above every
+    price in this window -- and then enter the fleet mean with its own efficiency and wear.  Both
+    refuse the vector, and the two reasons stay distinguishable (F2).
+    """
+    engine, store, _ha, _clock, settings = build_engine()
+    settings.set("optimizer.terminal_mode", "vector")
+    settings.add_battery(SECOND_EXAMPLE_BATTERY)
+    _ledger(store)
+    assert engine.fleet_sell_floor() is not None
+    assert [entry.basis_eur_per_kwh for entry in engine._terminal_request().basis] == [0.33, None]
+    plan = engine.plan_now("test")
+    assert plan.terminal["ok"] is False
+    assert plan.terminal["reason"] == "basis_unavailable"
+    assert plan.terminal["reason"] != "floor_binds"
+    assert plan.terminal["detail"]["basis_unprovable"] == [1]
+
+
+def test_the_terminal_kill_switch_builds_no_request_and_no_block():
+    """``salvage`` (the default) is the pre-stage-3 path: no request, no terminal block."""
+    engine, store, _ha, _clock, _settings = build_engine()
+    _ledger(store)
+    plan = engine.plan_now("test")
+    assert getattr(plan, "terminal", None) is None
+    assert plan.summary.terminal_mode == "salvage"
+    assert plan.summary.terminal_ok is None
+    assert engine._terminal_request() is None

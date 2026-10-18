@@ -135,6 +135,21 @@ and a read past `now` raises.
 - Chronological split (`tune` / `holdout`) is declared in the episode manifest and the report never
   mixes the two. Results over windows without valid vintages are labelled **empirical policy
   improvement**, never VSS.
+- An arm's price vintage is **deliberately unprovenanced**: the runner stamps no contract model on it,
+  exactly like any other caller-built forecast, and provenance is never inferred from price *shapes*.
+  Provenance is a fact only whoever resolved the tariff can record, and a recorded window's own sells
+  cannot establish it — 0.16/0.22 buys with 0.14/0.20 sells satisfy `sell = buy - fee` exactly and are
+  equally an entity publishing two explicit rates. Configuration cannot declare it either: a configured
+  entity may have been unavailable when the window was recorded, in which case production priced the
+  sells from the derived rule and stamped `unavailable`.
+
+  So such a vintage takes the engine's own two-step path instead (SPEC optimizer-v2 stage 3, the tail's
+  pricing models): one supported model must fit the window, and the tail is priced under **both**
+  readings — each published entry derived from its own buy, versus the clock-time reference rate — with
+  the vector refused (`tail_pricing_ambiguous`) if they disagree anywhere. E3 is unaffected because its
+  tail is entirely window-filled, so the two readings coincide by construction; a recording whose tail
+  gained published entries falls under the comparison automatically instead of being trusted. Recording
+  the contract model *as data* is a separate, deferred question.
 
 ## 4. Accounting (§3.2)
 

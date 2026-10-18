@@ -53,8 +53,17 @@ from ..models import (
     slot_range,
     utcnow,
 )
-from ..sources.feed_in import FeedInLimits, FeedInRequest, FeedInResult, settle_feed_in
+from ..sources.feed_in import (
+    FeedInLimits,
+    FeedInRequest,
+    FeedInResult,
+    max_reachable_export_kwh,
+    max_reachable_import_kwh,
+    settle_feed_in,
+)
+from ..sources.price import tail_sell_pricing
 from . import _fast
+from . import terminal as terminal_value
 
 log = logging.getLogger(__name__)
 
@@ -130,6 +139,16 @@ def normalize_pv_charge_preference(value: Any) -> str:
     return text if text in PV_CHARGE_PREFERENCES else "auto"
 
 
+#: ``optimizer.terminal_mode`` values (docs/OPTIMIZER_V2.md section 4).
+TERMINAL_MODES = ("salvage", "vector")
+
+
+def normalize_terminal_mode(value: Any) -> str:
+    """A valid terminal mode, else ``salvage`` (a stored typo must never break a plan)."""
+    text = str(value or "").strip().lower()
+    return text if text in TERMINAL_MODES else "salvage"
+
+
 @dataclass(frozen=True)
 class OptimizerOptions:
     """Tunables read from ``optimizer.*`` settings (SPEC section 3)."""
@@ -166,6 +185,16 @@ class OptimizerOptions:
     #: ``from_settings`` produces) keeps the schedule bit-for-bit as before; the engine sets it
     #: from a :class:`~app.sources.feed_in.FeedInResult`, never from a setting of its own.
     refuse_battery_export: bool = False
+    #: Optimizer v2 stage 3 (docs/OPTIMIZER_V2.md section 4): the terminal row.  ``salvage`` is the
+    #: pre-stage-3 behaviour, and the only mode the C core ever sees; ``vector`` replaces the row
+    #: with the tail's continuation value when the structural sufficiency condition holds.
+    terminal_mode: str = "salvage"
+    #: The tail length the stability test extends, in hours (stage 3 only).
+    terminal_tail_hours: float = 24.0
+    #: The tail solve's own resolution in minutes (stage 3 only).  The sufficiency checks and the
+    #: contract settlement stay at the plan's native resolution; the solve folds whole native
+    #: sub-slots into one tail slot, so the mode is reachable at all on a 15-minute plan.
+    terminal_tail_minutes: float = 60.0
 
     @classmethod
     def from_settings(cls, settings: Any) -> "OptimizerOptions":
@@ -186,6 +215,9 @@ class OptimizerOptions:
                 get("optimizer.pv_charge_preference", "auto")
             ),
             target_soc_pct_end=get("optimizer.target_soc_pct_end", None),
+            terminal_mode=normalize_terminal_mode(get("optimizer.terminal_mode", "salvage")),
+            terminal_tail_hours=float(get("optimizer.terminal_tail_hours", 24.0) or 24.0),
+            terminal_tail_minutes=float(get("optimizer.terminal_tail_minutes", 60.0) or 60.0),
         )
 
 
@@ -665,47 +697,75 @@ class _NumericResult:
     windows: list[tuple[float, float, float, float]]
 
 
-def _solve_once_numeric(
-    slots: Sequence[SlotInput],
-    agg: BatteryAggregate,
-    start_kwh: float,
-    opts: OptimizerOptions,
-    target_penalty: float,
-    e_target: float | None,
-    salvage: float,
-    minutes: Sequence[float],
-) -> _NumericResult:
-    """The Python reference: value iteration + path reconstruction (SPEC 8.2).
+@dataclass(frozen=True)
+class _StateGrid:
+    """The state grid one solve uses.
 
-    ``minutes`` is the per-slot modelled duration (0.20.1, SPEC 8.16); the caller resolves it so a
-    mid-slot plan shortens only the first slot.
+    Built once per solve so the stage-3 tail row and the main DP share the *same* states: a tail
+    solved on its own coarsened grid would no longer align index-by-index with the terminal row.
     """
+
+    points: list[float]
+    step_kwh: float
+    coarsened: bool = False
+
+
+def _anchors(start_kwh: float, agg: BatteryAggregate, e_target: float | None) -> list[float]:
+    """The grid anchors: the current energy and, when one is set, the terminal target."""
     anchors = [clamp(start_kwh, agg.e_min_kwh, agg.e_max_kwh)]
     if e_target is not None:
         anchors.append(e_target)
+    return anchors
+
+
+def _salvage_terminal_row(
+    grid: Sequence[float], salvage: float, target_penalty: float, e_target: float | None
+) -> list[float]:
+    """The pre-stage-3 terminal row: ``-salvage * e`` plus the target penalty (SPEC 8.1)."""
+    row = [-salvage * e for e in grid]
+    if e_target is not None:
+        row = [
+            value + target_penalty * abs(grid[index] - e_target)
+            for index, value in enumerate(row)
+        ]
+    return row
+
+
+def _main_grid(
+    agg: BatteryAggregate,
+    opts: OptimizerOptions,
+    slot_count: int,
+    anchors: Sequence[float],
+) -> _StateGrid:
+    """``_build_grid`` plus the complexity guard (SPEC 8.2), built once per solve."""
     grid, step = _build_grid(agg, opts.soc_step_kwh, anchors)
-    n = len(slots)
-    # Complexity guard (SPEC 8.2): slots x states x actions stays under the iteration budget.
     action_count = max(2, int(opts.power_steps) + 1)
-    budget = max(2, MAX_ITERATIONS // max(1, n * action_count))
+    budget = max(2, MAX_ITERATIONS // max(1, slot_count * action_count))
     if len(grid) > budget:
         span = max(0.0, agg.e_max_kwh - agg.e_min_kwh)
         grid, step = _build_grid(agg, max(step, span / max(1, budget - 1)), anchors)
-        log.debug(
-            "optimizer: coarsened to %d states (step %.4f kWh) for %d slots x %d actions",
-            len(grid),
-            step,
-            n,
-            action_count,
-        )
+        return _StateGrid(grid, step, coarsened=True)
+    return _StateGrid(grid, step)
 
+
+def _backward_sweep(
+    grid: Sequence[float],
+    slots: Sequence[SlotInput],
+    minutes: Sequence[float],
+    agg: BatteryAggregate,
+    opts: OptimizerOptions,
+    terminal_row: Sequence[float],
+    e_target: float | None = None,
+) -> tuple[list[list[float]], list[list[float]], int]:
+    """One deterministic value iteration over a caller-supplied grid (SPEC 8.2).
+
+    Shared by the reference solve and the stage-3 tail, so the two cannot drift: a tail value row
+    is only comparable to the main DP's if both use this exact transition arithmetic.  Returns
+    ``(value, argmin, iterations)`` with ``value[n]`` the supplied terminal row.
+    """
+    n = len(slots)
     value = [[0.0] * len(grid) for _ in range(n + 1)]
-    for k, e in enumerate(grid):
-        terminal = -salvage * e
-        if e_target is not None:
-            terminal += target_penalty * abs(e - e_target)
-        value[n][k] = terminal
-
+    value[n] = [float(entry) for entry in terminal_row]
     iterations = 0
     argmin: list[list[float]] = [[0.0] * len(grid) for _ in range(n)]
     for i in range(n - 1, -1, -1):
@@ -734,6 +794,50 @@ def _solve_once_numeric(
                     best_p = p
             row[k] = best
             choices[k] = best_p
+    return value, argmin, iterations
+
+
+def _solve_once_numeric(
+    slots: Sequence[SlotInput],
+    agg: BatteryAggregate,
+    start_kwh: float,
+    opts: OptimizerOptions,
+    target_penalty: float,
+    e_target: float | None,
+    salvage: float,
+    minutes: Sequence[float],
+    terminal_row: Sequence[float] | None = None,
+    state_grid: _StateGrid | None = None,
+) -> _NumericResult:
+    """The Python reference: value iteration + path reconstruction (SPEC 8.2).
+
+    ``minutes`` is the per-slot modelled duration (0.20.1, SPEC 8.16); the caller resolves it so a
+    mid-slot plan shortens only the first slot.
+
+    ``terminal_row`` (optimizer v2 stage 3) replaces the salvage row over the same grid.  A caller
+    that already built the grid -- so the tail row could be aligned to it -- hands it in through
+    ``state_grid``; ``None`` keeps the pre-stage-3 build for every existing caller.
+    """
+    n = len(slots)
+    if state_grid is None:
+        state_grid = _main_grid(agg, opts, n, _anchors(start_kwh, agg, e_target))
+        if state_grid.coarsened:
+            action_count = max(2, int(opts.power_steps) + 1)
+            log.debug(
+                "optimizer: coarsened to %d states (step %.4f kWh) for %d slots x %d actions",
+                len(state_grid.points),
+                state_grid.step_kwh,
+                n,
+                action_count,
+            )
+    grid = state_grid.points
+    step = state_grid.step_kwh
+    explicit_row = terminal_row is not None
+    if not explicit_row:
+        terminal_row = _salvage_terminal_row(grid, salvage, target_penalty, e_target)
+    value, argmin, iterations = _backward_sweep(
+        grid, slots, minutes, agg, opts, terminal_row, e_target
+    )
 
     def best_at(i: int, e: float) -> float:
         dt_hours = minutes[i] / 60.0
@@ -779,9 +883,16 @@ def _solve_once_numeric(
         cycle_cost += wear_cost_eur(opts.wear_eur_per_kwh, agg.eta_discharge, e_now, e_next)
         objective += slot_cost_eur(p, slot, dt_hours, opts)
         e_now = clamp(e_next, agg.e_min_kwh, agg.e_max_kwh)
-    objective += cycle_cost - salvage * e_now
-    if e_target is not None:
-        objective += target_penalty * abs(e_now - e_target)
+    if explicit_row:
+        # Stage 3: the terminal row *is* the continuation value, so the reported objective must use
+        # the same piecewise-linear row the DP's last slot interpolated (target penalty included).
+        objective += cycle_cost + _interp(terminal_row, grid, e_now)
+    else:
+        # Unchanged pre-stage-3 arithmetic, kept operation-for-operation so mode-off plans stay
+        # bit-for-bit identical.
+        objective += cycle_cost - salvage * e_now
+        if e_target is not None:
+            objective += target_penalty * abs(e_now - e_target)
     terminal_error = abs(e_now - e_target) if e_target is not None else 0.0
     start_index = min(range(len(grid)), key=lambda k: abs(grid[k] - clamp(start_kwh, agg.e_min_kwh, agg.e_max_kwh)))
 
@@ -808,6 +919,8 @@ def _solve_once(
     e_target: float | None,
     salvage: float,
     minutes_of: Sequence[float] | None = None,
+    terminal_row: Sequence[float] | None = None,
+    state_grid: _StateGrid | None = None,
 ) -> _DpResult:
     """Solve one scenario, preferring the validated C core, else the Python reference unchanged.
 
@@ -823,10 +936,29 @@ def _solve_once(
         if minutes_of is not None
         else [float(opts.slot_minutes)] * len(slots)
     )
-    numeric = _fast.solve(slots, agg, start_kwh, opts, target_penalty, e_target, salvage, minutes)
+    numeric = _fast.solve(
+        slots,
+        agg,
+        start_kwh,
+        opts,
+        target_penalty,
+        e_target,
+        salvage,
+        minutes,
+        terminal_row=terminal_row,
+    )
     if numeric is None:
         numeric = _solve_once_numeric(
-            slots, agg, start_kwh, opts, target_penalty, e_target, salvage, minutes
+            slots,
+            agg,
+            start_kwh,
+            opts,
+            target_penalty,
+            e_target,
+            salvage,
+            minutes,
+            terminal_row=terminal_row,
+            state_grid=state_grid,
         )
     else:
         # Same diagnostic the reference emits when the complexity guard widens the step.  The C
@@ -1123,6 +1255,125 @@ def _grid_violation(plan: Plan, options: OptimizerOptions) -> int | None:
     return None
 
 
+def _row_with_penalty(
+    row: Sequence[float], grid: Sequence[float], e_target: float | None, penalty: float
+) -> list[float]:
+    """The terminal row with the terminal-target penalty added on top (stage 3, SPEC 8.1).
+
+    ``e_target`` is always a grid anchor, so the penalty stays piecewise linear through it and the
+    reconstruction's interpolation is exact for that term as well.
+    """
+    if e_target is None:
+        return list(row)
+    return [value + penalty * abs(grid[index] - e_target) for index, value in enumerate(row)]
+
+
+def _attach_terminal_summary(
+    summary: PlanSummary, block: Mapping[str, Any] | None, mode: str
+) -> None:
+    """Additive stage-3 summary fields, read through ``getattr`` (``models.py`` is frozen).
+
+    These are set even when the mode is off or the vector was refused: the mode, the verdict and
+    the reason are per-plan eligibility facts (docs/OPTIMIZER_V2.md section 4), and a caller that
+    could not tell "salvage" from "vector, refused" would have to guess.
+    """
+    summary.terminal_mode = mode
+    summary.terminal_ok = None if block is None else bool(block.get("ok"))
+    summary.terminal_reason = None if block is None else block.get("reason")
+    summary.terminal_tail_hours = None if block is None else block.get("tail_hours")
+    summary.terminal_stability_span_eur = (
+        None if block is None else block.get("stability_span_eur")
+    )
+    summary.terminal_stability_tolerance_eur = (
+        None if block is None else block.get("stability_tolerance_eur")
+    )
+
+
+def _terminal_solution(
+    terminal: terminal_value.TerminalPlan | None,
+    options: OptimizerOptions,
+    agg: BatteryAggregate,
+    state_grid: _StateGrid,
+    main_slot_count: int,
+    main_sweeps: int = 1,
+) -> tuple[list[float] | None, dict[str, Any]]:
+    """The stage-3 continuation row over ``state_grid`` plus the plan's report block.
+
+    ``None`` for the row means ``salvage`` is used, and the block always says why.  The tail is
+    solved at ``L``, ``2L`` and ``3L`` (phase-aligned) on the *same* grid: the successive spans are
+    the numerical-stability evidence, and the ``L`` row is the one the main DP uses.  The **whole
+    solve** -- every main sweep plus every tail sweep -- must fit the SPEC 8.2 iteration budget, and
+    the tail is never coarsened on its own: a plan that does not fit disables the mode instead of
+    silently changing the discretisation.  ``main_sweeps`` is how many main sweeps this solve may
+    run: an unreachable terminal target retries the whole horizon under the soft penalty (SPEC 8.1),
+    so a plan with a target has to fit *both* sweeps plus the three tails -- reserving one would
+    under-count exactly the plans that can run the second sweep.  The budget is reported even when
+    the sufficiency verdict already refused, so "would this mode be reachable if the floor were
+    off?" is answerable from the plan itself.
+    """
+    block: dict[str, Any] = {
+        "mode": "vector",
+        "ok": False,
+        "reason": terminal_value.REASON_TAIL_UNAVAILABLE if terminal is None else terminal.reason,
+        "tail_hours": None if terminal is None else terminal.tail_hours,
+        "periods": None if terminal is None else terminal.periods,
+        "stability_span_eur": None,
+        "stability_tolerance_eur": terminal_value.stability_tolerance_eur(agg),
+        "stability_spans_eur": {},
+        "salvage_eur_per_kwh": None if terminal is None else terminal.salvage_eur_per_kwh,
+        "detail": {} if terminal is None else dict(terminal.detail),
+    }
+    if terminal is None or not terminal.slots:
+        return None, block
+    grid = state_grid.points
+    # ``_actions`` yields at most ``power_steps + 1`` powers and appends one exact-power action on
+    # a sweep's last slot when a terminal target is set, so the guard counts that worst case for
+    # every slot: it may over-count, never under-count.
+    action_count = max(2, int(options.power_steps) + 1) + 1
+    unit = max(1, terminal.periods * terminal.period_slots)
+    lengths = [unit * index for index in range(1, terminal_value.EXTENSION_COUNT + 1)]
+    if lengths[-1] > len(terminal.slots):
+        block["reason"] = terminal_value.REASON_TAIL_UNAVAILABLE
+        return None, block
+    work = (max(1, int(main_sweeps)) * main_slot_count + sum(lengths)) * len(grid) * action_count
+    block["detail"] = dict(
+        block["detail"], solve_iterations=work, iteration_budget=MAX_ITERATIONS
+    )
+    if not terminal.ok:
+        # The sufficiency verdict already refused this plan; the budget above is reported for the
+        # report's sake (it answers whether the mode would be budget-reachable at all).
+        return None, block
+    if work > MAX_ITERATIONS:
+        block["reason"] = terminal_value.REASON_TAIL_TOO_LONG
+        return None, block
+    rows = {
+        length: terminal_value.continuation_row(
+            grid,
+            terminal.slots[:length],
+            terminal.minutes[:length],
+            agg,
+            options,
+            terminal.salvage_eur_per_kwh,
+        )
+        for length in lengths
+    }
+    spans = {
+        f"{lengths[index] // unit}L": terminal_value.stability_span(
+            rows[lengths[index - 1]], rows[lengths[index]]
+        )
+        for index in range(1, len(lengths))
+    }
+    worst = max(spans.values()) if spans else float("inf")
+    block["stability_spans_eur"] = spans
+    block["stability_span_eur"] = worst
+    if not math.isfinite(worst) or worst > block["stability_tolerance_eur"]:
+        block["reason"] = terminal_value.REASON_TAIL_UNSTABLE
+        return None, block
+    block["ok"] = True
+    block["reason"] = None
+    return rows[lengths[0]], block
+
+
 def solve(
     slots: Sequence[SlotInput],
     *,
@@ -1136,6 +1387,7 @@ def solve(
     maintenance: Mapping[str, Any] | None = None,
     sell_floor_eur_per_kwh: float | None = None,
     now: datetime | None = None,
+    terminal: terminal_value.TerminalPlan | None = None,
 ) -> Plan:
     """Solve the horizon and return a ``Plan`` (SPEC 8.2).  Deterministic.
 
@@ -1154,6 +1406,11 @@ def solve(
     guards a sub-minute or negative remainder), so the schedule, its energy and its money all
     match the time the dispatcher really has.  ``None`` keeps the uniform full-slot model, so an
     older caller (or a recompute for a plan already on the grid) is bit-for-bit unchanged.
+
+    ``terminal`` is the prepared stage-3 tail (docs/OPTIMIZER_V2.md section 4): when
+    ``optimizer.terminal_mode = vector`` and its sufficiency verdict allows it, the tail's
+    continuation row replaces the salvage terminal row.  ``None`` (or a disabled verdict) keeps
+    the pre-stage-3 behaviour bit-for-bit and reports why on the plan.
     """
     moment = generated_at or utcnow()
     sources = dict(source_names or {})
@@ -1258,9 +1515,47 @@ def solve(
             aggregate.e_max_kwh,
         )
 
+    state_grid: _StateGrid | None = None
+    terminal_vector: list[float] | None = None
+    terminal_block: dict[str, Any] | None = None
+    if options.terminal_mode == "vector":
+        # The stage-3 tail must use the *main* grid, so the grid is built here once and handed to
+        # both the tail sweep and the solve below.
+        state_grid = _main_grid(
+            aggregate, options, len(slots), _anchors(start_kwh, aggregate, e_target)
+        )
+        if state_grid.coarsened:
+            action_count = max(2, int(options.power_steps) + 1)
+            log.debug(
+                "optimizer: coarsened to %d states (step %.4f kWh) for %d slots x %d actions",
+                len(state_grid.points),
+                state_grid.step_kwh,
+                len(slots),
+                action_count,
+            )
+        terminal_vector, terminal_block = _terminal_solution(
+            terminal,
+            options,
+            aggregate,
+            state_grid,
+            len(slots),
+            # A terminal target can retry the whole main sweep (hard penalty, then soft), so the
+            # budget reserves both sweeps: reserving one would under-count exactly the plans with a
+            # target, which are the ones that can run the second sweep.
+            main_sweeps=2 if e_target is not None else 1,
+        )
+
+    def terminal_row_for(penalty: float) -> list[float] | None:
+        """The terminal row for one target-penalty pass, or ``None`` (salvage)."""
+        if terminal_vector is None or state_grid is None:
+            return None
+        return _row_with_penalty(terminal_vector, state_grid.points, e_target, penalty)
+
     result = _solve_once(
         slots, aggregate, start_kwh, options, TARGET_HARD_PENALTY, e_target, salvage,
         minutes_of=minutes_of,
+        terminal_row=terminal_row_for(TARGET_HARD_PENALTY),
+        state_grid=state_grid,
     )
     infeasible: str | None = None
     if e_target is not None:
@@ -1271,6 +1566,8 @@ def solve(
             result = _solve_once(
                 slots, aggregate, start_kwh, options, TARGET_SOFT_PENALTY, e_target, salvage,
                 minutes_of=minutes_of,
+                terminal_row=terminal_row_for(TARGET_SOFT_PENALTY),
+                state_grid=state_grid,
             )
             infeasible = "terminal_target_unreachable"
 
@@ -1288,6 +1585,13 @@ def solve(
             maintenance=active_maintenance,
             sell_floor_eur_per_kwh=options.sell_floor_eur_per_kwh,
         ),
+    )
+    if terminal_block is not None:
+        # Additive stage-3 reporting: the plan block plus the summary fields, both read through
+        # ``getattr`` by the API (stage 1b's ``feed_in`` block is the precedent).
+        plan.terminal = terminal_block
+    _attach_terminal_summary(
+        plan.summary, terminal_block, normalize_terminal_mode(options.terminal_mode)
     )
     if infeasible is not None:
         plan.feasible = False
@@ -1319,6 +1623,7 @@ def solve_from_forecasts(
     maintenance: Mapping[str, Any] | None = None,
     sell_floor_eur_per_kwh: float | None = None,
     feed_in: FeedInRequest | None = None,
+    terminal: terminal_value.TerminalRequest | None = None,
 ) -> Plan:
     """Align the three forecasts, then solve.  Raises ``ValueError`` when inputs are unusable.
 
@@ -1332,6 +1637,12 @@ def solve_from_forecasts(
     """
     moment = now or utcnow()
     options = OptimizerOptions.from_settings(settings)
+    if sell_floor_eur_per_kwh is not None:
+        # The ledger floor is passed in, not stored in the settings (SPEC 5).  Apply it here as
+        # well as inside :func:`solve` so the terminal-value sufficiency check prices the tail
+        # with exactly the floor the sweep will apply -- a check against a disabled floor would
+        # pass tails that the sweep then refuses to discharge.
+        options = replace(options, sell_floor_eur_per_kwh=float(sell_floor_eur_per_kwh))
     hours = int(clamp(options.horizon_hours, 12, 48))
     start = quarter_floor(moment, options.slot_minutes)
     slots = align_slots(
@@ -1344,8 +1655,9 @@ def solve_from_forecasts(
     if flattened:
         sources["price_stale"] = "flat"
     result: FeedInResult | None = None
+    main_limits: FeedInLimits | None = None
     if feed_in is not None and slots:
-        limits = FeedInLimits(
+        main_limits = FeedInLimits(
             pv_kw=[slot.pv_kw for slot in slots],
             load_kw=[slot.load_kw for slot in slots],
             max_discharge_kw=feed_in.max_discharge_kw,
@@ -1357,6 +1669,7 @@ def solve_from_forecasts(
             tiers=feed_in.tiers,
             tier_volume_kwh=feed_in.tier_volume_kwh,
         )
+        limits = main_limits
         try:
             result = settle_feed_in(feed_in.settings, slots, feed_in.period_state, limits)
         except ValueError as exc:
@@ -1371,6 +1684,50 @@ def solve_from_forecasts(
             )
         slots = [replace(slot, sell=float(result.sells[i])) for i, slot in enumerate(slots)]
         options = replace(options, refuse_battery_export=not result.export_allowed)
+    terminal_plan: terminal_value.TerminalPlan | None = None
+    if options.terminal_mode == "vector" and slots:
+        # Stage 3 (docs/OPTIMIZER_V2.md section 4): build and price the tail, then let the
+        # sufficiency check decide whether it may replace the salvage row.  The worst-case
+        # reachable billing state at the horizon end is derived from the main horizon's own
+        # reachable-export bound (section 2.3).
+        # R1/R3/R4: the tail's sell prices must come from the *same* rule the fetched window's own
+        # slots went through, read from the forecast's pricing provenance rather than assumed: an
+        # explicit entity/flat contract keeps its one rate, a derived one derives per slot, and a
+        # window with no provenance at all is validated against the two supported models -- both fit
+        # means ``plan_terminal`` prices the tail both ways and refuses on a disagreement, neither
+        # fits means it refuses outright.
+        sell_pricing = tail_sell_pricing(price, settings)
+        terminal_plan = terminal_value.plan_terminal(
+            options=options,
+            aggregate=aggregate,
+            window_slots=slots,
+            price_tail=list(getattr(price, "tail_slots", None) or ()),
+            start=slots[-1].t + timedelta(minutes=options.slot_minutes),
+            request=terminal,
+            feed_in=feed_in,
+            main_max_export_kwh=(
+                max_reachable_export_kwh(len(slots), main_limits)
+                if main_limits is not None
+                else None
+            ),
+            main_max_import_kwh=(
+                max_reachable_import_kwh(
+                    len(slots),
+                    main_limits,
+                    max_charge_kw=aggregate.p_charge_kw,
+                    # ``optimizer.max_grid_import_w`` is 0 for "unlimited": an absent cap, not a
+                    # zero-kWh one.
+                    import_limit_kw=options.max_import_kw or None,
+                )
+                if main_limits is not None
+                else None
+            ),
+            # R1: the tail's sell prices must come from the *same* rule the fetched window's own
+            # slots went through, read from the forecast's pricing provenance rather than assumed:
+            # an explicit entity/flat contract keeps its one rate, a derived one derives per slot.
+            sell_pricing=sell_pricing,
+            slot_minutes=float(options.slot_minutes),
+        )
     plan = solve(
         slots,
         aggregate=aggregate,
@@ -1386,6 +1743,7 @@ def solve_from_forecasts(
         # ``moment``; passing it lets the solver model that slot with only its remaining minutes
         # (0.20.1, SPEC 8.16).
         now=moment,
+        terminal=terminal_plan,
     )
     if result is not None:
         # Additive (stage 1b): the contract decision rides on the plan and its summary the same way

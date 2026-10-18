@@ -343,6 +343,13 @@ class PriceForecast:
     stale: bool = False
     degraded: bool = False
     notes: list[str] = field(default_factory=list)
+    #: Additive (optimizer v2 stage 3, docs/OPTIMIZER_V2.md section 4): the provider entries past
+    #: the plan horizon, gridded out to ``optimizer.terminal_tail_hours`` on the same 15-minute
+    #: grid and filled periodically by time-of-day from the fetched window beyond the last real
+    #: entry. ``slots`` is deliberately unchanged -- the plan horizon, the feed-in settlement and
+    #: the saldering period volumes must not move -- and nothing in the live path reads this;
+    #: ``optimize/terminal.py`` is its only consumer.
+    tail_slots: list[PriceSlot] = field(default_factory=list)
 
     def covers(self, start: datetime, end: datetime) -> bool:
         if not self.slots:

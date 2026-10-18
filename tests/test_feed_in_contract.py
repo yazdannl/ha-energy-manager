@@ -32,6 +32,7 @@ from app.sources.feed_in import (  # noqa: E402
     FeedInLimits,
     PeriodState,
     max_reachable_export_kwh,
+    max_reachable_import_kwh,
     settle_feed_in,
     settle_saldering_schedule,
 )
@@ -129,6 +130,37 @@ def test_unknown_discharge_capability_is_unbounded_not_zero():
     assert max_reachable_export_kwh(
         2, FeedInLimits(pv_kw=(0.0,), load_kw=(0.0,), max_discharge_kw=1.0)
     ) is None
+
+
+def test_max_reachable_import_covers_the_house_load_and_a_grid_recharge():
+    # 2 slots, 0.25 h each: net load 1 kW (2 - 1) plus a 5 kW charge capability = 6 kW per slot.
+    limits = FeedInLimits(pv_kw=(1.0, 1.0), load_kw=(2.0, 2.0), max_discharge_kw=5.0,
+                          slot_hours=0.25)
+    assert max_reachable_import_kwh(2, limits, max_charge_kw=5.0) == pytest.approx(3.0)
+    # The connection's import cap applies per slot, exactly like the export side.
+    one = FeedInLimits(pv_kw=(1.0,), load_kw=(2.0,), max_discharge_kw=5.0, slot_hours=0.25)
+    assert max_reachable_import_kwh(
+        1, one, max_charge_kw=5.0, import_limit_kw=2.0
+    ) == pytest.approx(0.5)
+    # A PV-surplus slot imports only the recharge: net load is floored at zero, never negative.
+    surplus = FeedInLimits(pv_kw=(4.0,), load_kw=(1.0,), max_discharge_kw=1.0, slot_hours=0.5)
+    assert max_reachable_import_kwh(1, surplus, max_charge_kw=2.0) == pytest.approx(1.0)
+
+
+def test_unknown_import_inputs_are_unbounded_not_zero():
+    limits = FeedInLimits(pv_kw=(1.0,), load_kw=(2.0,), max_discharge_kw=5.0, slot_hours=0.25)
+    assert max_reachable_import_kwh(1, None, max_charge_kw=1.0) is None
+    assert max_reachable_import_kwh(1, limits, max_charge_kw=None) is None
+    assert max_reachable_import_kwh(1, limits, max_charge_kw=float("nan")) is None
+    # A PV/load series that does not cover every slot is unknown, not zero.
+    assert max_reachable_import_kwh(2, limits, max_charge_kw=1.0) is None
+    # A malformed sample is unknown too: a negative load would understate reachable imports.
+    malformed = FeedInLimits(pv_kw=(-1.0,), load_kw=(2.0,), max_discharge_kw=5.0, slot_hours=0.25)
+    assert max_reachable_import_kwh(1, malformed, max_charge_kw=1.0) is None
+    # A zero import limit is a real cap (the config's "0 = unlimited" is mapped to None by the
+    # caller), and a negative one is malformed rather than zero.
+    assert max_reachable_import_kwh(1, limits, max_charge_kw=1.0, import_limit_kw=0.0) == 0.0
+    assert max_reachable_import_kwh(1, limits, max_charge_kw=1.0, import_limit_kw=-1.0) is None
 
 
 @pytest.mark.parametrize(

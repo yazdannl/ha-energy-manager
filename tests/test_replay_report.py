@@ -39,7 +39,10 @@ from app.replay.report import (  # noqa: E402
     ANCHOR_LEG_IS_THE_FIDELITY_REFERENCE,
     DECISION_FIDELITY,
     FLOOR_STALL,
+    ILLUSTRATIVE_INTERVAL,
     SOURCE_BASIS_COMPARAND,
+    TERMINAL_PAIR_IS_EXTENDED_HORIZON,
+    TERMINAL_PAIR_SAME_SCHEDULE,
     Finding,
     _bootstrap_dict,
     gate_accounting_fidelity,
@@ -51,7 +54,9 @@ from app.replay.report import (  # noqa: E402
     contract_verdict,
     deterministic_view,
     gates_for,
+    pair_legs,
     render,
+    terminal_pair,
     toon,
 )
 from app.replay.runner import run_leg  # noqa: E402
@@ -64,6 +69,7 @@ from app.replay.statistics import (  # noqa: E402
 )
 from app.models import to_iso  # noqa: E402
 from app.store import Store  # noqa: E402
+from test_replay_accounting import add_cost_basis  # noqa: E402
 from test_replay_manifest import BATTERY, START, recording  # noqa: E402
 
 WINDOW_MINUTES = 5
@@ -352,6 +358,166 @@ def test_e4_reports_the_plant_model_term_and_labels_the_evidence(tmp_path: Path)
     paired = report["accounting"]["paired"]
     assert paired is not None and paired["change"] == "policy"
     assert report["accounting"]["terminal_pair"] is None
+
+
+def test_e3_pairs_the_terminal_vector_against_salvage_on_extended_horizon_accounting(
+    tmp_path: Path,
+) -> None:
+    """E3 is a real pair now: ``salvage`` vs ``vector``, read on the extended-horizon delta.
+
+    On this fixture the pair is an identity and says so: the recording's booked sell equals its buy
+    (the derived contract, which gate 3 checks), and the declared basis sets a sell floor above
+    every tail sale, so the vector is refused and both legs fall back to the same salvage schedule.
+    What is asserted is therefore the *shape* of the comparison -- which two legs, which number, and
+    that a zero is labelled rather than published as a terminal effect -- not a gain: the window is
+    shorter than one plan horizon, so the interval stays ``illustrative_interval``.
+    """
+    source = recording_path(tmp_path)
+    add_cost_basis(source, 0.4, 3.0)
+    code, report, _text = drive(tmp_path, arm="E3", minutes=10, source=source)
+    assert code == 0, report.get("refusal", report.get("gates"))
+    accounting = report["accounting"]
+    assert accounting["evidence"] == EMPIRICAL
+    assert [leg["leg"] for leg in accounting["legs"]] == ["replay", "salvage", "vector"]
+    paired = accounting["paired"]
+    assert paired is not None and paired["change"] == "terminal_treatment"
+    assert paired["legs"] == ["salvage", "vector"], "baseline first, the vector is the declared side"
+    # One declared valuation for both legs, so the two terminal terms are comparable at all.
+    terminal = accounting["terminal_pair"]
+    assert terminal is not None, "the fixture declares a window-start basis, so the term is valued"
+    assert terminal["valuations_agree"] is True
+    assert terminal["valuation_eur_per_kwh"] == pytest.approx(0.4)
+    assert terminal["valuation_source"] == "frozen_profile_row"
+    assert terminal["terminal_delta_eur"] == pytest.approx(
+        terminal["vector_terminal_adjustment_eur"] - terminal["salvage_terminal_adjustment_eur"]
+    )
+    assert paired["delta_with_terminal_eur"] == pytest.approx(
+        paired["delta_eur"] + paired["terminal_delta_eur"], abs=2e-4
+    )
+    codes = [note["code"] for note in accounting["notes"]]
+    assert TERMINAL_PAIR_IS_EXTENDED_HORIZON in codes, "the arm's number is the extended-horizon one"
+    assert terminal["schedule_moved"] is False
+    assert TERMINAL_PAIR_SAME_SCHEDULE in codes, "a pair whose schedules never moved is not a result"
+    # The evidence rules are unchanged by any of this.
+    assert accounting["bootstrap"]["underpowered"] is True
+    assert ILLUSTRATIVE_INTERVAL in accounting["evidence_labels"]
+    assert TERMINAL_PAIR_IS_EXTENDED_HORIZON in accounting["evidence_labels"]
+
+
+def _segment(start: datetime, end: datetime, grid_kw: float, import_kwh: float,
+             export_kwh: float) -> SimpleNamespace:
+    return SimpleNamespace(
+        start=start, end=end, grid_kw=grid_kw, import_kwh=import_kwh, export_kwh=export_kwh
+    )
+
+
+def _window(*segments: SimpleNamespace, withheld: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(withheld=withheld, segments=list(segments))
+
+
+def _terminal_leg(**overrides: object) -> SimpleNamespace:
+    """A leg stand-in with only the fields the terminal disclosure reads."""
+    account = {
+        "terminal_adjustment_eur": 1.0,
+        "valuation_eur_per_kwh": 0.4,
+        "valuation_source": "frozen_profile_row",
+        "valuation_frozen": ("pack",),
+        "valuation_derived": (),
+        "valuation_missing": (),
+        "profit_eur": 2.0,
+        "profit_with_terminal_eur": 3.0,
+        "sensitivity_valuation_eur_per_kwh": 0.35,
+        "sensitivity_terminal_adjustment_eur": 0.9,
+        "import_kwh": 4.0,
+        "export_kwh": 1.0,
+        "energy_delta_kwh": 2.0,
+    }
+    account.update(overrides)
+    return SimpleNamespace(account=SimpleNamespace(**account))
+
+
+def test_the_terminal_disclosure_names_both_legs_and_refuses_a_valuation_mismatch() -> None:
+    """The block is arithmetic, so it is tested as arithmetic: same valuation, two legs, one delta.
+
+    A delta between two *different* valuations is not the terminal treatment's effect, so the block
+    reports whether the two legs agreed instead of assuming it; and an unknown flow total leaves the
+    schedule question unknown rather than answering "nothing moved".
+    """
+    hour = timedelta(hours=1)
+    first = _segment(START, START + hour, 1.0, 1.0, 0.0)
+    second = _segment(START + hour, START + 2 * hour, -1.0, 0.0, 1.0)
+    pair = (
+        _terminal_leg(windows=[_window(first, second)]),
+        _terminal_leg(
+            terminal_adjustment_eur=2.5, import_kwh=5.0, windows=[_window(first, second)]
+        ),
+    )
+    block = terminal_pair(pair)
+    assert block is not None
+    assert block["valuations_agree"] is True
+    # An identity in every booked flow: the same trajectory, not merely the same totals.
+    assert block["schedule_moved"] is False
+    assert block["terminal_delta_eur"] == pytest.approx(1.5)
+    assert block["vector_profit_with_terminal_eur"] == pytest.approx(3.0)
+    assert terminal_pair((_terminal_leg(), _terminal_leg(valuation_eur_per_kwh=0.9)))[
+        "valuations_agree"
+    ] is False
+    # F6: equal totals are not an identity.  Both legs book the same 1 kWh in and 1 kWh out, but the
+    # second books the import one slot later -- a charge moved between priced slots, which a totals
+    # comparison would have labelled "the same schedule".
+    early = _terminal_leg(
+        windows=[_window(_segment(START, START + hour, 0.0, 1.0, 0.0),
+                          _segment(START + hour, START + 2 * hour, 0.0, 0.0, 1.0))]
+    )
+    late = _terminal_leg(
+        windows=[_window(_segment(START, START + hour, 0.0, 0.0, 1.0),
+                          _segment(START + hour, START + 2 * hour, 0.0, 1.0, 0.0))]
+    )
+    assert early.account.import_kwh == late.account.import_kwh
+    assert terminal_pair((early, late))["schedule_moved"] is True
+    # An unknown trajectory is unknown, never "nothing moved": a withheld window, a leg with no
+    # measured segment at all, and a segment with an unmeasured flow.
+    withheld = _terminal_leg(windows=[_window(withheld=True)])
+    assert terminal_pair((_terminal_leg(windows=[_window(first)]), withheld))[
+        "schedule_moved"
+    ] is None
+    assert terminal_pair((_terminal_leg(), _terminal_leg(windows=[_window(first)])))[
+        "schedule_moved"
+    ] is None
+    unknown_flow = _terminal_leg(windows=[_window(_segment(START, START + hour, 1.0, None, 0.0))])
+    assert terminal_pair((_terminal_leg(windows=[_window(first)]), unknown_flow))[
+        "schedule_moved"
+    ] is None
+    # R3: the comparison is exact, so flows that differ below the old rounding thresholds are a
+    # moved schedule rather than an identity (1e-10 under the old 9-decimal grid rate rounding,
+    # 1e-13 under the old 12-decimal energy rounding).
+    exact = _terminal_leg(windows=[_window(_segment(START, START + hour, 1.0, 1.0, 0.0))])
+    nudged_rate = _terminal_leg(
+        windows=[_window(_segment(START, START + hour, 1.0 + 1e-10, 1.0, 0.0))]
+    )
+    nudged_energy = _terminal_leg(
+        windows=[_window(_segment(START, START + hour, 1.0, 1.0 + 1e-13, 0.0))]
+    )
+    assert terminal_pair((exact, nudged_rate))["schedule_moved"] is True
+    assert terminal_pair((exact, nudged_energy))["schedule_moved"] is True
+    assert terminal_pair((_terminal_leg(), _terminal_leg(export_kwh=None)))[
+        "schedule_moved"
+    ] is None
+    assert terminal_pair(None) is None
+
+
+def test_pair_legs_selects_e3_by_name_not_by_position() -> None:
+    """E3's pair must survive its extra reference leg and a reordered leg list."""
+    arm = SimpleNamespace(name="E3")
+    salvage, vector = _terminal_leg(), _terminal_leg()
+    salvage.result = SimpleNamespace(name="salvage")
+    vector.result = SimpleNamespace(name="vector")
+    anchor = _terminal_leg()
+    anchor.result = SimpleNamespace(name="replay")
+    assert pair_legs(arm, [anchor, salvage, vector]) == (salvage, vector)
+    assert pair_legs(arm, [vector, anchor, salvage]) == (salvage, vector)
+    assert pair_legs(arm, [anchor, salvage]) is None, "half a pair is not a pair"
+    assert pair_legs(SimpleNamespace(name="E1"), [anchor, salvage, vector]) is None
 
 
 def test_a_recording_without_dispatch_history_refuses_the_recorded_policy(tmp_path: Path) -> None:
