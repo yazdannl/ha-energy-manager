@@ -39,7 +39,15 @@ from ..models import (
 from ..sources import load as load_source
 from ..sources import solar as solar_source
 from ..sources.measure import MEASUREMENT_MINUTES
-from ..store import Store
+from ..store import (
+    Store,
+    parsed_as_of_instant,
+    profile_as_of,
+    profile_deleted_as_of,
+    settings_as_of,
+    settings_deleted_as_of,
+    table_exists,
+)
 
 #: Refusal reasons; stable, machine-readable slugs (docs/REPLAY_HARNESS.md section 6).
 LIVE_STORE = "live_store"
@@ -182,6 +190,33 @@ class Truncation:
             "tables": {table: int(count) for table, count in sorted(self.rows.items())},
             "dropped_profiles": [[kind, key] for kind, key in self.dropped_profiles],
         }
+
+
+@dataclass(frozen=True)
+class _AsOfSettings:
+    """Every settings value in force at the window start, with its instant and provenance."""
+
+    as_of: Mapping[str, tuple[datetime, Any]]
+    origins: Mapping[str, str]
+
+    @property
+    def values(self) -> dict[str, Any]:
+        return {key: value for key, (_at, value) in self.as_of.items()}
+
+
+@dataclass(frozen=True)
+class _AsOfProfiles:
+    """Accepted decision-feeding profiles, and every kind's value the scratch must be given.
+
+    ``values``/``origins`` cover the decision-feeding kinds only -- they are what the episode
+    declares as frozen.  ``as_of`` covers every kind the recording knows, because the engine reads
+    the scratch's ``learning_profiles`` through ``profile_get`` for other kinds too (rate-limit
+    backoff, load/pv bias), and only the as-of row may survive the boundary.
+    """
+
+    as_of: Mapping[tuple[str, str], tuple[datetime, Any]]
+    values: Mapping[tuple[str, str], Any]
+    origins: Mapping[tuple[str, str], str]
 
 
 @dataclass(frozen=True)
@@ -483,6 +518,7 @@ class Episode:
         boundary: Boundary,
         truncation: Truncation | None = None,
         base: BaseProvenance | None = None,
+        asof_sources: Mapping[str, str] | None = None,
         keep_scratch: bool = False,
     ) -> None:
         self.source_path = source_path
@@ -505,6 +541,9 @@ class Episode:
         self.boundary = boundary
         self.truncation = truncation if truncation is not None else Truncation()
         self.base = base if base is not None else BaseProvenance()
+        #: Per frozen decision value, whether it came from the as-of history, the upgrade's seed,
+        #: or (for a recording made before the history existed) the current row.  Reporting only.
+        self.asof_sources = dict(asof_sources or {})
         self.now = start
         self._keep_scratch = keep_scratch
         self._store: Store | None = None
@@ -694,17 +733,23 @@ def open_episode(
     scratch_path: str | None = None
     try:
         _check_tables(conn)
-        settings_values = _freeze_settings(conn, start)
-        settings = Settings(_FrozenValues(settings_values), {}, options_path="")
-        profiles, dropped_profiles = _freeze_profiles(conn, start)
-        batteries = _effective_configs(settings, profiles, start)
+        frozen_settings = _freeze_settings(conn, start)
+        settings = Settings(_FrozenValues(frozen_settings.values), {}, options_path="")
+        frozen_profiles, dropped_profiles = _freeze_profiles(conn, start)
+        batteries = _effective_configs(settings, frozen_profiles.values, start)
         series, battery_samples, base = _read_series(conn, start, end, batteries)
         plans, dispatch, forecasts = _read_recorded(
             conn, start, end, [config.id for config in batteries]
         )
         warm_start = _warm_start(plans, forecasts, start)
         scratch_path = _backup(conn, scratch_dir)
-        truncation = _truncate(scratch_path, start, dropped_profiles=dropped_profiles)
+        truncation = _truncate(
+            scratch_path,
+            start,
+            dropped_profiles=dropped_profiles,
+            settings_as_of=frozen_settings.as_of,
+            profiles_as_of=frozen_profiles.as_of,
+        )
         boundary = _read_boundary(conn, start, end)
     except BaseException:
         conn.close()
@@ -713,6 +758,13 @@ def open_episode(
         raise
     conn.close()
 
+    asof_sources = {
+        **{f"settings:{key}": origin for key, origin in frozen_settings.origins.items()},
+        **{
+            f"profiles:{kind}/{key}": origin
+            for (kind, key), origin in frozen_profiles.origins.items()
+        },
+    }
     episode = Episode(
         source_path=str(source_path),
         scratch_path=scratch_path,
@@ -720,8 +772,8 @@ def open_episode(
         end=end,
         step_s=float(step_s),
         settings=settings,
-        settings_values=settings_values,
-        profiles=profiles,
+        settings_values=frozen_settings.values,
+        profiles=frozen_profiles.values,
         batteries=batteries,
         series=series,
         battery_samples=battery_samples,
@@ -732,6 +784,7 @@ def open_episode(
         boundary=boundary,
         truncation=truncation,
         base=base,
+        asof_sources=asof_sources,
         keep_scratch=keep_scratch,
     )
     try:
@@ -845,68 +898,150 @@ def _json_value(text: Any, *, where: str) -> Any:
         raise EpisodeError(MALFORMED_JSON, f"{where} is not readable JSON: {exc}") from exc
 
 
-def _freeze_settings(conn: sqlite3.Connection, start: datetime) -> dict[str, Any]:
-    """Every settings value with ``updated_at <= start``; anything newer is refused.
+def _tolerant_moment(text: Any) -> datetime | None:
+    """A stored instant for the refusal message; unreadable text still marks the key as known.
 
-    The table keeps one row per key, so a newer row is the recording's *end* state and there is no
-    older value to fall back to: using it would give the replay knowledge from after the window, and
-    dropping it silently would change what the engine plans on (section 1).
+    Uses the readers' own exact parse (``parsed_as_of_instant``), so a value that would be refused
+    as an instant cannot be quietly rotated backward by a looser parser here.
     """
-    values: dict[str, Any] = {}
-    newer: list[str] = []
-    for row in _fetch(conn, "SELECT key, value_json, updated_at FROM settings"):
-        updated = from_iso(row["updated_at"])
-        if updated is not None and updated <= start:
+    return parsed_as_of_instant(text)
+
+
+#: Rows removed per DELETE statement.  A long append-only history can hold far more rows newer than
+#: a window start than a connection has bind variables (999 on many builds), and one placeholder per
+#: doomed row would fail the whole scratch copy -- precisely on the long windows this cut exists
+#: for.  Deleting in bounded batches keeps the count of placeholders fixed however long the history.
+_DELETE_BATCH = 500
+
+
+def _delete_rowids(connection: sqlite3.Connection, table: str, rowids: list[int]) -> None:
+    """Delete rows by their own ids, in batches small enough for any connection to bind."""
+    for offset in range(0, len(rowids), _DELETE_BATCH):
+        batch = rowids[offset : offset + _DELETE_BATCH]
+        connection.execute(
+            f"DELETE FROM {table} WHERE rowid IN ({','.join('?' * len(batch))})", batch
+        )
+
+
+def _freeze_settings(conn: sqlite3.Connection, start: datetime) -> _AsOfSettings:
+    """Every settings value in force at ``start``, with its origin (SPEC.md 11).
+
+    The table keeps one row per key -- the recording's *end* state -- so a value newer than the
+    window is no longer readable at ``start`` from the table alone.  The append-only as-of history
+    is where the value in force at ``start`` now comes from.  A key the recording knows only from
+    after ``start`` (a first write, or a tombstone) is still refused with the key named: the past is
+    never back-filled, and the current row is only used when it is itself at or before ``start``
+    (a pre-history recording, or a row written around the choke points).  Within a key the newest
+    instant at or before ``start`` wins, ties broken by the newest insertion (a write may be
+    backdated, so insertion order is not chronological order), and the chosen row's own timestamp
+    is re-read and re-checked against the boundary before it is trusted.
+    """
+    try:
+        snapshot = settings_as_of(conn, start)
+        deleted = settings_deleted_as_of(conn, start)
+    except ValueError as exc:
+        raise EpisodeError(MALFORMED_JSON, str(exc)) from exc
+    seen: dict[str, datetime | None] = {}
+    if table_exists(conn, "settings_history"):
+        for row in _fetch(conn, "SELECT key, at FROM settings_history"):
             key = str(row["key"])
-            values[key] = _json_value(row["value_json"], where=f"settings[{key}].value_json")
-        else:
-            newer.append(f"{row['key']}@{row['updated_at']}")
+            moment = _tolerant_moment(row["at"])
+            if key not in seen or (
+                moment is not None and (seen[key] is None or moment > seen[key])
+            ):
+                seen[key] = moment
+    for row in _fetch(conn, "SELECT key, updated_at FROM settings"):
+        key = str(row["key"])
+        moment = _tolerant_moment(row["updated_at"])
+        if key not in seen or (
+            moment is not None and (seen[key] is None or moment > seen[key])
+        ):
+            seen[key] = moment
+    as_of: dict[str, tuple[datetime, Any]] = {}
+    origins: dict[str, str] = {}
+    for key, row in snapshot.items():
+        as_of[key] = (row.at, row.value)
+        origins[key] = row.origin
+    newer = sorted(
+        f"{key}@{to_iso(moment) if moment is not None else 'null'}"
+        for key, moment in seen.items()
+        if key not in snapshot and key not in deleted
+    )
     if newer:
         raise EpisodeError(
             NO_VINTAGE,
             f"{len(newer)} settings row(s) newer than {to_iso(start)}: "
-            + ", ".join(sorted(newer)[:5]),
+            + ", ".join(newer[:5]),
         )
-    return values
+    return _AsOfSettings(as_of, origins)
 
 
 def _freeze_profiles(
     conn: sqlite3.Connection, start: datetime
-) -> tuple[dict[tuple[str, str], Any], tuple[tuple[str, str], ...]]:
+) -> tuple[_AsOfProfiles, tuple[tuple[str, str], ...]]:
     """Accepted decision-feeding ``learning_profiles`` payloads, plus the dropped ones.
 
-    A row newer than ``start`` is the recording's *end* state (the table keeps one row per key, so
-    there is no older value to fall back to).  Two kinds can still be replayed without it, because
-    the engine rebuilds them from rows the replay is allowed to see: the cost-basis ledger resets
-    and rebuilds over its own lookback when the stored watermark is gone, and a learned capacity
-    falls back to the configured ``capacity_kwh``.  Those rows are DROPPED and reported as a declared
-    approximation; every other decision-feeding kind has no rebuild path inside a replay, so a newer
-    row refuses the window rather than silently planning on a value from after it.
+    Each key's value is its newest as-of history row at or before ``start``; a key with no history
+    rows at all falls back to its current row, and then only when that row is itself at or before
+    ``start``.  A key whose only rows (writes or tombstones) sit after ``start`` is refused, exactly
+    as before.  Two kinds can still be replayed without a value, because the engine rebuilds them
+    from rows the replay is allowed to see: the cost-basis ledger resets and rebuilds over its own
+    lookback when the stored watermark is gone, and a learned capacity falls back to the configured
+    ``capacity_kwh``.  Those keys are DROPPED and reported as a declared approximation; every other
+    decision-feeding kind has no rebuild path inside a replay, so it refuses the window rather than
+    silently planning on a value from after it.
+
+    The snapshot returned covers every profile kind, not only the decision-feeding ones, so the
+    scratch copy can be given exactly the values the engine's own ``profile_get`` reads would have
+    seen at ``start`` (the loads' bias, the fetch backoff, the maintenance state).
     """
+    keys: dict[tuple[str, str], datetime | None] = {}
+    if table_exists(conn, "learning_profiles_history"):
+        for row in _fetch(conn, "SELECT kind, key, at FROM learning_profiles_history"):
+            found = (str(row["kind"]), str(row["key"]))
+            moment = _tolerant_moment(row["at"])
+            if found not in keys or (
+                moment is not None and (keys[found] is None or moment > keys[found])
+            ):
+                keys[found] = moment
+    for row in _fetch(conn, "SELECT kind, key, updated_at FROM learning_profiles"):
+        found = (str(row["kind"]), str(row["key"]))
+        moment = _tolerant_moment(row["updated_at"])
+        if found not in keys or (
+            moment is not None and (keys[found] is None or moment > keys[found])
+        ):
+            keys[found] = moment
+    as_of: dict[tuple[str, str], tuple[datetime, Any]] = {}
     accepted: dict[tuple[str, str], Any] = {}
+    origins: dict[tuple[str, str], str] = {}
     dropped: list[tuple[str, str]] = []
     newer: list[str] = []
-    for row in _fetch(conn, "SELECT kind, key, updated_at, payload_json FROM learning_profiles"):
-        kind = str(row["kind"])
+    for (kind, key), newest in keys.items():
+        try:
+            row = profile_as_of(conn, kind, key, start)
+        except ValueError as exc:
+            raise EpisodeError(MALFORMED_JSON, str(exc)) from exc
+        if row is not None:
+            as_of[(kind, key)] = (row.at, row.value)
+            if kind in DECISION_PROFILE_KINDS:
+                accepted[(kind, key)] = row.value
+                origins[(kind, key)] = row.origin
+            continue
+        if profile_deleted_as_of(conn, kind, key, start):
+            continue  # a tombstone in force at start: the key is absent, not late
         if kind not in DECISION_PROFILE_KINDS:
             continue
-        key = str(row["key"])
-        updated = from_iso(row["updated_at"])
-        if updated is not None and updated <= start:
-            accepted[(kind, key)] = _json_value(
-                row["payload_json"], where=f"learning_profiles[{kind}/{key}].payload_json"
-            )
-        elif kind in REBUILDABLE_PROFILE_KINDS:
+        if kind in REBUILDABLE_PROFILE_KINDS:
             dropped.append((kind, key))
         else:
-            newer.append(f"{kind}/{key}@{row['updated_at']}")
+            newer.append(f"{kind}/{key}@{to_iso(newest) if newest is not None else 'null'}")
     if newer:
         raise EpisodeError(
             NO_VINTAGE,
             f"{len(newer)} decision-feeding profile row(s) newer than {to_iso(start)} and with no "
             "rebuild path inside a replay: " + ", ".join(sorted(newer)[:5]),
         )
-    return accepted, tuple(sorted(dropped))
+    return _AsOfProfiles(as_of, accepted, origins), tuple(sorted(dropped))
 
 
 def _truncate(
@@ -914,6 +1049,8 @@ def _truncate(
     start: datetime,
     *,
     dropped_profiles: Sequence[tuple[str, str]] = (),
+    settings_as_of: Mapping[str, tuple[datetime, Any]] | None = None,
+    profiles_as_of: Mapping[tuple[str, str], tuple[datetime, Any]] | None = None,
 ) -> Truncation:
     """Cut every row the recording wrote after the window start out of the scratch copy.
 
@@ -922,6 +1059,16 @@ def _truncate(
     depend on that (see :data:`BOUNDARY_COLUMNS`).  A row whose time column is NULL cannot be proven
     to be at or before the boundary, so it is removed too; the source is untouched, so the recording
     stays complete for the episode's own in-memory reads.
+
+    ``settings`` and ``learning_profiles`` need more than a cut.  The engine reads them through the
+    scratch store's own ``profile_get`` (the load bias, the fetch backoff, the maintenance and
+    control state), so a row the recording wrote after ``start`` may not simply vanish: the as-of
+    row must be written back, or the engine would see a key that was in force at ``start`` as
+    absent.  The cut compares parsed instants (never stored text), and a row whose timestamp cannot
+    be placed exactly is removed rather than left visible.  This is true of a pre-history recording
+    too: the same cut and the same write-back of the frozen rows run, and only the history tables'
+    own cuts are conditional on the history existing.  History rows after ``start`` are cut as well
+    when the tables are present.
     """
     counts: dict[str, int] = {}
     connection = sqlite3.connect(scratch_path, isolation_level=None)
@@ -931,8 +1078,13 @@ def _truncate(
             str(row["name"])
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
+        history_path = "settings_history" in present and "learning_profiles_history" in present
         for table, column in BOUNDARY_COLUMNS.items():
             if table not in present:
+                continue
+            if table in ("settings", "learning_profiles"):
+                # The strict cut below is the single owner of these two tables, history or no
+                # history, so their cut semantics stay in one place and at the right boundary.
                 continue
             bound = start.date().isoformat() if table == "savings_daily" else to_iso(start)
             cursor = connection.execute(
@@ -941,6 +1093,51 @@ def _truncate(
             removed = max(0, int(cursor.rowcount or 0))
             if removed:
                 counts[table] = removed
+        # ``settings`` and ``learning_profiles`` are cut by parsed instants rather than by a SQL
+        # string comparison, because a stored ``+02:00`` offset sorts on the wrong side of the
+        # boundary; an unplaceable timestamp cannot be proven old enough, so it is removed too.
+        # A row is kept only when its instant is exactly placeable and not after ``start``, so a
+        # fraction that names a real microsecond instant to more digits than that is never lost.
+        def prune_after_boundary(table: str, column: str) -> None:
+            # Keyed on ``rowid``: the two key tables have no ``id`` column, but every one of the
+            # four is an ordinary rowid table (on the history tables ``id`` is that same rowid).
+            doomed = [
+                int(row["rid"])
+                for row in connection.execute(f"SELECT rowid AS rid, {column} FROM {table}")
+                if (moment := _tolerant_moment(row[column])) is None or moment > start
+            ]
+            if not doomed:
+                return
+            _delete_rowids(connection, table, doomed)
+            counts[table] = counts.get(table, 0) + len(doomed)
+
+        for table, column in (
+            ("settings", "updated_at"),
+            ("learning_profiles", "updated_at"),
+        ):
+            prune_after_boundary(table, column)
+        if history_path:
+            for table, column in (
+                ("settings_history", "at"),
+                ("learning_profiles_history", "at"),
+            ):
+                prune_after_boundary(table, column)
+        for key, (at, value) in (settings_as_of or {}).items():
+            connection.execute(
+                "INSERT INTO settings(key, value_json, updated_at) VALUES(?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json,"
+                " updated_at = excluded.updated_at",
+                (key, json.dumps(value), to_iso(at)),
+            )
+        for (kind, key), (at, value) in (profiles_as_of or {}).items():
+            connection.execute(
+                "INSERT INTO learning_profiles(kind, key, updated_at, payload_json)"
+                " VALUES(?, ?, ?, ?) ON CONFLICT(kind, key) DO UPDATE SET"
+                " updated_at = excluded.updated_at, payload_json = excluded.payload_json",
+                (kind, key, to_iso(at), json.dumps(value)),
+            )
+        # A declared-dropped key must not survive the cut even if some row of it is old enough:
+        # the episode reports it as dropped, so the scratch the engine reads must not hold it.
         for kind, key in dropped_profiles:
             cursor = connection.execute(
                 "DELETE FROM learning_profiles WHERE kind = ? AND key = ?", (kind, key)

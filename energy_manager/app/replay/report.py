@@ -1463,6 +1463,7 @@ def _plant_section(manifest: Manifest, legs: Sequence[LegRun]) -> dict[str, Any]
 def _information_section(legs: Sequence[LegRun]) -> dict[str, Any]:
     provenance: dict[str, Any] = {}
     vintages: dict[str, Any] = {}
+    as_of_sources: dict[str, Any] = {}
     for leg in legs:
         result = leg.result
         provenance[result.name] = {
@@ -1470,6 +1471,9 @@ def _information_section(legs: Sequence[LegRun]) -> dict[str, Any]:
             "buckets": dict(result.episode.base.split(result.start, result.end)),
             "refused_buckets": [to_iso(bucket) for bucket in result.episode.base.refused],
         }
+        # Where each frozen decision input came from: an appended history row, the upgrade's seed,
+        # or a pre-history recording's current row (docs/REPLAY_HARNESS.md section 1).
+        as_of_sources[result.name] = dict(result.episode.asof_sources)
         kinds: dict[str, int] = {}
         sources: set[str] = set()
         uncovered = 0
@@ -1494,6 +1498,7 @@ def _information_section(legs: Sequence[LegRun]) -> dict[str, Any]:
             "start falls inside the window"
         ),
         "vintages": vintages,
+        "as_of_sources": as_of_sources,
     }
 
 
