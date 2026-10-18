@@ -450,7 +450,7 @@ Panels: **Add a chart to a dashboard**, **Feed entities**.
 | Item | Detail |
 | --- | --- |
 | `Download card` | `GET /api/v1/web/sem-charts-card.js` as a download, saved as `sem-charts-card.js` |
-| Steps | save to `/config/www/sem-charts-card.js`; add `/local/sem-charts-card.js` under Settings → Dashboards → Resources as a JavaScript module; add a Manual card |
+| Steps | save to `/config/www/sem-charts-card.js`; add `/local/sem-charts-card.js?v=<add-on version>` under Settings → Dashboards → Resources as a JavaScript module (Home Assistant caches `/local` for 31 days, so the query is what makes a replaced file take effect); add a Manual card |
 | Chart picker | `plan`, `mini`, `price`, `solar`, `load`, `savings` (range `day`), `accuracy` |
 | `Copy snippet` | `navigator.clipboard` where available (HTTPS/localhost); otherwise selects the snippet and says `Press Ctrl+C` |
 | Snippet | `type: custom:sem-charts-card`, `chart:`, `title:` and — for savings — `range:`; `entity:`/`title:` are optional overrides |

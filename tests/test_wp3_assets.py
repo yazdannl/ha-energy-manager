@@ -1242,6 +1242,21 @@ def test_the_card_only_reads_feeds_the_engine_actually_publishes():
     assert set(CHART_FEED_ENTITIES) <= published, "the engine no longer publishes a documented feed"
 
 
+def test_the_card_restates_every_token_the_shared_chart_sheet_reads():
+    """chart-theme.css is shared verbatim; every custom property it reads must exist in the card.
+
+    The SPA gets them from `:root` in style.css, the card from `:host` in sem-charts-card.css. A
+    property that is only in style.css silently resolves to nothing inside the shadow root (a gap
+    becomes 0, a colour becomes inherit), which is invisible to a test that only greps for names.
+    """
+    theme = read(WEB / "chart-theme.css")
+    card = read(WEB / "sem-charts-card.css")
+    used = set(re.findall(r"var\(\s*(--[\w-]+)", theme))
+    defined = set(re.findall(r"^\s*(--[\w-]+):", card, re.M))
+    assert used, "chart-theme.css reads no tokens at all any more"
+    assert not used - defined, f"the card sheet does not define {sorted(used - defined)}"
+
+
 def _js_color_object(text: str, declaration: str) -> dict[str, str]:
     match = re.search(re.escape(declaration) + r"\s*=\s*\{([^}]*)\}", text)
     assert match, f"{declaration} not found"
@@ -1489,6 +1504,35 @@ def test_the_card_bundle_has_no_duplicate_or_missing_source():
     assert "charts.js" in CARD_BUNDLE_SOURCES and "sem-charts-card.js" in CARD_BUNDLE_SOURCES
 
 
+def test_the_card_bundle_inlines_every_stylesheet_its_charts_need():
+    """A card cannot inherit the SPA's <link>s: whatever uPlot needs to lay out must be inlined.
+
+    Regression for the mangled 0.29.0 card: only the two product sheets were inlined, so uPlot's own
+    `.u-wrap { position: relative }` and `.uplot canvas { width/height: 100% }` never reached the shadow
+    root - the absolute canvases and `.u-axis` labels fell into normal flow, the plot painted over its
+    legend and the chart was clipped. The list is checked by content, not by order alone, so swapping
+    the file for something smaller cannot pass.
+    """
+    import sys as _sys
+
+    _sys.path.insert(0, str(ROOT / "energy_manager"))
+    from app.api import CARD_BUNDLE_CSS  # noqa: E402
+
+    assert CARD_BUNDLE_CSS[0] == "vendor/uPlot.min.css", "uPlot's own sheet must be inlined first"
+    assert CARD_BUNDLE_CSS.index("vendor/uPlot.min.css") < CARD_BUNDLE_CSS.index("chart-theme.css")
+    uplot_css = (WEB / "vendor" / "uPlot.min.css").read_text(encoding="utf-8")
+    for rule in (
+        ".u-wrap {position: relative",
+        ".u-over, .u-under {position: absolute",
+        ".u-axis {position: absolute",
+        ".uplot canvas {display: block",
+    ):
+        assert rule in uplot_css, f"vendored uPlot sheet no longer carries {rule}"
+    # The card's own sheet must not restate uPlot's layout: it defines tokens and chrome only.
+    card_css = (WEB / "sem-charts-card.css").read_text(encoding="utf-8")
+    assert ".u-wrap" not in card_css and ".u-axis" not in card_css
+
+
 CHARTS_HARNESS = r"""
 /* charts.js only ever runs in a browser, so a fake uPlot is the only way to execute its option
    building at all. What this harness is really for: the cursor-sync key. uPlot's sync registry keeps
@@ -1628,3 +1672,9 @@ def test_the_served_bundle_runs_and_registers_its_globals(tmp_path):
     assert result["charts"] == "object" and result["plan"] == "function", result
     assert result["uplot"] == "function", "the wrapped uPlot build did not reach globalThis"
     assert result["cssBytes"] > 4000 and result["styleTag"], result
+    # The assembled CSS must actually carry uPlot's layout rules, not just the two product sheets.
+    from app.api import CARD_BUNDLE_CSS as _bundle_css  # noqa: E402
+
+    css = "\n".join((WEB / name).read_text(encoding="utf-8") for name in _bundle_css)
+    for rule in (".u-wrap {position: relative", ".uplot canvas {display: block", ".u-axis {position: absolute"):
+        assert rule in css, f"the assembled card CSS is missing uPlot rule {rule}"

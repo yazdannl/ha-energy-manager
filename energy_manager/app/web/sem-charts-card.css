@@ -4,10 +4,15 @@
  * outside the SPA entirely, so this file defines the same names on `:host` (dark by default, light
  * when the card sets `data-theme="light"` from the active HA theme). Nothing here reads --chart-*:
  * the card hands charts.js an explicit palette object instead.
+ *
+ * The SPA gets uPlot's layout from vendor/uPlot.min.css and `box-sizing: border-box` from Bootstrap;
+ * the bundle inlines the former and this sheet restates the latter, because chart-theme.css was
+ * written against both and a card must measure like the SPA (0.29.1).
  */
 
 :host {
   display: block;
+  box-sizing: border-box;
   --panel: #1a222d;
   --border: #2e3a49;
   --text: #e7edf4;
@@ -36,6 +41,7 @@
 }
 
 .card-shell { display: block; padding: var(--sp-3); }
+.card-shell, .card-shell *, .card-shell *::before, .card-shell *::after { box-sizing: border-box; }
 .card-title { margin: 0 0 var(--sp-2); font-size: 1rem; font-weight: 600; color: var(--text); }
 .card-empty { margin: 0; color: var(--text-muted); font-size: 0.85rem; }
 .card-meta { margin: var(--sp-1) 0 0; color: var(--text-muted); font-size: 0.75rem; }

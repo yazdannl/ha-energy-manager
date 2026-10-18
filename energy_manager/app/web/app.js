@@ -6344,8 +6344,8 @@
     });
     p.body.appendChild(el("p", { class: "legend-note", text: "One card, seven charts. The file carries uPlot, the chart code and its styles, so the dashboard needs no other resource and the card never calls this add-on: it reads the sensor.sem_chart_* entities the add-on already publishes (SPEC 12)." }));
     p.body.appendChild(el("ol", { class: "chart-card-steps" }, [
-      el("li", null, ["Download the card and save it in your Home Assistant config share as ", el("code", { text: "/config/www/sem-charts-card.js" }), "."]),
-      el("li", null, ["In Home Assistant open ", el("strong", { text: "Settings → Dashboards → Resources" }), ", add ", el("code", { text: "/local/sem-charts-card.js" }), " and choose ", el("strong", { text: "JavaScript module" }), "."]),
+      el("li", null, ["Download the card and save it in your Home Assistant config share as ", el("code", { text: "/config/www/sem-charts-card.js" }), ". Saving over an older copy is the whole update."]),
+      el("li", null, ["In Home Assistant open ", el("strong", { text: "Settings → Dashboards → Resources" }), ", add ", el("code", { text: "/local/sem-charts-card.js?v=" + ((state.status && state.status.version) || "1") }), " and choose ", el("strong", { text: "JavaScript module" }), ". The ", el("code", { text: "?v=" }), " part matters: Home Assistant caches ", el("code", { text: "/local" }), " for 31 days, so bump it after you replace the file."]),
       el("li", null, ["Edit the dashboard, choose ", el("strong", { text: "Add card → Manual" }), ", and paste the snippet below. ", el("code", { text: "entity:" }), " and ", el("code", { text: "title:" }), " are optional overrides."])
     ]));
     p.body.appendChild(el("div", { class: "toolbar" }, [

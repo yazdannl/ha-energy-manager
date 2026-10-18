@@ -1524,14 +1524,20 @@ when there is nothing to draw, and the number of scored days for accuracy. `plan
 
 The add-on ships a Lovelace card as one downloadable, self-contained file:
 `GET /api/v1/web/sem-charts-card.js` assembles, from the committed web assets, a `SEM_CARD_CSS`
-string (`sem-charts-card.css` + `chart-theme.css`), the vendored uPlot (its IIFE wrapped and assigned
-to the global the other two read), `charts.js` and the card class. The card reads the §12.1 feeds and
+string (`vendor/uPlot.min.css` + `sem-charts-card.css` + `chart-theme.css`), the vendored uPlot (its
+IIFE wrapped and assigned to the global the other two read), `charts.js` and the card class. Every
+stylesheet the chart surface needs is inlined, because a card renders in its own shadow root where the
+SPA's `<link>`s do not reach: leaving uPlot's own sheet out of the bundle (0.29.0) put the absolute
+`.u-under`/`.u-over` canvases and the `.u-axis` labels back into normal flow, so the plot painted over
+its legend and the chart was clipped. `sem-charts-card.css` restates Bootstrap's `border-box` for the
+same reason. The card reads the §12.1 feeds and
 nothing else, so it works over HTTPS, in the mobile app, and with the add-on stopped; the lists live
 in `api.py` as `CARD_BUNDLE_CSS`/`CARD_BUNDLE_SOURCES` and a test fails if a listed source is missing
 or names a feed the engine never publishes.
 
 Install is **manual and deliberately so**: the user saves the file to `/config/www/sem-charts-card.js`,
-registers `/local/sem-charts-card.js` as a JavaScript module, and adds a card
+registers `/local/sem-charts-card.js?v=<add-on version>` as a JavaScript module (Home Assistant
+caches `/local` for 31 days, so the version query is what makes a replaced file take effect), and adds a card
 (`type: custom:sem-charts-card`, `chart:` one of `plan|mini|price|solar|load|savings|accuracy`, with
 optional `entity:`, `title:`, `range:`). The add-on does **not** take `map: config:rw` to write that
 folder itself: a self-registering card is not worth a permanent write path into the user's
@@ -1829,6 +1835,18 @@ than by weakening `tools/audit.sh`.
 ---
 
 ## 16. Amendment log (why the spec changed)
+
+**0.29.1 — the card carries every stylesheet it needs.** No requirement changed; §12.2 was wrong. The
+bundle inlined the two product sheets and not uPlot's own, and a card is a shadow root, so the SPA's
+`<link rel="stylesheet" href="vendor/uPlot.min.css">` never reached it. Everything uPlot positions
+absolutely - `.u-wrap`, the two canvases, the axis labels - fell back into normal flow: the plot drew
+over its own legend, the axes rendered at the browser's default type size, and the chart ran past the
+card and was clipped. The bundle now inlines `vendor/uPlot.min.css` first and a test checks the
+assembled CSS for the four layout rules by content, not by filename. The same test class also pins
+every custom property `chart-theme.css` reads against the card sheet, because a token defined only in
+`style.css` resolves to nothing inside the shadow root. §12.2's install steps gained `?v=<version>`:
+Home Assistant serves `/local` with `max-age=2678400`, so without a cache-busting query a fixed card
+never reaches a browser that already loaded the broken one.
 
 **0.29.0 — the action layer gets a shape: inline icons, a charge gauge and the horizon ribbon.** No
 requirement changed; §13.1 gained a vocabulary for a panel that used to be text only. *Icons are drawn,

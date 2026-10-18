@@ -232,7 +232,8 @@ state explicitly says that a surprising situation with an empty log is a bug.
 
 **Cards** — the dashboard-card installer. `Download card` links to
 `GET /api/v1/web/sem-charts-card.js`, the bundle the add-on assembles from its own committed assets
-(`sem-charts-card.css`, `chart-theme.css`, the vendored uPlot, `charts.js`, `sem-charts-card.js`), and
+(`vendor/uPlot.min.css`, `sem-charts-card.css`, `chart-theme.css`, the vendored uPlot, `charts.js`,
+`sem-charts-card.js`), and
 the panel spells out the three manual steps (`/config/www/`, a Lovelace resource, a manual card)
 because registering the resource for the user would need `map: config:rw`. A chart picker rewrites
 the YAML snippet, `Copy snippet` puts it on the clipboard, and the preview below is drawn by the same

@@ -311,7 +311,9 @@ limit. A null means unknown, never zero.
 **Cards** in the add-on UI (`#/cards`) is the whole installer: download the card, then
 
 1. save it as `/config/www/sem-charts-card.js` on your Home Assistant config share,
-2. add `/local/sem-charts-card.js` in **Settings → Dashboards → Resources** as a **JavaScript module**,
+2. add `/local/sem-charts-card.js?v=<add-on version>` in **Settings → Dashboards → Resources** as a
+   **JavaScript module** — the `?v=` query is what makes a replaced file take effect, since Home
+   Assistant caches `/local` for 31 days,
 3. add a card of type **Manual** and paste:
 
 ```yaml

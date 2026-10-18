@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.29.1
+
+- **Fix: the Lovelace card rendered mangled.** The downloaded card is one self-contained file, but it
+  inlined only the add-on's own two stylesheets, not uPlot's. A card lives in its own shadow root, so
+  the SPA's `<link>` to `vendor/uPlot.min.css` did not reach it, and the rules that page lays out with
+  - `.u-wrap { position: relative }`, the absolutely positioned under/over canvases and `.u-axis`
+  labels - were missing: the plot painted over its legend, the axis text rendered at the browser
+  default size and the chart spilled past the card and was clipped. The bundle now inlines
+  `vendor/uPlot.min.css` first, and `sem-charts-card.css` restates Bootstrap's `box-sizing:
+  border-box`, so a card measures exactly like the SPA.
+- Two tests close the class of bug rather than the instance: the assembled bundle's CSS is checked for
+  uPlot's layout rules by content (a swapped or trimmed file fails), and every custom property
+  `chart-theme.css` reads is checked against the card sheet (a token defined only on the SPA's `:root`
+  would silently resolve to nothing).
+- **Fix: a replaced card file now reaches the browser.** The `#/cards` installer and the docs register
+  the resource as `/local/sem-charts-card.js?v=<add-on version>`, because Home Assistant serves
+  `/local` with `max-age=2678400` and a plain URL keeps serving the old file for a month.
+
 ## 0.29.0
 
 - **Next actions now shows the plan instead of only describing it.** The panel was a stack of sentences

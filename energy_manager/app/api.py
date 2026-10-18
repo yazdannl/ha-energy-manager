@@ -42,10 +42,15 @@ MAX_BODY_BYTES = 1_000_000
 API_PREFIX = "/api/v1"
 
 #: The Lovelace card is served as one self-contained file assembled from committed sources: the
-#: card's own CSS, the shared chart sheet, the vendored uPlot, charts.js and the card class. The
-#: user downloads it once into /config/www/, so no add-on privilege or resource registration is
-#: involved (SPEC 12, 0.28.0).
-CARD_BUNDLE_CSS = ("sem-charts-card.css", "chart-theme.css")
+#: card's own CSS, uPlot's own stylesheet, the shared chart sheet, the vendored uPlot, charts.js and
+#: the card class. The user downloads it once into /config/www/, so no add-on privilege or resource
+#: registration is involved (SPEC 12, 0.28.0).
+#:
+#: uPlot.min.css MUST be inlined (0.29.1): a card renders in its own shadow root, so the SPA's
+#: <link> to it does not reach the card. Without `.u-wrap { position: relative }`, the absolute
+#: `.u-under`/`.u-over` canvases and `.u-axis` labels fall back into normal flow, so the plot painted
+#: over its own legend, the axes rendered oversized and the chart was clipped by the card.
+CARD_BUNDLE_CSS = ("vendor/uPlot.min.css", "sem-charts-card.css", "chart-theme.css")
 CARD_BUNDLE_SOURCES = ("vendor/uPlot.min.js", "charts.js", "sem-charts-card.js")
 SECRET_KEY_HINTS = ("key", "token", "secret", "password", "passwd")
 
