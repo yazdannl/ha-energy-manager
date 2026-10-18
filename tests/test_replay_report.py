@@ -308,6 +308,17 @@ def test_the_report_is_deterministic_apart_from_the_clock(tmp_path: Path) -> Non
     assert deterministic_view(first) == deterministic_view(second)
 
 
+def test_the_information_section_reports_where_each_frozen_value_came_from(tmp_path: Path) -> None:
+    """Every frozen decision input names its origin, so a report can say how it was vintaged."""
+    code, report, _text = drive(tmp_path)
+    assert code == 0
+    sources = report["information"]["as_of_sources"]
+    assert sources
+    for leg_sources in sources.values():
+        assert leg_sources
+        assert set(leg_sources.values()) <= {"history", "seed", "current"}
+
+
 def test_both_dialects_are_offered_and_toon_is_a_subset(tmp_path: Path) -> None:
     code, report, _text = drive(tmp_path)
     assert code == 0

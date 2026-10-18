@@ -18,12 +18,14 @@ writing a few tens of thousands of rows. Upgrade path: add indexes only if a que
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from .models import (
     Action,
@@ -37,12 +39,92 @@ from .models import (
     utcnow,
 )
 
-__all__ = ["DEFAULT_RETENTION", "SCHEMA_VERSION", "Store"]
+__all__ = [
+    "AsOfValue",
+    "DEFAULT_RETENTION",
+    "SCHEMA_VERSION",
+    "Store",
+    "parsed_as_of_instant",
+    "profile_as_of",
+    "profile_deleted_as_of",
+    "settings_as_of",
+    "settings_deleted_as_of",
+    "table_exists",
+]
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
-# Forward-only. Append new (version, statements) entries; never edit a released entry.
-MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
+#: One migration step: a SQL statement, or a Python step for work SQL cannot express (the history
+#: seed parses the instant it copies, and a stored ``+02:00`` offset is not a string operation).
+MigrationStep = str | Callable[[sqlite3.Connection], None]
+
+
+def _canonical_utc(moment: datetime) -> str:
+    """One canonical history stamp: UTC, at the microsecond precision a datetime really holds.
+
+    ``to_iso`` preserves whatever offset a caller supplied, which is fine for a row's own
+    ``updated_at`` but not for the history: the readers must be able to compare instants, and a
+    stored ``+02:00`` must not sort like 08:00 when it means 06:00.  Fractional seconds are kept --
+    truncating them to whole seconds would move the instant earlier and make a payload eligible
+    inside the second it was written -- and the result is verified to re-parse to the same instant,
+    so an input this form cannot represent exactly is refused instead of being rounded.
+    """
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    stamp = moment.astimezone(timezone.utc).isoformat()
+    if from_iso(stamp) != moment:
+        raise ValueError(f"cannot represent {moment!r} as an instant exactly")
+    return stamp
+
+
+def _seed_history(conn: sqlite3.Connection) -> None:
+    """Migration 5, part two: give every existing row its last-write instant as history.
+
+    Python rather than SQL because the copied ``updated_at`` may carry a non-UTC offset: the
+    instant is parsed with the same parser the readers use and stored canonically.  A timestamp
+    that cannot be read -- or whose fraction would lose precision -- seeds nothing: an instant we
+    cannot place exactly is not one we may invent, while one we can place exactly is never dropped
+    (data loss is worse than a refusal).  An existing history row for the key is never overwritten
+    (the statement is idempotent).
+    """
+    for key, updated_at, value_json in conn.execute(
+        "SELECT key, updated_at, value_json FROM settings"
+    ).fetchall():
+        moment = parsed_as_of_instant(updated_at)
+        if moment is None or conn.execute(
+            "SELECT 1 FROM settings_history WHERE key = ? LIMIT 1", (key,)
+        ).fetchone() is not None:
+            continue
+        try:
+            stamp = _canonical_utc(moment)
+        except ValueError:
+            continue  # an instant we cannot represent exactly seeds nothing
+        conn.execute(
+            "INSERT INTO settings_history(key, at, value_json, origin) VALUES(?, ?, ?, 'seed')",
+            (key, stamp, value_json),
+        )
+    for kind, key, updated_at, payload_json in conn.execute(
+        "SELECT kind, key, updated_at, payload_json FROM learning_profiles"
+    ).fetchall():
+        moment = parsed_as_of_instant(updated_at)
+        if moment is None or conn.execute(
+            "SELECT 1 FROM learning_profiles_history WHERE kind = ? AND key = ? LIMIT 1",
+            (kind, key),
+        ).fetchone() is not None:
+            continue
+        try:
+            stamp = _canonical_utc(moment)
+        except ValueError:
+            continue  # an instant we cannot represent exactly seeds nothing
+        conn.execute(
+            "INSERT INTO learning_profiles_history(kind, key, at, payload_json, origin)"
+            " VALUES(?, ?, ?, ?, 'seed')",
+            (kind, key, stamp, payload_json),
+        )
+
+
+MIGRATIONS: list[tuple[int, tuple[MigrationStep, ...]]] = [
+    # Forward-only. Append new (version, steps) entries; never edit a released entry.
     (
         1,
         (
@@ -224,7 +306,51 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
             "ALTER TABLE actuals ADD COLUMN load_derived_kw REAL",
         ),
     ),
+    (
+        5,
+        (
+            # 0.27.0 as-of history (SPEC.md 11; docs/REPLAY_HARNESS.md section 1): the replay can
+            # only freeze a value that was in force at an arbitrary past instant if the recording
+            # kept more than the end state.  ``settings`` and ``learning_profiles`` stay exactly as
+            # they were -- one upserted row per key -- and every write or delete through the store's
+            # own writers also appends the value here, so the newest row at or before an instant is
+            # the value that was in force then.  ``origin`` is 'write' for a post-migration write,
+            # 'seed' for the upgrade's copy of a row that already existed, and 'delete' for a
+            # tombstone.  The seed uses each row's existing ``updated_at`` as its only known 'at',
+            # parsed and stored canonically here, so a window that starts before a key's newest
+            # write still refuses (no_vintage): the past before this upgrade is not knowable, only
+            # the last write is.  Rows with a NULL or unreadable ``updated_at`` cannot be placed and
+            # seed nothing.
+            """
+            CREATE TABLE IF NOT EXISTS settings_history (
+                id INTEGER PRIMARY KEY,
+                key TEXT NOT NULL,
+                at TEXT NOT NULL,
+                value_json TEXT,
+                origin TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS learning_profiles_history (
+                id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL,
+                key TEXT NOT NULL,
+                at TEXT NOT NULL,
+                payload_json TEXT,
+                origin TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_settings_history_key_at"
+            " ON settings_history(key, at)",
+            "CREATE INDEX IF NOT EXISTS idx_profiles_history_key_at"
+            " ON learning_profiles_history(kind, key, at)",
+            # The seed is Python (below) so the copied instant is parsed and stored canonically.
+            _seed_history,
+        ),
+    ),
 ]
+
+
 #: Retention policy used by :meth:`Store.trim` (SPEC.md section 11).
 DEFAULT_RETENTION = {
     "measurements_days": 400,
@@ -304,6 +430,17 @@ def _to_ts(value: datetime | str | None, default: datetime | None = None) -> str
     return to_iso(value)
 
 
+def _write_stamps(value: datetime | None) -> tuple[str, str]:
+    """A write's two stamps: the current row's (unchanged) and the history's canonical UTC one.
+
+    The current row keeps exactly the representation :func:`_to_ts` always produced, because its
+    ``updated_at`` is read by production.  The history is a new column, and it is normalised here
+    so its instants are comparable without a parser having to guess an offset's meaning.
+    """
+    moment = value if value is not None else utcnow()
+    return to_iso(moment), _canonical_utc(moment)
+
+
 def _json_loads(text: str | None, default: Any = None) -> Any:
     if text is None:
         return default
@@ -311,6 +448,377 @@ def _json_loads(text: str | None, default: Any = None) -> Any:
         return json.loads(text)
     except ValueError:
         return default
+
+
+#: Where an as-of row came from.  ``history`` is a write appended after this schema existed,
+#: ``seed`` the migration's copy of a row that already existed when schema v5 was applied, and
+#: ``current`` a recording made before the history existed (its only row, read as before).
+#: ``delete`` is a tombstone: the key is absent from ``at`` on, never present with an old payload.
+_ASOF_ORIGINS = {"write": "history", "seed": "seed", "current": "current", "delete": "delete"}
+
+
+@dataclass(frozen=True)
+class AsOfValue:
+    """One settings/profile value in force at an instant, and where that row came from."""
+
+    at: datetime | None
+    value: Any
+    origin: str
+
+
+def table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    """Whether a table is present: how the readers tell an upgraded store from an old recording."""
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone() is not None
+
+
+def _decode_as_of(text: Any, where: str) -> Any:
+    """Decode one stored JSON payload; unlike :func:`_json_loads` this refuses corruption.
+
+    The readers are the replay's only path to a recorded value, and a payload that cannot be read
+    must refuse the window (``malformed_json``) rather than be read as a default the recording never
+    had.  The message carries the key so an operator can name the row.
+    """
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        raise ValueError(f"{where} is not readable JSON: {exc}") from exc
+
+
+def _as_of_moment(text: Any, where: str) -> datetime | None:
+    """Parse one stored instant, refusing a representation this build cannot place exactly.
+
+    ``None`` only when there is no instant at all.  Anything else is either a proper instant or an
+    error: a timestamp is compared as an instant, never as text, because ``2026-01-01T08:30:00-02:00``
+    sorts before ``2026-01-01T10:00:00+00:00`` while representing a later moment.  A stored string is
+    placed only when it matches the one accepted form (see ``_INSTANT``) as a whole; within that
+    form the rule about precision is exactness, not digit count, so a fraction is kept however many
+    digits it is written with (either separator) while every digit past microsecond precision is
+    zero -- that names the instant a datetime holds, and dropping such a row would be data loss, a
+    seed skipped or a row cut.  A digit that would be lost with real precision refuses instead of
+    being rounded, because the round would move the instant; nothing is ever assumed.
+    """
+    if text is None:
+        # The one legitimate absence: no instant was ever stored for this key.
+        return None
+    if not isinstance(text, str):
+        # A number is NOT accepted. ``from_iso`` happily reads one as Unix epoch seconds, which
+        # would fabricate an instant for a corrupted or mistyped row -- and a small number lands
+        # decades in the past, i.e. "old enough" for every boundary, so the row would be trusted
+        # instead of being refused. The accepted form is a string; anything else is unplaceable.
+        raise ValueError(f"{where} is not a stamp in the accepted form: {text!r}")
+    moment = _placed_moment(text, where)
+    if moment is not None and from_iso(_canonical_utc(moment)) != moment:
+        raise ValueError(f"{where} cannot be represented exactly as an instant: {text!r}")
+    return moment
+
+
+#: The one accepted form of a stored stamp, matched whole *before* anything is parsed::
+#:
+#:     date    := YYYY-MM-DD                        extended calendar form only
+#:     time    := HH:MM[:SS[.fraction]]             fraction after "," is accepted too
+#:     offset  := "Z" | [+-]HH:MM[:SS[.fraction]]
+#:
+#: Everything else -- week dates, ordinal dates, a basic-format date, another date/time separator,
+#: a missing offset -- is unplaceable: refused for a value row, pruned for a scratch row.  The
+#: alternative, inferring the structure of a stamp from its signs and parsing the pieces, reads a
+#: form the writer never writes as if it were an offset: ``2026-W01-1T12:00:00Z`` splits inside its
+#: week date, and ``2026-01-01+12:00:00`` (whose ``+`` the parser takes as a date/time separator,
+#: i.e. midday) reads as midnight with a twelve-hour offset -- a *different instant*, which is the
+#: failure this whole change exists to prevent.  The trade is stated plainly: every stamp a writer
+#: produces matches (``to_iso`` writes an extended date, seconds and an offset), so only hand-written
+#: or exotic rows are refused, and a refusal is safe where a guessed instant is not.
+_INSTANT = re.compile(
+    r"(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
+    r"T(?P<hour>\d{2}):(?P<minute>\d{2})(?::(?P<second>\d{2})(?P<fraction>[.,]\d+)?)?"
+    r"(?P<offset>Z|[+-]\d{2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?)"
+)
+
+#: The offset group's own grammar, read by this build from the matched group's digits: sign, hours,
+#: minutes, optional seconds and fraction.  Read here rather than trusted to ``fromisoformat``,
+#: which can drop an offset fraction whole (``+00:00:00.5`` comes back with no offset at all) and
+#: so place a row half a second late -- or early, for a negative offset.
+_OFFSET = re.compile(r"([+-])(\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d+))?)?")
+
+
+def _microseconds(digits: str, where: str, text: str) -> int:
+    """One fraction's digits as microseconds, by exactness rather than by digit count.
+
+    Any number of digits is fine while every digit past microsecond precision is zero, because
+    that names the instant a datetime holds and dropping such a row would be data loss (a seed
+    skipped, a row cut); a nonzero digit there refuses rather than being rounded.
+    """
+    if any(digit != "0" for digit in digits[6:]):
+        raise ValueError(
+            f"{where} would lose sub-microsecond precision this build cannot place: {text!r}"
+        )
+    return int(digits[:6].ljust(6, "0"))
+
+
+def _placed_moment(text: str, where: str) -> datetime:
+    """Place one stored stamp exactly from the accepted form above, or refuse it.
+
+    The form decides the structure; the digits then build the instant here, timezone included, so
+    no piece of a stamp is ever inferred from how it sorts or which side of a sign it sits.
+    """
+    match = _INSTANT.fullmatch(text.strip())
+    if match is None:
+        raise ValueError(f"{where} is not a stamp in the accepted form: {text!r}")
+    fields = match.groupdict()
+    microsecond = _microseconds((fields["fraction"] or "")[1:], where, text)
+    offset_text = fields["offset"]
+    offset = timedelta(0)
+    if offset_text != "Z":
+        written = _OFFSET.fullmatch(offset_text)
+        if written is None:
+            raise ValueError(f"{where} has an offset this build cannot place: {text!r}")
+        sign, hours, minutes, seconds, fraction = written.groups()
+        if int(minutes) > 59 or int(seconds or 0) > 59:
+            raise ValueError(f"{where} has an offset this build cannot place: {text!r}")
+        offset = (-1 if sign == "-" else 1) * timedelta(
+            hours=int(hours),
+            minutes=int(minutes),
+            seconds=int(seconds or 0),
+            microseconds=_microseconds(fraction or "", where, text),
+        )
+    try:
+        zone = timezone.utc if offset_text == "Z" else timezone(offset)
+        return datetime(
+            int(fields["year"]),
+            int(fields["month"]),
+            int(fields["day"]),
+            int(fields["hour"]),
+            int(fields["minute"]),
+            int(fields["second"] or 0),
+            microsecond,
+            tzinfo=zone,
+        ).astimezone(timezone.utc)
+    except (ValueError, OverflowError) as exc:
+        # OverflowError is reachable from astimezone() at the calendar edges: a stamp of year 1
+        # with a positive offset (or year 9999 with a negative one) constructs and then overflows
+        # when it is moved to UTC. Translated here, at the single place every caller goes through,
+        # so a caller that guards only ValueError (a scratch prune, a seed) treats the row as
+        # unplaceable -- removed or skipped -- instead of aborting the whole operation.
+        raise ValueError(f"{where} is not a readable timestamp: {exc}") from exc
+
+
+def parsed_as_of_instant(text: Any) -> datetime | None:
+    """Exactly parse one stored instant, or answer ``None`` (the fail-closed tolerant form).
+
+    Used where a row may legitimately be unplaceable -- a migration seed, a scratch cut: the caller
+    then skips or removes the row instead of guessing a moment for it.
+    """
+    try:
+        return _as_of_moment(text, "stored instant")
+    except ValueError:
+        return None
+
+
+def _verified_moment(text: Any, now: datetime, where: str) -> datetime:
+    """Re-read the timestamp of a row about to be trusted; refuse one unusable or in the future.
+
+    Selection already compares parsed instants, so this is the independent backstop in front of the
+    frozen window: the chosen row is verified by parsing its own timestamp, and a row later than
+    the boundary (or with no readable timestamp) refuses rather than being silently dropped.
+    """
+    moment = _as_of_moment(text, where)
+    if moment is None:
+        raise ValueError(f"{where} has no timestamp")
+    if moment > now:
+        raise ValueError(f"{where} is later than the boundary {to_iso(now)}: {to_iso(moment)}")
+    return moment
+
+
+def _newest_settings_history_rows(
+    conn: sqlite3.Connection, now: datetime
+) -> dict[str, tuple[datetime, sqlite3.Row]]:
+    """The newest history row per key at or before ``now``: by instant, ties by newest insertion.
+
+    Chosen by ``(at, id)`` rather than by insertion id alone, because a write may legitimately be
+    backdated (the writers take the write time), so insertion order is not chronological order.
+    Every row's timestamp is parsed here, so an unreadable representation refuses the read.
+    """
+    best: dict[str, tuple[datetime, int, sqlite3.Row]] = {}
+    for row in conn.execute("SELECT id, key, at, value_json, origin FROM settings_history"):
+        key = str(row["key"])
+        # The origin is checked before eligibility: a row we would not trust if selected must not
+        # silently pass because a newer or older row happens to win (or because a tombstone is read).
+        _as_of_origin(row["origin"], f"settings_history[{key}].origin")
+        at = _as_of_moment(row["at"], f"settings_history[{key}].at")
+        if at is None or at > now:
+            continue
+        row_id = int(row["id"])
+        current = best.get(key)
+        if current is None or (at, row_id) > (current[0], current[1]):
+            best[key] = (at, row_id, row)
+    winners: dict[str, tuple[datetime, sqlite3.Row]] = {}
+    for key, (_at, _row_id, row) in best.items():
+        winners[key] = (
+            _verified_moment(row["at"], now, f"settings_history[{key}].at"), row,
+        )
+    return winners
+
+
+def _as_of_origin(origin: Any, where: str) -> str:
+    """Map a stored origin, refusing one this build does not know rather than trusting it."""
+    mapped = _ASOF_ORIGINS.get(str(origin))
+    if mapped is None:
+        raise ValueError(f"{where} is not a known origin: {origin!r}")
+    return mapped
+
+
+def settings_as_of(conn: sqlite3.Connection, now: datetime) -> dict[str, AsOfValue]:
+    """Newest ``settings`` row per key with ``at <= now``; a tombstoned key is absent.
+
+    With the v5 history the answer comes from ``settings_history``: the newest row at or before
+    ``now`` per key.  A key whose newest row there is a tombstone is *not* returned -- the value it
+    held before the delete is never resurrected (:func:`settings_deleted_as_of` tells that apart
+    from a key that has no value yet).  A key with no history rows at all -- a row written by hand,
+    or a recording made before v5 in which the history table exists for other keys -- falls back to
+    the current ``settings`` row, and only when *that* row is at or before ``now``; a key whose only
+    row is newer is simply absent here, and the caller refuses on the current table's timestamp.
+    Instants are compared as parsed datetimes, never as stored text, and the chosen row's own
+    timestamp is re-checked before it is returned (``_verified_moment``).
+    """
+    snapshot: dict[str, AsOfValue] = {}
+    if table_exists(conn, "settings_history"):
+        for key, (at, row) in _newest_settings_history_rows(conn, now).items():
+            where = f"settings_history[{key}]"
+            origin = str(row["origin"])
+            if origin == "delete":
+                continue
+            snapshot[key] = AsOfValue(
+                at,
+                _decode_as_of(row["value_json"], f"{where}.value_json"),
+                _as_of_origin(origin, f"{where}.origin"),
+            )
+        tracked = {
+            str(row[0]) for row in conn.execute("SELECT DISTINCT key FROM settings_history")
+        }
+        for row in conn.execute("SELECT key, updated_at, value_json FROM settings"):
+            key = str(row["key"])
+            if key in snapshot or key in tracked:
+                continue
+            at = _as_of_moment(row["updated_at"], f"settings[{key}].updated_at")
+            if at is not None and at <= now:
+                snapshot[key] = AsOfValue(
+                    at, _decode_as_of(row["value_json"], f"settings[{key}].value_json"), "current"
+                )
+        return snapshot
+    for row in conn.execute("SELECT key, updated_at, value_json FROM settings"):
+        key = str(row["key"])
+        at = _as_of_moment(row["updated_at"], f"settings[{key}].updated_at")
+        if at is not None and at <= now:
+            snapshot[key] = AsOfValue(
+                at, _decode_as_of(row["value_json"], f"settings[{key}].value_json"), "current"
+            )
+    return snapshot
+
+
+def settings_deleted_as_of(conn: sqlite3.Connection, now: datetime) -> set[str]:
+    """Keys whose newest history row at or before ``now`` is a tombstone.
+
+    A tombstone is a change like any write: a window starting before it must refuse the key, and
+    one starting after it reads the key as absent.  Only the history can answer this, so a legacy
+    recording without the table answers with the empty set.
+    """
+    if not table_exists(conn, "settings_history"):
+        return set()
+    return {
+        key
+        for key, (_at, row) in _newest_settings_history_rows(conn, now).items()
+        if str(row["origin"]) == "delete"
+    }
+
+
+def profile_as_of(conn: sqlite3.Connection, kind: str, key: str, now: datetime) -> AsOfValue | None:
+    """Newest ``learning_profiles`` row for one key with ``at <= now``, or ``None``.
+
+    A tombstone at or before ``now`` returns ``None``: the key was deleted then, and the payload
+    before the delete is never returned (:func:`profile_deleted_as_of` distinguishes that from a
+    key that was never written).  A key with no history rows at all falls back to its current row,
+    and only when that row is at or before ``now``.  Instants are compared as parsed datetimes,
+    never as stored text, and the chosen row's own timestamp is re-checked before it is returned.
+    """
+    if table_exists(conn, "learning_profiles_history"):
+        found = _newest_profile_history_row(conn, kind, key, now)
+        if found is not None:
+            at, row = found
+            where = f"learning_profiles_history[{kind}/{key}]"
+            origin = str(row["origin"])
+            if origin == "delete":
+                return None
+            return AsOfValue(
+                at,
+                _decode_as_of(row["payload_json"], f"{where}.payload_json"),
+                _as_of_origin(origin, f"{where}.origin"),
+            )
+        if _profile_history_known(conn, kind, key):
+            return None
+        return _current_profile_as_of(conn, kind, key, now)
+    return _current_profile_as_of(conn, kind, key, now)
+
+
+def _newest_profile_history_row(
+    conn: sqlite3.Connection, kind: str, key: str, now: datetime
+) -> tuple[datetime, sqlite3.Row] | None:
+    """One key's newest history row at or before ``now``: by instant, ties by newest insertion."""
+    best: tuple[datetime, int, sqlite3.Row] | None = None
+    for row in conn.execute(
+        "SELECT id, at, payload_json, origin FROM learning_profiles_history"
+        " WHERE kind = ? AND key = ?",
+        (kind, key),
+    ):
+        # Checked before eligibility, so both profile readers enforce exactly the same rule.
+        _as_of_origin(row["origin"], f"learning_profiles_history[{kind}/{key}].origin")
+        at = _as_of_moment(row["at"], f"learning_profiles_history[{kind}/{key}].at")
+        if at is None or at > now:
+            continue
+        row_id = int(row["id"])
+        if best is None or (at, row_id) > (best[0], best[1]):
+            best = (at, row_id, row)
+    if best is None:
+        return None
+    where = f"learning_profiles_history[{kind}/{key}].at"
+    return _verified_moment(best[2]["at"], now, where), best[2]
+
+
+def _profile_history_known(conn: sqlite3.Connection, kind: str, key: str) -> bool:
+    """Whether the key has any history row at all, even one after the boundary."""
+    return conn.execute(
+        "SELECT 1 FROM learning_profiles_history WHERE kind = ? AND key = ? LIMIT 1",
+        (kind, key),
+    ).fetchone() is not None
+
+
+def profile_deleted_as_of(conn: sqlite3.Connection, kind: str, key: str, now: datetime) -> bool:
+    """Whether one profile key was deleted at or before ``now`` (its newest row is a tombstone)."""
+    if not table_exists(conn, "learning_profiles_history"):
+        return False
+    found = _newest_profile_history_row(conn, kind, key, now)
+    return found is not None and str(found[1]["origin"]) == "delete"
+
+
+def _current_profile_as_of(
+    conn: sqlite3.Connection, kind: str, key: str, now: datetime
+) -> AsOfValue | None:
+    """The current row as an as-of value, when it is itself at or before ``now``."""
+    row = conn.execute(
+        "SELECT updated_at, payload_json FROM learning_profiles WHERE kind = ? AND key = ?",
+        (kind, key),
+    ).fetchone()
+    if row is None:
+        return None
+    at = _as_of_moment(row["updated_at"], f"learning_profiles[{kind}/{key}].updated_at")
+    if at is None or at > now:
+        return None
+    return AsOfValue(
+        at, _decode_as_of(row["payload_json"], f"learning_profiles[{kind}/{key}].payload_json"),
+        "current",
+    )
 
 
 class Store:
@@ -380,18 +888,59 @@ class Store:
         self.set_settings({key: value}, now=now)
 
     def set_settings(self, values: Mapping[str, Any], now: datetime | None = None) -> None:
-        ts = _to_ts(now, utcnow())
+        ts, history_ts = _write_stamps(now)
+        payloads = [(key, json.dumps(value)) for key, value in values.items()]
         with _transaction(self.connection) as conn:
-            conn.executemany(
-                "INSERT INTO settings(key, value_json, updated_at) VALUES(?, ?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, "
-                "updated_at = excluded.updated_at",
-                [(key, json.dumps(value), ts) for key, value in values.items()],
-            )
+            for key, payload in payloads:
+                previous = conn.execute(
+                    "SELECT value_json FROM settings WHERE key = ?", (key,)
+                ).fetchone()
+                # The current row keeps its exact upsert semantics; the history only records a
+                # write whose serialised value actually changed, which bounds the growth of keys
+                # the add-on re-stamps on every tick (SPEC.md 11).
+                conn.execute(
+                    "INSERT INTO settings(key, value_json, updated_at) VALUES(?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, "
+                    "updated_at = excluded.updated_at",
+                    (key, payload, ts),
+                )
+                if previous is None or previous["value_json"] != payload:
+                    conn.execute(
+                        "INSERT INTO settings_history(key, at, value_json, origin)"
+                        " VALUES(?, ?, ?, 'write')",
+                        (key, history_ts, payload),
+                    )
 
-    def delete_setting(self, key: str) -> None:
+    def delete_setting(self, key: str, now: datetime | None = None) -> None:
+        ts, history_ts = _write_stamps(now)
         with _transaction(self.connection) as conn:
-            conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            cursor = conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            if cursor.rowcount:
+                # A tombstone, not a gap: a window starting before it still refuses the key, and a
+                # window starting after it reads the key as absent, never as its old value.
+                conn.execute(
+                    "INSERT INTO settings_history(key, at, value_json, origin)"
+                    " VALUES(?, ?, NULL, 'delete')",
+                    (key, history_ts),
+                )
+
+    def settings_as_of(self, now: datetime | None = None) -> dict[str, AsOfValue]:
+        """The settings in force at ``now`` (see :func:`settings_as_of`)."""
+        return settings_as_of(self.connection, now or utcnow())
+
+    def settings_deleted_as_of(self, now: datetime | None = None) -> set[str]:
+        """Settings keys deleted at or before ``now`` (see :func:`settings_deleted_as_of`)."""
+        return settings_deleted_as_of(self.connection, now or utcnow())
+
+    def profile_as_of(self, kind: str, key: str, now: datetime | None = None) -> AsOfValue | None:
+        """One profile in force at ``now`` (see :func:`profile_as_of`)."""
+        return profile_as_of(self.connection, kind, key, now or utcnow())
+
+    def profile_deleted_as_of(
+        self, kind: str, key: str, now: datetime | None = None
+    ) -> bool:
+        """Whether one profile key was deleted at or before ``now`` (see the module function)."""
+        return profile_deleted_as_of(self.connection, kind, key, now or utcnow())
 
     # ------------------------------------------------------------------ meta
     def get_meta(self, key: str, default: str | None = None) -> str | None:
@@ -778,19 +1327,38 @@ class Store:
     def profile_put(
         self, kind: str, key: str, payload: Any, updated_at: datetime | None = None
     ) -> None:
+        ts, history_ts = _write_stamps(updated_at)
+        encoded = json.dumps(payload)
         with _transaction(self.connection) as conn:
+            previous = conn.execute(
+                "SELECT payload_json FROM learning_profiles WHERE kind = ? AND key = ?",
+                (kind, key),
+            ).fetchone()
             conn.execute(
                 "INSERT INTO learning_profiles(kind, key, updated_at, payload_json)"
                 " VALUES(?, ?, ?, ?) ON CONFLICT(kind, key) DO UPDATE SET"
                 " updated_at = excluded.updated_at, payload_json = excluded.payload_json",
-                (kind, key, _to_ts(updated_at, utcnow()), json.dumps(payload)),
+                (kind, key, ts, encoded),
             )
+            if previous is None or previous["payload_json"] != encoded:
+                conn.execute(
+                    "INSERT INTO learning_profiles_history(kind, key, at, payload_json, origin)"
+                    " VALUES(?, ?, ?, ?, 'write')",
+                    (kind, key, history_ts, encoded),
+                )
 
-    def profile_delete(self, kind: str, key: str) -> None:
+    def profile_delete(self, kind: str, key: str, now: datetime | None = None) -> None:
+        ts, history_ts = _write_stamps(now)
         with _transaction(self.connection) as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "DELETE FROM learning_profiles WHERE kind = ? AND key = ?", (kind, key)
             )
+            if cursor.rowcount:
+                conn.execute(
+                    "INSERT INTO learning_profiles_history(kind, key, at, payload_json, origin)"
+                    " VALUES(?, ?, ?, NULL, 'delete')",
+                    (kind, key, history_ts),
+                )
 
     # ------------------------------------------------------------------ savings
     def upsert_savings_daily(
@@ -935,5 +1503,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             if fresh is not None and int(fresh["version"]) >= version:
                 continue
             for statement in statements:
-                tx.execute(statement)
+                if callable(statement):
+                    statement(tx)
+                else:
+                    tx.execute(statement)
             tx.execute("UPDATE schema_version SET version = ?", (version,))

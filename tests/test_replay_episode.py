@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "energy_manager"))
 
 from app import capacity as capacity_learning
 from app import cost_basis as cost_basis_ledger
+from app import full_charge
 from app.main import EXAMPLE_BATTERY, _selfcheck_settings
 from app.models import (
     Action,
@@ -23,9 +24,11 @@ from app.models import (
     Plan,
     PlanSlot,
     PlanSummary,
+    from_iso,
     quarter_floor,
     to_iso,
 )
+from app.replay import episode as episode_mod  # noqa: E402
 from app.replay.episode import (
     BASE_DERIVED,
     BASE_MEASURED,
@@ -43,6 +46,8 @@ from app.replay.episode import (
     open_episode,
 )
 from app.replay.plant import SIMULATED, plant_factory
+from app.sources import load as load_source
+from app.sources import solar as solar_source
 from app.store import Store
 
 START = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
@@ -581,15 +586,429 @@ def test_a_source_name_with_uri_metacharacters_opens_the_intended_file(
         episode.close()
 
 
-def test_a_settings_row_newer_than_the_window_is_refused(tmp_path: Path) -> None:
+def test_a_settings_key_written_only_after_the_window_is_refused(tmp_path: Path) -> None:
+    """A key the recording knows only from after ``start`` still refuses, and names itself."""
     path = recording(tmp_path)
+    store = Store(path)
+    try:
+        store.set_setting("late.setting", "advisory", now=START + timedelta(minutes=5))
+    finally:
+        store.close()
+    with pytest.raises(EpisodeError) as error:
+        open_episode(path, START, END)
+    assert error.value.reason == NO_VINTAGE
+    assert "late.setting" in str(error.value)
+
+
+def test_a_setting_rewritten_after_the_window_start_uses_the_as_of_value(tmp_path: Path) -> None:
+    """The running add-on re-stamps mode/dry_run; the window still opens on the old value."""
+    path = recording(tmp_path, settings_extra={"mode": "auto"})
     store = Store(path)
     try:
         store.set_setting("mode", "advisory", now=START + timedelta(minutes=5))
     finally:
         store.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.settings_values["mode"] == "auto"
+        assert episode.asof_sources["settings:mode"] == "history"
+        # The engine reads settings through the frozen view, but the scratch copy must agree: the
+        # as-of row, not the recording's end state, is what every reader of the copy sees.
+        assert episode.store().get_setting("mode") == "auto"
+        row = episode.store().connection.execute(
+            "SELECT updated_at FROM settings WHERE key = 'mode'"
+        ).fetchone()
+        assert from_iso(row["updated_at"]) <= START
+
+
+def test_a_backdated_write_cannot_displace_a_later_one_in_the_frozen_settings(tmp_path):
+    """R1: selection is by instant, not by insertion id -- a write may be backdated."""
+    path = recording(tmp_path, settings_extra={"mode": "auto"})
+    store = Store(path)
+    try:
+        store.set_setting("mode", "advisory", now=START - timedelta(hours=1))
+        store.set_setting("mode", "sneaky", now=START - timedelta(hours=3))  # backdated, newest id
+    finally:
+        store.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.settings_values["mode"] == "advisory"
+        assert episode.store().get_setting("mode") == "advisory"
+
+
+def test_a_history_offset_cannot_smuggle_a_later_value_into_the_window(tmp_path):
+    """R2: ``START + 30 min`` spelled ``08:30-02:00`` is textually before ``10:00+00:00``."""
+    path = recording(tmp_path, settings_extra={"mode": "auto"})
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO settings_history(key, at, value_json, origin)"
+            " VALUES('mode', '2026-01-01T08:30:00-02:00', '\"advisory\"', 'write')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.settings_values["mode"] == "auto"
+        assert episode.store().get_setting("mode") == "auto"
+
+
+def test_an_unreadable_history_timestamp_refuses_the_window(tmp_path):
+    """R2(b): an instant that cannot be read refuses rather than being trusted."""
+    path = recording(tmp_path, settings_extra={"mode": "auto"})
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("UPDATE settings_history SET at = 'sometime' WHERE key = 'mode'")
+        conn.commit()
+    finally:
+        conn.close()
     with pytest.raises(EpisodeError) as error:
-        open_episode(path, START, END)
+        open_episode(path, START, END, 60.0)
+    assert error.value.reason == MALFORMED_JSON
+    assert "mode" in str(error.value)
+
+
+def test_a_legacy_recording_keeps_a_frozen_value_at_exactly_the_window_start(tmp_path):
+    """R3: the pre-v5 path must not delete a row the freeze accepted at exactly ``start``."""
+    path = recording(tmp_path)
+    store = Store(path)
+    try:
+        store.set_setting("mode", "start", now=START)
+        store.profile_put("control", "live_writes", {"batteries": []}, updated_at=START)
+    finally:
+        store.close()
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("DROP TABLE settings_history")
+        conn.execute("DROP TABLE learning_profiles_history")
+        conn.execute("UPDATE schema_version SET version = 4")
+        conn.commit()
+    finally:
+        conn.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.settings_values["mode"] == "start"
+        assert episode.profiles[("control", "live_writes")] == {"batteries": []}
+        # The scratch keeps it: the engine reads through the store, not through the freeze.
+        assert episode.store().get_setting("mode") == "start"
+        assert episode.store().profile_get("control", "live_writes") == (START, {"batteries": []})
+
+
+def test_a_legacy_recording_does_not_show_the_engine_a_post_start_profile(tmp_path):
+    """R3: without a history table the strict cut must still run, or the scratch leaks the future.
+
+    The fetch backoff is not a decision-feeding kind, so the freeze neither refuses it nor declares
+    it dropped: only the boundary cut can keep a post-start backoff out of the engine's own reads.
+    """
+    path = recording(tmp_path)
+    store = Store(path)
+    try:
+        store.profile_put(
+            solar_source.BACKOFF_KIND,
+            solar_source.BACKOFF_KEY,
+            {"failures": 9},
+            updated_at=START + timedelta(minutes=5),
+        )
+    finally:
+        store.close()
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("DROP TABLE settings_history")
+        conn.execute("DROP TABLE learning_profiles_history")
+        conn.execute("UPDATE schema_version SET version = 4")
+        conn.commit()
+    finally:
+        conn.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.store().profile_get(
+            solar_source.BACKOFF_KIND, solar_source.BACKOFF_KEY
+        ) is None
+
+
+def test_the_cut_deletes_more_rows_than_a_connection_can_bind(tmp_path, monkeypatch):
+    """M3: the cut must not spell one placeholder per doomed row.
+
+    A long history can hold far more future rows than a connection has bind variables, and the
+    window this cut exists for is exactly the long one.  The limit is lowered here, and the batch
+    with it, so the failure the batching prevents is reachable in a small test.
+    """
+    conn = sqlite3.connect(tmp_path / "many.db")
+    try:
+        if not hasattr(conn, "setlimit"):
+            pytest.skip("this sqlite3 binding cannot lower the variable limit")
+        conn.execute("CREATE TABLE doomed (at TEXT)")
+        conn.executemany("INSERT INTO doomed(at) VALUES(?)", [("x",)] * 12)
+        conn.commit()
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 3)
+        monkeypatch.setattr(episode_mod, "_DELETE_BATCH", 2)
+        rowids = [int(row[0]) for row in conn.execute("SELECT rowid FROM doomed")]
+        assert len(rowids) > 3
+        episode_mod._delete_rowids(conn, "doomed", rowids)
+        assert conn.execute("SELECT COUNT(*) FROM doomed").fetchone()[0] == 0
+        # The batch in production stays under the smallest variable limit any build may have.
+        monkeypatch.undo()
+        assert episode_mod._DELETE_BATCH < 999
+    finally:
+        conn.close()
+
+
+def test_a_history_with_thousands_of_future_rows_is_cut(tmp_path):
+    """M3: a long append-only history prunes without error, and only its future rows go."""
+    path = recording(tmp_path)
+    conn = sqlite3.connect(path)
+    try:
+        before = conn.execute("SELECT COUNT(*) FROM settings_history").fetchone()[0]
+        conn.executemany(
+            "INSERT INTO settings_history(key, at, value_json, origin) VALUES('mode', ?, '1', 'write')",
+            [(to_iso(START + timedelta(seconds=30 + index)),) for index in range(4000)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.truncation.rows.get("settings_history") == 4000
+        store = episode.store()
+        assert store.settings_as_of(START)["mode"].value == "auto"
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM settings_history WHERE at > ?", (to_iso(START),)
+        ).fetchone()[0] == 0
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM settings_history"
+        ).fetchone()[0] == before
+
+
+def test_a_legacy_row_with_extra_zero_digits_survives_the_cut(tmp_path):
+    """R2: a fraction written to ten digits with zeros past the microsecond is still a real row.
+
+    Counting digits refuses it, the cut then deletes it as unplaceable, and the engine loses a row
+    the recording really had -- data loss rather than a safe refusal.
+    """
+    path = recording(tmp_path)
+    store = Store(path)
+    try:
+        store.profile_put(
+            solar_source.BACKOFF_KIND,
+            solar_source.BACKOFF_KEY,
+            {"failures": 4},
+            updated_at=datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc),
+        )
+    finally:
+        store.close()
+    conn = sqlite3.connect(path)
+    try:
+        spelled = "2026-01-01T09:00:00.5" + "0" * 6 + "+00:00"
+        conn.execute(
+            "UPDATE learning_profiles SET updated_at = ? WHERE kind = ? AND key = ?",
+            (spelled, solar_source.BACKOFF_KIND, solar_source.BACKOFF_KEY),
+        )
+        conn.execute("DROP TABLE settings_history")
+        conn.execute("DROP TABLE learning_profiles_history")
+        conn.execute("UPDATE schema_version SET version = 4")
+        conn.commit()
+    finally:
+        conn.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        got = episode.store().profile_get(solar_source.BACKOFF_KIND, solar_source.BACKOFF_KEY)
+        assert got is not None and got[1] == {"failures": 4}
+
+
+def test_a_legacy_offset_profile_after_the_window_is_cut_not_shown(tmp_path):
+    """R1: ``08:30-02:00`` is 10:30Z -- after a 10:00Z start -- however it sorts as text.
+
+    The text comparison kept the row, so the engine saw a post-start backoff the freeze had not
+    frozen (and, being a non-decision kind, never replaced).  The cut must compare instants.
+    """
+    path = recording(tmp_path)
+    store = Store(path)
+    try:
+        store.profile_put(
+            solar_source.BACKOFF_KIND,
+            solar_source.BACKOFF_KEY,
+            {"failures": 9},
+            updated_at=datetime(2026, 1, 1, 8, 30, tzinfo=timezone(timedelta(hours=-2))),
+        )
+    finally:
+        store.close()
+    conn = sqlite3.connect(path)
+    try:
+        bumped = conn.execute(
+            "SELECT updated_at FROM learning_profiles"
+        ).fetchone()[0]
+        assert bumped == "2026-01-01T08:30:00-02:00", "the row really is spelled with an offset"
+        conn.execute("DROP TABLE settings_history")
+        conn.execute("DROP TABLE learning_profiles_history")
+        conn.execute("UPDATE schema_version SET version = 4")
+        conn.commit()
+    finally:
+        conn.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.store().profile_get(
+            solar_source.BACKOFF_KIND, solar_source.BACKOFF_KEY
+        ) is None
+
+
+def test_a_control_profile_rewritten_after_the_window_start_is_materialised_as_of(
+    tmp_path: Path,
+) -> None:
+    """The engine reads ``control/live_writes`` from the scratch store, so the as-of row must live
+    there: merely returning it from a reader would leave the engine reading the future."""
+    path = recording(tmp_path)
+    store = Store(path)
+    try:
+        store.profile_put(
+            "control",
+            "live_writes",
+            {"batteries": [{"battery_id": BATTERY.id, "power_w": 100.0}]},
+            updated_at=START - timedelta(hours=1),
+        )
+        store.profile_put(
+            "control",
+            "live_writes",
+            {"batteries": [{"battery_id": BATTERY.id, "power_w": 900.0}]},
+            updated_at=START + timedelta(minutes=5),
+        )
+    finally:
+        store.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.profiles[("control", "live_writes")]["batteries"][0]["power_w"] == 100.0
+        assert episode.asof_sources["profiles:control/live_writes"] == "history"
+        stored = episode.store().profile_get("control", "live_writes")
+        assert stored is not None
+        at, payload = stored
+        assert at <= START
+        assert payload["batteries"][0]["power_w"] == 100.0, (
+            "the engine's profile_get must return the frozen value, not the newer write"
+        )
+        newer = episode.store().connection.execute(
+            "SELECT COUNT(*) FROM learning_profiles WHERE updated_at > ?", (to_iso(START),)
+        ).fetchone()[0]
+        assert newer == 0
+
+
+def test_the_scratch_carries_every_frozen_value_and_nothing_newer(tmp_path: Path) -> None:
+    """The invariant behind the materialisation, for every non-rebuildable decision kind."""
+    path = recording(tmp_path)
+    store = Store(path)
+    try:
+        store.set_setting("mode", "advisory", now=START + timedelta(minutes=5))
+        for index, kind in enumerate(
+            ("control", full_charge.STATE_KIND, load_source.PROFILE_KIND, solar_source.BIAS_KIND)
+        ):
+            store.profile_put(kind, f"key{index}", {"value": index}, updated_at=START - timedelta(hours=1))
+            store.profile_put(
+                kind, f"key{index}", {"value": 100 + index}, updated_at=START + timedelta(minutes=5)
+            )
+    finally:
+        store.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        connection = episode.store().connection
+        for table, column in (("settings", "updated_at"), ("learning_profiles", "updated_at")):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE {column} > ?", (to_iso(START),)
+            ).fetchone()[0] == 0
+        assert episode.store().get_setting("mode") == "auto"
+        for (kind, key), payload in episode.profiles.items():
+            stored = episode.store().profile_get(kind, key)
+            assert stored is not None, f"{kind}/{key} is frozen but missing from the scratch"
+            at, stored_payload = stored
+            assert at <= START
+            assert stored_payload == payload
+
+
+def test_a_profile_row_at_exactly_the_window_start_survives_the_strict_cut(tmp_path: Path) -> None:
+    path = recording(tmp_path)
+    store = Store(path)
+    try:
+        store.profile_put("control", "live_writes", {"batteries": []}, updated_at=START)
+    finally:
+        store.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        stored = episode.store().profile_get("control", "live_writes")
+        assert stored is not None and stored[0] == START
+        assert episode.profiles[("control", "live_writes")] == {"batteries": []}
+
+
+def test_a_tombstone_before_the_window_leaves_the_key_absent_without_refusing(
+    tmp_path: Path,
+) -> None:
+    path = recording(tmp_path)
+    store = Store(path)
+    try:
+        store.profile_put(
+            "control", "live_writes", {"batteries": []}, updated_at=START - timedelta(hours=1)
+        )
+        store.profile_delete("control", "live_writes", now=START - timedelta(minutes=30))
+    finally:
+        store.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        assert ("control", "live_writes") not in episode.profiles
+        assert episode.store().profile_get("control", "live_writes") is None
+
+
+def test_a_setting_written_and_deleted_after_the_window_still_refuses(tmp_path: Path) -> None:
+    """A tombstone is a change too: a window starting before both must refuse that key."""
+    path = recording(tmp_path)
+    store = Store(path)
+    try:
+        store.set_setting("late.setting", "v", now=START + timedelta(minutes=3))
+        store.delete_setting("late.setting", now=START + timedelta(minutes=5))
+    finally:
+        store.close()
+    with pytest.raises(EpisodeError) as error:
+        open_episode(path, START, END, 60.0)
+    assert error.value.reason == NO_VINTAGE
+    assert "late.setting" in str(error.value)
+
+
+def test_an_upgraded_recording_freezes_seeded_rows_and_says_so(tmp_path: Path) -> None:
+    """A pre-v5 recording upgraded by opening it: migration 5 seeds the history."""
+    path = recording(tmp_path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("DROP TABLE settings_history")
+        conn.execute("DROP TABLE learning_profiles_history")
+        conn.execute("UPDATE schema_version SET version = 4")
+        conn.commit()
+    finally:
+        conn.close()
+    upgraded = Store(path)
+    upgraded.connection  # open once: migration 5 seeds the history
+    upgraded.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.settings_values["mode"] == "auto"
+        assert episode.asof_sources["settings:mode"] == "seed"
+        assert episode.store().get_setting("mode") == "auto"
+
+
+def test_a_recording_without_history_falls_back_to_the_current_row(tmp_path: Path) -> None:
+    """A source that never saw v5 keeps today's behaviour: the current row is the as-of row."""
+    path = recording(tmp_path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("DROP TABLE settings_history")
+        conn.execute("DROP TABLE learning_profiles_history")
+        conn.execute("UPDATE schema_version SET version = 4")
+        conn.commit()
+    finally:
+        conn.close()
+    with open_episode(path, START, END, 60.0) as episode:
+        assert episode.settings_values["mode"] == "auto"
+        assert episode.asof_sources["settings:mode"] == "current"
+
+
+def test_a_recording_without_history_still_refuses_a_newer_settings_row(tmp_path: Path) -> None:
+    path = recording(tmp_path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("DROP TABLE settings_history")
+        conn.execute("DROP TABLE learning_profiles_history")
+        conn.execute("UPDATE schema_version SET version = 4")
+        conn.execute(
+            "UPDATE settings SET updated_at = ? WHERE key = 'mode'",
+            (to_iso(START + timedelta(minutes=5)),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(EpisodeError) as error:
+        open_episode(path, START, END, 60.0)
     assert error.value.reason == NO_VINTAGE
     assert "mode" in str(error.value)
 
@@ -883,7 +1302,7 @@ def test_malformed_decision_json_is_refused(tmp_path: Path, table: str) -> None:
     conn = sqlite3.connect(path)
     try:
         if table == "settings":
-            conn.execute("UPDATE settings SET value_json = '{oops' WHERE key = 'mode'")
+            conn.execute("UPDATE settings_history SET value_json = '{oops' WHERE key = 'mode'")
         else:
             conn.execute(
                 "INSERT INTO learning_profiles(kind, key, updated_at, payload_json)"

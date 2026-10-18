@@ -49,12 +49,37 @@ battery config snapshot, the settings values, and every `learning_profiles` row 
 decision (`control`/`live_writes`, `control`/`cell_voltage_latch`, `full_charge`/…, `capacity`/…,
 `cost_basis`/…, `load`/`profile`, `pv_bias`/`hourly`).
 
-Each of those has an **as-of rule**. The stored row is the end state of the recording and there is
-no history to interpolate — `settings`, `learning_profiles` and the other upsert tables hold one row
-per key — so the rule is exact, not approximate: a row whose `updated_at ≤ window start` is the
-recording's value for that window, and a key whose only row is newer is **refused** (`no_vintage`),
-never back-filled. The harness may prune such a key from the scratch copy only as an explicitly
-labelled variant, because pruning changes what the engine plans on.
+Each of those has an **as-of rule**, and for `settings` and decision-feeding `learning_profiles`
+rows the rule rests on an append-only history (`settings_history` / `learning_profiles_history`,
+SPEC.md 11): every write or delete through the store's own writers appends a row (a write only when
+the serialised value changed), and the migration seeds the rows that existed when the schema was
+upgraded. The value in force at a window start is the newest history row with `at ≤ start` -- exact,
+never interpolated, compared as a parsed instant rather than as text (a stored `+02:00` offset can
+sort on the wrong side of the boundary), and stored canonically in UTC at full microsecond
+precision. A stored stamp is accepted only as a whole: extended calendar date, `T`, `HH:MM[:SS]`
+with an optional `.`/`,` fraction of any length, and a `Z` or signed `HH:MM[:SS]` offset; the
+offset's digits are read from that match, not from the parser, which can drop an offset fraction
+whole. Anything else -- a week or ordinal date, a basic-format date, another separator, a missing
+offset -- is unplaceable: refused for a value, pruned from the scratch. That refusal is the safe
+half of the trade, since a stamp this build writes always matches and a guessed instant does not.
+Within the form, any number of fractional digits is fine, time and offset alike, while each digit
+past microsecond precision is zero; only one that would lose real precision refuses instead of
+being rounded. The scratch cut removes such rows in bounded batches, so a long history prunes
+without a bind-variable error. A key
+whose only row (a write or a tombstone) is newer than the start is still
+**refused** (`no_vintage`), never back-filled, and the refusal names the key. A recording made
+before the history existed reads its current row exactly as before. The scratch copy the engine runs
+on is then given those as-of rows, because the engine reads `learning_profiles` through
+`profile_get` itself; a rebuildable key may be pruned only as an explicitly labelled variant,
+because pruning changes what the engine plans on. The episode records, per frozen value, whether it
+came from an appended history row, the upgrade's seed, or a pre-history recording's current row,
+and the report's information section carries that list.
+
+A seeded row's `at` is its pre-upgrade last-write time, so the history cannot recover any value from
+before its seed: a window starting before a decision key's newest write still refuses, because only
+that write is known. A long window will therefore generally need further uptime after the upgrade,
+but it need not begin strictly after it -- a start later than every relevant seed can qualify, even
+if that start is still before the deployment.
 
 **Warm start.** The recorded run did not begin from nothing, and neither may the replay: the active
 plan (`_plan`, the newest recorded `plans` row with `created_at ≤ start`, which is the §3 as-of rule

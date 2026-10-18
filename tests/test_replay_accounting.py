@@ -90,6 +90,8 @@ def make_the_recording_older(source: Path, *, version: int = 1) -> None:
             if number <= version:
                 continue
             for statement in statements:
+                if not isinstance(statement, str):
+                    continue  # a Python migration step adds no column to roll back
                 match = re.match(r"\s*ALTER TABLE (\w+) ADD COLUMN (\w+)", statement)
                 if match is None:
                     continue

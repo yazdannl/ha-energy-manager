@@ -1387,6 +1387,9 @@ savings_daily(day TEXT PK, import_kwh REAL, export_kwh REAL, cost_eur REAL, reve
               battery_measured INTEGER)
 events(id PK, ts TEXT, level TEXT, code TEXT, message TEXT, payload_json TEXT)
 settings(key TEXT PK, value_json TEXT, updated_at TEXT)
+settings_history(id INTEGER PK, key TEXT, at TEXT, value_json TEXT, origin TEXT)
+learning_profiles_history(id INTEGER PK, kind TEXT, key TEXT, at TEXT, payload_json TEXT,
+                          origin TEXT)
 meta(key TEXT PK, value TEXT)
 ```
 
@@ -1394,6 +1397,43 @@ Scheduled-full-charge runtime state is not a new table: it is a per-battery reco
 ``learning_profiles`` profile store (``kind='maintenance'``, ``key='full_charge'``) with
 ``last_completed``/``next_due``/``first_seen``/``overdue_alerted_at`` per battery id. A missing or
 unreadable profile means "no history" (the battery is due immediately), never an invented date.
+
+The two upsert tables a replay must freeze -- ``settings`` and ``learning_profiles`` -- additionally
+keep an append-only as-of history, so the value that was in force at a past instant stays readable
+after the live add-on has re-stamped the row (the replay harness cannot capture a long window
+otherwise; docs/REPLAY_HARNESS.md section 1). Every write through ``set_settings``/``profile_put``
+that changes the serialised value appends a history row in the same transaction, and every delete
+appends a tombstone (``origin='delete'``) once a row existed; re-stamping an unchanged value appends
+nothing, which bounds the growth of command-cadence keys such as ``control``/``live_writes``.
+``origin`` is ``write`` for such a write, ``seed`` for migration 5's copy of a row that already
+existed, and ``delete`` for a tombstone. Migration 5 creates both tables and seeds them from the
+current rows, using each row's existing ``updated_at`` as its only known ``at``; a row with a NULL
+``updated_at`` seeds nothing. A seeded row's ``at`` is the pre-upgrade last-write time, so a window
+starting before a decision key's newest write still refuses (``no_vintage``): the history cannot
+recover a value from before the relevant seed, only the last write is known. A usable window will
+therefore generally require further uptime, but it need not begin after the deployment -- a start
+later than every relevant seed can qualify, even if that start is still before the upgrade.
+The readers ``settings_as_of(now)`` and ``profile_as_of(kind, key, now)`` return the newest row
+at or before an instant (a tombstone means the key is absent then); production never calls them --
+the current tables keep their exact upsert semantics and only gain rows here. History instants are
+compared as parsed datetimes, never as stored text, and are stored canonically in UTC at the full
+microsecond precision a datetime holds. A stored string is placed only when it matches one accepted
+form *as a whole*: an extended calendar date `YYYY-MM-DD`, a `T`, a time `HH:MM[:SS]` with an
+optional `.`/`,` fraction of any length, and an offset of `Z` or a signed `HH:MM[:SS]`. The structure
+is decided by that whole match rather than inferred from the stamp's signs, because inferring it
+reads forms this build never writes as if they were an offset -- `2026-W01-1T12:00:00Z` splits inside
+its week date and becomes unplaceable, and `2026-01-01+12:00:00` (whose `+` is a legal date/time
+separator, so midday) reads as midnight with a twelve-hour offset, a different instant. Everything
+else -- week and ordinal dates, basic-format dates, another separator, a missing offset -- is treated
+as unplaceable: refused for a value row, pruned for a scratch row. Within the form the rule is
+exactness, not digit count: any number of fractional digits is fine, in the time and in the offset,
+as long as every digit past microsecond precision is zero (so a seed or a row is never dropped for
+naming a real instant); a digit that would be lost with real precision refuses rather than being
+rounded. The offset digits are read from the matched offset group rather than trusted to the parser,
+which can drop an offset fraction whole and so shift the instant. The trade is honest: every stamp
+this build writes matches, so only hand-written or exotic rows are refused, and a refusal is safe
+where a guessed instant is not. The same rule governs the harness's scratch cut, which also removes
+rows it cannot place at all and deletes in bounded batches however long the history is.
 
 Retention: `measurements`/`actuals` raw rows trimmed to 400 days on a daily maintenance run,
 `dispatch_log` to 20 000 rows, `events` to 5 000, and plans to the `plans_rows` (default 200) most
@@ -1711,6 +1751,21 @@ than by weakening `tools/audit.sh`.
 ---
 
 ## 16. Amendment log (why the spec changed)
+
+**As-of history for the replay's decision inputs (schema v5).** A replay window is only faithful if
+the settings and decision-feeding profiles in force at its start are still readable, and the live
+add-on re-stamps exactly those rows (`control`/`live_writes` on every applied command, `mode`,
+`manual_limits`), so a recording that spans days could never be replayed from its start. §11 now
+adds an append-only `settings_history`/`learning_profiles_history` written inside
+`set_settings`/`profile_put`/the deletes, with the current tables and their upsert semantics
+untouched; the migration seeds pre-existing rows with their last-write instant as the only known
+`at`. The honest limit: a seeded row's `at` is the pre-upgrade last-write time, so a window starting
+before a decision key's newest write still refuses (`no_vintage`) — the history cannot recover a
+value from before the relevant seed, only the last write is known. A usable window will therefore
+generally require further uptime, but it need not begin after the deployment: a start later than
+every relevant seed can qualify, even if that start is still before the upgrade.
+A value is appended only when it changes (the serialised payload is compared), which bounds the
+history of keys the add-on re-stamps at command cadence.
 
 **Optimizer v2 stage 3 — the terminal-value vector, default off (no version bump).** The DP ends a plan
 by pricing the energy left in the pack with a scalar salvage row (`-salvage * e`, plus the optional
