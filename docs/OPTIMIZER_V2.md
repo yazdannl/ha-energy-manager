@@ -205,7 +205,34 @@ be stable within tolerance.
 **Tests:** small exhaustive enumeration over the complete reachable state domain versus the
 DP+vector, and the `salvage` baseline as the reference arm.
 
-## 5. Candidate layer and risk (stage 4, only if stage 2 justifies it)
+## 5. Candidate layer and risk (stage 4 — MOTHBALLED 2026-10-18, see docs/STAGE4_FINDINGS.md)
+
+**Status: not built, and not to be built without new evidence.** Stage 4's premise was that
+candidate policies produce materially different plans, so a selector has something to choose
+between. The first dimension of that premise — whether PV/load inputs change dispatch at all — was
+tested on the live recording before any code was written, with deterministic input perturbations,
+and no feasible plan power value changed: PV- and load-scaled inputs move **no** plan power value
+(exactly 0.0 W, unrounded, in 41/41 faithfully reconstructed windows, and in the severity sweep down
+to PV = 0 and up to load = 5x). That is a statement about deterministic input perturbations only —
+not about scenario objectives, recourse or any uncertainty-aware policy, none of which were
+tested.
+
+The price-side and floor variants *do* produce different plans, so the premise is not false in
+general; what is established is that the tested PV/load dimension supplies no demonstrated
+selection benefit, and that no candidate layer is worth building on this evidence. The observations
+are consistent with grid cost being separable in flows and with
+non-decisive PV/load-dependent constraints; they do not establish that the feasible set is
+PV/load independent (it demonstrably is not under `no_export`, where the same perturbation does move
+power — though those plans are themselves infeasible on this instance). The measurement, its limits,
+and the re-run recipe are in **docs/STAGE4_FINDINGS.md**; the probe is
+**tools/candidate_probe.py**. Reconsider only on representative new data or a materially different
+price/risk objective — see that note's section (i) for the exact conditions. The design below is
+retained as the record of what was intended, with the amendments the review forced, so a future
+revival does not restart from the rejected version.
+
+The precondition "only if stage 2 justifies it" was circular — stage 2 cannot price a candidate
+layer that does not exist — so it is resolved by measuring first, in a replay-only probe, before
+any production surface is added.
 
 ### 5.1 Candidates are policies, not paths
 
@@ -215,8 +242,16 @@ the ordinary dispatcher path. The candidate identity is the objective/scenario s
 re-solve, never a stored action path:
 
 - deterministic policy — point forecast, today's objective;
-- expected-cost SAA policy — scenario-averaged costs;
+- **`expected_inputs`** policy — the DP solved on scenario-**mean inputs**;
 - per-scenario policy `s` — the costs of scenario `s`.
+
+The middle candidate was called "expected-cost SAA" until review. It is not: the DP's constraints
+are not affine in the inputs, so scenario-dependent feasibility and transitions mean mean inputs do
+**not** produce expected cost — the name `expected_inputs` is the honest description of a heuristic,
+and true stochastic optimisation is deferred. Note also that a per-(state, action) scenario-*cost*
+sweep in the accelerator would not by itself deliver it: scenarios that change feasibility or the
+successor state need recourse and transition handling, which is a different and much larger change
+than a cost sweep.
 
 Each policy is scored by replaying that exact policy through the same MPC loop: same replan
 cadence and triggers, same clamps, and the resulting post-clamp SoC and ledger transitions. No
@@ -227,11 +262,23 @@ execution time.
 
 At each replan, generate the candidate policies' current actions, evaluate them under the frozen
 risk objective, and execute the winner's action for the slot; repeat. Selection is
-`min over candidates of E[total cost] + λ·CVaR_α(total cost)`, labelled **best among candidates**.
+`min over candidates of (1−λ)·E[total cost] + λ·CVaR_α(total cost)`, labelled **best among
+candidates**, with λ ∈ [0, 1]; λ = 1 is the CVaR-only endpoint (of the empirical tail, not a
+general worst-case objective) and λ = 0 is pure min-E. (An earlier draft called the
+traditional `E + λ·CVaR` form wrong. It is not: for λ ≥ 0 that form equals
+`(1+λ)·[(1−β)·E + β·CVaR]` with β = λ/(1+λ), i.e. the same ranking reparameterised. The mixture is
+used here because λ is directly interpretable as a tail weight, not because the other form is
+invalid.) A stability margin δ on the incumbent is applied when the winner changes, so an
+indistinguishable improvement does not flip the plan; δ is a measured margin, **not** a switching
+cost, since the physical wear of switched actions already enters each rollout's own cost. At most
+one candidate draw is added, and only if measured held-out value justifies widening the set.
 Each candidate's cost distribution is obtained by **closed-loop policy rollouts per scenario** —
-the candidate policy is re-solved and re-selected exactly as it would run — never from an
-open-loop path. The selector itself is a policy: it is the thing replayed in §3 and gated in §8,
-and because CVaR is not time-consistent, the design states plainly that switching candidates every
+the candidate policy is re-solved at every rollout replan and driven through the same clamps — and
+each rollout holds **one fixed candidate**: a rollout that re-runs the selector would be a
+recursive, undefined process, and the composite selector's own switching effect is measured
+separately, in selector replay, rather than assumed here. The selector itself is a policy: it is
+the thing replayed in §3 and gated in §8, and because CVaR is not time-consistent, the design
+states plainly that switching candidates every
 slot yields a composite policy whose realised risk is the *replayed* selector's risk, not the risk
 of any single candidate. Probabilities, the CVaR convention, `α` and admissible `λ` are frozen in
 the SPEC amendment before any comparison. Cut: distorted-probability reweighting and per-slot
