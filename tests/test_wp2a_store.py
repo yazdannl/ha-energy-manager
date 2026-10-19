@@ -636,7 +636,7 @@ def test_schema_v5_seeds_the_history_from_the_pre_upgrade_rows(tmp_path):
     conn.close()
     store = Store(path)
     try:
-        assert store.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 6
+        assert store.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 7
         seeded = store.connection.execute(
             "SELECT at, origin FROM settings_history WHERE key = 'mode'"
         ).fetchone()
@@ -730,7 +730,7 @@ def test_schema_v2_migrates_a_v1_database_and_keeps_its_rows(tmp_path):
         store.upsert_savings_daily("2026-01-02", charged_kwh=1.5, battery_measured=1)
         assert store.savings_daily_range("2026-01-02", "2026-01-02")[0]["charged_kwh"] == 1.5
         version = store.connection.execute("SELECT version FROM schema_version").fetchone()[0]
-        assert version == SCHEMA_VERSION == 6
+        assert version == SCHEMA_VERSION == 7
     finally:
         store.close()
 
@@ -762,6 +762,46 @@ def test_schema_v6_reapplies_cleanly_to_an_already_migrated_database(tmp_path):
         assert row["total_hours"] == 2.0 and row["battery_hours"] == 1.5
     finally:
         store.close()
+
+
+def test_schema_v7_drops_only_the_day_0_30_0_mixed_scopes(tmp_path):
+    """Migration 7 deletes today's coverage-bearing row, and nothing else.
+
+    A row written by 0.30.0 could carry the whole day's import/cost (continued from a pre-coverage
+    row) against a minutes-old baseline; it cannot be repaired arithmetically, so that day starts
+    over.  A row from before coverage tracking has no hours and is the legacy day it always was
+    (0.30.1 never continues it), and an older day is history: both are kept.
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+
+    def reopen(path, day, **values):
+        store = Store(path)
+        store.upsert_savings_daily(day, **values)
+        store.close()
+        conn = sqlite3.connect(path)
+        conn.execute("UPDATE schema_version SET version = 6")
+        conn.commit()
+        conn.close()
+        return Store(path)
+
+    poisoned = reopen(tmp_path / "today-hours.db", today, charged_kwh=1.0, total_hours=0.1, cost_eur=2.0)
+    try:
+        assert poisoned.savings_daily_range(today, today) == []
+    finally:
+        poisoned.close()
+
+    legacy = reopen(tmp_path / "today-legacy.db", today, charged_kwh=1.0)
+    try:
+        assert legacy.savings_daily_range(today, today)[0]["charged_kwh"] == 1.0
+    finally:
+        legacy.close()
+
+    history = reopen(tmp_path / "yesterday.db", yesterday, charged_kwh=1.0, total_hours=0.5)
+    try:
+        assert history.savings_daily_range(yesterday, yesterday)[0]["total_hours"] == 0.5
+    finally:
+        history.close()
 
 
 def make_plan(moment, slots=2):

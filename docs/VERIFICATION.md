@@ -1674,7 +1674,9 @@ shown: at the first upgrade the stored row was written by 0.29.1, so it carried 
 baseline of the minutes since the restart -- `savings` read **-2.03 EUR**. A stored row from before
 the coverage columns is therefore not continued at all: today's coverage restarts at the upgrade and
 that earlier part of the day reads as unmeasured. A restart on 0.30.0 itself (the normal case, the
-row has hours) continues the stored day.
+row has hours) continues the stored day. Because the 0.30.0 build was live for ~25 minutes and left
+such a mixed row behind, migration 7 deletes the current day's row when it carries hour coverage --
+exactly once per database (0.30.2), and only for rows 0.30.0 could have written.
 
 Tests: the three suite tests that pinned the old all-or-nothing contract were rewritten to the new
 one (analytics grid gap, analytics battery-flow gap, engine measurement gap), and seven new tests pin

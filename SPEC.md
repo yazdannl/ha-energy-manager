@@ -1472,7 +1472,9 @@ their all-or-nothing meaning (the whole day/period was measured); rows written b
 columns existed have no hours and are counted as legacy periods, not as zero-coverage time; such a
 row is never continued into a new day's accumulator, because totals accumulated without the hour
 columns span time this build cannot scope -- today's coverage restarts at the upgrade instead of
-comparing a whole-day cost with a minutes-old baseline.
+comparing a whole-day cost with a minutes-old baseline.  Migration 7 deletes that one day (the
+current day's row when it carries coverage hours, i.e. the row 0.30.0 wrote) once per database; a
+pre-coverage row has no hours and is kept.
 
 ---
 

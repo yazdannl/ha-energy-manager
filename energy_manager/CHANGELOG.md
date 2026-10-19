@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.30.2
+
+- **Fix: the one day 0.30.0 poisoned is repaired at startup.** Migration 7 deletes today's
+  `savings_daily` row when it carries hour coverage, i.e. when it was written by 0.30.0 — that row
+  mixed the whole day's import/cost (carried over from the pre-coverage row) with a minutes-old
+  baseline. It cannot be repaired arithmetically, so that day starts over; a row from before
+  coverage tracking (NULL hours) is kept as the legacy day it is, and no other day is touched
+  (`day = date('now')`, UTC, exactly once per database).
+
 ## 0.30.1
 
 - **Fix: a stored day from a build without coverage hours is not continued.** 0.30.0 restored the

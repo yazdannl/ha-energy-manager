@@ -52,7 +52,7 @@ __all__ = [
     "table_exists",
 ]
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 #: One migration step: a SQL statement, or a Python step for work SQL cannot express (the history
 #: seed parses the instant it copies, and a stored ``+02:00`` offset is not a string operation).
@@ -389,6 +389,18 @@ MIGRATIONS: list[tuple[int, tuple[MigrationStep, ...]]] = [
                     "battery_hours": "REAL",
                 },
             ),
+        ),
+    ),
+    (
+        7,
+        (
+            # 0.30.0 could leave one day that mixes scopes: it continued a stored row written by a
+            # build *without* hour columns, so the row kept the whole day's import and cost but only
+            # a minutes-old baseline (live: -2.03 EUR).  Only 0.30.x writes ``total_hours``, and the
+            # mixture cannot be repaired by arithmetic, so that one day starts over.  A row from
+            # before coverage tracking (NULL hours) is the legacy row it always was and is kept: it
+            # is never continued into a new accumulator (0.30.1), so it cannot poison another day.
+            "DELETE FROM savings_daily WHERE day = date('now') AND total_hours IS NOT NULL",
         ),
     ),
 ]
