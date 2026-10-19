@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.30.1
+
+- **Fix: a stored day from a build without coverage hours is not continued.** 0.30.0 restored the
+  in-progress `savings_daily` row at startup, but the row written by 0.29.1 carried the whole day's
+  import (5.22 kWh) and cost (2.13 EUR) with no hours, while the new accumulator only knew the
+  baseline of the minutes since the restart: `sensor.sem_savings_today` read **-2.03 EUR** for a day
+  that was being accounted correctly interval by interval. A row without hour coverage is now left
+  alone and today restarts its coverage at the upgrade; the earlier part of that one day reads as
+  unmeasured. A restart on 0.30.x itself (the row has hours) still continues the stored day.
+
 ## 0.30.0
 
 - **Fix: savings are counted per interval, not thrown away per day.** A single missing grid, load or
@@ -19,12 +29,8 @@
   erase its measured flows; a bucket now sums the rows that reported a measurement and still marks
   itself not fully measured.
 - **Fix: an add-on restart no longer discards today's savings.** The in-progress `savings_daily` row
-  is restored from the store at startup when it carries coverage hours, so the next flush adds to it
-  instead of overwriting it with the post-start partial totals. A row written before this release has
-  no hours and is deliberately **not** continued: its totals were accumulated without coverage, and
-  mixing them with the new interval-scoped baseline produced a nonsense saving (a whole-day cost
-  compared with a five-minute baseline). Today's coverage restarts at the upgrade; that earlier part
-  of the day reads as unmeasured.
+  is restored from the store at startup, so the next flush adds to it instead of overwriting it with
+  the post-start partial totals. See 0.30.1 for the row written before coverage hours existed.
 - **UI:** the Savings panel states `Sampled-time coverage: grid X h, battery Y h, baseline Z h of
   W h sampled`, `Savings cover N% of the sampled time`, `Measured over N% of the sampled time`, and
   the per-card scope each total covers; the per-bucket table gains the same coverage line. Legacy

@@ -1632,7 +1632,7 @@ only its effect (the boot hold) is observable. Whether a *stalled* control loop 
 setpoint is covered separately by the guard thread's `Dispatcher.watchdog()` (0.13.0-era, SPEC
 9.1 step 5), which holds every driver unconditionally; no new timer was added here.
 
-### 8.24 Savings are counted over the time that could be priced and measured (0.30.0)
+### 8.24 Savings are counted over the time that could be priced and measured (0.30.1)
 
 The report was "the savings section still does not work". It did not, and the live instance said so in
 numbers: `sensor.sem_savings_today` was `unknown` with `month_eur: -0.07`, the month view had **30
@@ -1669,7 +1669,7 @@ of the time the figure covers. `Engine.start()` calls `_hydrate_savings_today()`
 flush.
 
 Checking the fixed build on the live instance added one more defect the code reading had not
-shown: at the 0.30.0 upgrade the stored row was written by 0.29.1, so it carried the whole day's
+shown: at the first upgrade the stored row was written by 0.29.1, so it carried the whole day's
 `import_kwh` 5.22 and `cost_eur` 2.13 but no coverage hours, while the new accumulator only knew the
 baseline of the minutes since the restart -- `savings` read **-2.03 EUR**. A stored row from before
 the coverage columns is therefore not continued at all: today's coverage restarts at the upgrade and
