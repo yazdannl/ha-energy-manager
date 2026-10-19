@@ -1469,7 +1469,10 @@ in hours (`total_hours`, `grid_hours`, `savings_hours`, `battery_hours`): baseli
 `null` only when no interval could be priced, and battery flows/cycles are `null` only when no
 interval was measured. `grid_measured`, `load_measured`, `pv_measured` and `battery_measured` keep
 their all-or-nothing meaning (the whole day/period was measured); rows written before the coverage
-columns existed have no hours and are counted as legacy periods, not as zero-coverage time.
+columns existed have no hours and are counted as legacy periods, not as zero-coverage time; such a
+row is never continued into a new day's accumulator, because totals accumulated without the hour
+columns span time this build cannot scope -- today's coverage restarts at the upgrade instead of
+comparing a whole-day cost with a minutes-old baseline.
 
 ---
 

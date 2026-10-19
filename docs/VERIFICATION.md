@@ -1668,11 +1668,20 @@ could be priced", and a `null` flow means "no interval was measured"; the covera
 of the time the figure covers. `Engine.start()` calls `_hydrate_savings_today()` before the first
 flush.
 
+Checking the fixed build on the live instance added one more defect the code reading had not
+shown: at the 0.30.0 upgrade the stored row was written by 0.29.1, so it carried the whole day's
+`import_kwh` 5.22 and `cost_eur` 2.13 but no coverage hours, while the new accumulator only knew the
+baseline of the minutes since the restart -- `savings` read **-2.03 EUR**. A stored row from before
+the coverage columns is therefore not continued at all: today's coverage restarts at the upgrade and
+that earlier part of the day reads as unmeasured. A restart on 0.30.0 itself (the normal case, the
+row has hours) continues the stored day.
+
 Tests: the three suite tests that pinned the old all-or-nothing contract were rewritten to the new
-one (analytics grid gap, analytics battery-flow gap, engine measurement gap), and six new tests pin
+one (analytics grid gap, analytics battery-flow gap, engine measurement gap), and seven new tests pin
 the defects above: sampled-time coverage, calendar months for year/all (no holes, February present),
-a partly measured month keeping its measured flows, a restart continuing the stored row, the coverage
-attributes the savings sensor publishes, and the hours keys in the API payload. `tools/ui_render_check.js`
+a partly measured month keeping its measured flows, a restart continuing a stored row that has hours,
+a pre-coverage row *not* being continued, the coverage attributes the savings sensor publishes, the
+hours keys in the API payload, and migration 6 re-applying cleanly to an already-migrated database. `tools/ui_render_check.js`
 gained three checks: the sampled-time coverage line, the per-card scope captions, and `fmtHours`.
 
 Measured on this tree: `python3 -m pytest tests -q` -> **1594 passed, 1 skipped** (1586 passed

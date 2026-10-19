@@ -3006,14 +3006,23 @@ class Engine:
         ``savings_daily`` is keyed by day and every flush *replaces* the row, so a process that
         started with an empty accumulator used to overwrite the earlier part of the day with the
         post-restart part only.  Restoring the row (and keeping its coverage hours) makes the
-        stored total additive across restarts.  A row written before the coverage columns existed
-        hydrates with NULL hours and simply keeps accumulating from the new intervals.
+        stored total additive across restarts.
+
+        A row written by a build without coverage hours is **not** continued (0.30.0): its
+        ``import_kwh``/``cost_eur``/``baseline_cost_eur`` were accumulated without the coverage
+        columns, so they span time this build cannot scope -- mixing them with interval-scoped
+        figures produced a nonsense saving on the live instance (a whole-day cost against a
+        five-minute baseline).  Today restarts its coverage at the upgrade; the earlier part of
+        that one day reads as unmeasured rather than as a comparison it never made.
         """
         day = self._clock().date().isoformat()
         rows = self._store_call("savings_daily_range", day, day) or []
         if not rows:
             return
         row = dict(rows[0])
+        if float(row.get("total_hours") or 0.0) <= 0.0:
+            log.info("savings: %s predates hour coverage; restarting today's coverage", day)
+            return
         with self._lock:
             self._savings_today = row
             self._savings_flushed_at = self._clock()

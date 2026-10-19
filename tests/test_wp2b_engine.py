@@ -645,6 +645,31 @@ def test_savings_row_survives_an_addon_restart():
     assert abs(after["savings_hours"] - 1.0) < 1e-9
 
 
+def test_a_pre_coverage_stored_row_is_not_mixed_into_todays_figures():
+    """A 0.29 row has totals but no hours: continuing it compared a whole-day cost with a new baseline.
+
+    Live shape at the 0.30.0 upgrade: the stored day held every import and cost of the day, while
+    the new accumulator only knew the baseline of the minutes since the restart, so ``savings``
+    read -2.03 EUR.  The row is not continued; today's coverage starts at the upgrade and the
+    earlier part of that one day reads as unmeasured instead.
+    """
+    engine, store, _ha, clock, _settings = build_engine()
+    today = clock.now.date().isoformat()
+    store.savings = {today: {"import_kwh": 5.2, "cost_eur": 2.1, "baseline_cost_eur": None,
+                             "savings_eur": None, "charged_kwh": None, "battery_measured": 0}}
+    engine._hydrate_savings_today()  # noqa: SLF001
+    assert engine._savings_today == {}  # noqa: SLF001
+    engine.plan_now("test")
+    row = savings_tick(
+        engine, clock, {"grid_w": 500.0, "load_w": 1200.0, "pv_w": 300.0},
+        [measured_battery(power_w=500.0)],
+    )
+    assert row["import_kwh"] < 5.0, "the pre-coverage totals are not carried into the new row"
+    assert abs(row["total_hours"] - 0.5) < 1e-9
+    assert row["baseline_cost_eur"] is not None
+    assert abs(row["savings_eur"] - (row["baseline_cost_eur"] - row["cost_eur"] + row["revenue_eur"])) < 1e-9
+
+
 def test_savings_sensor_publishes_time_coverage():
     """0.30.0: the saving is scoped by sampled hours, not by an all-or-nothing day."""
     engine, store, ha, clock, _settings = build_engine()

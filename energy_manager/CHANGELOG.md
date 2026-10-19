@@ -19,8 +19,12 @@
   erase its measured flows; a bucket now sums the rows that reported a measurement and still marks
   itself not fully measured.
 - **Fix: an add-on restart no longer discards today's savings.** The in-progress `savings_daily` row
-  is restored from the store at startup, so the next flush adds to it instead of overwriting it with
-  the post-start partial totals.
+  is restored from the store at startup when it carries coverage hours, so the next flush adds to it
+  instead of overwriting it with the post-start partial totals. A row written before this release has
+  no hours and is deliberately **not** continued: its totals were accumulated without coverage, and
+  mixing them with the new interval-scoped baseline produced a nonsense saving (a whole-day cost
+  compared with a five-minute baseline). Today's coverage restarts at the upgrade; that earlier part
+  of the day reads as unmeasured.
 - **UI:** the Savings panel states `Sampled-time coverage: grid X h, battery Y h, baseline Z h of
   W h sampled`, `Savings cover N% of the sampled time`, `Measured over N% of the sampled time`, and
   the per-card scope each total covers; the per-bucket table gains the same coverage line. Legacy
