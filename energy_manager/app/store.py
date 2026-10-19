@@ -52,7 +52,7 @@ __all__ = [
     "table_exists",
 ]
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 #: One migration step: a SQL statement, or a Python step for work SQL cannot express (the history
 #: seed parses the instant it copies, and a stored ``+02:00`` offset is not a string operation).
@@ -121,6 +121,22 @@ def _seed_history(conn: sqlite3.Connection) -> None:
             " VALUES(?, ?, ?, ?, 'seed')",
             (kind, key, stamp, payload_json),
         )
+
+
+def _add_columns_if_missing(
+    conn: sqlite3.Connection, table: str, columns: dict[str, str]
+) -> None:
+    """Add only the columns an ``ALTER TABLE`` would duplicate.
+
+    Plain ``ALTER TABLE … ADD COLUMN`` is not idempotent, and migration steps can legitimately run
+    twice: a replay recording may claim a version older than the file really is (a scratch DB
+    restored from a newer build, SPEC 14 R3), and the forward-only runner then re-applies the
+    later steps against columns that already exist.
+    """
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, kind in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
 
 
 MIGRATIONS: list[tuple[int, tuple[MigrationStep, ...]]] = [
@@ -348,6 +364,33 @@ MIGRATIONS: list[tuple[int, tuple[MigrationStep, ...]]] = [
             _seed_history,
         ),
     ),
+    (
+        6,
+        (
+            # 0.30.0 gap-tolerant savings: how much sampled time each stored total actually covers.
+            # A single unreadable interval used to null out a whole day's baseline and battery
+            # flows, which on real hardware left most days unknowable.  The accounting now sums the
+            # intervals it could price and states their coverage in hours instead of discarding the
+            # day; ``savings_hours`` is the time behind ``baseline_cost_eur``/``savings_eur``,
+            # ``battery_hours`` the time behind the measured flows, ``grid_hours`` the metered time
+            # behind import/export, and ``total_hours`` the sampled time they are a share of.
+            # Rows written before this migration keep NULLs: their coverage is unknown, and the
+            # aggregator reports them as legacy rather than pretending they covered 0 hours.
+            # Idempotent by inspection: a replay recording that only *claims* an older version than
+            # its file really is (a scratch DB restored from a newer build, SPEC 14 R3) re-runs the
+            # migration against columns that already exist, and must not fail on them.
+            lambda conn: _add_columns_if_missing(
+                conn,
+                "savings_daily",
+                {
+                    "total_hours": "REAL",
+                    "grid_hours": "REAL",
+                    "savings_hours": "REAL",
+                    "battery_hours": "REAL",
+                },
+            ),
+        ),
+    ),
 ]
 
 
@@ -405,6 +448,10 @@ _SAVINGS_COLUMNS = (
     "load_measured",
     "pv_measured",
     "battery_measured",
+    "total_hours",
+    "grid_hours",
+    "savings_hours",
+    "battery_hours",
 )
 
 

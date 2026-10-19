@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.30.0
+
+- **Fix: savings are counted per interval, not thrown away per day.** A single missing grid, load or
+  battery poll - or one interval whose price could not be resolved on the baseline side - used to
+  poison the whole day: baseline, savings and battery flows became `null` and stayed that way. On a
+  live system that meant 6 of 10 measured days had no baseline, the savings sensor read `unknown`
+  while the battery was actively controlled, and `year`/`all` summed to nothing because one unmeasured
+  day inside a month erased the month. Baseline, actual net cost and flows now accumulate over the
+  intervals that could be priced and measured (`savings_daily` migration 6 adds `total_hours`,
+  `grid_hours`, `savings_hours`, `battery_hours`), `null` is reserved for "no interval could be
+  priced/measured", and the UI says what share of the sampled time each figure covers instead of
+  calling the range unknown.
+- **Fix: `year`/`all` buckets are calendar months.** They advanced in 30-day steps from 1970-01-01,
+  producing 679 buckets with visible holes and skipping February entirely; they are now contiguous
+  calendar months (Jan 1970 … the current month).
+- **Fix: a bucket keeps its measured part.** A month (or any bucket) with one unmeasured day used to
+  erase its measured flows; a bucket now sums the rows that reported a measurement and still marks
+  itself not fully measured.
+- **Fix: an add-on restart no longer discards today's savings.** The in-progress `savings_daily` row
+  is restored from the store at startup, so the next flush adds to it instead of overwriting it with
+  the post-start partial totals.
+- **UI:** the Savings panel states `Sampled-time coverage: grid X h, battery Y h, baseline Z h of
+  W h sampled`, `Savings cover N% of the sampled time`, `Measured over N% of the sampled time`, and
+  the per-card scope each total covers; the per-bucket table gains the same coverage line. Legacy
+  rows (written before the coverage columns) are reported as legacy periods, never as uncovered time.
+
 ## 0.29.1
 
 - **Fix: the Lovelace card rendered mangled.** The downloaded card is one self-contained file, but it

@@ -909,7 +909,13 @@
         load_measured: known,
         pv_measured: true,
         battery_measured: batteryOk,
-        has_data: true
+        has_data: true,
+        // 0.30.0 sampled-time coverage (hours): a partially measured bucket keeps its numbers and
+        // states how much of the sampled time they cover instead of going null.
+        total_hours: 72,
+        grid_hours: batteryOk ? 70 : 55.5,
+        savings_hours: known ? (batteryOk ? 68 : 52) : 0,
+        battery_hours: batteryOk ? 66 : 0
       });
     }
     return out;
@@ -933,7 +939,8 @@
       battery_throughput_kwh: 5.9 * buckets.length, buckets: buckets.length,
       charged_kwh: null, discharged_kwh: null, charge_cost_eur: null, discharge_value_eur: null,
       measured_periods: 0, baseline_periods: 0,
-      measured_buckets: { grid: 0, load: 0, pv: 0, battery: 0 }
+      measured_buckets: { grid: 0, load: 0, pv: 0, battery: 0 },
+      total_hours: 0, grid_hours: 0, savings_hours: 0, battery_hours: 0, legacy_periods: 0
     };
     var knownBaseline = false;
     var flowSeen = { charged_kwh: false, discharged_kwh: false, charge_cost_eur: false, discharge_value_eur: false };
@@ -944,6 +951,9 @@
       totals.cost_eur += b.cost_eur;
       totals.revenue_eur += b.revenue_eur;
       totals.cycles += b.cycles;
+      ["total_hours", "grid_hours", "savings_hours", "battery_hours"].forEach(function (key) {
+        totals[key] += b[key] || 0;
+      });
       ["grid", "load", "pv", "battery"].forEach(function (name) {
         if (b[name + "_measured"]) totals.measured_buckets[name] += 1;
       });

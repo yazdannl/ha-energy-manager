@@ -290,6 +290,12 @@
     return kwh.toFixed(digits === undefined ? 2 : digits) + " kWh";
   }
 
+  // Sampled-time coverage (0.30.0) is hours, never an energy or a percentage on its own.
+  function fmtHours(hours) {
+    if (!isNum(hours)) return "--";
+    return hours >= 10 ? hours.toFixed(1) + " h" : hours.toFixed(2) + " h";
+  }
+
   // Power in kW, so a kW payload is never labelled as an energy (UI_REVIEW §3.6).
   function fmtKw(kw, digits) {
     if (!isNum(kw)) return "--";
@@ -4545,21 +4551,34 @@
     var withData = cov.withData;
     var savingsKnown = isNum(t.savings_eur);
     var baselineKnown = isNum(t.baseline_cost_eur);
+    // 0.30.0: a missing interval is excluded from the comparison instead of discarding the period,
+    // so the honest scope of the saving is the share of *sampled time* it covers.
+    var sampledHours = isNum(t.total_hours) ? t.total_hours : 0;
+    var coveredHours = isNum(t.savings_hours) ? t.savings_hours : 0;
+    var gridHours = isNum(t.grid_hours) ? t.grid_hours : 0;
+    var batteryHours = isNum(t.battery_hours) ? t.battery_hours : 0;
+    var legacyPeriods = isNum(t.legacy_periods) ? t.legacy_periods : 0;
+    var coveragePct = sampledHours > 0 ? Math.max(0, Math.min(100, Math.round(coveredHours / sampledHours * 100))) : null;
+    var batteryPct = sampledHours > 0 ? Math.max(0, Math.min(100, Math.round(batteryHours / sampledHours * 100))) : null;
+    function legacyNote() {
+      if (!legacyPeriods) return "";
+      return " " + legacyPeriods + " earlier period" + (legacyPeriods === 1 ? " predates" : "s predate") + " hour coverage; its stored totals still count.";
+    }
     var reason = (!savingsKnown || !baselineKnown)
       ? (withData.length
-          ? "unknown — the realised load could not be re-priced against a baseline"
+          ? "unknown — no sampled interval in these periods could be re-priced against a baseline"
           : "unknown — no measured activity in this range yet")
       : "";
     // Loss, unknown and stale are three different states and never share one visual treatment
     // (UI_REVIEW §3.6).
     function savingsCard() {
       if (!savingsKnown) return statCard("Savings", "--", reason, "unknown");
-      if (t.savings_eur < 0) return statCard("Savings", fmtEur(t.savings_eur), "a loss: the battery cost more than doing nothing", "loss");
-      return statCard("Savings", fmtEur(t.savings_eur), "baseline minus actual (net)", false);
+      if (t.savings_eur < 0) return statCard("Savings", fmtEur(t.savings_eur), coveragePct == null ? "a loss: the battery cost more than doing nothing" : "a loss over " + coveragePct + "% of the sampled time: the battery cost more than doing nothing", "loss");
+      return statCard("Savings", fmtEur(t.savings_eur), coveragePct == null ? "baseline minus actual (net)" : "baseline minus actual (net), over " + coveragePct + "% of the sampled time", false);
     }
     var cards = el("div", { class: "cards" }, [
       savingsCard(),
-      statCard("Import cost", fmtEur(t.cost_eur), "grid import cost before export revenue"),
+      statCard("Import cost", fmtEur(t.cost_eur), "metered intervals, before export revenue"),
       statCard("Baseline cost", fmtEur(t.baseline_cost_eur), baselineKnown ? "same load and tariffs, battery idle (net)" : reason, baselineKnown ? false : "unknown"),
       statCard("Import", fmtKwh(t.import_kwh), "from the grid"),
       statCard("Export", fmtKwh(t.export_kwh), "to the grid"),
@@ -4567,17 +4586,24 @@
       statCard(
         "Cycles",
         isNum(t.discharged_kwh) && isNum(t.cycles) ? t.cycles.toFixed(2) + " cycles" : "--",
-        isNum(t.discharged_kwh) ? "measured battery throughput" : "unknown: no confirmed battery measurement",
+        isNum(t.discharged_kwh) ? "measured discharge ÷ pack capacity" : "unknown: no confirmed battery measurement",
         isNum(t.discharged_kwh) ? false : "unknown"
       )
     ]);
     body.appendChild(cards);
+    // Time coverage first: it is the scope of the number, not a caveat to hide at the bottom.
+    if (savingsKnown && coveragePct != null && coveragePct < 100) {
+      body.appendChild(el("div", { class: "banner banner-info" }, [
+        el("p", { class: "banner-title", text: "Savings cover " + coveragePct + "% of the sampled time" }),
+        el("p", { text: "The baseline and the saving add up interval by interval: " + fmtHours(coveredHours) + " of " + fmtHours(sampledHours) + " could be re-priced. An interval without a confirmed meter reading, battery flow or price is left out of both sides of the comparison instead of guessed, so the figure stays exact for the time it covers." + legacyNote() })
+      ]));
+    }
     // Coverage first: a partial baseline is scope, not a total (UI_REVIEW §3.6).
     var missing = withData.length - covered.length;
     if (withData.length && covered.length && covered.length < withData.length) {
       body.appendChild(el("div", { class: "banner banner-warn" }, [
         el("p", { class: "banner-title", text: "Baseline available for " + covered.length + " of " + withData.length + " measured periods" }),
-        el("p", { text: "The saving and the baseline cost describe only the measured periods that could be re-priced. " + missing + " measured period" + (missing === 1 ? " has" : "s have") + " no baseline, so " + (missing === 1 ? "its" : "their") + " cost is not part of the comparison — the whole-range import/export/PV figures below still cover every period." })
+        el("p", { text: missing + " measured period" + (missing === 1 ? " has" : "s have") + " no sampled interval that could be re-priced against a baseline (the meter, the realized load or the price was missing), so " + (missing === 1 ? "its" : "their") + " cost is not part of the comparison — the whole-range import/export/PV figures below still cover every metered interval." })
       ]));
     }
     if (buckets.length && withData.length < buckets.length) {
@@ -4625,11 +4651,18 @@
         el("li", null, [el("span", { class: "stat-label", text: "Charge cost (measured, at buy)" }), el("span", { class: "stat-value", text: fmtEur(t.charge_cost_eur) })]),
         el("li", null, [el("span", { class: "stat-label", text: "Discharge value (measured, at sell)" }), el("span", { class: "stat-value", text: fmtEur(t.discharge_value_eur) })])
       ]));
+      if (batteryPct != null) {
+        body.appendChild(el("p", { class: "legend-note", text: "Measured over " + batteryPct + "% of the sampled time (" + fmtHours(batteryHours) + " of " + fmtHours(sampledHours) + "). A gap is not counted as a flow and not counted as a zero." }));
+      }
     } else {
       body.appendChild(el("p", { class: "legend-note", text: "No confirmed battery measurement in this range, so the measured battery flows are unknown (--): a planned or requested setpoint is not counted as delivered energy." }));
     }
-    var measured = t.measured_buckets;
-    if (measured && buckets.length) {
+    // Sampled-time coverage (0.30.0).  The series-completeness counts are kept for an older API
+    // payload, but hours are what a partially measured period can honestly state.
+    if (sampledHours > 0) {
+      body.appendChild(el("p", { class: "legend-note", text: "Sampled-time coverage: grid " + fmtHours(gridHours) + ", battery " + fmtHours(batteryHours) + ", baseline " + fmtHours(coveredHours) + " of " + fmtHours(sampledHours) + " sampled." + legacyNote() }));
+    } else if (t.measured_buckets) {
+      var measured = t.measured_buckets;
       var names = [["grid", "grid"], ["load", "load"], ["pv", "PV"], ["battery", "battery"]];
       var parts = names.map(function (pair) {
         return pair[1] + " " + (measured[pair[0]] || 0) + " of " + buckets.length;
@@ -6388,6 +6421,7 @@
     fmtPrice: fmtPrice,
     fmtEur: fmtEur,
     savingsCoverage: savingsCoverage,
+    fmtHours: fmtHours,
     fmtPct: fmtPct,
     fmtDuration: fmtDuration,
     timeAgo: timeAgo,

@@ -635,6 +635,14 @@ class SavingsBucket:
     # activity" (the bucket is listed for a steady chart), which is different from a bucket that
     # has data but no knowable baseline.  Both report baseline/savings as None.
     has_data: bool = False
+    # Additive (0.30.0): the sampled time each figure covers, in hours.  ``savings_hours`` is the
+    # time behind baseline/savings, ``battery_hours`` the time behind the measured flows,
+    # ``grid_hours`` the metered time behind import/export and ``total_hours`` the sampled time they
+    # are a share of.  0 means the row predates coverage tracking, not that nothing was measured.
+    total_hours: float = 0.0
+    grid_hours: float = 0.0
+    savings_hours: float = 0.0
+    battery_hours: float = 0.0
 
 
 @dataclass

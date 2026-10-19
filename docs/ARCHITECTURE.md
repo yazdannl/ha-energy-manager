@@ -226,10 +226,14 @@ it only covers price components present in the selected price series.
 
 Battery credit is measured, not planned (0.13.0): `charged_kwh`/`discharged_kwh` integrate only
 confirmed AC flow readings and are priced at the buy/sell series in force at flow time. A dry-run,
-blocked, stale-refused or unconfirmed-setpoint interval is never credited, and a day with any
-unmeasured interval reports its battery flows and cycle count as `null` rather than a partial or
-planned number. Each `savings_daily` row also records which of the grid, load, PV and battery series
-were measured for every interval.
+blocked, stale-refused or unconfirmed-setpoint interval is never credited. Accounting is
+interval-level (0.30.0): an interval with a missing meter, price or battery reading is left out of
+both the baseline and the actual it is compared with, and out of the flows, instead of discarding
+the whole day. Each `savings_daily` row records the sampled time it actually covers
+(`total_hours`, `grid_hours`, `savings_hours`, `battery_hours`) plus which of the grid, load, PV and
+battery series were measured for *every* interval (the all-or-nothing flags). That is why a day can
+report a real saving for 6.5 of 24 sampled hours, and why the year/all buckets keep the measured
+part of a partly measured month instead of erasing it.
 
 ## Deliberate simplifications
 

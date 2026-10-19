@@ -1632,6 +1632,58 @@ only its effect (the boot hold) is observable. Whether a *stalled* control loop 
 setpoint is covered separately by the guard thread's `Dispatcher.watchdog()` (0.13.0-era, SPEC
 9.1 step 5), which holds every driver unconditionally; no new timer was added here.
 
+### 8.24 Savings are counted over the time that could be priced and measured (0.30.0)
+
+The report was "the savings section still does not work". It did not, and the live instance said so in
+numbers: `sensor.sem_savings_today` was `unknown` with `month_eur: -0.07`, the month view had **30
+buckets, 10 measured periods and only 4 with a baseline**, the per-series coverage was grid 8/30,
+load 0/30, PV 0/30, battery 5/30 -- and `year`/`all` reported `measured_buckets: 0` for every series
+even though the month contains 8 grid-measured and 5 battery-measured days. The battery was meanwhile
+demonstrably discharging: the cost-basis journal booked `applied_w: -800` with `discharge_kwh`
+0.0387 + 0.0666 + 0.0667 … that afternoon, while the savings row reported 0.032 kWh for the month.
+
+Reading the data against the code (`analytics.daily_row_delta`, `savings_from_daily`) gave four
+independent defects, all of which had to be fixed for the number to become right:
+
+1. **One gap discarded a day.** Baseline, cost and flows were all-or-nothing. `add_known` returned
+   `None` the moment any input was missing and the row never recovered, and the same rule applied to
+   the battery flows. The live rows show the result: Oct 12 had both grid and battery measured and
+   still no baseline (one interval had no resolvable price), and Oct 13, 17 and 19 had grid but a
+   single missing battery poll -- enough to erase the flows the ledger had just booked. A day with a
+   true 0.00 baseline was indistinguishable from a day nobody measured.
+2. **A month discarded its measured days.** `year`/`all` buckets kept flows only when *every*
+   contained row was measured, so the 8 measured days in the month summed to `None` at month level.
+3. **`year`/`all` were not months.** Buckets stepped 30 days from 1970-01-01, producing 679 buckets
+   with holes and no February.
+4. **A restart erased the current day.** `_savings_today` was never restored from the store, so the
+   first flush after an add-on update overwrote the stored day with the post-start partial row.
+
+The fix is interval-level: `daily_row_delta` accumulates cost, baseline, savings, flows and the
+sampled hours (`total_hours`, `grid_hours`, `savings_hours`, `battery_hours`; store migration 6) over
+the intervals that *can* be priced and measured, and leaves the rest out of both sides of the
+comparison. `savings_from_daily` sums the known rows of a bucket instead of nulling it, reports
+`legacy_periods` for rows that predate the hours so coverage denominators stay honest, and buckets
+`year`/`all` by contiguous calendar month. A `null` baseline/saving now means "no sampled interval
+could be priced", and a `null` flow means "no interval was measured"; the coverage hours say how much
+of the time the figure covers. `Engine.start()` calls `_hydrate_savings_today()` before the first
+flush.
+
+Tests: the three suite tests that pinned the old all-or-nothing contract were rewritten to the new
+one (analytics grid gap, analytics battery-flow gap, engine measurement gap), and six new tests pin
+the defects above: sampled-time coverage, calendar months for year/all (no holes, February present),
+a partly measured month keeping its measured flows, a restart continuing the stored row, the coverage
+attributes the savings sensor publishes, and the hours keys in the API payload. `tools/ui_render_check.js`
+gained three checks: the sampled-time coverage line, the per-card scope captions, and `fmtHours`.
+
+Measured on this tree: `python3 -m pytest tests -q` -> **1594 passed, 1 skipped** (1586 passed
+before; 9 new tests and 3 rewritten ones), `sh tools/audit.sh` -> clean, `node tools/ui_render_check.js`
+-> **159 passed, 0 failed** (156 before).
+
+What is *not* verified: the live savings figures were read from the running 0.29.1 add-on before the
+change (month/week/year/all JSON via the add-on's own API on the HA host). No post-deploy live figure
+is recorded here; verifying that the corrected accounting reproduces the ledger's booked discharge on
+the real instance is the follow-up check scheduled 24 hours after deploy.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)

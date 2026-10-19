@@ -739,6 +739,13 @@ class Engine:
             self._load_cell_voltage_latch()
         except Exception as exc:  # pragma: no cover - defensive, startup must not fail
             log.warning("cell-voltage latch recovery failed: %s", exc)
+        # Continue today's savings row instead of starting from zero.  Without this, every restart
+        # (every add-on update) overwrote the day's stored row with only the post-restart part, so
+        # a redeployed day silently lost its earlier import, baseline and measured flows.
+        try:
+            self._hydrate_savings_today()
+        except Exception as exc:  # pragma: no cover - defensive, startup must not fail
+            log.warning("savings row hydration failed: %s", exc)
         self._stop.clear()
         for name, target in (
             ("sem-control", self._control_loop),
@@ -755,6 +762,12 @@ class Engine:
         for thread in self._threads:
             thread.join(timeout=2.0)
         self._threads = []
+        # Persist the part of today's row that has not been flushed yet, so a clean stop cannot
+        # lose the minutes since the last flush (the next start hydrates it again).
+        try:
+            self._flush_savings()
+        except Exception as exc:  # pragma: no cover - defensive, shutdown must not fail
+            log.warning("savings flush on stop failed: %s", exc)
         self._journal.event("info", "engine_stopped", "threads stopped")
 
     def request_replan(self, reason: str = "api") -> dict[str, Any]:
@@ -2979,7 +2992,32 @@ class Engine:
             load_measured=self._savings_cover("load_measured"),
             pv_measured=self._savings_cover("pv_measured"),
             battery_measured=self._savings_cover("battery_measured"),
+            # 0.30.0 gap-tolerant accounting: how much sampled time each total covers.  A gap in
+            # one interval no longer nulls the day; it lowers this coverage share instead.
+            total_hours=self._savings_optional("total_hours"),
+            grid_hours=self._savings_optional("grid_hours"),
+            savings_hours=self._savings_optional("savings_hours"),
+            battery_hours=self._savings_optional("battery_hours"),
         )
+
+    def _hydrate_savings_today(self) -> None:
+        """Seed today's accumulator from the stored row so a restart continues the day.
+
+        ``savings_daily`` is keyed by day and every flush *replaces* the row, so a process that
+        started with an empty accumulator used to overwrite the earlier part of the day with the
+        post-restart part only.  Restoring the row (and keeping its coverage hours) makes the
+        stored total additive across restarts.  A row written before the coverage columns existed
+        hydrates with NULL hours and simply keeps accumulating from the new intervals.
+        """
+        day = self._clock().date().isoformat()
+        rows = self._store_call("savings_daily_range", day, day) or []
+        if not rows:
+            return
+        row = dict(rows[0])
+        with self._lock:
+            self._savings_today = row
+            self._savings_flushed_at = self._clock()
+        log.info("savings: continuing the stored row for %s", day)
 
     def _savings_optional(self, key: str) -> float | None:
         value = self._savings_today.get(key)
@@ -3010,6 +3048,15 @@ class Engine:
             + float(discharged),
             2,
         )
+
+    @staticmethod
+    def _coverage_pct(totals: Mapping[str, Any]) -> float | None:
+        """Share of the sampled time a range's baseline/saving covers, in percent (0.30.0)."""
+        total = float(totals.get("total_hours") or 0.0)
+        if total <= 0.0:
+            return None
+        covered = float(totals.get("savings_hours") or 0.0)
+        return round(min(1.0, max(0.0, covered / total)) * 100.0, 1)
 
     def _replan_loop(self) -> None:
         while not self._stop.is_set():
@@ -4332,6 +4379,15 @@ class Engine:
                     # unknown. The old value read a ``battery_cycles`` key the totals never had
                     # and quietly published import - export as if it were the baseline.
                     "baseline_kwh": self._baseline_grid_kwh(today),
+                    # 0.30.0: how much sampled time each figure covers, so a partial day is visible
+                    # to an automation instead of looking like a complete one.  None = no hour
+                    # coverage recorded for that range (nothing sampled yet, or a legacy row).
+                    "sampled_hours": round(float(today.get("total_hours") or 0.0), 2) or None,
+                    "baseline_hours": round(float(today.get("savings_hours") or 0.0), 2) or None,
+                    "battery_hours": round(float(today.get("battery_hours") or 0.0), 2) or None,
+                    "coverage_pct": self._coverage_pct(today),
+                    "month_coverage_pct": self._coverage_pct(month),
+                    "year_coverage_pct": self._coverage_pct(year),
                 },
             ),
             SEM_SOC_AVG: (

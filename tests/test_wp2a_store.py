@@ -636,7 +636,7 @@ def test_schema_v5_seeds_the_history_from_the_pre_upgrade_rows(tmp_path):
     conn.close()
     store = Store(path)
     try:
-        assert store.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+        assert store.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 6
         seeded = store.connection.execute(
             "SELECT at, origin FROM settings_history WHERE key = 'mode'"
         ).fetchone()
@@ -730,7 +730,36 @@ def test_schema_v2_migrates_a_v1_database_and_keeps_its_rows(tmp_path):
         store.upsert_savings_daily("2026-01-02", charged_kwh=1.5, battery_measured=1)
         assert store.savings_daily_range("2026-01-02", "2026-01-02")[0]["charged_kwh"] == 1.5
         version = store.connection.execute("SELECT version FROM schema_version").fetchone()[0]
-        assert version == SCHEMA_VERSION == 5
+        assert version == SCHEMA_VERSION == 6
+    finally:
+        store.close()
+
+
+def test_schema_v6_reapplies_cleanly_to_an_already_migrated_database(tmp_path):
+    """A recording claiming a lower version than its file (SPEC 14 R3) must not crash the runner.
+
+    A replay scratch DB can be a copy of a newer build whose ``schema_version`` row says 5.  The
+    forward-only runner then re-applies migration 6, whose columns already exist: adding them again
+    would raise ``duplicate column name`` and refuse the recording instead of replaying it.
+    """
+    path = tmp_path / "v6.db"
+    store = Store(path)
+    try:
+        store.upsert_savings_daily("2026-01-01", charged_kwh=1.0, total_hours=2.0, battery_hours=1.5)
+    finally:
+        store.close()
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE schema_version SET version = 5")
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    try:
+        version = store.connection.execute("SELECT version FROM schema_version").fetchone()[0]
+        assert version == SCHEMA_VERSION
+        row = store.savings_daily_range("2026-01-01", "2026-01-01")[0]
+        assert row["charged_kwh"] == 1.0
+        assert row["total_hours"] == 2.0 and row["battery_hours"] == 1.5
     finally:
         store.close()
 

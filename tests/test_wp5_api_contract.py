@@ -666,10 +666,15 @@ def test_savings_totals_include_the_split(wired):
     assert "self_consumption_kwh" in body["totals"], body["totals"]
     assert "cycles" in body["totals"]
     assert "measured_periods" in body["totals"] and "baseline_periods" in body["totals"]
+    # Additive (0.30.0): sampled-time coverage in hours, per bucket and in the totals.
+    for key in ("total_hours", "grid_hours", "savings_hours", "battery_hours"):
+        assert key in body["totals"], body["totals"]
+    assert "legacy_periods" in body["totals"]
     assert body["range"] == "day"
     assert body["buckets"] and {"key", "start", "end", "savings_eur", "baseline_cost_eur", "has_data"} <= set(
         body["buckets"][0]
     )
+    assert {"total_hours", "grid_hours", "savings_hours", "battery_hours"} <= set(body["buckets"][0])
     # unknown range is a 400
     status, _headers, _body = wired.json("GET", "/api/v1/savings?range=example_bad")
     assert status == 400

@@ -70,7 +70,9 @@ def test_ui_renders_and_settings_ia_holds():
         # bucket stays unknown.
         "the savings payload carries measured battery flows and per-bucket coverage",
         "the savings view labels measured battery flows",
-        "the savings view states measured-series coverage",
+        "the savings view states sampled-time coverage",
+        "the savings cards state the scope of each figure",
+        "the time-coverage figure is formatted as hours",
         "an unmeasured bucket reports its cycle energy as unknown, not planned",
         "a measured bucket renders its charged and discharged energy",
         # SPEC 5 learned capacity: the Batteries card must state the effective value and where it

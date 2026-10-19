@@ -602,6 +602,14 @@ def savings_bucket_dict(bucket: SavingsBucket) -> dict[str, Any]:
         "load_measured": bucket.load_measured,
         "pv_measured": bucket.pv_measured,
         "battery_measured": bucket.battery_measured,
+        # Additive (0.30.0): sampled-time coverage behind each figure, in hours.  ``savings_hours``
+        # is the time the baseline/saving covers and ``battery_hours`` the time the measured flows
+        # cover; ``total_hours`` is the sampled time they are a share of.  0 on a data-bearing
+        # bucket means the row predates coverage tracking (a legacy period).
+        "total_hours": bucket.total_hours,
+        "grid_hours": bucket.grid_hours,
+        "savings_hours": bucket.savings_hours,
+        "battery_hours": bucket.battery_hours,
         # Additive (0.22.1): False = no stored row in this bucket (compared with a measured row
         # whose baseline is unknown).  Both carry None baseline/savings; only a data-bearing bucket
         # can appear in the baseline coverage counts.

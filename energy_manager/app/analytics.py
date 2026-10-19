@@ -31,6 +31,13 @@ MEASURED_SERIES = ("grid", "load", "pv", "battery")
 #: reports unknown instead of a smaller number that looks measured (0.13.0).
 MEASURED_FLOWS = ("charged_kwh", "discharged_kwh", "charge_cost_eur", "discharge_value_eur")
 
+#: Sampled-time coverage behind the stored totals (0.30.0), in hours.  ``savings_hours`` is the
+#: time behind ``baseline_cost_eur``/``savings_eur``, ``battery_hours`` the time behind the measured
+#: flows, ``grid_hours`` the metered time behind import/export, and ``total_hours`` the sampled time
+#: they are a share of.  Rows written before these columns existed report 0 and are counted as
+#: legacy periods.
+COVERAGE_HOURS = ("total_hours", "grid_hours", "savings_hours", "battery_hours")
+
 
 def range_bounds(range_key: str, now: datetime) -> tuple[datetime, datetime]:
     """Start/end of a savings range, both inclusive of ``now``."""
@@ -92,8 +99,21 @@ def _empty_bucket(key: str, range_key: str) -> SavingsBucket:
 
 
 def _bucket_days(start: datetime, end: datetime, range_key: str):
-    """Ordered bucket keys covering the range (empty buckets included for a steady chart)."""
-    keys: list[str] = []
+    """Ordered bucket keys covering the range (empty buckets included for a steady chart).
+
+    Year and all buckets are *calendar* months, not 30-day steps: stepping 30 days from the first
+    day of a month drifts out of the calendar (1970-01-01 + 30d = 1970-01-31, +30d = 1970-03-02,
+    so February was skipped for the whole ``all`` axis and every later month could be missing or
+    duplicated).
+    """
+    if range_key in ("year", "all"):
+        keys: list[str] = []
+        year, month = start.year, start.month
+        while (year, month) <= (end.year, end.month):
+            keys.append(f"{year:04d}-{month:02d}")
+            year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+        return keys
+    keys = []
     cursor = start.date()
     last = end.date()
     while cursor <= last:
@@ -119,11 +139,17 @@ def savings_from_daily(
     ``cycles * capacity_kwh``; pass the capacity of the batteries in use and treat the split as the
     documented estimate it is (0.0 when no capacity is known).
 
-    ``baseline_cost_eur``/``savings_eur`` are only known when the bucket has at least one row that
-    could be re-priced, and are summed per row: an unknown row's cost is never subtracted from a
-    known baseline (a month bucket can span days from before and after a baseline gap).  A bucket
-    with no such row reports ``None`` for both, never a fabricated 0, and exposes ``has_data`` so a
-    bucket with no stored rows is never counted as a covered period (SPEC 11).
+    ``baseline_cost_eur``/``savings_eur`` are known when the bucket has at least one row that could
+    be re-priced, and are summed per row: an unknown row's cost is never subtracted from a known
+    baseline (a month bucket can span days from before and after a gap).  A bucket with no such row
+    reports ``None`` for both, never a fabricated 0, and exposes ``has_data`` so a bucket with no
+    stored rows is never counted as a covered period (SPEC 11).
+
+    Coverage is summed in *hours* (0.30.0): ``savings_hours`` is the sampled time behind the
+    baseline/savings, ``battery_hours`` the time behind the measured flows, ``grid_hours`` the
+    metered time behind import/export and ``total_hours`` the sampled time they are a share of.  A
+    row written before the hour columns existed contributes 0 hours and is counted once in
+    ``legacy_periods``; its stored totals still contribute, so old history is not lost.
     """
     start, end = range_bounds(range_key, now)
     keys = _bucket_days(start, end, range_key)
@@ -136,12 +162,14 @@ def savings_from_daily(
     # covered 0.00 period (SPEC 11).
     baseline_known: set[str] = set()
     bucket_rows: set[str] = set()
-    # Per-bucket coverage of each measured series and per-bucket sums of the measured battery
-    # flows.  A series is covered only when every row in the bucket had it; a flow is known only
-    # when every row carried it (a gap makes the day unknown, never a smaller measured number).
+    # Per-bucket coverage of each measured series (only a fully measured bucket keeps the flag) and
+    # per-bucket sums of the measured battery flows.  Flows are summed whenever a row carries one:
+    # since 0.30.0 a row's flow is the part that *was* measured, not an all-or-nothing day, so one
+    # earlier gap must not erase the measured part (that is what hid the year/all flows entirely).
     measured_series: dict[str, set[str]] = {}
     flow_sums: dict[str, dict[str, float]] = {}
-    flow_known: dict[str, set[str]] = {}
+    flow_seen: dict[str, set[str]] = {}
+    hour_sums: dict[str, dict[str, float]] = {}
 
     for row in rows:
         day = _parse_day(row.get("day") or row.get("ts"))
@@ -156,14 +184,16 @@ def savings_from_daily(
         for name in MEASURED_SERIES:
             if not row.get(f"{name}_measured"):
                 series.discard(name)
-        known = flow_known.setdefault(key, set(MEASURED_FLOWS))
+        seen = flow_seen.setdefault(key, set())
         sums = flow_sums.setdefault(key, {name: 0.0 for name in MEASURED_FLOWS})
         for name in MEASURED_FLOWS:
             value = row.get(name)
-            if value is None:
-                known.discard(name)
-            else:
+            if value is not None:
+                seen.add(name)
                 sums[name] += float(value)
+        hours = hour_sums.setdefault(key, {name: 0.0 for name in COVERAGE_HOURS})
+        for name in COVERAGE_HOURS:
+            hours[name] += float(row.get(name) or 0.0)
         # The realised battery throughput is measured discharge when the flow is known; legacy
         # rows (and pre-0.13 rows) fall back to the stored cycle estimate.
         discharged = row.get("discharged_kwh")
@@ -207,12 +237,14 @@ def savings_from_daily(
             # no longer mislabel empty days as covered periods (SPEC 11).
             bucket = replace(bucket, baseline_cost_eur=None, savings_eur=None)
         if has_data:
-            known = flow_known.get(key, set())
+            seen = flow_seen.get(key, set())
             sums = flow_sums.get(key, {})
+            hours = hour_sums.get(key, {})
             bucket = replace(
                 bucket,
-                **{name: (float(sums.get(name, 0.0)) if name in known else None) for name in MEASURED_FLOWS},
+                **{name: (float(sums.get(name, 0.0)) if name in seen else None) for name in MEASURED_FLOWS},
                 **{f"{name}_measured": name in measured_series.get(key, set()) for name in MEASURED_SERIES},
+                **{name: float(hours.get(name, 0.0)) for name in COVERAGE_HOURS},
             )
         bucket = replace(bucket, has_data=has_data)
         ordered.append(bucket)
@@ -220,6 +252,9 @@ def savings_from_daily(
     def _total_flow(name: str) -> float | None:
         values = [getattr(b, name) for b in ordered if getattr(b, name) is not None]
         return sum(values) if values else None
+
+    def _total_hours(name: str) -> float:
+        return sum(float(getattr(b, name) or 0.0) for b in ordered)
 
     # Only buckets with a known baseline contribute a total; an empty bucket must not be silently
     # added as zero (SPEC 11).
@@ -248,7 +283,7 @@ def savings_from_daily(
         "measured_periods": float(len(measured_buckets)),
         "baseline_periods": float(len(known_buckets)),
         # Additive (0.13.0): measured battery flows and how many buckets actually measured each
-        # series.  ``None`` for a flow means no bucket in this range had a complete measurement.
+        # series.  ``None`` for a flow means no bucket in this range carried one.
         "charged_kwh": _total_flow("charged_kwh"),
         "discharged_kwh": _total_flow("discharged_kwh"),
         "charge_cost_eur": _total_flow("charge_cost_eur"),
@@ -256,6 +291,14 @@ def savings_from_daily(
         "measured_buckets": {
             name: sum(1 for b in ordered if getattr(b, f"{name}_measured")) for name in MEASURED_SERIES
         },
+        # Additive (0.30.0): the sampled time behind each total, so a partial day is presented as
+        # "savings over X of Y sampled hours" instead of being reported as unknown.  A data-bearing
+        # bucket with no hours at all predates the coverage columns (legacy_periods); its stored
+        # totals still count, but it cannot claim a coverage share.
+        **{name: _total_hours(name) for name in COVERAGE_HOURS},
+        "legacy_periods": float(
+            sum(1 for b in measured_buckets if float(b.total_hours or 0.0) <= 0.0)
+        ),
     }
     return ordered, totals
 
@@ -277,8 +320,10 @@ def daily_row_delta(
     """Accumulate one tick into a ``savings_daily`` row (SPEC 11).
 
     ``battery_kw`` must be a *measured* flow; ``None`` means no confirmed measurement for this
-    interval, which makes the day's battery flows and cycle count unknown rather than a planned
-    value (0.13.0).  The grid/load/PV coverage flags record which measured series were present.
+    interval, which adds nothing to the day's battery flows or cycle count rather than a planned
+    value (0.13.0, interval-level since 0.30.0).  The grid/load/PV coverage flags record which
+    measured series were present; the ``*_hours`` counters record how much sampled time the totals
+    really cover.
 
     The do-nothing baseline needs the realised ``load - pv`` for the interval.  It is taken from
     the metered load and PV when both exist, and otherwise from the grid identity
@@ -328,8 +373,9 @@ def daily_row_delta(
         row[key] = float(row.get(key) or 0.0) + value
 
     def add_known(key: str, value: float | None) -> None:
-        # A gap poisons the day: a partially measured total is unknown, never a smaller number
-        # that would look measured (0.13.0).
+        # Sticky unknown for a *value* (not for delivered energy): a partially priced total must
+        # never look like a measured number.  Since 0.30.0 only the two flow values use this; the
+        # energies and the coverage hours keep accumulating through a gap.
         if value is None or (key in row and row[key] is None):
             row[key] = None
         else:
@@ -337,46 +383,64 @@ def daily_row_delta(
 
     def cover(key: str, present: bool) -> None:
         # Coverage can only be lost: one unmeasured interval makes the day's series incomplete.
+        # This flag stays "the whole period was measured"; the hour counters below say how much
+        # of it the totals actually cover.
         if present:
             if row.get(key) is None:
                 row[key] = 1
         else:
             row[key] = 0
 
-    add("import_kwh", import_kwh)
-    add("export_kwh", export_kwh)
-    add("pv_kwh", max(0.0, float(pv_kw)) * hours if pv_kw is not None else 0.0)
-    add("cost_eur", cost)
-    add("revenue_eur", revenue)
-    # The saving compares the baseline with the metered grid, so a grid gap poisons the period's
-    # baseline too: a partially metered day has no knowable actual net cost.  ``add_known`` keeps
-    # that poison sticky, exactly like the measured battery flows (audit finding 13).
-    add_known("baseline_cost_eur", baseline)
+    add("total_hours", hours)
+    if grid_kw is not None:
+        add("grid_hours", hours)
+        add("import_kwh", import_kwh)
+        add("export_kwh", export_kwh)
+        add("cost_eur", cost)
+        add("revenue_eur", revenue)
+    if pv_kw is not None:
+        add("pv_kwh", max(0.0, float(pv_kw)) * hours)
+    # The do-nothing baseline and the actual net cost are accumulated for the same interval, so an
+    # interval whose price or reading is missing is excluded from both and the saving stays exact
+    # for the time it covers.  A single unreadable interval no longer discards the whole day
+    # (0.30.0); ``savings_hours`` states how much sampled time the figure covers.
+    if baseline is not None and grid_kw is not None:
+        add("baseline_cost_eur", baseline)
+        add("savings_eur", baseline - (cost - revenue))
+        add("savings_hours", hours)
     # Measured AC battery flows: only real, confirmed flow earns credit.  This covers charging and
     # discharging (a clamped or ramp-limited write counts what was measured, not what was asked)
-    # and prices each leg with the price series in force at flow time.
+    # and prices each leg with the price series in force at flow time.  The energies survive a gap;
+    # the two priced values stay unknown if any measured interval could not be priced.
     if battery_kw is not None:
         charged = max(0.0, float(battery_kw)) * hours
         discharged = max(0.0, -float(battery_kw)) * hours
-        add_known("charged_kwh", charged)
-        add_known("discharged_kwh", discharged)
+        add("battery_hours", hours)
+        add("charged_kwh", charged)
+        add("discharged_kwh", discharged)
         add_known("charge_cost_eur", buy * charged if price_buy is not None else None)
         add_known("discharge_value_eur", sell * discharged if price_sell is not None else None)
-        add_known("battery_cycles", discharged / capacity_kwh if capacity_kwh > 0 else 0.0)
-    else:
-        for key in ("charged_kwh", "discharged_kwh", "charge_cost_eur", "discharge_value_eur", "battery_cycles"):
-            row[key] = None
+        add("battery_cycles", discharged / capacity_kwh if capacity_kwh > 0 else 0.0)
     cover("grid_measured", grid_kw is not None)
     cover("load_measured", load_kw is not None)
     cover("pv_measured", pv_kw is not None)
     cover("battery_measured", battery_kw is not None)
-    known_baseline = row.get("baseline_cost_eur")
-    if known_baseline is None:
+    # Unknown is still not zero: a day that never priced an interval reports None for its baseline
+    # and saving, and a day that never measured the battery reports None for its flows.  This keys
+    # off "nothing was ever accumulated" rather than the hour counters, so a stored row from a
+    # build without coverage hours keeps its value when a later interval happens to be missing.
+    if row.get("baseline_cost_eur") is None:
+        row["baseline_cost_eur"] = None
         row["savings_eur"] = None
-    else:
-        row["savings_eur"] = float(known_baseline) - (
-            float(row.get("cost_eur") or 0.0) - float(row.get("revenue_eur") or 0.0)
-        )
+    if row.get("charged_kwh") is None:
+        for key in (
+            "charged_kwh",
+            "discharged_kwh",
+            "charge_cost_eur",
+            "discharge_value_eur",
+            "battery_cycles",
+        ):
+            row[key] = None
     row["updated_at"] = to_iso(now)
     return row
 

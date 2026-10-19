@@ -315,7 +315,9 @@ def test_savings_unknown_state_copy():
     app = read(WEB / "app.js")
     assert "Baseline and savings are unknown for this range" in app
     assert "Unknown is not zero" in app
-    assert "could not be re-priced against a baseline" in app
+    assert "no sampled interval in these periods could be re-priced against a baseline" in app
+    assert "Savings cover " in app and "of the sampled time" in app
+    assert "Sampled-time coverage" in app
     assert "skipped, not plotted as zero" in app
     charts = read(WEB / "charts.js")
     assert "No baseline or savings to plot for this range" in charts

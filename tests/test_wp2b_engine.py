@@ -544,19 +544,25 @@ def test_savings_measurement_gap_is_unknown_not_planned():
     values = {"grid_w": 500.0, "load_w": 1200.0, "pv_w": 300.0}
     first = savings_tick(engine, clock, values, [measured_battery(power_w=500.0)])
     assert first["battery_measured"] == 1 and first["charged_kwh"] > 0.0
+    measured_kwh = first["charged_kwh"]
     # The only value now is a setpoint we wrote (power_measured False, e.g. a generic driver or a
-    # Zendure setpoint whose measured pair went missing): the day's flow is unknown, not planned.
+    # Zendure setpoint whose measured pair went missing): that interval earns nothing, and the
+    # unconfirmed 800 W never becomes delivered energy.
     clock.advance(minutes=30)
     gap = savings_tick(
         engine, clock, values, [measured_battery(power_w=800.0, power_measured=False)]
     )
     assert gap["battery_measured"] == 0
-    assert gap["charged_kwh"] is None and gap["battery_cycles"] is None
-    # It stays unknown: a later confirmed interval cannot repair an incomplete day into a partial
-    # total that would look fully measured.
+    assert abs(gap["charged_kwh"] - measured_kwh) < 1e-9
+    assert abs(gap["battery_hours"] - 0.5) < 1e-9
+    assert gap["total_hours"] == 1.0
+    # A later confirmed interval adds its own measured energy; the gap is left out of the flows but
+    # still visible in the coverage hours, instead of making the whole day unreadable forever.
     clock.advance(minutes=30)
     later = savings_tick(engine, clock, values, [measured_battery(power_w=500.0)])
-    assert later["charged_kwh"] is None
+    assert abs(later["charged_kwh"] - (measured_kwh + 0.25)) < 1e-9
+    assert abs(later["battery_hours"] - 1.0) < 1e-9
+    assert later["total_hours"] == 1.5
     assert later["battery_measured"] == 0
 
 
@@ -612,6 +618,55 @@ def test_savings_totals_aggregate_measured_flows_across_ranges():
     # sum of the two measured days only and the bucket flags zero coverage for those days.
     assert abs(all_totals["charged_kwh"] - 3.0) < 1e-9
     assert all_buckets and all_totals["measured_buckets"]["battery"] == 2
+
+
+def test_savings_row_survives_an_addon_restart():
+    """A restart continues today's stored row instead of overwriting it with the post-start part."""
+    engine, store, ha, clock, _settings = build_engine()
+    engine.plan_now("test")
+    values = {"grid_w": 500.0, "load_w": 1200.0, "pv_w": 300.0}
+    first = savings_tick(engine, clock, values, [measured_battery(power_w=1000.0)], minutes=30)
+    engine._flush_savings()  # noqa: SLF001
+    assert abs(first["charged_kwh"] - 0.5) < 1e-9
+    persisted = dict(store.savings[clock.now.date().isoformat()])
+
+    # A new Engine over the same store (what Supervisor does on an add-on update) hydrates the row
+    # before its first tick, so the next interval adds to it instead of starting from zero.
+    restarted, restarted_store, _ha2, restarted_clock, _settings2 = build_engine(clock=clock)
+    restarted_store.savings = {clock.now.date().isoformat(): dict(persisted)}
+    restarted._hydrate_savings_today()  # noqa: SLF001
+    restarted.plan_now("test")
+    assert abs(restarted._savings_today["charged_kwh"] - 0.5) < 1e-9  # noqa: SLF001
+    after = savings_tick(
+        restarted, restarted_clock, values, [measured_battery(power_w=1000.0)], minutes=30
+    )
+    assert abs(after["charged_kwh"] - 1.0) < 1e-9
+    assert abs(after["total_hours"] - 1.0) < 1e-9
+    assert abs(after["savings_hours"] - 1.0) < 1e-9
+
+
+def test_savings_sensor_publishes_time_coverage():
+    """0.30.0: the saving is scoped by sampled hours, not by an all-or-nothing day."""
+    engine, store, ha, clock, _settings = build_engine()
+    today = clock.now.date().isoformat()
+    store.savings = {
+        today: {
+            "import_kwh": 4.0, "export_kwh": 0.0, "cost_eur": 1.2, "revenue_eur": 0.0,
+            "baseline_cost_eur": 1.5, "savings_eur": 0.3,
+            "charged_kwh": 1.0, "discharged_kwh": 0.5,
+            "charge_cost_eur": 0.2, "discharge_value_eur": 0.05,
+            "total_hours": 4.0, "grid_hours": 4.0, "savings_hours": 3.0, "battery_hours": 2.0,
+            "grid_measured": 0, "battery_measured": 0,
+        }
+    }
+    engine._savings_cache = None  # noqa: SLF001
+    engine.publish_states(clock.now)
+    reading = ha.published["sensor.sem_savings_today"]
+    assert reading["state"] == "0.3"
+    assert reading["attributes"]["sampled_hours"] == 4.0
+    assert reading["attributes"]["baseline_hours"] == 3.0
+    assert reading["attributes"]["battery_hours"] == 2.0
+    assert reading["attributes"]["coverage_pct"] == 75.0
 
 
 def test_plan_execution_joins_measured_actuals_and_dispatches():

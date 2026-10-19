@@ -1460,11 +1460,16 @@ because it is the number the user will judge the add-on by.
 Savings are earned only by measured energy: `charged_kwh`/`discharged_kwh` integrate the measured AC
 battery power over time (a clamped or ramp-limited write counts the measured power, not the request),
 and `charge_cost_eur`/`discharge_value_eur` price those flows with the buy/sell series in force at
-flow time. A dry-run, blocked, stale-refused or unconfirmed-setpoint interval is never credited; if
-any interval in a day lacks a confirmed measurement, that day's battery flows and cycle count are
-`null`/unknown rather than a planned or partially measured number. `grid_measured`, `load_measured`,
-`pv_measured` and `battery_measured` record which measured series were present for every interval of
-the day; rows written before these columns existed keep working and read as unknown.
+flow time. A dry-run, blocked, stale-refused or unconfirmed-setpoint interval is never credited.
+**0.30.0 amendment — interval-level accounting.** A missing reading no longer poisons the whole day.
+Baseline, actual net cost and savings are accumulated per interval; an interval whose meter, price
+or battery reading is missing is excluded from both sides of the comparison and from the measured
+flows, so the remaining figure is exact for the time it covers. The day also records that coverage
+in hours (`total_hours`, `grid_hours`, `savings_hours`, `battery_hours`): baseline/savings are
+`null` only when no interval could be priced, and battery flows/cycles are `null` only when no
+interval was measured. `grid_measured`, `load_measured`, `pv_measured` and `battery_measured` keep
+their all-or-nothing meaning (the whole day/period was measured); rows written before the coverage
+columns existed have no hours and are counted as legacy periods, not as zero-coverage time.
 
 ---
 
@@ -1835,6 +1840,20 @@ than by weakening `tools/audit.sh`.
 ---
 
 ## 16. Amendment log (why the spec changed)
+
+**0.30.0 — savings are counted per interval, not per day.** No requirement changed; §11's "one gap
+makes the day unknown" rule produced a savings panel that read `unknown` on a live system where the
+battery was demonstrably being controlled: a single missing grid or battery poll (or a price that
+could not be priced on the baseline side) discarded the whole day, so 8 of 10 measured days had no
+baseline and the year/all views summed to nothing at all. §11 now states the interval-level rule:
+baseline, actual net cost and flows accumulate over the intervals that could be priced/measured, and
+the row records the sampled time it covers (`total_hours`, `grid_hours`, `savings_hours`,
+`battery_hours`, store migration 6). `null` means "no interval could be priced/measured", not "one
+interval was missing"; the all-or-nothing `*_measured` flags stay for "fully measured". The same
+amendment makes the `year`/`all` buckets contiguous calendar months (they stepped 30 days from the
+epoch, which skipped February and left holes), rolls a bucket up from the known rows instead of
+erasing it when one contained day was unmeasured, and restores the in-progress day from the store on
+startup so a restart no longer overwrites it with the post-start partial totals.
 
 **0.29.1 — the card carries every stylesheet it needs.** No requirement changed; §12.2 was wrong. The
 bundle inlined the two product sheets and not uPlot's own, and a card is a shadow root, so the SPA's

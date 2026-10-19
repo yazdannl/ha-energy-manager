@@ -338,11 +338,11 @@ Panels: **Savings range** (controls), **Totals**, **Savings vs baseline**, **Per
 | --- | --- |
 | Range select | `day`, `week`, `month`, `year`, `all` |
 | Totals cards | `Savings` (baseline minus actual, net), `Import cost`, `Baseline cost`, `Import`, `Export`, `PV`, `Cycles` |
-| Answer first | the saving/loss line, then `Baseline available for N of M measured periods`; the comparable baseline and actual net cost cover **the same periods** |
-| Unknown handling | `--`, a distinct `Unknown` card flag and an explicit banner when `savings_eur` / `baseline_cost_eur` are `null`; `Loss` and `Stale` are separate flags; unknown is never rendered as zero |
+| Answer first | the saving/loss line, then `Savings cover N% of the sampled time` (omitted at 100%); the comparable baseline and actual net cost cover **the same priced time** |
+| Unknown handling | `--`, a distinct `Unknown` card flag and an explicit banner when `savings_eur` / `baseline_cost_eur` are `null` (no sampled interval could be priced); `Loss` and `Stale` are separate flags; unknown is never rendered as zero |
 | Split row | `Battery energy for arbitrage` and `Battery energy for self-consumption`, or a note that the backend does not report the split |
-| Measured battery flows | a `Measured battery flows` banner, then `Charged (measured)`, `Discharged (measured)`, `Charge cost (measured, at buy)`, `Discharge value (measured, at sell)`; `--` when no bucket had a confirmed measurement. A dry-run, blocked or unconfirmed setpoint earns nothing |
-| Coverage | `Measured-series coverage (buckets with every interval measured): grid N of M, load N of M, PV N of M, battery N of M` |
+| Measured battery flows | a `Measured battery flows` banner, then `Charged (measured)`, `Discharged (measured)`, `Charge cost (measured, at buy)`, `Discharge value (measured, at sell)`; `--` only when no sampled interval had a confirmed measurement, plus `Measured over N% of the sampled time`. A dry-run, blocked or unconfirmed setpoint earns nothing |
+| Coverage | `Sampled-time coverage: grid X h, battery Y h, baseline Z h of W h sampled.` — the share of sampled time each figure really covers (0.30.0); legacy rows without hours are reported as legacy periods, not as uncovered time |
 | Baseline banner | `How the baseline is defined` — server `baseline_note`, plus the counterfactual re-pricing caveat |
 | Chart | savings bars + solid actual net cost / long-dashed baseline cost lines; null series are skipped, not plotted as 0 |
 | Per-bucket table | `Bucket`, `Period`, `Import`, `Export`, `PV`, `Cost`, `Revenue`, `Baseline`, `Savings`, `Cycles` (or `-- (unmeasured)`), `Charged (measured)`, `Discharged (measured)`, `Charge cost`, `Discharge value` |
@@ -1693,21 +1693,23 @@ savings     = baseline − (cost − revenue)
 
 `baseline` and `savings` are `None` (unknown) when the load is not knowable — that is, when neither
 ``load_kw``/``pv_kw`` nor the ``grid_kw``/``battery_kw`` pair is measured — and whenever the price on
-the side the baseline lands on is missing. A grid gap poisons the day's baseline exactly like a
-battery gap poisons its flows. Never a fabricated zero.
+the side the baseline lands on is missing. Since 0.30.0 both sides are accumulated interval by
+interval: a grid gap skips that interval's baseline *and* the matching actual cost instead of
+poisoning the day. Never a fabricated zero.
 
 **Measured-only battery credit (0.13.0).** `battery_kw` is passed only when the driver confirmed a
 real flow measurement (``BatteryState.power_measured``). A setpoint read back by the generic driver,
 or a Zendure reading that fell back to ``manual_power`` because the measured pair was incomplete, is
-an unconfirmed command and is passed as `None`. One unmeasured interval poisons the day: `charged_kwh`,
-`discharged_kwh`, `charge_cost_eur`, `discharge_value_eur` and `battery_cycles` become `None` and stay
-unknown, never a smaller partial total. Each day also records the coverage of the grid, load, PV and
-battery series (`grid_measured`, `load_measured`, `pv_measured`, `battery_measured`); rows written
-before these columns existed carry `NULL` and read as unknown.
+an unconfirmed command and is passed as `None`. Such an interval adds nothing to the flows; a later
+confirmed interval still counts (0.30.0), and `battery_hours` says how much of the sampled time was
+measured. Each day also records the fully measured series (`grid_measured`, `load_measured`,
+`pv_measured`, `battery_measured`); rows written before these columns existed carry `NULL` and read
+as unknown.
 
 **Ranges** (`range_bounds`): `day` = today from midnight; `week` = 7 days; `month` = 30 days;
 `year` = 365 days; `all` = since epoch. Buckets are days, except `year`/`all`, which bucket per month
-(`_BUCKET_LENGTHS` = 1 day, 30 days for year/all). Empty buckets are kept so the chart stays steady.
+(`_BUCKET_LENGTHS` = 1 day; year/all are contiguous **calendar months** since 0.30.0, so no month
+is skipped and February is never lost to a 30-day step). Empty buckets are kept so the chart stays steady.
 
 **Totals and split** (`savings_from_daily`):
 
@@ -1728,10 +1730,12 @@ and unknown rows keeps only the known rows (summed per row), so an unknown row's
 subtracted from a known baseline. `measured_periods` is how many buckets have data and
 `baseline_periods` how many of those could be re-priced.
 
-A per-bucket flow is `None` unless every row in the bucket measured it; totals sum the known buckets
-and the per-series `measured_buckets` counts say how many did. Buckets carry the same flags as
-booleans (`grid_measured`, `load_measured`, `pv_measured`, `battery_measured`). All of this is
-additive: a legacy row with no such columns reports unknown rather than crashing.
+A per-bucket flow is `None` only when no row in the bucket measured it; totals sum the rows that did
+and the per-series `measured_buckets` counts say how many buckets were measured for *every*
+interval. Buckets carry the same flags as booleans (`grid_measured`, `load_measured`, `pv_measured`,
+`battery_measured`) plus the sampled-time coverage in hours (`total_hours`, `grid_hours`,
+`savings_hours`, `battery_hours`) that the totals sum into `legacy_periods`-aware coverage. All of
+this is additive: a legacy row with no such columns reports unknown rather than crashing.
 
 Baselines are computed **before** the daily maintenance trim and stored in `savings_daily`, so the
 numbers stay comparable after raw rows are gone.
@@ -1941,7 +1945,7 @@ connection per thread.
 | `measurements` | 5-minute bucketed raw samples per role |
 | `actuals` | per-tick ground truth (pv, load, grid, measured battery, soc, buy/sell price, plan/dispatch power) |
 | `dispatch_log` | requested vs applied power, mode, dry run, result, code, message |
-| `savings_daily` | the accounting: import/export kWh, cost, revenue, baseline, savings, PV, cycles, measured charged/discharged kWh and their value, per-series coverage flags |
+| `savings_daily` | the accounting: import/export kWh, cost, revenue, baseline, savings, PV, cycles, measured charged/discharged kWh and their value, per-series coverage flags, sampled hours (total/grid/savings/battery) |
 | `learning_profiles` | PV and load corrections, derived solar capacity, and the live-write latch |
 | `forecast_cache` | cached provider payloads with fetch timestamps |
 | `events` | events and alerts |

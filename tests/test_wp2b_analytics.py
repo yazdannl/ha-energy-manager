@@ -98,7 +98,8 @@ def test_baseline_is_the_do_nothing_net_cost():
     assert buckets[0].savings_eur is None
     assert buckets[0].has_data is True and buckets[0].baseline_cost_eur is None
 
-    # A grid gap poisons the baseline for the whole day, even after a measurable interval.
+    # A grid gap no longer discards the whole day (0.30.0): the interval that could be priced stays
+    # in the figure, and the sampled time it covers is reported separately.
     good = analytics.daily_row_delta(
         None,
         day="2026-01-01",
@@ -126,7 +127,11 @@ def test_baseline_is_the_do_nothing_net_cost():
         capacity_kwh=5.0,
         now=now,
     )
-    assert gap["baseline_cost_eur"] is None and gap["savings_eur"] is None
+    assert abs(gap["baseline_cost_eur"] - good["baseline_cost_eur"]) < 1e-9
+    assert abs(gap["savings_eur"] - good["savings_eur"]) < 1e-9
+    assert gap["savings_hours"] == 1.0 and gap["total_hours"] == 2.0
+    assert gap["grid_hours"] == 1.0
+    assert gap["grid_measured"] == 0, "the series flag still records the full-period gap"
 
 
 def test_savings_daily_buckets_by_range():
@@ -295,8 +300,8 @@ def test_daily_row_delta_measured_battery_flows_and_coverage():
     assert abs(row["charge_cost_eur"] - 0.15) < 1e-9
     assert abs(row["discharge_value_eur"]) < 1e-9
     assert row["grid_measured"] == 1 and row["load_measured"] == 1 and row["battery_measured"] == 1
-    # A measurement gap makes the battery series unknown and poisons the day's flows: never a
-    # smaller partial total that looks measured, and never the planned value.
+    # A measurement gap is excluded from the flows instead of discarding them (0.30.0): the energy
+    # that *was* measured stays, the sampled time says how much of the period it covers.
     gap = analytics.daily_row_delta(
         row,
         day="2026-01-01",
@@ -310,10 +315,11 @@ def test_daily_row_delta_measured_battery_flows_and_coverage():
         capacity_kwh=5.0,
         now=NOW,
     )
-    assert gap["charged_kwh"] is None and gap["discharged_kwh"] is None
-    assert gap["charge_cost_eur"] is None and gap["discharge_value_eur"] is None
-    assert gap["battery_cycles"] is None
+    assert abs(gap["charged_kwh"] - 0.5) < 1e-9
+    assert abs(gap["discharged_kwh"]) < 1e-9
+    assert abs(gap["charge_cost_eur"] - 0.15) < 1e-9
     assert gap["battery_measured"] == 0
+    assert gap["battery_hours"] == 0.5 and gap["total_hours"] == 1.0
     recovered = analytics.daily_row_delta(
         gap,
         day="2026-01-01",
@@ -327,7 +333,9 @@ def test_daily_row_delta_measured_battery_flows_and_coverage():
         capacity_kwh=5.0,
         now=NOW,
     )
-    assert recovered["charged_kwh"] is None, "a measured interval cannot repair an incomplete day"
+    # A later measured interval adds to the measured part; the period still says it had a gap.
+    assert abs(recovered["charged_kwh"] - 1.0) < 1e-9
+    assert recovered["battery_hours"] == 1.0 and recovered["battery_measured"] == 0
     # A missing grid/PV interval is recorded too, so the bucket can say which series were present.
     missing = analytics.daily_row_delta(
         None,
@@ -380,6 +388,85 @@ def test_savings_daily_legacy_rows_stay_readable_as_unknown():
     assert totals["measured_buckets"] == {"grid": 0, "load": 0, "pv": 0, "battery": 0}
     # The legacy cycle estimate still drives the estimate-only arbitrage split.
     assert totals["arbitrage_kwh"] > 0.0
+
+
+def test_savings_coverage_is_sampled_time_not_all_or_nothing():
+    """A gap lowers the covered hours instead of discarding the measured part (0.30.0)."""
+    row = analytics.daily_row_delta(
+        None,
+        day="2026-01-01",
+        dt_hours=0.5,
+        grid_kw=1.0,
+        load_kw=1.0,
+        pv_kw=0.0,
+        battery_kw=0.0,
+        price_buy=0.3,
+        price_sell=0.1,
+        capacity_kwh=5.0,
+        now=NOW,
+    )
+    gap = analytics.daily_row_delta(
+        row,
+        day="2026-01-01",
+        dt_hours=0.5,
+        grid_kw=None,
+        load_kw=None,
+        pv_kw=None,
+        battery_kw=None,
+        price_buy=None,
+        price_sell=None,
+        capacity_kwh=5.0,
+        now=NOW,
+    )
+    assert gap["total_hours"] == 1.0
+    assert gap["grid_hours"] == 0.5 and gap["savings_hours"] == 0.5 and gap["battery_hours"] == 0.5
+    assert gap["savings_eur"] is not None, "the measured half is still a knowable saving"
+    assert gap["grid_measured"] == 0 and gap["battery_measured"] == 0
+
+    buckets, totals = analytics.savings_from_daily([gap], "day", NOW, capacity_kwh=5.0)
+    assert abs(buckets[0].savings_hours - 0.5) < 1e-9
+    assert abs(buckets[0].total_hours - 1.0) < 1e-9
+    assert abs(totals["savings_hours"] - 0.5) < 1e-9
+    assert abs(totals["grid_hours"] - 0.5) < 1e-9
+    assert abs(totals["battery_hours"] - 0.5) < 1e-9
+    assert totals["legacy_periods"] == 0.0
+
+    # A row from before the coverage columns has totals but no hour coverage: it is counted once
+    # as legacy, never as a 0-hour period that would make the coverage look worse than it is.
+    _buckets, legacy_totals = analytics.savings_from_daily(
+        [daily_row("2026-01-01", savings=1.0)], "day", NOW
+    )
+    assert legacy_totals["legacy_periods"] == 1.0
+    assert legacy_totals["total_hours"] == 0.0
+    assert abs(legacy_totals["savings_eur"] - 1.0) < 1e-9
+
+
+def test_year_and_all_buckets_are_calendar_months_without_gaps():
+    """Year/all are calendar months: stepping 30 days skipped February and holes in ``all``."""
+    rows = [daily_row("2026-01-01", savings=1.0), daily_row("2025-02-01", savings=2.0)]
+
+    year_buckets, _ = analytics.savings_from_daily(rows, "year", NOW)
+    year_keys = [bucket.key for bucket in year_buckets]
+    assert year_keys[0] == "2025-01" and year_keys[-1] == "2026-01"
+    assert len(year_keys) == 13 and year_keys == sorted(set(year_keys))
+    assert year_keys.index("2025-12") + 1 == year_keys.index("2026-01")
+
+    all_buckets, _ = analytics.savings_from_daily(rows, "all", NOW)
+    all_keys = [bucket.key for bucket in all_buckets]
+    assert all_keys[0] == "1970-01" and all_keys[-1] == "2026-01"
+    assert "1970-02" in all_keys, "February must not be skipped by a 30-day step"
+    assert all_keys.index("1970-12") + 1 == all_keys.index("1971-01")
+    assert len(all_keys) == len(set(all_keys)) == (2026 - 1970) * 12 + 1
+
+
+def test_year_bucket_keeps_the_measured_part_of_a_partly_measured_month():
+    """A month with one unmeasured day must not erase its measured flows (the year/all bug)."""
+    rows = [flow_row("2025-12-15", 2.0, 1.0), flow_row("2025-12-31", measured=False)]
+    buckets, totals = analytics.savings_from_daily(rows, "year", NOW)
+    december = next(bucket for bucket in buckets if bucket.key == "2025-12")
+    assert december.charged_kwh == 2.0 and december.discharged_kwh == 1.0
+    assert december.battery_measured is False, "the whole month was not fully measured"
+    assert totals["charged_kwh"] == 2.0 and totals["discharged_kwh"] == 1.0
 
 
 def test_accuracy_reports_mape_bias_and_series():

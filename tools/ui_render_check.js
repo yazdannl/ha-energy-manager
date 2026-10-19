@@ -707,9 +707,18 @@ function classTokens(text) {
     /Measured battery flows/.test(savingsText) && /Charged \(measured\)/.test(savingsText)
     && /Discharged \(measured\)/.test(savingsText) && /Charge cost/.test(savingsText),
     savingsText.slice(0, 160));
-  check("the savings view states measured-series coverage",
-    /Measured-series coverage/.test(savingsText) && /battery \d+ of \d+/.test(savingsText),
-    savingsText.slice(0, 200));
+  check("the savings view states sampled-time coverage",
+    /Sampled-time coverage: grid [\d.]+ h, battery [\d.]+ h, baseline [\d.]+ h of [\d.]+ h sampled\./.test(savingsText)
+    && /Savings cover \d+% of the sampled time/.test(savingsText)
+    && /Measured over \d+% of the sampled time/.test(savingsText),
+    savingsText.slice(0, 240));
+  check("the savings cards state the scope of each figure",
+    /metered intervals, before export revenue/.test(savingsText)
+    && /measured discharge ÷ pack capacity/.test(savingsText)
+    && /baseline minus actual \(net\)/.test(savingsText),
+    savingsText.slice(0, 240));
+  check("the time-coverage figure is formatted as hours", A.fmtHours(0.5) === "0.50 h"
+    && A.fmtHours(12) === "12.0 h" && A.fmtHours(null) === "--");
   const coverage = A.savingsCoverage([
     { has_data: false, baseline_cost_eur: null },
     { has_data: true, baseline_cost_eur: null },
