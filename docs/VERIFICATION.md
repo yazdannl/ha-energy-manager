@@ -1813,10 +1813,16 @@ that mismatch no longer reaches the hardware; making the capacity number itself 
 device's energy counters as a data source, which is a separate change.
 
 Measured on this tree: `python3 -m pytest tests -q` -> **1621 passed**, `sh tools/audit.sh` ->
-**clean, 171 files scanned**, `node tools/ui_render_check.js` -> **161 passed, 0 failed**. What is
-*not* verified from here: the add-on's `/api/v1/batteries` record, because it is ingress-only; the
-published plan feed is the readable surface, and after the 0.31.2 deploy its `round_trip` is the check
-(it must land near 0.845 instead of 0.9057).
+**clean, 171 files scanned**, `node tools/ui_render_check.js` -> **161 passed, 0 failed**.
+
+Deployed and observed live (2026-10-20T10:12Z, add-on **0.31.2**, `state: started`): the published
+plan now assumes **0.8473** instead of 0.9057, i.e. 0.2 points off the pack's own counters (0.8455)
+and well inside the 0.844-0.850 band those counters give across every equal-SoC span. The wear
+re-derived with it (0.0201 EUR/kWh), the cost basis replayed to 0.3103 EUR/kWh and the plan action
+moved to `pv_charge`, which is the efficiency change reaching the optimiser rather than a field.
+
+What is *not* verified from here: the add-on's `/api/v1/batteries` record (learned value, sample
+count and reason slug) and the battery card, because the add-on is ingress-only.
 
 ---
 
