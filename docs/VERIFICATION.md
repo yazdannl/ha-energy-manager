@@ -1797,11 +1797,28 @@ Measured on this tree: `python3 -m pytest tests -q` -> **1619 passed**, `sh tool
 171 files scanned**, `node tools/ui_render_check.js` -> **161 passed, 0 failed**. The UI wording now
 says what is measured ("complete charge/discharge cycle(s)") everywhere it used to say "pair(s)".
 
-What is *not* verified from here: the live relearned number. The add-on is ingress-only and advisory,
-so the published feed is the only readable surface; after the 0.31.1 deploy the plan summary's
-`round_trip` is the check (it must move off 0.8849 towards the pack's own figure, or fall back to the
-typed seed while fewer than three complete cycles are in the retained rows — both are correct
-outcomes, and the typed seed is what a rejected estimate is supposed to leave in force).
+Deployed and observed live (2026-10-20T09:36Z): a `POST /store/reload` (`GET` left `version_latest`
+at 0.31.0 and answered `unknown_error`; the `POST` refreshed it to 0.31.1) then
+`/addons/f20c2e09_energy_manager/update` moved the add-on to **0.31.1** with `state: started`. The
+restart ran daily maintenance, and the published plan now assumes **0.9057** — a schema-3 estimate
+from complete cycles, not the typed 0.8464, so the new rule did relearn.
+
+The live rows themselves are only inside the add-on, so the estimator was reproduced offline against
+the same Home Assistant history (`history/history_during_period` at 5-minute bucket alignment,
+2026-10-13 → 2026-10-20): 34 accepted windows, **6 complete cycles** (weighted median 0.9015, matching
+the live 0.9057), 4 half cycles rejected as incomplete and 2 as drift. The rule behaves on real data —
+the pack discharges deeper than it charges most days, those cycles are accepted, and the recordings that
+stop mid-leg are not extrapolated any more.
+
+The residual gap to the pack's own figure is *not* a pairing artefact and is not fixed here: the
+Solarflow reports `aggr_discharge / aggr_charge` = 26.375 / 30.836 = **0.8554**, 5 points below the
+learned 0.90, and the window capacities split the same way — charge legs imply 1.97 kWh against a
+1.92 kWh nominal (0.5 % high) while discharge legs imply 2.18 kWh (11 % high), i.e. the pack's own
+AC-out per SoC point runs ahead of its AC-in per SoC point by more than a 0.855 round trip allows. The
+device's 0.855 is a lifetime aggregate that includes the taper and every partial cycle, so a full-power
+cycle measuring higher is plausible; whether the planner should use the marginal figure it measures or
+be bounded by the device's aggregate is a separate decision (SPEC 5 does not constrain it, and the
+learned value is applied on its own evidence).
 
 ---
 
