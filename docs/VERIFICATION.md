@@ -1695,6 +1695,71 @@ change (month/week/year/all JSON via the add-on's own API on the HA host). No po
 is recorded here; verifying that the corrected accounting reproduces the ledger's booked discharge on
 the real instance is the follow-up check scheduled 24 hours after deploy.
 
+### 8.25 The pack stops at the plan's target, and both learned values are the default (0.31.0)
+
+The report was three sentences against one live plan: "it still charges to 100 % although the plan
+says 95 %", "the plans should use the learned capacity" and "the round trip should be learned too".
+Reading the live feed against the code turned them into one cause with three faces.
+
+*The plan was already right.* `sensor.sem_chart_plan` ended its charge window on the terminal target
+(1000 W slots taking 79.0 % → 90.2 %, a final 422 W slot landing on exactly 95.0 %, then 0 W), so
+nothing in the solver had to change. What ran past it was the guard: `control.safety.check` clamped
+only against `max_soc_pct` (100 %), so every tick wrote the slot's modelled power and the pack went on
+to 100 %. Clause 5b now bounds the tick with the slot's own end-of-slot energy
+(`soc_kwh + power·h·eta`, cut at zero in the plan's direction) and names `plan_soc_target` when it is
+the binding clause.
+
+*The learned capacity was never used.* `capacity_source` defaulted to `manual`, so the estimate that
+explains the overshoot never reached the planner, and the UI dialog coerced every value that was not
+exactly `learned` back to `manual`. The semantics are now `auto` (default) / `pinned` (opt-out), with
+`manual`/`learned` accepted and normalised on load, on write and in every view.
+
+*The round trip was the last guess.* It drives the DP transitions, the salvage value, the break-even,
+the wear and the cost-basis floor, and it was the only number still typed in. `app/efficiency.py`
+learns it from charge/discharge pairs of the same accepted windows, where the capacity cancels
+exactly: `eta_c·eta_d = Ed·dSoc_c / (Ec·dSoc_d)`.
+
+*And the capacity learner was integrating a command.* It preferred the signed `battery_power` role,
+which for this integration is `power_setpoint_entity` — a value the BMS need not follow (the live
+2026-10-12 charge never started while the setpoint was written every tick). The measured
+`battery_charge`/`battery_discharge` pair now wins and the signed role is only a fallback. Payload
+schema 2 makes an estimate written by the old formula reported-but-not-applied, so an upgrade cannot
+inherit it; the next maintenance relearn rewrites it.
+
+Tests: 6 new control-layer tests (the cut at the target, riding the trajectory instead of the
+hardware ceiling, never reversing the direction, the mirrored discharge, `_plan_track`'s target and
+boundary including the hold slot, and an end-to-end dispatcher tick that holds a pack ahead of the
+plan and journals `plan_soc_target` rather than a driver error), the engine-level tests that the
+learned round trip reaches the plan summary and that `pinned` ignores it, the two schema-guard tests
+(an old capacity/round-trip payload is reported but never applied), and the API-capability test that
+`manual`/`learned` normalise to `auto` while `nonsense` is still refused. `tools/ui_render_check.js`
+gained two checks: the batteries card states the learned round trip with its evidence, and the
+configured seed next to the effective value. The one existing test whose plan contradicted its own
+device (a slot modelled from 50 % while the device reported 55 %) now uses a self-consistent plan, so
+the trajectory guard has nothing to cut and the failsafe regression it pins is unchanged.
+
+Measured on this tree: `python3 -m pytest tests -q` -> **1607 passed** (1594 passed, 1 skipped
+before; 13 new tests, 1 rewritten), `sh tools/audit.sh` -> **clean, 170 files scanned**,
+`node tools/ui_render_check.js` -> **161 passed, 0 failed** (159 before).
+
+Deployed and observed live (2026-10-20T07:26Z): `supervisor/api /store/reload` then
+`/addons/f20c2e09_energy_manager/update` moved the add-on to **0.31.0** with `state: started`, and the
+first tick of the day ran daily maintenance, so the new round-trip learner immediately published an
+estimate. The published feed shows the change in the number the planner uses: `round_trip` moved from
+the typed `0.8464` (0.92²) to **0.884866** (eta 0.94067 per leg) and `wear_eur_per_kwh` from 0.0201
+to **0.019748**, with `sell_floor_eur_per_kwh` 0.38962 = 0.32729/0.884866 + 0.019748 — the cost-basis
+floor moving with it, i.e. the learned value is in force in the plan and the ledger, not only in a
+field. The plan's own trajectory still lands on the target (a 422 W slot from 90.2 % to exactly
+95.0 %), which is now also the guard's target: its slots imply a modelled capacity of 2.08–2.11 kWh
+against the pack's 1.92 kWh nominal, the very mismatch that made the pack run ahead of the plan
+during charging and reach 100 % before this change.
+
+What is *not* verified from here: the add-on's `/api/v1/batteries` record (learned capacity and round
+trip with their sample counts and reason slugs) and the battery card itself, because the add-on is
+ingress-only and the ingress session needs the owner's browser; and an actual dispatch cut, because
+the live instance runs `mode: advisory` with `dry_run: true` and the current plan is a hold. The cut
+is covered by the six control-layer tests above.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
