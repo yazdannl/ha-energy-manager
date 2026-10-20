@@ -1858,7 +1858,7 @@ capacity in both directions. Reading the implied capacity out of every slot tran
 (`|power| × h × eta / |dSoC|`) gives 2.045 kWh while charging and 2.050 while discharging -- the same
 number, the 0.25 % spread being the feed's two-decimal SoC rounding, and the mixed median it replaced
 was 2.097. The round trip is unchanged at 0.8473 (0.32.0 did not touch that estimator) and wear
-re-derived to 0.02062 EUR/kWh from the new capacity.
+re-derived to 0.0206 EUR/kWh from the new capacity.
 
 The learned 2.05 kWh still sits ~7 % above the 1.92 nameplate, and that is expected rather than a
 second bug: the model's capacity is *energy per reported SoC point* (what the DP needs to turn power
