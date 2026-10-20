@@ -3720,12 +3720,12 @@
       return "Round-trip efficiency: pinned — the configured " + asPct(eff.configured) + " is used everywhere and the estimate is ignored.";
     }
     if (eff.learned == null) {
-      return "Learned round trip: no published estimate yet (" + eff.samples + " of 3 accepted charge/discharge pairs). The configured " + asPct(eff.configured) + " seed is used meanwhile.";
+      return "Learned round trip: no published estimate yet (" + eff.samples + " of 3 complete charge/discharge cycles). The configured " + asPct(eff.configured) + " seed is used meanwhile.";
     }
     if (!eff.applied) {
-      return "Learned round trip ignored (" + (eff.reason || "rejected") + "); the configured " + asPct(eff.configured) + " seed is used. Estimate was " + asPct(eff.learned) + " from " + eff.samples + " pair(s).";
+      return "Learned round trip ignored (" + (eff.reason || "rejected") + "); the configured " + asPct(eff.configured) + " seed is used. Estimate was " + asPct(eff.learned) + " from " + eff.samples + " complete cycle(s).";
     }
-    return "Learned from measured cycles: " + asPct(eff.learned) + " round trip from " + eff.samples + " accepted charge/discharge pair(s), last learned " + timeAgo(eff.updated) + ". Effective round trip " + asPct(eff.effective) + ".";
+    return "Learned from measured cycles: " + asPct(eff.learned) + " round trip from " + eff.samples + " complete charge/discharge cycle(s), last learned " + timeAgo(eff.updated) + ". Effective round trip " + asPct(eff.effective) + ".";
   }
 
   /** The config the card's economics must use: the learned round trip when it is in force (SPEC 5). */
@@ -3917,7 +3917,7 @@
           el("p", { class: "field-help", text: capacityLearningText(cap) }),
           el("p", { class: "field-help", text: "Configured " + fmtKwh(cap.configured) + " kWh · effective " + fmtKwh(cap.effective) + " kWh" + (cap.samples ? " · " + cap.samples + " accepted measurement window(s)" : "") + (cap.updated ? " · last learned " + timeAgo(cap.updated) : "") + ". Switch between auto and pinned in Edit → Learned values." }),
           el("p", { class: "field-help", text: efficiencyLearningText(effInfo) }),
-          el("p", { class: "field-help", text: "Round trip " + fmtPct(effInfo.configured == null ? null : effInfo.configured * 100) + " configured · " + fmtPct(effInfo.effective == null ? null : effInfo.effective * 100) + " effective" + (effInfo.samples ? " · " + effInfo.samples + " accepted charge/discharge pair(s)" : "") + (effInfo.updated ? " · last learned " + timeAgo(effInfo.updated) : "") + ". A pair is one measured charge followed by one measured discharge, so the round trip is measured without trusting any capacity figure." })
+          el("p", { class: "field-help", text: "Round trip " + fmtPct(effInfo.configured == null ? null : effInfo.configured * 100) + " configured · " + fmtPct(effInfo.effective == null ? null : effInfo.effective * 100) + " effective" + (effInfo.samples ? " · " + effInfo.samples + " complete charge/discharge cycle(s)" : "") + (effInfo.updated ? " · last learned " + timeAgo(effInfo.updated) : "") + ". A cycle is one measured charge and the measured discharge that takes the pack back through the same range, so the round trip is measured without trusting any capacity figure and without extrapolating a half cycle." })
         ])
       ]),
       economics,

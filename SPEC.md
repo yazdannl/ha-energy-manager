@@ -420,7 +420,9 @@ The capacity estimate pairs AC energy with SoC change over 5-minute rows (SPEC 7
 window ``capacity = AC_charge_kWh * eta_charge / dSoC`` and for a discharge window
 ``capacity = AC_discharge_kWh / eta_discharge / |dSoC|`` (each efficiency sits on its own leg). A
 window is accepted only with ``|dSoC| >= 10`` points, ``mean |power| >= 20 %`` of that battery's own
-limit for the direction, finite values and no gap longer than one sample; accepted windows are
+limit for the direction, finite values and no gap longer than one sample, and only the sample pairs
+that moved the SoC in the run's direction book energy (a pack resting at its limit adds no phantom
+energy to the window); accepted windows are
 combined with a median after a median-absolute-deviation outlier filter, kept to the last 20, clamped
 to a plausible 1..200 kWh and published only with at least 3 accepted windows. An estimate older than
 30 days is stale. The window's AC energy is the **measured** ``battery_charge``/``battery_discharge``
@@ -430,10 +432,16 @@ low-confidence estimate falls back to the seed, and every transition is logged w
 slug (``capacity_learned`` / ``capacity_learned_stale`` / ``capacity_learned_low_confidence`` /
 ``capacity_learned_unavailable``; ``capacity_manual`` is the pinned case).
 
-The round-trip estimate reuses those windows as **pairs** (one accepted charge followed by one
-accepted discharge). With charge AC energy ``Ec`` over ``dSoc_c`` and discharge ``Ed`` over
-``dSoc_d``: ``eta_c * eta_d = Ed * dSoc_c / (Ec * dSoc_d)`` — the capacity cancels exactly, so the
-round trip is measured without believing any capacity figure. A pair's diagnostic capacity
+The round-trip estimate reuses those windows as **pairs**: one accepted charge and *the discharge
+that follows it*, forming a complete cycle. With charge AC energy ``Ec`` over ``dSoc_c`` and
+discharge ``Ed`` over ``dSoc_d``: ``eta_c * eta_d = (Ed / dSoc_d) / (Ec / dSoc_c)`` — AC energy per
+SoC point out against AC energy per SoC point in, in which the capacity cancels exactly, so the round
+trip is measured without believing any capacity figure and without extrapolating a partial leg. Only
+a *complete* cycle counts: the discharge has to take the pack back to (or past) the SoC the charge
+started from, within 15 % of the charge's span or 2 points (a shorter discharge is a half cycle and
+is rejected; a deeper one is fine, and its extra depth is never counted as charged energy), and the
+pack has to hold the energy in between (drift at most 10 % of the span or 1 point, otherwise the
+energy left the pack without being converted). A pair's diagnostic capacity
 ``sqrt(Ec * Ed / (dSoc_c * dSoc_d))`` merely rejects a pair whose energy cannot come from a plausible
 pack. Pairs are weighted by ``min(dSoc_c, dSoc_d)``, outlier-filtered by median absolute deviation,
 combined with a weighted median, and published after at least 3 accepted pairs (30-day staleness);
@@ -2922,7 +2930,33 @@ round, with the reason:
   learned against a 1.92 kWh nominal, i.e. exactly the fast-pack overshoot). Rejected alternatives:
   hard-coding the terminal target into the safety layer (a second source of truth that would drift from
   the plan), clamping on the *current* SoC against the target without a trajectory (flapping at the
-  boundary), and learning the round trip from full cycles only (the live pack rarely completes one).
+  boundary), and pair-less totals (see the 0.31.1 amendment, which does require a complete cycle).
+
+- **§5/§7.3 (a round trip is a complete cycle, and only SoC-moving samples pay for it; requested
+  2026-10-20, "we should only compare a full charge cycle in our range with a full discharge cycle in
+  our range, so the efficiency does not fluctuate when we go from full charge to full discharge and
+  vice versa")** — the 0.31.0 estimator paired each charge window with the *next* discharge window and
+  scored it as ``Ed·dSoc_c / (Ec·dSoc_d)``: two independent totals, each measured over whatever span
+  the range happened to contain. The live consequence was an 88.5 % learned round trip (0.9407 per
+  leg) against a pack whose own integration reports 82.9 %, and an estimate that moved whenever a
+  recording began or ended mid-leg. Two changes: (i) pairing is now a *complete cycle* — the next
+  discharge only counts when it takes the pack back to (or past) the SoC the charge started from
+  (within 15 % of the charge's span or 2 points) and the pack held the energy in between (drift at
+  most 10 % of the span or 1 point); a shorter discharge is rejected as `pairs_incomplete` instead of
+  being scaled up, a deeper one is accepted because the score is energy per SoC point, and the payload
+  reports `deeper_pct`/`charge_dsoc_pct`/`discharge_dsoc_pct` so the UI can show what was measured.
+  (ii) `extract_windows` books AC energy only for the sample pairs that moved the SoC in the run's
+  direction. A pair that leaves the SoC where it was — the pack resting at its ceiling, or a
+  whole-percent reading that did not tick — used to book full power for five minutes, which credited a
+  window with energy it never moved: it inflated short windows most (a 12-point charge by up to a
+  third) and it biased the live capacity high (2.09-2.11 kWh learned against a 1.92 kWh nominal), which
+  is the mismatch the 0.31.0 dispatch clamp was absorbing. Both learners consume the corrected window,
+  so `capacity.SCHEMA` and `efficiency.SCHEMA` are bumped to 3 and payloads written by 0.31.0 are
+  reported but never auto-applied; a restart relearns from the persisted rows. Rejected alternatives:
+  comparing the two AC totals (a deeper discharge would report more energy out than in), scaling a
+  partial window by its SoC-delta ratio (exactly the extrapolation this removes), and requiring the
+  discharge to close to the *point* (the live daily pattern charges to the ceiling and discharges past
+  where the charge began, so a strict closure would reject nearly every real cycle).
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

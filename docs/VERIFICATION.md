@@ -1746,8 +1746,8 @@ Deployed and observed live (2026-10-20T07:26Z): `supervisor/api /store/reload` t
 `/addons/f20c2e09_energy_manager/update` moved the add-on to **0.31.0** with `state: started`, and the
 first tick of the day ran daily maintenance, so the new round-trip learner immediately published an
 estimate. The published feed shows the change in the number the planner uses: `round_trip` moved from
-the typed `0.8464` (0.92²) to **0.884866** (eta 0.94067 per leg) and `wear_eur_per_kwh` from 0.0201
-to **0.019748**, with `sell_floor_eur_per_kwh` 0.38962 = 0.32729/0.884866 + 0.019748 — the cost-basis
+the typed `0.8464` (0.92²) to **0.8849** (eta 0.9406 per leg) and `wear_eur_per_kwh` from 0.0201
+to **0.0197**, with `sell_floor_eur_per_kwh` 0.3896 = 0.3273/0.8849 + 0.0197 — the cost-basis
 floor moving with it, i.e. the learned value is in force in the plan and the ledger, not only in a
 field. The plan's own trajectory still lands on the target (a 422 W slot from 90.2 % to exactly
 95.0 %), which is now also the guard's target: its slots imply a modelled capacity of 2.08–2.11 kWh
@@ -1759,6 +1759,49 @@ trip with their sample counts and reason slugs) and the battery card itself, bec
 ingress-only and the ingress session needs the owner's browser; and an actual dispatch cut, because
 the live instance runs `mode: advisory` with `dry_run: true` and the current plan is a hold. The cut
 is covered by the six control-layer tests above.
+
+### 8.26 The learned round trip is a complete cycle (0.31.1)
+
+The correction was one sentence: "we should only compare a full charge cycle in our range vs a full
+discharge cycle in our range, so the efficiency does not fluctuate when we go from full charge to
+full discharge and vice versa". The 0.31.0 estimator paired a charge window with the next discharge
+window and scored two independent AC totals scaled by their own SoC spans, so a recording that began
+or ended mid-leg was extrapolated into an efficiency, and the live estimate (88.5 %, eta 0.9406 per
+leg) sat well above the pack's own integration (82.9 %).
+
+What changed, and what the tests pin:
+
+* **A pair is a complete cycle.** The discharge has to take the pack back to (or past) the SoC the
+  charge started from — within 15 % of the charge's span or 2 points — with the pack holding the
+  energy in between (drift at most 10 % or 1 point). A shorter discharge is rejected as
+  `pairs_incomplete` rather than scaled up; a deeper one is a cycle, because the score is AC energy
+  per SoC point (`0.8` for the fixture pack at either depth) and the extra depth is energy that was
+  already in the pack, never charged energy.
+* **The fixture pack is physically consistent.** Every test leg takes exactly the time its AC energy
+  needs at its power (`stored = AC·eta` while charging, `AC = stored·eta` while discharging), so the
+  arithmetic is asserted exactly rather than to a tolerance: a 60-point cycle at a 0.8 round trip
+  measures 0.8, an edge-trimmed recording measures 0.8, and the diagnostic capacity comes back as the
+  2.0 kWh the fixture holds.
+* **A window books only the energy that moved the SoC.** The edge pair of every run — the pack resting
+  at its ceiling, a whole-percent reading that did not tick — used to book full power for five
+  minutes. On a 12-point charge that is up to a third of the window's energy, and on the live pack it
+  biased the learned capacity high (2.09–2.11 kWh against a 1.92 kWh nominal), which is exactly the
+  mismatch the 0.31.0 dispatch clamp was absorbing. Only SoC-moving pairs accumulate `ac_kwh` now, so
+  a window's energy pays for exactly its `dsoc_pct`.
+* **Both schemas are 3.** Payloads written by 0.31.0 (schema 2) are still reported — samples, median,
+  evidence — but never auto-applied, so a restart relearns from the persisted 5-minute rows instead of
+  planning on a phantom-inflated capacity. The tests cover a schema-2 payload being reported and not
+  applied for both learners.
+
+Measured on this tree: `python3 -m pytest tests -q` -> **1619 passed**, `sh tools/audit.sh` -> **clean,
+171 files scanned**, `node tools/ui_render_check.js` -> **161 passed, 0 failed**. The UI wording now
+says what is measured ("complete charge/discharge cycle(s)") everywhere it used to say "pair(s)".
+
+What is *not* verified from here: the live relearned number. The add-on is ingress-only and advisory,
+so the published feed is the only readable surface; after the 0.31.1 deploy the plan summary's
+`round_trip` is the check (it must move off 0.8849 towards the pack's own figure, or fall back to the
+typed seed while fewer than three complete cycles are in the retained rows — both are correct
+outcomes, and the typed seed is what a rejected estimate is supposed to leave in force).
 
 ---
 

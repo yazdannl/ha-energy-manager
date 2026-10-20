@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.31.1
+
+- **Fix: the learned round trip is measured on a complete cycle only.** The 0.31.0 estimator paired
+  each charge window with the *next* discharge and scored `Ed·dSoc_c / (Ec·dSoc_d)`: two independent
+  totals, each over whatever span the recording happened to contain, so a cycle that started or ended
+  mid-leg was extrapolated and the estimate moved as the pack ran between full and empty (live:
+  88.5 % learned against the pack's own 82.9 %). A pair is now a *complete cycle*: the discharge has
+  to take the pack back to (or past) the SoC the charge started from — within 15 % of the charge's
+  span or 2 points — and the pack has to hold the energy in between (drift at most 10 % or 1 point).
+  A shorter discharge is rejected as `pairs_incomplete` instead of being scaled up; a deeper one is
+  accepted, and the score `(Ed / dSoc_d) / (Ec / dSoc_c)` means its extra depth (energy that was
+  already in the pack) is never counted as charged energy. Each pair reports `charge_dsoc_pct`,
+  `discharge_dsoc_pct` and `deeper_pct`.
+- **Fix: a window books only the energy that moved the SoC.** `extract_windows` used to add
+  `|power| × gap` for every same-direction sample pair, including the pair that leaves the SoC where
+  it was — the pack resting at its ceiling, or a whole-percent reading that did not tick. That
+  credited a window with energy it never moved: worst on short windows (a 12-point charge by up to a
+  third), and on the live pack it biased the learned capacity high (2.09-2.11 kWh against a 1.92 kWh
+  nominal), which is the mismatch the 0.31.0 dispatch clamp was quietly absorbing. A window's
+  `ac_kwh` now pays for exactly its `dsoc_pct`, in both learners.
+- **Schema:** `capacity.SCHEMA` and `efficiency.SCHEMA` are 3; a payload written by 0.31.0 (or older)
+  is still reported but never auto-applied, so a restart relearns from the persisted 5-minute rows
+  instead of planning on a phantom-inflated capacity.
+
 ## 0.31.0
 
 - **Fix: the pack stops charging where the plan says, not where the hardware says.** The plan already

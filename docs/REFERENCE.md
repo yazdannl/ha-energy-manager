@@ -810,7 +810,9 @@ persisted 5-minute `battery_charge|discharge:<id>` (measured AC pair, preferred)
 `learning_profiles` payload of kind `battery_capacity`, keyed by battery id (never a settings key).
 A *window* is a maximal run of same-direction power broken by a direction change, a zero sample or a
 gap longer than one sample; it is accepted only with `|dSoC| >= 10` points and
-`mean |power| >= 20 %` of that battery's own limit. The capacity is `AC_kWh * eta_charge / dSoC`
+`mean |power| >= 20 %` of that battery's own limit, and only the sample pairs that moved the SoC in
+the run's direction book AC energy (a pack resting at its limit must not add phantom energy to the
+window, and the window's `ac_kwh` then pays for exactly its `dsoc_pct`). The capacity is `AC_kWh * eta_charge / dSoC`
 while charging and `AC_kWh / eta_discharge / |dSoC|` while discharging. Accepted windows are
 combined with a median after a MAD outlier filter, kept to the last 20, clamped to 1..200 kWh and
 published only with at least 3 windows; an estimate older than 30 days is stale. `auto` falls back
@@ -822,13 +824,21 @@ journals a stable reason slug (`capacity_learned`, `capacity_learned_stale`,
 Re-learning runs in daily maintenance.
 
 **Learned round trip.** `app/efficiency.py` learns `eta_charge * eta_discharge` from *pairs* of the
-same accepted windows (one charge window followed by one discharge window, at most
-`MAX_PAIR_GAP_DAYS` apart, same battery, finite values): `eta_c·eta_d = Ed·dSoc_c / (Ec·dSoc_d)`, in
-which the capacity cancels exactly — the efficiency is measured without trusting any capacity figure.
-The pair's diagnostic capacity `sqrt(Ec·Ed / (dSoc_c·dSoc_d))` only rejects energy that cannot come
-from a plausible 1..200 kWh pack. Pairs are weighted by `min(dSoc_c, dSoc_d)`, MAD-filtered and
-combined with a weighted median (`weighted_median`), kept to the last 20, and published only with at
-least 3 accepted pairs (30-day staleness). The learned round trip is split evenly into
+same accepted windows (one charge window and the discharge that follows it, at most
+`MAX_PAIR_GAP_DAYS` apart, same battery, finite values), and only a **complete cycle** counts: the
+discharge must take the pack back to (or past) the SoC the charge started from, within
+`FULL_CYCLE_TOLERANCE_FRACTION` of the charge's span or `FULL_CYCLE_TOLERANCE_PCT` points, and the
+pack must have held the energy in between (drift at most `HOLD_DRIFT_TOLERANCE_FRACTION` /
+`HOLD_DRIFT_TOLERANCE_PCT`). A shorter discharge is rejected (`pairs_incomplete`) rather than
+extrapolated; a deeper one is fine, because the score is AC energy per SoC point:
+`eta_c·eta_d = (Ed / dSoc_d) / (Ec / dSoc_c)`, in which the capacity cancels exactly — the efficiency
+is measured without trusting any capacity figure, and without turning the depth of a leg (energy that
+was already in the pack) into a loss, so the estimate no longer moves as the cycle runs between full
+and empty. The pair's diagnostic capacity `sqrt(Ec·Ed / (dSoc_c·dSoc_d))` only rejects energy that
+cannot come from a plausible 1..200 kWh pack; each pair reports `charge_dsoc_pct`,
+`discharge_dsoc_pct` and `deeper_pct` so the payload says what it measured. Pairs are weighted by
+`min(dSoc_c, dSoc_d)`, MAD-filtered and combined with a weighted median (`weighted_median`), kept to
+the last 20, and published only with at least 3 accepted pairs (30-day staleness). The learned round trip is split evenly into
 `eta_charge = eta_discharge = sqrt(round_trip)` — the same convention as a typed round trip — so the
 DP, the wear, the break-even, the cost-basis floor and the UI all read one number. Reason slugs:
 `efficiency_learned`, `efficiency_learned_stale`, `efficiency_learned_low_confidence`,

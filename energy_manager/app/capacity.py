@@ -62,11 +62,12 @@ __all__ = [
 #: Store ``learning_profiles`` kind for the per-battery estimate; the key is the battery id.
 PROFILE_KIND = "battery_capacity"
 
-#: Payload schema (0.31.0 raises it to 2).  The AC energy of a window used to be read from the
-#: signed ``battery_power`` role -- the ``power_setpoint_entity`` *command* -- and is now the measured
-#: charge/discharge pair, so a payload written by the old formula measured partly the setpoint and is
-#: not trusted (the typed seed stands until the next maintenance relearn rewrites it).
-SCHEMA = 2
+#: Payload schema.  Schema 2 (0.31.0) reads a window's AC energy from the measured
+#: charge/discharge pair instead of the signed ``battery_power`` *command*; schema 3 (0.31.1) books
+#: energy only for the sample pairs that moved the SoC, which removes the phantom edge sample that used
+#: to inflate short windows.  A payload from an older schema is reported but not trusted -- the typed
+#: seed stands until the next maintenance relearn rewrites it.
+SCHEMA = 3
 
 #: A window's SoC must move at least this many points to be trusted.
 MIN_DSOC_PCT = 10.0
@@ -168,10 +169,13 @@ def extract_windows(
     """Turn ``(ts, ac_power_w, soc_pct)`` samples into accepted capacity windows.
 
     Returns ``(accepted, rejected)``. Each accepted window is
-    ``{kind, capacity_kwh, dsoc_pct, mean_power_w, samples, ac_kwh, start, end}``. A run is broken
+    ``{kind, capacity_kwh, dsoc_pct, mean_power_w, samples, ac_kwh, start, end, soc_start_pct,
+    soc_end_pct}``. A run is broken
     (and never joined
     across the break) by a direction change, a zero/invalid power sample or a gap longer than one
-    sample, so a missing measurement can only shorten a window, never bridge it.
+    sample, so a missing measurement can only shorten a window, never bridge it. Energy is booked
+    only for the sample pairs that moved the SoC in the run's direction, so a window's ``ac_kwh``
+    always paid for its ``dsoc_pct`` (a pack resting at its limit does not add phantom energy).
     """
     accepted: list[dict[str, Any]] = []
     rejected = {"gaps": 0, "direction": 0, "dsoc": 0, "power": 0, "invalid": 0}
@@ -228,6 +232,11 @@ def extract_windows(
                 "ac_kwh": ac_kwh,
                 "start": current["start_ts"],
                 "end": current["end_ts"],
+                # The SoC the window started and ended on, so a *complete cycle* can be recognised
+                # (``app.efficiency`` pairs a charge with the discharge that returns the pack to
+                # where it started; a partial leg is not extrapolated into an efficiency).
+                "soc_start_pct": round(start_soc, 3),
+                "soc_end_pct": round(end_soc, 3),
             }
         )
 
@@ -262,11 +271,16 @@ def extract_windows(
                 "power_abs": 0.0,
                 "count": 0,
             }
-        run["end_soc"] = soc_end
-        run["end_ts"] = t1
-        run["ac_kwh"] += abs(power) * gap / 60.0 / 1000.0
-        run["power_abs"] += abs(power)
-        run["count"] += 1
+        # Book the energy only when the pack actually moved in the run's direction.  A sample pair
+        # that leaves the SoC where it was carries no SoC movement to divide the energy by, and in
+        # practice it is the pack resting at its limit (or the whole-percent reading not ticking):
+        # booking it would credit a window with energy it never moved and inflate its capacity.
+        if (soc_end - soc_start) * sign > 0:
+            run["end_soc"] = soc_end
+            run["end_ts"] = t1
+            run["ac_kwh"] += abs(power) * gap / 60.0 / 1000.0
+            run["power_abs"] += abs(power)
+            run["count"] += 1
     flush()
     return accepted, rejected
 

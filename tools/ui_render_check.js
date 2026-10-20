@@ -204,7 +204,7 @@ function classTokens(text) {
   check(
     "the batteries card states the learned round trip and its evidence",
     /Learned from measured cycles: 81\.3 % round trip/.test(capacityText)
-      && /4 accepted charge\/discharge pair/.test(capacityText),
+      && /4 complete charge\/discharge cycle/.test(capacityText),
     capacityText.slice(0, 240),
   );
   check(
