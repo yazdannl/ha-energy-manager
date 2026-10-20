@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.31.2
+
+- **Fix: the learned round trip is an energy balance, not a per-SoC-point ratio.** 0.31.1 learned
+  0.9057 on the live pack while the pack's own cumulative counters said 0.8554, and the same counters
+  measured between moments with identical SoC — the one comparison that needs neither a capacity nor
+  a SoC scale — put the truth at **0.8455**. Dividing each leg's AC energy by its own SoC span
+  assumed the SoC reading is proportional to the energy moved; this pack's taper compresses the top of
+  its range, so the per-point ratio read the SoC scale as extra efficiency. A pair is now scored by
+  `dSOC·C = I·x − O/x` for `x = eta_charge = eta_discharge` (round trip `x²`): a closed cycle is
+  `O/I` exactly, a deeper one is corrected by the energy the pack gave up, and the capacity is only a
+  small correction term (the median is identical at 1.92, 2.05 and 2.10 kWh). Each pair is weighted by
+  its span and by `I / (I + |dSOC·C|)`, so a deep cycle cannot dominate on a guessed capacity. On the
+  live rows the same cycles now score **0.843** (30 days) / 0.851 (7 days).
+- **Fix: a window books its taper.** 0.31.1 dropped *every* sample pair whose SoC did not move, which
+  threw away the real energy a pack absorbs while the whole-percent reading stalls at the top. Only
+  the *trailing* pairs of a run (the pack resting at its limit) are dropped now.
+- **Schema:** `efficiency.SCHEMA` is 4 (capacity stays 3, its window rule changed in the same sense);
+  a payload written by an older build is reported but never auto-applied, so a restart relearns.
+- The learned capacity now reads 2.02 kWh on charge legs and 2.15 on discharge legs against the 1.92
+  nameplate, because the top of the range really does compress the SoC reading. That number is not
+  re-derived here: dispatch is already bounded by the plan's own SoC trajectory (0.31.0), so the
+  overshoot it used to hide cannot happen.
+
 ## 0.31.1
 
 - **Fix: the learned round trip is measured on a complete cycle only.** The 0.31.0 estimator paired

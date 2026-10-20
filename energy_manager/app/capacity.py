@@ -204,7 +204,7 @@ def extract_windows(
         if limit <= 0 or mean_power < MIN_POWER_FRACTION * limit:
             rejected["power"] += 1
             return
-        ac_kwh = current["ac_kwh"]
+        ac_kwh = current["ac_kwh"] - current.get("tail_ac", 0.0)
         if ac_kwh <= 0 or not math.isfinite(ac_kwh):
             rejected["invalid"] += 1
             return
@@ -264,23 +264,34 @@ def extract_windows(
             run = {
                 "sign": sign,
                 "start_soc": soc_start,
-                "end_soc": soc_end,
+                "end_soc": soc_start,
                 "start_ts": t0,
-                "end_ts": t1,
+                "end_ts": t0,
                 "ac_kwh": 0.0,
                 "power_abs": 0.0,
                 "count": 0,
+                "tail_ac": 0.0,
+                "tail_count": 0,
             }
-        # Book the energy only when the pack actually moved in the run's direction.  A sample pair
-        # that leaves the SoC where it was carries no SoC movement to divide the energy by, and in
-        # practice it is the pack resting at its limit (or the whole-percent reading not ticking):
-        # booking it would credit a window with energy it never moved and inflate its capacity.
-        if (soc_end - soc_start) * sign > 0:
+        energy = abs(power) * gap / 60.0 / 1000.0
+        moved = (soc_end - soc_start) * sign > 0
+        if moved:
             run["end_soc"] = soc_end
             run["end_ts"] = t1
-            run["ac_kwh"] += abs(power) * gap / 60.0 / 1000.0
-            run["power_abs"] += abs(power)
-            run["count"] += 1
+        run["ac_kwh"] += energy
+        run["power_abs"] += abs(power)
+        run["count"] += 1
+        # Keep the energy of the *trailing* sample pairs that did not move the SoC apart.  A pack
+        # resting at its limit (or a whole-percent reading that stopped ticking) leaves the run one
+        # or more samples long after it stopped storing energy; booking that would credit the window
+        # with energy it never moved and inflate its capacity.  Mid-run plateaus are quantization and
+        # stay booked -- they are paid for by SoC movement on either side.
+        if moved:
+            run["tail_ac"] = 0.0
+            run["tail_count"] = 0
+        else:
+            run["tail_ac"] += energy
+            run["tail_count"] += 1
     flush()
     return accepted, rejected
 

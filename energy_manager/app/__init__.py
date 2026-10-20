@@ -4,4 +4,4 @@ See the atom's own modules: :mod:`app.models` (frozen vocabulary), :mod:`app.con
 :mod:`app.harest`, :mod:`app.haws`, :mod:`app.store` and :mod:`app.sources`.
 """
 
-__version__ = "0.31.1"
+__version__ = "0.31.2"

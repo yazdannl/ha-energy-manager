@@ -810,9 +810,10 @@ persisted 5-minute `battery_charge|discharge:<id>` (measured AC pair, preferred)
 `learning_profiles` payload of kind `battery_capacity`, keyed by battery id (never a settings key).
 A *window* is a maximal run of same-direction power broken by a direction change, a zero sample or a
 gap longer than one sample; it is accepted only with `|dSoC| >= 10` points and
-`mean |power| >= 20 %` of that battery's own limit, and only the sample pairs that moved the SoC in
-the run's direction book AC energy (a pack resting at its limit must not add phantom energy to the
-window, and the window's `ac_kwh` then pays for exactly its `dsoc_pct`). The capacity is `AC_kWh * eta_charge / dSoC`
+`mean |power| >= 20 %` of that battery's own limit, and the window's AC energy is every
+same-direction sample pair except the *trailing* pairs that left the SoC where it was: a pack resting
+at its limit must not add phantom energy to the window, while a mid-run SoC plateau is the taper
+storing real energy and stays booked. The capacity is `AC_kWh * eta_charge / dSoC`
 while charging and `AC_kWh / eta_discharge / |dSoC|` while discharging. Accepted windows are
 combined with a median after a MAD outlier filter, kept to the last 20, clamped to 1..200 kWh and
 published only with at least 3 windows; an estimate older than 30 days is stale. `auto` falls back
@@ -830,11 +831,15 @@ discharge must take the pack back to (or past) the SoC the charge started from, 
 `FULL_CYCLE_TOLERANCE_FRACTION` of the charge's span or `FULL_CYCLE_TOLERANCE_PCT` points, and the
 pack must have held the energy in between (drift at most `HOLD_DRIFT_TOLERANCE_FRACTION` /
 `HOLD_DRIFT_TOLERANCE_PCT`). A shorter discharge is rejected (`pairs_incomplete`) rather than
-extrapolated; a deeper one is fine, because the score is AC energy per SoC point:
-`eta_c·eta_d = (Ed / dSoc_d) / (Ec / dSoc_c)`, in which the capacity cancels exactly — the efficiency
-is measured without trusting any capacity figure, and without turning the depth of a leg (energy that
-was already in the pack) into a loss, so the estimate no longer moves as the cycle runs between full
-and empty. The pair's diagnostic capacity `sqrt(Ec·Ed / (dSoc_c·dSoc_d))` only rejects energy that
+extrapolated; a deeper one is fine, because the score is the cycle's **energy balance**, not a ratio
+of the legs: with `I` kWh in, `O` kWh out, an assumed capacity `C` and a net SoC change `dSOC`,
+`x = eta_charge = eta_discharge` solves `dSOC·C = I·x − O/x`, and the round trip is `x²`. A closed
+cycle reduces to `O/I`; a deeper one is corrected by the energy the pack gave up. `C` (the battery's
+own `capacity_kwh`, reported as `assumed_capacity_kwh`) is only a correction term — a closed cycle
+never uses it — and each pair weighs `min(dSoc_c, dSoc_d) · I / (I + |dSOC·C|)` so a deep cycle cannot
+dominate on a guessed capacity. Dividing by the SoC per leg instead is measurably optimistic on a real
+pack: its taper compresses the top of the range, which per-point scoring reads as extra efficiency
+(live: 0.889 against 0.8455 measured from the pack's energy counters). The pair's diagnostic capacity `sqrt(Ec·Ed / (dSoc_c·dSoc_d))` only rejects energy that
 cannot come from a plausible 1..200 kWh pack; each pair reports `charge_dsoc_pct`,
 `discharge_dsoc_pct` and `deeper_pct` so the payload says what it measured. Pairs are weighted by
 `min(dSoc_c, dSoc_d)`, MAD-filtered and combined with a weighted median (`weighted_median`), kept to

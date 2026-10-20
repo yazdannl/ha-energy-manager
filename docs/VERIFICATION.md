@@ -1760,65 +1760,63 @@ ingress-only and the ingress session needs the owner's browser; and an actual di
 the live instance runs `mode: advisory` with `dry_run: true` and the current plan is a hold. The cut
 is covered by the six control-layer tests above.
 
-### 8.26 The learned round trip is a complete cycle (0.31.1)
+### 8.26 The learned round trip is a complete cycle, scored by its energy balance (0.31.1, 0.31.2)
 
 The correction was one sentence: "we should only compare a full charge cycle in our range vs a full
 discharge cycle in our range, so the efficiency does not fluctuate when we go from full charge to
-full discharge and vice versa". The 0.31.0 estimator paired a charge window with the next discharge
-window and scored two independent AC totals scaled by their own SoC spans, so a recording that began
-or ended mid-leg was extrapolated into an efficiency, and the live estimate (88.5 %, eta 0.9406 per
-leg) sat well above the pack's own integration (82.9 %).
+full discharge and vice versa". Then, after the first deploy: "chase it down, I need accurate
+figures". Both are closed here; the second one needed a ground truth, not a better guess.
 
-What changed, and what the tests pin:
+**0.31.1 — pairing.** The 0.31.0 estimator paired a charge window with the next discharge window and
+scored two independent AC totals scaled by their own SoC spans, so a recording that began or ended
+mid-leg was extrapolated into an efficiency. A pair is now a *complete cycle*: the discharge has to
+take the pack back to (or past) the SoC the charge started from (within 15 % of the span or 2 points),
+the pack has to hold the energy in between (drift at most 10 % or 1 point), a shallower discharge is
+rejected as `pairs_incomplete`, and a deeper one is accepted. Deployed and observed live
+(2026-10-20T09:36Z): `POST /store/reload` (the `GET` variant left `version_latest` at the old
+version and answered `unknown_error`; the POST refreshed it) then `/addons/f20c2e09_energy_manager/
+update` moved the add-on to 0.31.1 with `state: started`, and the plan immediately assumed the new
+estimate (0.9057) instead of the typed 0.8464.
 
-* **A pair is a complete cycle.** The discharge has to take the pack back to (or past) the SoC the
-  charge started from — within 15 % of the charge's span or 2 points — with the pack holding the
-  energy in between (drift at most 10 % or 1 point). A shorter discharge is rejected as
-  `pairs_incomplete` rather than scaled up; a deeper one is a cycle, because the score is AC energy
-  per SoC point (`0.8` for the fixture pack at either depth) and the extra depth is energy that was
-  already in the pack, never charged energy.
-* **The fixture pack is physically consistent.** Every test leg takes exactly the time its AC energy
-  needs at its power (`stored = AC·eta` while charging, `AC = stored·eta` while discharging), so the
-  arithmetic is asserted exactly rather than to a tolerance: a 60-point cycle at a 0.8 round trip
-  measures 0.8, an edge-trimmed recording measures 0.8, and the diagnostic capacity comes back as the
-  2.0 kWh the fixture holds.
-* **A window books only the energy that moved the SoC.** The edge pair of every run — the pack resting
-  at its ceiling, a whole-percent reading that did not tick — used to book full power for five
-  minutes. On a 12-point charge that is up to a third of the window's energy, and on the live pack it
-  biased the learned capacity high (2.09–2.11 kWh against a 1.92 kWh nominal), which is exactly the
-  mismatch the 0.31.0 dispatch clamp was absorbing. Only SoC-moving pairs accumulate `ac_kwh` now, so
-  a window's energy pays for exactly its `dsoc_pct`.
-* **Both schemas are 3.** Payloads written by 0.31.0 (schema 2) are still reported — samples, median,
-  evidence — but never auto-applied, so a restart relearns from the persisted 5-minute rows instead of
-  planning on a phantom-inflated capacity. The tests cover a schema-2 payload being reported and not
-  applied for both learners.
+**The ground truth.** The pack exposes cumulative energy counters, so the round trip can be read
+without any model at all: take two moments with the *same* reported SoC and divide the counter
+deltas. 91 such spans over five days (2026-10-14 → 2026-10-19) give **0.844-0.850, median 0.8455**,
+and one clean five-day stretch gives 11.864 / 13.970 = **0.8492**. The device's own
+`roundtrip_efficiency` sensor read 85.5 % and its lifetime counters 26.375 / 30.836 = 0.8554 (a
+lifetime average that includes higher-efficiency cycles), so the order of magnitude was never in
+doubt: the learner at 0.9057 was ~5 points optimistic.
 
-Measured on this tree: `python3 -m pytest tests -q` -> **1619 passed**, `sh tools/audit.sh` -> **clean,
-171 files scanned**, `node tools/ui_render_check.js` -> **161 passed, 0 failed**. The UI wording now
-says what is measured ("complete charge/discharge cycle(s)") everywhere it used to say "pair(s)".
+**0.31.2 — scoring.** The cause was not the pairing but the score: dividing each leg's AC energy by
+its own SoC span assumes the SoC reading is proportional to the energy moved, and this pack's is not.
+Its taper compresses the top of the range, so a charge that puts 1.35 kWh across 63 points reads
+0.0214 kWh/point while its matching discharge reads 0.0193 across 76, and the per-point ratio booked
+the SoC scale as extra efficiency. The pair is now scored by the cycle's energy balance —
+`dSOC*C = I*x - O/x`, `x = eta_charge = eta_discharge`, round trip `x^2` — which uses the SoC only as
+a small net-change correction and never divides by it. Replaying the live rows offline (the same
+`history/history_during_period` 5-minute buckets, 2026-10-13 → 2026-10-20) gives:
 
-Deployed and observed live (2026-10-20T09:36Z): a `POST /store/reload` (`GET` left `version_latest`
-at 0.31.0 and answered `unknown_error`; the `POST` refreshed it to 0.31.1) then
-`/addons/f20c2e09_energy_manager/update` moved the add-on to **0.31.1** with `state: started`. The
-restart ran daily maintenance, and the published plan now assumes **0.9057** — a schema-3 estimate
-from complete cycles, not the typed 0.8464, so the new rule did relearn.
+| scorer | 30-day window | 7-day window | vs counters (0.8455) |
+|---|---|---|---|
+| per SoC point (0.31.1) | 0.889 | 0.889 | +4.4 pt |
+| cycle totals (rejected) | 0.964 | — | meaningless (spans differ) |
+| energy balance (0.31.2) | **0.843** | **0.851** | 0.2 / 0.5 pt |
 
-The live rows themselves are only inside the add-on, so the estimator was reproduced offline against
-the same Home Assistant history (`history/history_during_period` at 5-minute bucket alignment,
-2026-10-13 → 2026-10-20): 34 accepted windows, **6 complete cycles** (weighted median 0.9015, matching
-the live 0.9057), 4 half cycles rejected as incomplete and 2 as drift. The rule behaves on real data —
-the pack discharges deeper than it charges most days, those cycles are accepted, and the recordings that
-stop mid-leg are not extrapolated any more.
+The balance is also insensitive to the capacity it assumes (median 0.843 at 1.92, 0.843 at 2.05,
+0.843 at 2.10 kWh), and a *closed* cycle does not use it at all. One window rule was corrected with
+it: 0.31.1 dropped every sample pair whose SoC did not move, which threw away the taper's real
+energy; only the *trailing* pairs of a run are dropped now.
 
-The residual gap to the pack's own figure is *not* a pairing artefact and is not fixed here: the
-Solarflow reports `aggr_discharge / aggr_charge` = 26.375 / 30.836 = **0.8554**, 5 points below the
-learned 0.90, and the window capacities split the same way — charge legs imply 1.97 kWh against a
-1.92 kWh nominal (0.5 % high) while discharge legs imply 2.18 kWh (11 % high), i.e. the pack's own
-AC-out per SoC point runs ahead of its AC-in per SoC point by more than a 0.855 round trip allows. The
-device's 0.855 is a lifetime aggregate that includes the taper and every partial cycle, so a full-power
-cycle measuring higher is plausible; whether the planner should use the marginal figure it measures or
-be bounded by the device's aggregate is a separate decision (SPEC 5 does not constrain it, and the
-learned value is applied on its own evidence).
+Known and deliberately not fixed here: booking the taper raises the learned capacity (charge legs
+2.02 kWh, discharge legs 2.15, against the 1.92 nameplate) because the top of the range compresses
+the SoC reading. Dispatch is already bounded by the plan's own trajectory (SPEC 9.3 clause 5b), so
+that mismatch no longer reaches the hardware; making the capacity number itself exact would need the
+device's energy counters as a data source, which is a separate change.
+
+Measured on this tree: `python3 -m pytest tests -q` -> **1621 passed**, `sh tools/audit.sh` ->
+**clean, 171 files scanned**, `node tools/ui_render_check.js` -> **161 passed, 0 failed**. What is
+*not* verified from here: the add-on's `/api/v1/batteries` record, because it is ingress-only; the
+published plan feed is the readable surface, and after the 0.31.2 deploy its `round_trip` is the check
+(it must land near 0.845 instead of 0.9057).
 
 ---
 

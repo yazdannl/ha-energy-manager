@@ -233,8 +233,8 @@ def test_an_untracked_soc_window_is_invalid_not_guessed():
     assert pairs == [] and rejected["invalid"] == 1
 
 
-def test_the_pair_is_energy_per_soc_point_not_two_totals():
-    """Exact arithmetic, no extraction in the way: 1.2 kWh in, 0.96 kWh out, 50 points each."""
+def test_a_closed_cycle_is_the_energy_ratio_and_needs_no_capacity():
+    """1.2 kWh in, 0.96 kWh out, same SoC at both ends: 0.8, whatever the capacity assumed."""
     charged = {
         "kind": "charge",
         "ac_kwh": 1.2,
@@ -253,14 +253,39 @@ def test_the_pair_is_energy_per_soc_point_not_two_totals():
         "start": T0 + timedelta(hours=2),
         "end": T0 + timedelta(hours=4),
     }
-    pairs, _rejected = pair_windows([charged, drained])
-    assert pairs[0]["round_trip"] == pytest.approx(0.8, rel=1e-12)
-    # Depth does not enter the ratio: the same pack discharged 50 -> 10 (60 points) is still 0.8,
-    # even though its AC total is 1.2x the charge's.
-    deeper = dict(drained, ac_kwh=0.96 * 60 / 50, dsoc_pct=60.0, soc_end_pct=10.0)
-    pairs, _rejected = pair_windows([charged, deeper])
-    assert pairs[0]["round_trip"] == pytest.approx(0.8, rel=1e-12)
-    assert pairs[0]["deeper_pct"] == pytest.approx(10.0)
+    for capacity in (1.0, 1.92, 2.0, 4.0):
+        pairs, _rejected = pair_windows([charged, drained], capacity_kwh=capacity)
+        assert pairs[0]["round_trip"] == pytest.approx(0.8, rel=1e-12)
+        assert pairs[0]["net_kwh"] == pytest.approx(0.0)
+        assert pairs[0]["weight"] == pytest.approx(50.0)
+
+
+def test_a_deeper_cycle_is_corrected_by_the_energy_the_pack_gave_up():
+    """60 points down instead of 50: the extra 0.2 kWh stored leaves at `eta`, so 1.2522 kWh out."""
+    eta = ROUND_TRIP**0.5
+    charged = {
+        "kind": "charge",
+        "ac_kwh": 1.2,
+        "dsoc_pct": 50.0,
+        "soc_start_pct": 20.0,
+        "soc_end_pct": 70.0,
+        "start": T0,
+        "end": T0 + timedelta(hours=2),
+    }
+    drained = {
+        "kind": "discharge",
+        "ac_kwh": 0.96 + 0.2 * eta,
+        "dsoc_pct": 60.0,
+        "soc_start_pct": 70.0,
+        "soc_end_pct": 10.0,
+        "start": T0 + timedelta(hours=2),
+        "end": T0 + timedelta(hours=4),
+    }
+    pairs, _rejected = pair_windows([charged, drained], capacity_kwh=CAPACITY)
+    assert pairs[0]["round_trip"] == pytest.approx(ROUND_TRIP, rel=1e-9)
+    assert pairs[0]["net_kwh"] == pytest.approx(-0.2)
+    # A deep cycle leans on the capacity, so it weighs less than a closed one of the same span.
+    assert pairs[0]["weight"] < pairs[0]["charge_dsoc_pct"]
 
 
 # ------------------------------------------------------------------------------- payload
@@ -278,6 +303,18 @@ def test_the_estimate_needs_three_complete_cycles_before_it_is_published():
     assert three["eta_charge"] == pytest.approx(ETA, rel=REL)
     # The diagnostic capacity: AC energy per SoC point taken in, times the span -> 2.0 kWh.
     assert three["capacity_kwh"] == pytest.approx(CAPACITY, rel=REL)
+
+
+def test_the_payload_says_which_capacity_the_balance_used():
+    """The capacity is a correction term, so the payload states it and stays insensitive to it."""
+    samples = cycle(T0) + cycle(T0 + timedelta(hours=12)) + cycle(T0 + timedelta(hours=24))
+    closed = estimate(samples)
+    assert closed["assumed_capacity_kwh"] == pytest.approx(CAPACITY)
+    # A closed cycle never divides by the SoC, so a wrong capacity cannot move it.
+    for capacity in (1.2, 4.0):
+        assert estimate(samples, capacity_kwh=capacity)["round_trip"] == pytest.approx(
+            ROUND_TRIP, rel=1e-9
+        )
 
 
 def test_an_implausible_round_trip_is_not_published():
@@ -304,5 +341,5 @@ def test_the_payload_is_stamped_with_the_current_schema():
         cycle(T0) + cycle(T0 + timedelta(hours=12)) + cycle(T0 + timedelta(hours=24))
     )
     assert payload["schema"] == efficiency_learning.SCHEMA
-    # 3: complete cycles only, scored per SoC point, on windows that book only SoC-moving energy.
-    assert efficiency_learning.SCHEMA == 3
+    # 4: complete cycles only, scored by energy balance, on windows that book their taper.
+    assert efficiency_learning.SCHEMA == 4

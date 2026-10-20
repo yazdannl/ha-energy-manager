@@ -82,17 +82,22 @@ __all__ = [
 PROFILE_KIND = "battery_efficiency"
 
 #: Payload schema.  Schema 1 paired *any* later discharge with a charge and scaled by the SoC-span
-#: ratio, so a partial cycle was extrapolated into an efficiency; schema 2 already required a complete
-#: cycle but still scored the two AC totals over differing depths; schema 3 scores AC energy per SoC
-#: point on a complete cycle over windows whose energy only pays for SoC movement (see
-#: :data:`app.capacity.SCHEMA`).  A payload from an older schema is reported but not trusted, and the
-#: typed value stands until the next maintenance relearn rewrites it.
-SCHEMA = 3
+#: ratio; schema 2 required a complete cycle but compared the two AC totals across differing depths;
+#: schema 3 scored AC energy per SoC point (which turns an asymmetric SoC reading into ~3 points of
+#: optimism); schema 4 scores the **energy balance** over the cycle (see :func:`pair_windows`), which
+#: needs no SoC division at all and matches the pack's own counters to half a point.  A payload from
+#: an older schema is reported but not trusted, and the typed value stands until the next maintenance
+#: relearn rewrites it.
+SCHEMA = 4
 
 #: At least this many accepted charge/discharge pairs before the estimate is published.
 MIN_ACCEPTED_PAIRS = 3
 #: Accepted pairs kept in the stored payload (the combination only needs their medians).
 MAX_KEPT_PAIRS = 20
+#: The capacity a pair uses to turn its net SoC change into stored energy.  Only a correction term:
+#: a closed cycle (``net_kwh == 0``) does not use it at all, and a deep one is weighted down by how
+#: much it leans on it.  ``estimate_round_trip`` is given the battery's own capacity.
+DEFAULT_CAPACITY_KWH = 2.0
 #: A pair is only a cycle when the discharge immediately follows the charge; a week apart is still
 #: one pack (the windows are consecutive, so this only bounds the idle time between them).
 MAX_PAIR_GAP_DAYS = 7.0
@@ -160,25 +165,40 @@ def weighted_median(pairs: Sequence[tuple[float, float]]) -> float | None:
 def pair_windows(
     windows: Sequence[Mapping[str, Any]],
     *,
+    capacity_kwh: float = DEFAULT_CAPACITY_KWH,
     max_gap_days: float = MAX_PAIR_GAP_DAYS,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Turn accepted capacity windows into *complete-cycle* pairs.
 
-    Returns ``(accepted, rejected)``.  Each accepted pair is
-    ``{round_trip, capacity_kwh, charge_dsoc_pct, discharge_dsoc_pct, deeper_pct, weight, at}``.
+    Returns ``(accepted, rejected)``.  Each accepted pair is ``{round_trip, charge_kwh,
+    discharge_kwh, net_kwh, charge_dsoc_pct, discharge_dsoc_pct, deeper_pct, implied_capacity_kwh,
+    weight, at}``.
+
     Only two *consecutive* windows are ever a candidate -- a charge and the discharge that follows
     it -- and the discharge must cover the charge's whole span: it has to bring the pack back to (or
     past) the SoC the charge started from, within :data:`FULL_CYCLE_TOLERANCE_FRACTION` of the
     charge's span (or :data:`FULL_CYCLE_TOLERANCE_PCT` points), with the pack holding that energy in
     between (drift within :data:`HOLD_DRIFT_TOLERANCE_FRACTION` / :data:`HOLD_DRIFT_TOLERANCE_PCT`).
-    A discharge that stops higher is a half cycle and is rejected; a deeper one is fine, because the
-    comparison is per SoC point and the extra depth is never counted as energy the charge put in.
+    A discharge that stops higher is a half cycle and is rejected; a deeper one is fine.
 
-    Comparing a charge with an *unrelated* later discharge, or scaling one leg's span onto the
-    other's, is what makes a partial cycle look like a measurement: the pack ends the range fuller
-    or emptier than it started and the ratio absorbs stored energy as if it were a loss.  Such a
-    candidate is rejected (``pairs_incomplete`` / ``pairs_drift``) rather than extrapolated, so the
-    estimate does not move when a range happens to start or end mid-cycle.
+    The score is the **energy balance** over the cycle, not a ratio of the two legs' totals and not
+    a per-SoC-point ratio: with AC energy ``I`` in and ``O`` out, an assumed ``C`` kWh and a net SoC
+    change ``dSOC``, the split efficiency ``x = eta_charge = eta_discharge`` satisfies
+    ``dSOC * C = I * x - O / x``, so ``x = (dSOC*C + sqrt((dSOC*C)^2 + 4*I*O)) / (2*I)`` and the
+    round trip is ``x^2``.  A closed cycle (``dSOC = 0``) reduces to ``O / I`` exactly, and a deeper
+    one is corrected by the energy the pack actually gave up instead of being extrapolated from
+    whole-percent SoC readings.  That matters because a measured pack can report SoC *asymmetrically*
+    (live: 0.0219 kWh per charge point against 0.0186 kWh per discharge point), which a per-point
+    ratio turns into a 3-point error: on the live rows the same cycles score 0.889 per point against
+    0.861 by balance, and the balance agrees with the pack's own counters to 0.6 points.  Each pair
+    is weighted by its SoC span *and* by how little the capacity assumption matters to it
+    (``I / (I + |dSOC*C|)``), so a deep cycle cannot dominate on a guessed capacity.
+
+    Comparing a charge with an *unrelated* later discharge is what makes a partial cycle look like a
+    measurement: the pack ends the range fuller or emptier than it started and the ratio absorbs
+    stored energy as if it were a loss.  Such a candidate is rejected (``pairs_incomplete`` /
+    ``pairs_drift``) rather than extrapolated, so the estimate does not move when a range happens to
+    start or end mid-cycle.
     """
     accepted: list[dict[str, Any]] = []
     rejected = {"order": 0, "gap": 0, "drift": 0, "incomplete": 0, "invalid": 0}
@@ -230,12 +250,15 @@ def pair_windows(
         if deeper < -tolerance:
             rejected["incomplete"] += 1
             continue
-        fraction_c = dsoc_c / 100.0
-        fraction_d = dsoc_d / 100.0
-        # AC energy per SoC point, delivered against taken in: the capacity cancels, and the residual
-        # span mismatch is divided out instead of being extrapolated onto the other leg.
-        round_trip = (ed / fraction_d) / (ec / fraction_c)
-        implied_capacity = math.sqrt(ec * ed / (fraction_c * fraction_d))
+        # The cycle's net stored-energy change, from the pin-to-pin SoC change and the assumed
+        # capacity.  It is the only place the SoC scale enters, and it enters as a *small* correction
+        # term (a closed cycle has none at all).
+        net_kwh = (float(soc_end_d) - float(soc_start_c)) / 100.0 * capacity_kwh
+        # Solve I*x - O/x = net for the per-leg efficiency x (the positive root of a quadratic).
+        root = math.sqrt(net_kwh * net_kwh + 4.0 * ec * ed)
+        x = (net_kwh + root) / (2.0 * ec)
+        round_trip = x * x
+        implied_capacity = math.sqrt(ec * ed / (dsoc_c / 100.0 * dsoc_d / 100.0))
         if not (
             math.isfinite(round_trip)
             and math.isfinite(implied_capacity)
@@ -246,16 +269,22 @@ def pair_windows(
         ):
             rejected["invalid"] += 1
             continue
+        # A cycle whose own stored change is large relative to the energy moved leans on the capacity
+        # assumption, so it counts for less than a closed one: I / (I + |net|) is 1 at closure.
+        conditioning = ec / (ec + abs(net_kwh))
         accepted.append(
             {
                 "round_trip": round_trip,
-                "capacity_kwh": implied_capacity,
+                "charge_kwh": round(ec, 4),
+                "discharge_kwh": round(ed, 4),
+                "net_kwh": round(net_kwh, 4),
                 "charge_dsoc_pct": round(dsoc_c, 3),
                 "discharge_dsoc_pct": round(dsoc_d, 3),
-                # How much deeper than the charge the discharge went (0 = a closed cycle).  The
-                # per-SoC-point ratio means that extra depth is not counted as charged energy.
+                # How much deeper than the charge the discharge went (0 = a closed cycle).
                 "deeper_pct": round(deeper, 3),
-                "weight": min(dsoc_c, dsoc_d),
+                # The capacity that pairs *would* imply (a diagnostic; the score does not use it).
+                "implied_capacity_kwh": round(implied_capacity, 4),
+                "weight": min(dsoc_c, dsoc_d) * conditioning,
                 "at": to_iso(drained["start"]),
             }
         )
@@ -267,6 +296,7 @@ def estimate_round_trip(
     *,
     max_charge_w: float,
     max_discharge_w: float,
+    capacity_kwh: float = DEFAULT_CAPACITY_KWH,
     sample_minutes: float = capacity_learning.DEFAULT_SAMPLE_MINUTES,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -285,7 +315,8 @@ def estimate_round_trip(
         eta_discharge=1.0,
         sample_minutes=sample_minutes,
     )
-    pairs, rejected_pairs = pair_windows(windows)
+    capacity = _finite(capacity_kwh) or DEFAULT_CAPACITY_KWH
+    pairs, rejected_pairs = pair_windows(windows, capacity_kwh=capacity)
     values = [pair["round_trip"] for pair in pairs]
     mask = capacity_learning.mad_filter(values)
     kept = [pair for pair, keep in zip(pairs, mask) if keep]
@@ -300,7 +331,7 @@ def estimate_round_trip(
     applied_value = round_trip if count >= MIN_ACCEPTED_PAIRS else None
     eta = math.sqrt(applied_value) if applied_value is not None else None
     implied_capacity = capacity_learning.robust_median(
-        [pair["capacity_kwh"] for pair in kept]
+        [pair["implied_capacity_kwh"] for pair in kept]
     )
     rejected = {f"windows_{key}": value for key, value in rejected_windows.items()}
     rejected.update({f"pairs_{key}": value for key, value in rejected_pairs.items()})
@@ -309,6 +340,9 @@ def estimate_round_trip(
         "median_round_trip": round_trip,
         "eta_charge": eta,
         "eta_discharge": eta,
+        # The battery capacity the balance used (a correction term only) and the capacity the pairs
+        # would imply on their own, kept as a diagnostic and never fed back into planning.
+        "assumed_capacity_kwh": capacity,
         "capacity_kwh": implied_capacity,
         "samples": count,
         "pairs": kept[-MAX_KEPT_PAIRS:],
@@ -422,6 +456,7 @@ def learn_round_trip(
         capacity_learning.samples_from_rows(rows, battery.id),
         max_charge_w=battery.max_charge_w,
         max_discharge_w=battery.max_discharge_w,
+        capacity_kwh=float(battery.capacity_kwh),
         sample_minutes=sample_minutes,
         now=moment,
     )

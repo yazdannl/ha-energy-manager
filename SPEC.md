@@ -420,9 +420,10 @@ The capacity estimate pairs AC energy with SoC change over 5-minute rows (SPEC 7
 window ``capacity = AC_charge_kWh * eta_charge / dSoC`` and for a discharge window
 ``capacity = AC_discharge_kWh / eta_discharge / |dSoC|`` (each efficiency sits on its own leg). A
 window is accepted only with ``|dSoC| >= 10`` points, ``mean |power| >= 20 %`` of that battery's own
-limit for the direction, finite values and no gap longer than one sample, and only the sample pairs
-that moved the SoC in the run's direction book energy (a pack resting at its limit adds no phantom
-energy to the window); accepted windows are
+limit for the direction, finite values and no gap longer than one sample; the window's energy is
+every same-direction sample pair except the *trailing* ones that left the SoC where it was (a pack
+resting at its limit must not add phantom energy to the window, while a mid-run SoC plateau is the
+taper doing real work and stays booked); accepted windows are
 combined with a median after a median-absolute-deviation outlier filter, kept to the last 20, clamped
 to a plausible 1..200 kWh and published only with at least 3 accepted windows. An estimate older than
 30 days is stale. The window's AC energy is the **measured** ``battery_charge``/``battery_discharge``
@@ -433,15 +434,25 @@ slug (``capacity_learned`` / ``capacity_learned_stale`` / ``capacity_learned_low
 ``capacity_learned_unavailable``; ``capacity_manual`` is the pinned case).
 
 The round-trip estimate reuses those windows as **pairs**: one accepted charge and *the discharge
-that follows it*, forming a complete cycle. With charge AC energy ``Ec`` over ``dSoc_c`` and
-discharge ``Ed`` over ``dSoc_d``: ``eta_c * eta_d = (Ed / dSoc_d) / (Ec / dSoc_c)`` — AC energy per
-SoC point out against AC energy per SoC point in, in which the capacity cancels exactly, so the round
-trip is measured without believing any capacity figure and without extrapolating a partial leg. Only
-a *complete* cycle counts: the discharge has to take the pack back to (or past) the SoC the charge
-started from, within 15 % of the charge's span or 2 points (a shorter discharge is a half cycle and
-is rejected; a deeper one is fine, and its extra depth is never counted as charged energy), and the
-pack has to hold the energy in between (drift at most 10 % of the span or 1 point, otherwise the
-energy left the pack without being converted). A pair's diagnostic capacity
+that follows it*, forming a complete cycle. Only a *complete* cycle counts: the discharge has to take
+the pack back to (or past) the SoC the charge started from, within 15 % of the charge's span or 2
+points (a shorter discharge is a half cycle and is rejected; a deeper one is fine), and the pack has
+to hold the energy in between (drift at most 10 % of the span or 1 point, otherwise the energy left
+the pack without being converted).
+
+The pair is scored by its **energy balance**, never by a ratio of the two legs' totals or of their
+per-SoC-point energies. With ``I`` kWh AC in, ``O`` kWh AC out, an assumed capacity ``C`` and a net
+SoC change ``dSOC`` (pin to pin), the split ``x = eta_charge = eta_discharge`` solves
+``dSOC * C = I * x - O / x``, so ``x = (dSOC*C + sqrt((dSOC*C)^2 + 4*I*O)) / (2*I)`` and the round
+trip is ``x^2``. A closed cycle (``dSOC = 0``) is just ``O / I``; a deeper one is corrected by the
+energy the pack actually gave up instead of being extrapolated from whole-percent readings. The
+capacity is a correction term only, which is why a wrong one barely moves the result (the live rows
+give 0.843 at 1.92 kWh and 0.843 at 2.10 kWh), and each pair is weighted by its SoC span *and* by
+``I / (I + |dSOC*C|)`` so a deep cycle cannot dominate on a guessed capacity. Dividing by the SoC
+per leg — the natural-looking alternative — is measurably wrong on a real pack: the live Solarflow
+reports a taper that compresses the top of its range and 0.0219 kWh per charge point against 0.0186
+per discharge point, and per-point scoring turned that into ~4 points of optimism (0.889 against
+0.8455 measured from the pack's own energy counters). A pair's diagnostic capacity
 ``sqrt(Ec * Ed / (dSoc_c * dSoc_d))`` merely rejects a pair whose energy cannot come from a plausible
 pack. Pairs are weighted by ``min(dSoc_c, dSoc_d)``, outlier-filtered by median absolute deviation,
 combined with a weighted median, and published after at least 3 accepted pairs (30-day staleness);
@@ -2957,6 +2968,28 @@ round, with the reason:
   partial window by its SoC-delta ratio (exactly the extrapolation this removes), and requiring the
   discharge to close to the *point* (the live daily pattern charges to the ceiling and discharges past
   where the charge began, so a strict closure would reject nearly every real cycle).
+
+- **§5/§7.3 (the learned round trip is an energy balance, and the live gap is closed; requested
+  2026-10-20, "chase it down, I need accurate figures")** — 0.31.1 learned 0.9057 on the live pack
+  while the pack's own counters said 0.8554, so the number the planner used was ~5 points optimistic.
+  The cause was the score, not the pairing: dividing each leg's AC energy by its own SoC span assumes
+  the SoC reading is proportional to the energy moved, and this pack's is not. Its taper compresses
+  the top of the range (a charge that puts 1.35 kWh across 63 points reads 0.0214 kWh/point while the
+  matching discharge across 76 points reads 0.0193), so the per-point ratio absorbed the SoC scale as
+  if it were conversion loss. Measured against the device's cumulative energy counters between
+  moments with *identical* SoC — the one comparison that needs no capacity and no SoC scale — the
+  truth is **0.8455** (91 equal-SoC spans over five days, 0.844-0.850, and 11.864/13.970 = 0.8492 for
+  a clean five-day stretch). The new score solves the cycle's energy balance
+  ``dSOC*C = I*x - O/x`` for ``x = eta_charge = eta_discharge``; it uses the SoC only as a small
+  net-change correction and never divides by it. On the same rows that gives **0.843** (30-day window)
+  and 0.851 (last seven days), i.e. within half a point of the counters, and it is insensitive to the
+  capacity assumption (identical median at 1.92, 2.05 and 2.10 kWh). The window energy was also
+  corrected: 0.31.1 dropped *every* sample pair whose SoC did not move, which threw away the taper's
+  real energy; only the *trailing* pairs that leave the SoC where it was are dropped now. A side
+  effect worth stating: booking the taper raises the capacity estimate (charge legs 2.02, discharge
+  legs 2.15 kWh against the 1.92 nameplate) because the top of the range really does compress the
+  SoC reading — the capacity number is a separate, already-clamped input (SPEC 9.3 clause 5b bounds
+  dispatch by the plan's own trajectory) and is not re-derived here.
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded
