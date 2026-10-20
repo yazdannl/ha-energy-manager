@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, fields
 from zoneinfo import ZoneInfo
 from typing import Any, Mapping
 
-from .models import BatteryConfig, ConfigError
+from .models import LEGACY_CAPACITY_SOURCES, BatteryConfig, ConfigError
 # The control layer is the single authority on which drivers exist (SPEC 5/9.2): asking it here
 # keeps save-time validation from drifting away from the registry the dispatcher builds from.
 from .control.drivers import names as driver_names
@@ -1029,6 +1029,13 @@ def _coerce_battery(battery: BatteryConfig | Mapping[str, Any]) -> BatteryConfig
     if not isinstance(payload.get("mapping", {}), Mapping):
         raise ConfigError("battery mapping must be an object")
     payload["mapping"] = {str(k): str(v) for k, v in (payload.get("mapping") or {}).items()}
+    # SPEC.md section 5: ``auto`` learns from the pack's own cycles and ``pinned`` always uses the
+    # typed values.  The pre-0.31.0 spellings ``manual``/``learned`` are still accepted and both
+    # mean ``auto``: a typed capacity is a seed, not a measurement.  An unknown value is left
+    # alone so validation can reject it instead of silently changing what the user asked for.
+    if isinstance(payload.get("capacity_source"), str):
+        source = str(payload["capacity_source"]).strip().lower()
+        payload["capacity_source"] = "auto" if source in LEGACY_CAPACITY_SOURCES else source
     # An explicit per-direction efficiency wins; otherwise the requested round trip is split
     # symmetrically so its product is exactly the number the user entered (SPEC.md section 5).
     if battery.get("round_trip_efficiency_pct") is not None:

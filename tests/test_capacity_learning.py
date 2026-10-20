@@ -27,6 +27,7 @@ from app.capacity import (  # noqa: E402
     REASON_MANUAL,
     REASON_STALE,
     REASON_UNAVAILABLE,
+    SCHEMA,
     capacity_status,
     estimate_capacity,
     extract_windows,
@@ -35,8 +36,10 @@ from app.capacity import (  # noqa: E402
     robust_median,
     samples_from_rows,
 )
+from app import efficiency as efficiency_learning  # noqa: E402
 from app.engine import Engine  # noqa: E402
 from app.main import _FakeHA, _FakeStore, _selfcheck_settings, _selfcheck_sources  # noqa: E402
+from app import models  # noqa: E402
 from app.models import BatteryConfig, Measurement, to_iso  # noqa: E402
 from app.store import Store  # noqa: E402
 
@@ -201,6 +204,29 @@ def test_samples_from_rows_reads_signed_or_paired_power():
     ]
     assert samples_from_rows(paired, "battery_1") == [(T0, 500.0, 42.0)]
 
+    # The measured pair wins over the command: ``battery_power`` is the power_setpoint_entity, and
+    # a pack that did not follow the setpoint (a taper) would otherwise inflate the AC energy.
+    both = paired + [{"ts": stamp, "entity_role": "battery_power:battery_1", "value": 900.0}]
+    assert samples_from_rows(both, "battery_1") == [(T0, 500.0, 42.0)]
+
+
+def test_a_payload_from_the_old_formula_is_reported_but_never_applied():
+    """0.31.0 changed what a window measures (flow, not setpoint): an old estimate is not trusted."""
+    now = T0 + timedelta(days=1)
+    legacy = {
+        "capacity_kwh": LEARNED_KWH,
+        "median_kwh": LEARNED_KWH,
+        "samples": 6,
+        "windows": [LEARNED_KWH] * 6,
+        "updated_at": to_iso(now),
+    }
+    status = capacity_status(legacy, now)
+    assert status["applied"] is False
+    assert status["capacity_kwh"] is None, "the effective capacity must stay the typed seed"
+    assert status["learned_kwh"] == pytest.approx(LEARNED_KWH), "the evidence is still reported"
+    assert status["reason"] == REASON_LOW_CONFIDENCE
+    assert capacity_status({**legacy, "schema": SCHEMA}, now)["applied"] is True
+
 
 # ----------------------------------------------------------------------------------- runtime store
 
@@ -269,7 +295,7 @@ EXAMPLE_BATTERY = BatteryConfig(
 )
 
 
-def build_engine(capacity_source: str = "learned"):
+def build_engine(capacity_source: str = "auto"):
     settings = _selfcheck_settings()
     settings["control.grid_follow"] = False
     settings.add_battery(replace(EXAMPLE_BATTERY, capacity_source=capacity_source))
@@ -294,13 +320,14 @@ def put_estimate(store, battery_id: str, *, kwh: float | None, samples: int, now
         "median_kwh": kwh,
         "samples": samples,
         "windows": [kwh] * samples if kwh is not None else [],
+        "schema": SCHEMA,
         "updated_at": to_iso(now),
     }
     store.profile_put(PROFILE_KIND, battery_id, payload, now)
 
 
-def test_manual_source_always_uses_the_configured_capacity():
-    engine, store, _settings, clock = build_engine(capacity_source="manual")
+def test_pinned_source_always_uses_the_configured_capacity():
+    engine, store, _settings, clock = build_engine(capacity_source="pinned")
     put_estimate(store, EXAMPLE_BATTERY.id, kwh=LEARNED_KWH, samples=6, now=clock.now)
     config = engine.battery_configs()[0]
     assert engine.effective_capacity_kwh(config) == 5.0
@@ -309,8 +336,26 @@ def test_manual_source_always_uses_the_configured_capacity():
     assert engine.effective_config(config).capacity_kwh == 5.0
 
 
+def test_legacy_manual_source_now_learns_like_auto():
+    """0.31.0: ``manual``/``learned`` both mean auto, so a typed capacity is only a seed."""
+    for legacy in ("manual", "learned"):
+        engine, store, _settings, clock = build_engine(capacity_source=legacy)
+        put_estimate(store, EXAMPLE_BATTERY.id, kwh=LEARNED_KWH, samples=6, now=clock.now)
+        config = engine.battery_configs()[0]
+        assert config.learns_from_measurements is True
+        assert engine.effective_capacity_kwh(config) == pytest.approx(LEARNED_KWH)
+
+
+def test_auto_is_the_shipped_default():
+    assert BatteryConfig(
+        id="b", name="B", driver="generic", capacity_kwh=5.0,
+        mapping={"power_setpoint_entity": "number.example_battery_power"},
+    ).capacity_source == "auto"
+    assert "pinned" in models.CAPACITY_SOURCES
+
+
 def test_learned_source_wins_when_confident_and_fresh():
-    engine, store, _settings, clock = build_engine(capacity_source="learned")
+    engine, store, _settings, clock = build_engine(capacity_source="auto")
     put_estimate(store, EXAMPLE_BATTERY.id, kwh=LEARNED_KWH, samples=6, now=clock.now)
     config = engine.battery_configs()[0]
     assert engine.effective_capacity_kwh(config) == pytest.approx(LEARNED_KWH)
@@ -325,7 +370,7 @@ def test_learned_source_falls_back_when_stale_low_confidence_or_missing():
         (LEARNED_KWH, 2, 1, REASON_LOW_CONFIDENCE),
         (None, 0, 1, REASON_LOW_CONFIDENCE),
     ):
-        engine, store, _settings, clock = build_engine(capacity_source="learned")
+        engine, store, _settings, clock = build_engine(capacity_source="auto")
         put_estimate(
             store,
             EXAMPLE_BATTERY.id,
@@ -339,7 +384,7 @@ def test_learned_source_falls_back_when_stale_low_confidence_or_missing():
 
 
 def test_missing_profile_is_unavailable_and_falls_back():
-    engine, _store, _settings, _clock = build_engine(capacity_source="learned")
+    engine, _store, _settings, _clock = build_engine(capacity_source="auto")
     config = engine.battery_configs()[0]
     assert engine.effective_capacity_kwh(config) == 5.0
     assert engine.capacity_status(config.id)["reason"] == REASON_UNAVAILABLE
@@ -347,15 +392,60 @@ def test_missing_profile_is_unavailable_and_falls_back():
 
 def test_plan_and_allocation_use_the_learned_capacity():
     """The planner receives the effective capacity: the published plan states it."""
-    engine, store, _settings, clock = build_engine(capacity_source="learned")
+    engine, store, _settings, clock = build_engine(capacity_source="auto")
     put_estimate(store, EXAMPLE_BATTERY.id, kwh=LEARNED_KWH, samples=6, now=clock.now)
     plan = engine.plan_now("learned-capacity-test")
     assert plan is not None and plan.batteries
     assert plan.batteries[0]["capacity_kwh"] == pytest.approx(LEARNED_KWH)
 
 
+def put_round_trip(store, battery_id: str, *, round_trip: float, samples: int, now: datetime) -> None:
+    eta = round_trip**0.5
+    store.profile_put(
+        efficiency_learning.PROFILE_KIND,
+        battery_id,
+        {
+            "round_trip": round_trip,
+            "median_round_trip": round_trip,
+            "eta_charge": eta,
+            "eta_discharge": eta,
+            "samples": samples,
+            "pairs": [],
+            "schema": efficiency_learning.SCHEMA,
+            "updated_at": to_iso(now),
+        },
+        now,
+    )
+
+
+def test_the_learned_round_trip_reaches_the_plan():
+    """SPEC 5: the DP, the published summary and the wear read the learned round trip."""
+    engine, store, _settings, clock = build_engine(capacity_source="auto")
+    put_round_trip(store, EXAMPLE_BATTERY.id, round_trip=0.75, samples=4, now=clock.now)
+    config = engine.battery_configs()[0]
+    (eta_charge, eta_discharge), status = engine.effective_efficiency(config)
+    assert eta_charge == pytest.approx(0.75**0.5)
+    assert eta_discharge == pytest.approx(0.75**0.5)
+    assert status["applied"] is True and status["reason"] == efficiency_learning.REASON_APPLIED
+    effective = engine.effective_config(config)
+    assert effective.round_trip_efficiency == pytest.approx(0.75)
+    plan = engine.plan_now("learned-efficiency-test")
+    assert plan is not None and plan.batteries
+    assert plan.batteries[0]["round_trip_efficiency"] == pytest.approx(0.75)
+    assert plan.summary.round_trip_efficiency == pytest.approx(0.75)
+
+
+def test_pinned_ignores_the_learned_round_trip_too():
+    engine, store, _settings, clock = build_engine(capacity_source="pinned")
+    put_round_trip(store, EXAMPLE_BATTERY.id, round_trip=0.75, samples=4, now=clock.now)
+    config = engine.battery_configs()[0]
+    (eta_charge, _eta_discharge), status = engine.effective_efficiency(config)
+    assert eta_charge == pytest.approx(EXAMPLE_BATTERY.eta_charge)
+    assert status["applied"] is False and status["reason"] == efficiency_learning.REASON_PINNED
+
+
 def test_learn_capacities_updates_the_profile_from_measurements():
-    engine, store, _settings, clock = build_engine(capacity_source="learned")
+    engine, store, _settings, clock = build_engine(capacity_source="auto")
     rows = []
     for index in range(3):
         for ts, watts, soc in _window(clock.now - timedelta(days=1, hours=2 * index), 40.0, 60.0, 500.0):
@@ -371,12 +461,12 @@ def test_learn_capacities_updates_the_profile_from_measurements():
 
 
 def test_batteries_view_exposes_the_capacity_payload():
-    engine, store, _settings, clock = build_engine(capacity_source="learned")
+    engine, store, _settings, clock = build_engine(capacity_source="auto")
     put_estimate(store, EXAMPLE_BATTERY.id, kwh=LEARNED_KWH, samples=6, now=clock.now)
     record = engine.batteries_view()[0]
-    assert record["config"]["capacity_source"] == "learned"
+    assert record["config"]["capacity_source"] == "auto"
     assert record["config"]["capacity_kwh"] == 5.0  # configured seed stays visible
-    assert record["capacity_source"] == "learned"
+    assert record["capacity_source"] == "auto"
     assert record["capacity_kwh"] == 5.0
     assert record["capacity_learned_kwh"] == pytest.approx(LEARNED_KWH)
     assert record["capacity_samples"] == 6

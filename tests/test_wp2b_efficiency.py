@@ -28,8 +28,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from app.api import ApiServer  # noqa: E402
 from app.engine import Engine  # noqa: E402
 from app.main import _FakeHA, _FakeStore, _selfcheck_settings, _selfcheck_sources  # noqa: E402
-from app.models import Action, BatteryConfig, Mode, Plan, PlanSlot, Reason  # noqa: E402
+from app.models import Action, BatteryConfig, Mode, Plan, PlanSlot, Reason, to_iso  # noqa: E402
 from app.optimize import dp  # noqa: E402
+from app import efficiency as efficiency_learning  # noqa: E402
 from app.sources.measure import MEASUREMENT_MINUTES  # noqa: E402
 
 T0 = datetime(2026, 1, 1, 11, 0, tzinfo=timezone.utc)
@@ -605,3 +606,22 @@ def test_a_battery_without_price_or_life_plans_with_no_wear():
     plan = dp.solve(slots, aggregate=agg, start_kwh=1.0, options=opts, generated_at=T0)
     assert plan.summary.cycle_cost_eur == 0.0
     assert plan.summary.wear_eur_per_kwh == 0.0
+
+
+def test_an_efficiency_payload_from_an_older_formula_is_reported_but_not_applied():
+    """0.31.0 owns the pair formula: a payload without its schema stamp is never trusted."""
+    now = T0 + timedelta(days=1)
+    legacy = {
+        "round_trip": 0.80,
+        "eta_charge": 0.80**0.5,
+        "eta_discharge": 0.80**0.5,
+        "samples": 5,
+        "updated_at": to_iso(now),
+    }
+    status = efficiency_learning.round_trip_status(legacy, now)
+    assert status["applied"] is False
+    assert status["round_trip"] is None and status["eta_charge"] is None
+    assert status["learned_round_trip"] == pytest.approx(0.80), "the evidence is still reported"
+    assert status["reason"] == efficiency_learning.REASON_LOW_CONFIDENCE
+    current = {**legacy, "schema": efficiency_learning.SCHEMA}
+    assert efficiency_learning.round_trip_status(current, now)["applied"] is True

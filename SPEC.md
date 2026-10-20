@@ -399,27 +399,53 @@ class BatteryConfig:
     eta_discharge: float    # 0<eta<=1, cell->AC
     price_eur: float = 0.0  # purchase price (EUR); 0 = unknown, no derived wear
     cycle_life: float = 0.0 # rated full cycles; 0 = unknown, no derived wear
-    capacity_source: str = "manual"  # manual | learned (SPEC 5)
+    capacity_source: str = "auto"  # auto | pinned (SPEC 5; legacy manual/learned == auto)
     mapping: dict[str, str] # driver-specific entity mapping, resolved at runtime
     enabled: bool = True
 ```
 
-**Learned capacity (``capacity_source``, additive 0.14.0).** A pack rarely holds its label's figure.
-``capacity_source="manual"`` (the shipped default) keeps ``capacity_kwh`` as the effective capacity.
-``capacity_source="learned"`` keeps ``capacity_kwh`` as a seed/fallback and uses an estimate learned
-from the pack's own measured cycles for planning, allocation, UI and the published summaries. The
-estimate pairs AC energy with SoC change over 5-minute rows (SPEC 7.3): for a charge window
-``capacity = AC_charge_kWh * eta_charge / dSoC`` and for a discharge window
+**Learned capacity and round trip (``capacity_source``, 0.14.0; semantics of 0.31.0).** A pack rarely
+holds its label's figure, and a datasheet round trip is rarely what the pack delivers, so both numbers
+are measured from the pack's own cycles.
+
+``capacity_source="auto"`` (the shipped default since 0.31.0) keeps ``capacity_kwh``, ``eta_charge``
+and ``eta_discharge`` as seeds/fallbacks and uses the estimates for planning, allocation, UI, the
+break-even and the published summaries whenever they are confident and fresh.
+``capacity_source="pinned"`` always uses the typed values and ignores the estimates (a per-battery
+opt-out). The pre-0.31.0 spellings ``manual`` and ``learned`` are still accepted and both mean
+``auto``, and are normalised on load, on write and in every view: 0.31.0 made the measurements the
+default because a typed capacity is a guess while an estimate is a measurement.
+
+The capacity estimate pairs AC energy with SoC change over 5-minute rows (SPEC 7.3): for a charge
+window ``capacity = AC_charge_kWh * eta_charge / dSoC`` and for a discharge window
 ``capacity = AC_discharge_kWh / eta_discharge / |dSoC|`` (each efficiency sits on its own leg). A
 window is accepted only with ``|dSoC| >= 10`` points, ``mean |power| >= 20 %`` of that battery's own
 limit for the direction, finite values and no gap longer than one sample; accepted windows are
 combined with a median after a median-absolute-deviation outlier filter, kept to the last 20, clamped
 to a plausible 1..200 kWh and published only with at least 3 accepted windows. An estimate older than
-30 days is stale. ``manual`` always wins; in ``learned`` mode a missing, stale or low-confidence
-estimate falls back to the seed, and the transition is logged with a stable reason slug
-(``capacity_learned`` / ``capacity_learned_stale`` / ``capacity_learned_low_confidence`` /
-``capacity_learned_unavailable``). The estimate is runtime data (a ``learning_profiles`` payload per
-battery), never written back into user settings.
+30 days is stale. The window's AC energy is the **measured** ``battery_charge``/``battery_discharge``
+pair; the signed ``battery_power`` role is only a fallback because it is a command
+(``power_setpoint_entity``) that a tapering BMS need not follow. In ``auto`` a missing, stale or
+low-confidence estimate falls back to the seed, and every transition is logged with a stable reason
+slug (``capacity_learned`` / ``capacity_learned_stale`` / ``capacity_learned_low_confidence`` /
+``capacity_learned_unavailable``; ``capacity_manual`` is the pinned case).
+
+The round-trip estimate reuses those windows as **pairs** (one accepted charge followed by one
+accepted discharge). With charge AC energy ``Ec`` over ``dSoc_c`` and discharge ``Ed`` over
+``dSoc_d``: ``eta_c * eta_d = Ed * dSoc_c / (Ec * dSoc_d)`` — the capacity cancels exactly, so the
+round trip is measured without believing any capacity figure. A pair's diagnostic capacity
+``sqrt(Ec * Ed / (dSoc_c * dSoc_d))`` merely rejects a pair whose energy cannot come from a plausible
+pack. Pairs are weighted by ``min(dSoc_c, dSoc_d)``, outlier-filtered by median absolute deviation,
+combined with a weighted median, and published after at least 3 accepted pairs (30-day staleness);
+the learned round trip is split evenly into ``eta_charge = eta_discharge = sqrt(round_trip)``, the
+same convention a typed round trip uses, so wear, break-even, cost basis and the DP transitions all
+read one number. Reason slugs mirror the capacity ones (``efficiency_learned`` /
+``efficiency_learned_stale`` / ``efficiency_learned_low_confidence`` / ``efficiency_learned_unavailable``
+/ ``efficiency_pinned``), and the round trip is learned **before** the capacity because the capacity
+estimate consumes it.
+
+Both estimates are runtime data (one ``learning_profiles`` payload per battery and kind), never
+written back into user settings.
 
 Efficiency is entered per battery as a **round trip**: the UI/API field `round_trip_efficiency_pct` is
 split evenly into `eta_charge = eta_discharge = sqrt(pct/100)`, and explicit per-direction values (when
@@ -1219,6 +1245,17 @@ clamped: bool, reasons: list[str], block: bool)` enforcing, in order:
    discharged until it recovers. `cell_voltage_warning_v` and `cell_voltage_resume_v` must sit
    above the cutoff, validated at save time.
 5. SoC clamp: no charge above `E_max`, no discharge below `E_min + reserve`.
+5b. **Plan SoC tracking (0.31.0).** The active slot's own trajectory bounds the tick. `PlanSlot.soc_kwh`
+   is the energy at the slot's *start* as the solver modelled it, so the target is
+   `soc_kwh + power_w × hours × eta` for a charge (and `/ eta` for a discharge) and the boundary is
+   the slot's end. The guard allows at most the power that still lands on that target, clamped at
+   zero in the plan's own direction: a pack that is faster than the model (an over-seeded capacity, a
+   better efficiency, a tapered command the BMS followed) has its setpoint cut the moment the
+   trajectory is reached instead of running the whole slot at the modelled power into the hardware
+   ceiling — the live 2026-10-20 defect, where a plan that ended at 95 % kept charging to 100 %.
+   Tracking never turns a charge into a discharge or the other way round, and a hold slot (power 0)
+   is deliberately not tracked (it would invent a charge the plan never asked for). Reason
+   `plan_soc_target`; the physical `max_soc_pct` clamp stays as the outer bound.
 6. Power clamp per battery limits (after allocation) and aggregated limits.
 7. Grid limits: predicted import/export with the requested power must stay inside
    `max_grid_import_w`/`max_grid_export_w`; clamp, and block if the resulting power would still
@@ -2859,6 +2896,33 @@ round, with the reason:
   is (its newest sample *is* the window start), so a healthy ledger updating twice inside one sample
   bin books nothing extra and never switches ``sample_source`` to ``actuals``.  No optimiser,
   dispatcher, sampler or ledger-economics change.
+
+- **§5/§9.3/§10/§13 (learned values by default, a learned round trip, and a plan-aware setpoint;
+  requested 2026-10-20, "the pack charges to 100 % although the plan ends at 95 %, plans should use the
+  learned capacity, and the round trip should be learned too")** — three coupled defects, one cause:
+  the guard trusted the *hardware* ceiling while the plan's own numbers were guesses. (a) The published
+  plan already stopped at its terminal target (a final 648 W slot landed on 95 %, then 0 W), but the
+  per-tick clamp only knew `max_soc_pct` (100 %), so dispatch kept running the slot's modelled power
+  into the hardware ceiling and the pack reached 100 %. §9.3 clause 5b now bounds the tick with the
+  active slot's own end-of-slot energy, cut at zero in the plan's direction, so the setpoint stops when
+  the trajectory is met (reason `plan_soc_target`). (b) The typed capacity is a seed, yet
+  `capacity_source="manual"` was the shipped default, so the learner's estimate — the measurement that
+  explains the overshoot in the first place — was never used unless the user flipped a toggle (and the
+  UI coerced every value that was not exactly `learned` back to `manual`). The semantics are now
+  `auto` (default: use the estimate whenever it is confident and fresh, typed values as seed/fallback)
+  and `pinned` (opt-out), with `manual`/`learned` accepted and normalised on load, write and view.
+  (c) The round trip was the last trusted guess, and it drives the DP transitions, the salvage value,
+  the break-even sale price, the wear and the cost-basis floor: a new `app/efficiency.py` learns it
+  from charge/discharge *pairs* of the same accepted windows, where the capacity cancels exactly
+  (`eta_c·eta_d = Ed·dSoc_c / (Ec·dSoc_d)`), published after 3 accepted pairs with the same
+  MAD/weighted-median/30-day-staleness rules, and learned before the capacity because the capacity
+  learner consumes it. The capacity learner also stopped integrating the signed `battery_power` role
+  (the `power_setpoint_entity`, a command the BMS need not follow) in favour of the measured
+  `battery_charge`/`battery_discharge` pair (this is what over-estimated the live pack: 2.09 kWh
+  learned against a 1.92 kWh nominal, i.e. exactly the fast-pack overshoot). Rejected alternatives:
+  hard-coding the terminal target into the safety layer (a second source of truth that would drift from
+  the plan), clamping on the *current* SoC against the target without a trajectory (flapping at the
+  boundary), and learning the round trip from full cycles only (the live pack rarely completes one).
 
 The 398-passes/13-mutations figures in earlier revisions of this file and in `docs/VERIFICATION.md`
 were true of the pre-audit tree; the final numbers are re-measured on a frozen tree hash and recorded

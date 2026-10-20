@@ -123,6 +123,10 @@ class Reason:
     BATTERY_UNAVAILABLE = "battery_unavailable"
     SOC_FLOOR = "soc_floor"
     SOC_CEILING = "soc_ceiling"
+    #: The plan's own SoC trajectory for this slot is reached or about to be: the setpoint is cut
+    #: (a charge to zero, a discharge to zero) so the pack lands on the plan instead of running the
+    #: slot at its modelled power past the target (SPEC 9.3 clause 5b, 0.31.0).
+    PLAN_TARGET = "plan_soc_target"
     POWER_CLAMP = "power_clamp"
     GRID_IMPORT_LIMIT = "grid_import_limit"
     GRID_EXPORT_LIMIT = "grid_export_limit"
@@ -155,10 +159,16 @@ PRICE_UNITS = ("auto", "eur_per_kwh", "eur_per_mwh", "micro_eur_per_kwh")
 #: driver pick, which keeps the shipped behaviour for every existing configuration.
 CONTROL_PATHS = ("auto", "manager", "device")
 
-#: Where a battery's capacity comes from (SPEC.md section 5): ``manual`` uses ``capacity_kwh`` as
-#: typed; ``learned`` keeps it as the seed/fallback and uses the self-measured estimate once it is
-#: confident and fresh, otherwise falling back to the seed.
-CAPACITY_SOURCES = ("manual", "learned")
+#: Where a battery's capacity and round-trip efficiency come from (SPEC.md section 5): ``auto``
+#: uses the values measured from the pack's own cycles once the estimate is confident and fresh and
+#: keeps the typed values as the seed/fallback; ``pinned`` always uses what was typed.  ``manual``
+#: and ``learned`` are the pre-0.31.0 spellings (both pinned / both learned) and are still accepted
+#: on load, but they no longer mean "typed always wins": 0.31.0 made the learned values the
+#: default because a typed capacity is a guess while the estimate is a measurement.
+CAPACITY_SOURCES = ("auto", "pinned")
+LEGACY_CAPACITY_SOURCES = ("manual", "learned")
+#: Values ``capacity_source`` may carry; ``pinned`` is the only one that blocks learning.
+ALL_CAPACITY_SOURCES = CAPACITY_SOURCES + LEGACY_CAPACITY_SOURCES
 
 
 # --------------------------------------------------------------------------------------
@@ -207,10 +217,19 @@ class BatteryConfig:
     #: talks to the inverter directly, so it does not wait for the manager's next P1 event; the
     #: manager path is the only one that can split power across a fuse group.
     control_path: str = "auto"
-    #: ``manual`` (default) or ``learned`` (SPEC.md section 5). In ``learned`` mode
-    #: ``capacity_kwh`` stays the seed/fallback and the self-measured estimate is used for
-    #: planning, allocation, UI and the published summaries once it is confident and fresh.
-    capacity_source: str = "manual"
+    #: ``auto`` (default) or ``pinned`` (SPEC.md section 5).  ``auto`` keeps ``capacity_kwh`` and
+    #: the typed round trip as seeds/fallbacks and uses the self-measured capacity and round-trip
+    #: efficiency for planning, allocation, UI and the published summaries once they are confident
+    #: and fresh; ``pinned`` always uses the typed values.  The pre-0.31.0 spellings ``manual`` and
+    #: ``learned`` are still accepted and both mean ``auto`` (see ``ALL_CAPACITY_SOURCES``).
+    capacity_source: str = "auto"
+
+    def __post_init__(self) -> None:
+        """Keep one canonical spelling (SPEC.md section 5): the legacy ones both mean ``auto``."""
+        source = str(self.capacity_source or "auto").strip().lower()
+        canonical = "auto" if source in LEGACY_CAPACITY_SOURCES else source
+        if canonical != self.capacity_source:
+            object.__setattr__(self, "capacity_source", canonical)
 
     def usable_kwh(self) -> float:
         """Energy between the configured SoC floor and ceiling."""
@@ -284,9 +303,16 @@ class BatteryConfig:
             problems.append("mapping is empty: confirm the entity mapping in the UI")
         if self.control_path not in CONTROL_PATHS:
             problems.append(f"control_path must be one of {', '.join(CONTROL_PATHS)}")
-        if self.capacity_source not in CAPACITY_SOURCES:
-            problems.append(f"capacity_source must be one of {', '.join(CAPACITY_SOURCES)}")
+        if self.capacity_source not in ALL_CAPACITY_SOURCES:
+            problems.append(
+                f"capacity_source must be one of {', '.join(ALL_CAPACITY_SOURCES)}"
+            )
         return problems
+
+    @property
+    def learns_from_measurements(self) -> bool:
+        """True unless the operator pinned the typed capacity and round trip (SPEC.md section 5)."""
+        return self.capacity_source != "pinned"
 
 
 @dataclass

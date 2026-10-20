@@ -771,8 +771,8 @@ override `optimizer.cycle_cost_eur_per_kwh`, `optimizer.sell_floor_margin_eur_pe
 | `id` | str | required | stable slug, unique |
 | `name` | str | — | display name |
 | `driver` | str | required | `zendure`, `zendure_mqtt`, `zendure_native` or `generic` |
-| `capacity_kwh` | float | required | must be > 0; usable AC-side capacity. In `learned` mode this is the seed/fallback |
-| `capacity_source` | str | `manual` | `manual` uses `capacity_kwh`; `learned` uses the estimate measured from the pack's own cycles once it is confident and fresh (SPEC 5). Validated at save time |
+| `capacity_kwh` | float | required | must be > 0; usable AC-side capacity. In `auto` mode this is the seed/fallback |
+| `capacity_source` | str | `auto` | `auto` uses the capacity **and round trip** measured from the pack's own cycles once they are confident and fresh (SPEC 5); `pinned` always uses the typed values. The pre-0.31.0 spellings `manual`/`learned` both mean `auto` and are normalised on load, write and view. Validated at save time |
 | `min_soc_pct` | float | `10.0` | must be < `max_soc_pct`, both in 0…100 |
 | `max_soc_pct` | float | `100.0` | — |
 | `max_charge_w` | float | `800.0` | at least one of charge/discharge must be > 0 |
@@ -805,20 +805,35 @@ every read-back (`battery_payload`) and accepted-but-ignored on a patch, like
 `round_trip_efficiency_pct`.
 
 **Learned capacity.** `app/capacity.py` is pure except for `learn_capacity`, which reads the
-persisted 5-minute `battery_power:<id>` / `battery_charge|discharge:<id>` and `battery_soc:<id>`
-rows and writes a `learning_profiles` payload of kind `battery_capacity`, keyed by battery id (never
-a settings key). A *window* is a maximal run of same-direction power broken by a direction change, a
-zero sample or a gap longer than one sample; it is accepted only with `|dSoC| >= 10` points and
+persisted 5-minute `battery_charge|discharge:<id>` (measured AC pair, preferred) /
+`battery_power:<id>` (the signed command, fallback only) and `battery_soc:<id>` rows and writes a
+`learning_profiles` payload of kind `battery_capacity`, keyed by battery id (never a settings key).
+A *window* is a maximal run of same-direction power broken by a direction change, a zero sample or a
+gap longer than one sample; it is accepted only with `|dSoC| >= 10` points and
 `mean |power| >= 20 %` of that battery's own limit. The capacity is `AC_kWh * eta_charge / dSoC`
 while charging and `AC_kWh / eta_discharge / |dSoC|` while discharging. Accepted windows are
 combined with a median after a MAD outlier filter, kept to the last 20, clamped to 1..200 kWh and
-published only with at least 3 windows; an estimate older than 30 days is stale. `manual` always
-wins; `learned` falls back to the seed for a missing, stale or low-confidence estimate. The engine
+published only with at least 3 windows; an estimate older than 30 days is stale. `auto` falls back
+to the seed for a missing, stale or low-confidence estimate; `pinned` never uses it. The engine
 resolves the effective capacity in `resolved_config` / `effective_battery_configs` — used by the
 drivers, the DP optimiser, allocation, the savings baseline and the published summaries — and
 journals a stable reason slug (`capacity_learned`, `capacity_learned_stale`,
-`capacity_learned_low_confidence`, `capacity_learned_unavailable`). Re-learning runs in daily
-maintenance.
+`capacity_learned_low_confidence`, `capacity_learned_unavailable`, `capacity_manual` for pinned).
+Re-learning runs in daily maintenance.
+
+**Learned round trip.** `app/efficiency.py` learns `eta_charge * eta_discharge` from *pairs* of the
+same accepted windows (one charge window followed by one discharge window, at most
+`MAX_PAIR_GAP_DAYS` apart, same battery, finite values): `eta_c·eta_d = Ed·dSoc_c / (Ec·dSoc_d)`, in
+which the capacity cancels exactly — the efficiency is measured without trusting any capacity figure.
+The pair's diagnostic capacity `sqrt(Ec·Ed / (dSoc_c·dSoc_d))` only rejects energy that cannot come
+from a plausible 1..200 kWh pack. Pairs are weighted by `min(dSoc_c, dSoc_d)`, MAD-filtered and
+combined with a weighted median (`weighted_median`), kept to the last 20, and published only with at
+least 3 accepted pairs (30-day staleness). The learned round trip is split evenly into
+`eta_charge = eta_discharge = sqrt(round_trip)` — the same convention as a typed round trip — so the
+DP, the wear, the break-even, the cost-basis floor and the UI all read one number. Reason slugs:
+`efficiency_learned`, `efficiency_learned_stale`, `efficiency_learned_low_confidence`,
+`efficiency_learned_unavailable`, `efficiency_pinned`. It is learned **before** the capacity, because
+the capacity learner consumes the learned eta.
 
 ### 3.5 Discovery API fields
 
@@ -1898,7 +1913,7 @@ additive 0.20.3), `manual_limits{}` (additive, 0.20.0: the raw per-direction map
 | `GET /api/v1/plan/execution` | `hours` | additive (0.10.0): `{generated_at, slot_minutes, now, floors{reserve_soc_pct, min_soc_pct, floor_soc_pct}, batteries[{id, name, min_soc_pct, floor_soc_pct, capacity_kwh}], progress{…}, slots[{t, minutes (additive 0.20.1), dispatch, actual}]}` — the same slot grid as `/plan`, joined with the persisted 5-minute actuals and the dispatch log. `dispatch` is the last attempt per battery in that slot (`requested_w`, `applied_w`, `ok`, `dry_run`, `clamped`, `code`, `reason`, `message`, `records`, `batteries[]`) and `actual` the measured aggregate (`samples`, `coverage_pct`, `pv_kw`, `load_kw`, `grid_kw`, `battery_kw`, `planned_kw`, `measured_kw`, `import_kwh`, `export_kwh`, `charged_kwh`, `discharged_kwh`, `soc_kwh_start`, `soc_kwh_end`). Both are `null` for a slot nothing was measured or dispatched in — never a fabricated zero |
 | `POST /api/v1/plan/recompute` | — | `{queued: true}` (async; poll status) |
 | `GET /api/v1/forecast` | `kind=price\|solar\|load`, `hours` | `{kind, generated_at, source, stale, slots, provider, contract, notes[], reason, hint}` |
-| `GET /api/v1/batteries` | — | `{batteries: [{config, state, capabilities, mapping_resolved, discovery[], capacity_source, capacity_kwh, capacity_learned_kwh, capacity_samples, capacity_updated_at, effective_capacity_kwh, capacity_reason, capacity{source,configured_kwh,learned_kwh,samples,updated_at,effective_kwh,reason,stale,confident,applied}, maintenance{id,watching,state,due,overdue,at_target,due_at,due_in_days,last_completed,first_seen,target_soc_pct,interval_days,soc_pct} (additive, 0.17.0)}]}` (the capacity fields are additive, SPEC 5) |
+| `GET /api/v1/batteries` | — | `{batteries: [{config, state, capabilities, mapping_resolved, discovery[], capacity_source, capacity_kwh, capacity_learned_kwh, capacity_samples, capacity_updated_at, effective_capacity_kwh, capacity_reason, capacity{source,configured_kwh,learned_kwh,samples,updated_at,effective_kwh,reason,stale,confident,applied}, efficiency_round_trip, efficiency_learned_round_trip, efficiency_samples, efficiency_updated_at, efficiency_reason, efficiency{source,configured_round_trip,learned_round_trip,samples,updated_at,effective_round_trip,reason,stale,confident,applied} (additive, 0.31.0), maintenance{id,watching,state,due,overdue,at_target,due_at,due_in_days,last_completed,first_seen,target_soc_pct,interval_days,soc_pct} (additive, 0.17.0)}]}` (the capacity fields are additive, SPEC 5) |
 | `POST /api/v1/batteries` | `{config}` | 201 `{config}` |
 | `PATCH /api/v1/batteries/{id}` | `{patch}` | `{config}` |
 | `DELETE /api/v1/batteries/{id}` | — | result |

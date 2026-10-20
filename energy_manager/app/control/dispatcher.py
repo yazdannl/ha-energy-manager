@@ -280,6 +280,11 @@ class Dispatcher:
         target = corrected
         outcome.target_w = target
 
+        # 2b. The plan's own SoC trajectory for this slot (SPEC 9.3 clause 5b): handed to the guard
+        #     so the setpoint is cut when the pack reaches where the plan wants it, instead of the
+        #     slot running at its modelled power and overshooting a terminal target.
+        plan_track = self._plan_track(plan if slot is not None else None, slot, usable_configs)
+
         # 3. Guard rails.
         decision = safety.check(
             target,
@@ -290,6 +295,7 @@ class Dispatcher:
             moment,
             cell_voltage_latch=cell_voltage_latch,
             sell_floor_eur_per_kwh=sell_floor_eur_per_kwh,
+            plan_track=plan_track,
         )
         outcome.allowed_w = decision.allowed_w
         outcome.block = decision.block
@@ -528,6 +534,55 @@ class Dispatcher:
             if candidate.t == slot.t - step:
                 return candidate
         return None
+
+    @staticmethod
+    def _plan_track(
+        plan: Plan | None,
+        slot: PlanSlot | None,
+        batteries: Sequence[BatteryConfig],
+    ) -> dict[str, Any] | None:
+        """The plan's aggregate pack energy at the end of this slot, and when that is (SPEC 9.3).
+
+        ``PlanSlot.soc_kwh`` is the energy at the slot's *start* as the solver modelled it, so the
+        target is that plus the slot's own AC energy converted with the aggregate efficiency the
+        guard uses.  ``None`` when there is nothing to follow: no plan/slot, a hold slot (power 0),
+        no enabled capacity, or an unusable efficiency.  A hold slot is deliberately not tracked:
+        it would otherwise let the guard "catch up" the SoC with a charge the plan never asked for.
+        """
+        if plan is None or slot is None:
+            return None
+        power = float(slot.power_w or 0.0)
+        if abs(power) < 1e-9:
+            return None
+        enabled = [config for config in batteries if config.enabled]
+        capacity = sum(float(config.capacity_kwh) for config in enabled)
+        if not enabled or capacity <= 0.0:
+            return None
+        eta_charge = (
+            sum(config.capacity_kwh * config.eta_charge for config in enabled) / capacity
+        )
+        eta_discharge = (
+            sum(config.capacity_kwh * config.eta_discharge for config in enabled) / capacity
+        )
+        minutes = float(slot.minutes or 0.0)
+        if minutes <= 0.0:
+            minutes = float(plan.slot_minutes or 0.0)
+        if minutes <= 0.0:
+            return None
+        hours = minutes / 60.0
+        if power > 0.0 and eta_charge > 0.0:
+            target = float(slot.soc_kwh) + power / 1000.0 * hours * eta_charge
+        elif power < 0.0 and eta_discharge > 0.0:
+            target = float(slot.soc_kwh) + power / 1000.0 * hours / eta_discharge
+        else:
+            return None
+        # ``slot.t`` is clock-aligned; a partial first slot's ``minutes`` is only the part that was
+        # modelled, so the boundary is always one full slot after the timestamp.
+        return {
+            "energy_kwh": target,
+            "until": slot.t + timedelta(minutes=float(plan.slot_minutes or minutes)),
+            "power_w": power,
+        }
 
     def _grid_follow(
         self,

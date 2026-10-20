@@ -304,6 +304,13 @@ def test_real_engine_battery_view_and_stop_route(wired):
         "capacity_updated_at",
         "effective_capacity_kwh",
         "capacity_reason",
+        # SPEC 5 learned round trip (0.31.0, additive): the same shape as the capacity fields.
+        "efficiency",
+        "efficiency_round_trip",
+        "efficiency_learned_round_trip",
+        "efficiency_samples",
+        "efficiency_updated_at",
+        "efficiency_reason",
         # SPEC 8.1 scheduled full-charge maintenance (additive): the per-battery state.
         "maintenance",
     }

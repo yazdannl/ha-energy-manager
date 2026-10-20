@@ -137,14 +137,14 @@ def config(**overrides) -> BatteryConfig:
     return BatteryConfig(**data)
 
 
-def plan_slot(power_w=600.0, load_kw=0.5, pv_kw=0.0) -> PlanSlot:
+def plan_slot(power_w=600.0, load_kw=0.5, pv_kw=0.0, soc_kwh=2.5) -> PlanSlot:
     return PlanSlot(
         t=NOW,
         buy=0.2,
         sell=0.05,
         pv_kw=pv_kw,
         load_kw=load_kw,
-        soc_kwh=2.5,
+        soc_kwh=soc_kwh,
         power_w=power_w,
         action=Action.CHARGE if power_w > 0 else Action.DISCHARGE,
         reason=Reason.ARBITRAGE_CHARGE if power_w > 0 else Reason.SELF_CONSUMPTION,
@@ -665,13 +665,142 @@ def test_dispatcher_keeps_a_commanded_charge_alive():
     driver = registry.create(cfg, ha, sleep=lambda _s: None)
     journal = FakeJournal()
     dispatcher = Dispatcher(SETTINGS, journal, {cfg.id: driver})
-    outcome = dispatcher.tick(NOW, state=system_state(), plan=make_plan(), batteries=[cfg])
+    # The plan starts where the device is (55 % of 5 kWh), so the trajectory guard has nothing to
+    # cut: this test is about the failsafe, not about the plan's SoC accounting.
+    plan = make_plan([plan_slot(600.0, soc_kwh=2.75)])
+    outcome = dispatcher.tick(NOW, state=system_state(), plan=plan, batteries=[cfg])
     assert outcome.results and outcome.results[0].ok is True
     assert outcome.results[0].code == Reason.COMMANDED
     assert [entry["code"] for entry in journal.dispatches] == [Reason.COMMANDED]
     writes = [call for call in ha.calls if call[2].get("entity_id") == "number.example_manager_manual_power"]
     assert writes, ha.calls
     assert all(call[2]["value"] != 0 for call in writes), "a pending command must not be zeroed"
+    assert not any(code == "driver_error" for _, code, _, _ in journal.events)
+
+
+def plan_track(energy_kwh: float, power_w: float, *, minutes: float = 15.0) -> dict:
+    """The guard's view of the plan: this slot's end-of-slot pack energy and its boundary."""
+    return {"energy_kwh": energy_kwh, "until": NOW + timedelta(minutes=minutes), "power_w": power_w}
+
+
+def live_pack(cfg, soc_pct: float) -> BatteryState:
+    capacity = float(cfg.capacity_kwh)
+    return BatteryState(
+        id=cfg.id,
+        available=True,
+        soc_pct=soc_pct,
+        power_w=0.0,
+        energy_kwh=capacity * soc_pct / 100.0,
+        read_at=NOW,
+    )
+
+
+def test_guard_cuts_a_charge_once_the_plan_target_is_reached():
+    """SPEC 9.3 clause 5b (0.31.0): the live 95 % -> 100 % overshoot.
+
+    The guard only knew the physical ``max_soc_pct`` (100 %), so a plan whose terminal target was
+    95 % kept charging at full power into the hardware ceiling.  The slot's own end-of-slot energy
+    now bounds the tick: at the target the setpoint is zero -- a cut, never a block.
+    """
+    cfg = config(eta_charge=0.95, eta_discharge=0.95)
+    pack = live_pack(cfg, 95.0)
+    decision = safety.check(
+        1000.0,
+        plan_slot(600.0),
+        [cfg],
+        system_state(batteries=[pack]),
+        SETTINGS,
+        NOW,
+        plan_track=plan_track(4.75, 600.0),
+    )
+    assert decision.block is False
+    assert decision.allowed_w == 0.0
+    assert Reason.PLAN_TARGET in decision.reasons
+    assert Reason.SOC_CEILING not in decision.reasons, "100 % is not the target in force"
+
+
+def test_guard_lands_the_charge_on_the_plans_trajectory_not_the_hardware_ceiling():
+    cfg = config(eta_charge=0.95, eta_discharge=0.95)
+    pack = live_pack(cfg, 90.0)
+    decision = safety.check(
+        1000.0,
+        plan_slot(600.0),
+        [cfg],
+        system_state(batteries=[pack]),
+        SETTINGS,
+        NOW,
+        plan_track=plan_track(4.70, 600.0),
+    )
+    # 0.20 kWh still fit in the slot at eta 0.95 over 0.25 h -> 842 W, below the 1000 W request
+    assert decision.allowed_w == pytest.approx(842.105, rel=1e-4)
+    assert decision.clamped is True
+    # The plan's own trajectory is the binding clause, so it is named as such -- the point is that
+    # the tick rides it instead of running the slot's modelled power into the hardware ceiling.
+    assert Reason.PLAN_TARGET in decision.reasons
+    assert Reason.SOC_CEILING not in decision.reasons
+
+
+def test_guard_never_turns_a_charge_into_a_discharge():
+    cfg = config(eta_charge=0.95, eta_discharge=0.95)
+    pack = live_pack(cfg, 98.0)  # already past the plan's 95 % target
+    decision = safety.check(
+        1000.0,
+        plan_slot(600.0),
+        [cfg],
+        system_state(batteries=[pack]),
+        SETTINGS,
+        NOW,
+        plan_track=plan_track(4.75, 600.0),
+    )
+    assert decision.allowed_w == 0.0
+    assert Reason.PLAN_TARGET in decision.reasons
+
+
+def test_guard_tracks_a_discharge_down_to_the_plans_target():
+    cfg = config(eta_charge=0.95, eta_discharge=0.95)
+    pack = live_pack(cfg, 50.0)  # 2.50 kWh now, the plan wants 2.30 kWh at the slot's end
+    decision = safety.check(
+        -1000.0,
+        plan_slot(-600.0),
+        [cfg],
+        system_state(batteries=[pack]),
+        SETTINGS,
+        NOW,
+        plan_track=plan_track(2.30, -600.0),
+    )
+    assert decision.allowed_w == pytest.approx(-760.0, rel=1e-6)
+    assert Reason.PLAN_TARGET in decision.reasons
+    assert Reason.SOC_FLOOR not in decision.reasons
+
+
+def test_plan_track_is_the_slots_end_energy_and_its_boundary():
+    cfg = config()
+    plan = make_plan([plan_slot(600.0, soc_kwh=2.5)])
+    track = Dispatcher._plan_track(plan, plan.slots[0], [cfg])
+    assert track is not None
+    assert track["energy_kwh"] == pytest.approx(2.5 + 0.6 * 0.25 * 0.95)
+    assert track["until"] == NOW + timedelta(minutes=15)
+    assert track["power_w"] == 600.0
+    assert track["until"] > NOW, "the target is always in the future, never already past"
+    # A hold slot has no trajectory to follow (following it would invent a charge the plan never
+    # asked for), and without a plan there is nothing to follow at all.
+    assert Dispatcher._plan_track(plan, plan_slot(0.0), [cfg]) is None
+    assert Dispatcher._plan_track(None, plan.slots[0], [cfg]) is None
+
+
+def test_dispatcher_cuts_the_setpoint_when_the_pack_is_past_the_plan_target():
+    """End to end: a pack ahead of the plan is held, not charged up to the hardware ceiling."""
+    cfg = config(driver="zendure", mapping=manager_mapping())
+    ha = offline_manager_ha()  # the device reports 55 % of 5 kWh = 2.75 kWh
+    driver = registry.create(cfg, ha, sleep=lambda _s: None)
+    journal = FakeJournal()
+    dispatcher = Dispatcher(SETTINGS, journal, {cfg.id: driver})
+    plan = make_plan([plan_slot(600.0, soc_kwh=2.60)])  # ends at 2.7425 kWh, below the live 2.75
+    outcome = dispatcher.tick(NOW, state=system_state(), plan=plan, batteries=[cfg])
+    assert outcome.allowed_w == 0.0
+    assert Reason.PLAN_TARGET in outcome.reasons
+    assert outcome.results[0].applied_w == 0.0
+    assert journal.dispatches[0]["reason"] == Reason.PLAN_TARGET
     assert not any(code == "driver_error" for _, code, _, _ in journal.events)
 
 

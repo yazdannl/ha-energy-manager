@@ -28,6 +28,7 @@ from typing import Any, Callable, Mapping, Sequence
 from . import analytics
 from . import capacity as capacity_learning
 from . import cost_basis as cost_basis_ledger
+from . import efficiency as efficiency_learning
 from . import feeds
 from . import full_charge
 from .control import drivers as driver_registry
@@ -349,11 +350,13 @@ class Engine:
         self._control_lock = threading.RLock()
         self._drivers: dict[str, Any] = {}
         self._driver_signature: tuple[Any, ...] | None = None
-        # Learned capacity (SPEC 5): the stored profile read is cached briefly because
-        # ``effective_config`` runs inside the tick, and a note is journaled only when the
-        # applied value or its reason slug changes, so the tick cannot spam the log.
+        # Learned capacity and round-trip efficiency (SPEC 5): the stored profile reads are cached
+        # briefly because ``effective_config`` runs inside the tick, and a note is journaled only
+        # when the applied value or its reason slug changes, so the tick cannot spam the log.
         self._capacity_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
         self._capacity_notes: dict[str, str] = {}
+        self._efficiency_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
+        self._efficiency_notes: dict[str, str] = {}
         # Cost-basis ledger (SPEC 5, 0.18.0): the stored payload per battery, cached like the
         # learned capacity, and the moment the last update ran (so a replan storm cannot re-book).
         self._basis_cache: dict[str, tuple[datetime, dict[str, Any] | None]] = {}
@@ -1410,47 +1413,98 @@ class Engine:
         Cached for a short time: the profile is written once a day by maintenance, so reading it
         on every tick would be pure overhead.  A missing store/profile is ``no estimate``.
         """
+        return self._profile_status(
+            self._capacity_cache,
+            battery_id,
+            capacity_learning.load_estimate,
+            capacity_learning.capacity_status,
+        )
+
+    def efficiency_status(self, battery_id: str) -> dict[str, Any]:
+        """The stored learned round trip for one battery, classified (SPEC 5).
+
+        Same caching as :meth:`capacity_status`: one profile read per battery per cache window.
+        """
+        return self._profile_status(
+            self._efficiency_cache,
+            battery_id,
+            efficiency_learning.load_estimate,
+            efficiency_learning.round_trip_status,
+        )
+
+    def _profile_status(
+        self,
+        cache: dict[str, tuple[datetime, dict[str, Any]]],
+        battery_id: str,
+        load: Any,
+        classify: Any,
+    ) -> dict[str, Any]:
         now = self._clock()
-        cached = self._capacity_cache.get(battery_id)
+        cached = cache.get(battery_id)
         if cached is not None and (now - cached[0]).total_seconds() < CAPACITY_CACHE_S:
             return cached[1]
-        payload = capacity_learning.load_estimate(self._store, battery_id)
-        status = capacity_learning.capacity_status(payload, now)
-        self._capacity_cache[battery_id] = (now, status)
+        payload = load(self._store, battery_id)
+        status = classify(payload, now)
+        cache[battery_id] = (now, status)
         return status
 
     def invalidate_capacity_cache(self) -> None:
         """Drop the cached estimates (after maintenance has re-learned them)."""
         self._capacity_cache = {}
+        self._efficiency_cache = {}
 
     def learn_capacities(self, now: datetime | None = None) -> dict[str, Any]:
-        """Re-estimate every enabled battery from its stored measurements (SPEC 5).
+        """Re-estimate every enabled battery's capacity and round trip (SPEC 5).
 
-        Called from daily maintenance.  Each battery is guarded independently: one bad series is a
-        note, never a crash, and the manual capacity remains usable throughout.  Returns a small
-        summary (batteries, published) for logging/tests.
+        Called from daily maintenance.  The round trip is learned first: it needs no capacity at
+        all (a charge/discharge pair cancels it), and the capacity estimate then uses the learned
+        efficiency instead of the typed one, so the two numbers come from the same measurement.
+        Each battery is guarded independently: one bad series is a note, never a crash, and the
+        typed values remain usable throughout.  Returns a small summary for logging/tests.
         """
         moment = now or self._clock()
         configs = [config for config in self.battery_configs() if config.enabled]
         learned: list[str] = []
         estimated: list[str] = []
+        efficiency_learned: list[str] = []
         for config in configs:
+            learned_eta: tuple[float, float] | None = None
             try:
-                payload = capacity_learning.learn_capacity(self._store, config, moment)
+                payload = efficiency_learning.learn_round_trip(self._store, config, moment)
+            except Exception as exc:  # noqa: BLE001 - learning must never break maintenance
+                log.warning("round-trip learning failed for %s: %s", config.id, exc)
+                payload = None
+            if payload is not None:
+                status = efficiency_learning.round_trip_status(payload, moment)
+                if status.get("applied"):
+                    efficiency_learned.append(config.id)
+                    eta = float(status.get("eta_charge") or 0.0)
+                    if 0.0 < eta <= 1.0:
+                        learned_eta = (eta, eta)
+            try:
+                capacity_payload = capacity_learning.learn_capacity(
+                    self._store,
+                    config,
+                    moment,
+                    eta_charge=None if learned_eta is None else learned_eta[0],
+                    eta_discharge=None if learned_eta is None else learned_eta[1],
+                )
             except Exception as exc:  # noqa: BLE001 - learning must never break maintenance
                 log.warning("capacity learning failed for %s: %s", config.id, exc)
                 continue
-            if payload is None:
+            if capacity_payload is None:
                 continue
             estimated.append(config.id)
-            if capacity_learning.capacity_status(payload, moment).get("applied"):
+            if capacity_learning.capacity_status(capacity_payload, moment).get("applied"):
                 learned.append(config.id)
         self._capacity_notes = {}
+        self._efficiency_notes = {}
         self.invalidate_capacity_cache()
         return {
             "batteries": [config.id for config in configs],
             "estimated": estimated,
             "learned": learned,
+            "efficiency_learned": efficiency_learned,
         }
 
     # ------------------------------------------------------------------ cost basis (0.18.0)
@@ -1508,7 +1562,9 @@ class Engine:
         if not self._sell_floor_enabled():
             return None
         entries: list[tuple[BatteryConfig, float | None, float | None, float | None]] = []
-        for config in self.battery_configs():
+        # The effective capacity and round trip: the floor must price the plan's own efficiency,
+        # never the typed seed (SPEC 5).
+        for config in self.effective_battery_configs():
             if not config.enabled:
                 continue
             status = self.battery_cost_basis(config.id)
@@ -1566,7 +1622,7 @@ class Engine:
         rows: list[dict[str, Any]] = []
         basis_entries: list[tuple[BatteryConfig, float | None, float | None]] = []
         floor_entries: list[tuple[BatteryConfig, float | None, float | None, float | None]] = []
-        for config in sorted(self.battery_configs(), key=lambda c: c.id):
+        for config in sorted(self.effective_battery_configs(), key=lambda c: c.id):
             status = self.battery_cost_basis(config.id)
             rows.append({"id": config.id, "name": config.name, **status})
             if not config.enabled:
@@ -1645,13 +1701,15 @@ class Engine:
     def effective_capacity(self, config: BatteryConfig) -> tuple[float, dict[str, Any]]:
         """``(kwh, status)``: the value to use and why (a stable reason slug in ``status``).
 
-        ``manual`` always returns the configured value.  ``learned`` returns the estimate only when
+        ``pinned`` always returns the configured value.  ``auto`` returns the estimate only when
         the classifier marked it applied (confident, from at least three windows, not stale); a
         stale or low-confidence estimate falls back to the seed, which is never a fabricated
-        number.
+        number.  The pre-0.31.0 ``manual``/``learned`` spellings behave like ``auto``
+        (``learns_from_measurements``), so a typed capacity is a seed until the pack proves a
+        better one.
         """
         manual = float(config.capacity_kwh)
-        if config.capacity_source != "learned":
+        if not config.learns_from_measurements:
             status = self.capacity_status(config.id)
             return manual, {**status, "applied": False, "reason": capacity_learning.REASON_MANUAL,
                             "capacity_kwh": None}
@@ -1661,8 +1719,35 @@ class Engine:
             return manual, status
         return float(learned), status
 
+    def effective_efficiency(self, config: BatteryConfig) -> tuple[tuple[float, float], dict[str, Any]]:
+        """``((eta_charge, eta_discharge), status)``: the round trip planning must use (SPEC 5).
+
+        Mirrors :meth:`effective_capacity`: ``pinned`` keeps the typed pair, ``auto`` uses the
+        learned round trip when it is confident and fresh and splits it evenly into the two legs
+        (the same convention ``config._split_round_trip`` uses for a typed round trip).
+        """
+        typed = (float(config.eta_charge), float(config.eta_discharge))
+        if not config.learns_from_measurements:
+            status = self.efficiency_status(config.id)
+            return typed, {
+                **status,
+                "applied": False,
+                "reason": efficiency_learning.REASON_PINNED,
+                "round_trip": None,
+                "eta_charge": None,
+                "eta_discharge": None,
+            }
+        status = self.efficiency_status(config.id)
+        learned = status.get("eta_charge")
+        if learned is None:
+            return typed, status
+        eta = float(learned)
+        if not 0.0 < eta <= 1.0:
+            return typed, status
+        return (eta, eta), status
+
     def effective_config(self, config: BatteryConfig) -> BatteryConfig:
-        """A copy of ``config`` with the effective capacity and the manual caps (SPEC 5).
+        """A copy of ``config`` with the effective capacity/efficiency and the manual caps (SPEC 5).
 
         The manual limits are applied here, by lowering the configured maxima, so the planner, the
         safety clamps, the dispatcher, the HA publisher and ``/status`` all read one number and no
@@ -1671,12 +1756,18 @@ class Engine:
         """
         learned, status = self.effective_capacity(config)
         self._note_capacity_use(config, learned, status)
+        (eta_charge, eta_discharge), eta_status = self.effective_efficiency(config)
+        self._note_efficiency_use(config, eta_charge, eta_discharge, eta_status)
         limits = self._state.manual_limits
         charge_cap = resolve_manual_limit(limits, config.id, "charge", config.max_charge_w)
         discharge_cap = resolve_manual_limit(limits, config.id, "discharge", config.max_discharge_w)
         updates: dict[str, Any] = {}
         if abs(learned - float(config.capacity_kwh)) >= 1e-9:
             updates["capacity_kwh"] = learned
+        if abs(eta_charge - float(config.eta_charge)) >= 1e-9:
+            updates["eta_charge"] = eta_charge
+        if abs(eta_discharge - float(config.eta_discharge)) >= 1e-9:
+            updates["eta_discharge"] = eta_discharge
         if charge_cap is not None and charge_cap < float(config.max_charge_w):
             updates["max_charge_w"] = charge_cap
         if discharge_cap is not None and discharge_cap < float(config.max_discharge_w):
@@ -1697,7 +1788,11 @@ class Engine:
         if self._capacity_notes.get(config.id) == signature:
             return
         self._capacity_notes[config.id] = signature
-        if config.capacity_source != "learned":
+        if not config.learns_from_measurements:
+            return
+        if status.get("learned_kwh") is None:
+            # No estimate at all yet: the seed is used silently. Only a *refused* estimate is worth
+            # a journal line, so a fleet with no cycle history cannot spam the log every start.
             return
         detail = {
             "reason": status.get("reason"),
@@ -1717,6 +1812,44 @@ class Engine:
                 "info",
                 "capacity_learned_rejected",
                 f"battery {config.id}: keeping the seed capacity {learned:.3f} kWh",
+                detail,
+            )
+
+    def _note_efficiency_use(
+        self,
+        config: BatteryConfig,
+        eta_charge: float,
+        eta_discharge: float,
+        status: Mapping[str, Any],
+    ) -> None:
+        """Journal an applied/rejected learned round trip once per change (SPEC 5)."""
+        round_trip = eta_charge * eta_discharge
+        signature = f"{status.get('reason')}:{round_trip:.4f}"
+        if self._efficiency_notes.get(config.id) == signature:
+            return
+        self._efficiency_notes[config.id] = signature
+        if not config.learns_from_measurements:
+            return
+        if status.get("learned_round_trip") is None:
+            return
+        detail = {
+            "reason": status.get("reason"),
+            "samples": status.get("samples"),
+            "seed_round_trip": round(float(config.round_trip_efficiency), 4),
+            "effective_round_trip": round(round_trip, 4),
+        }
+        if status.get("applied"):
+            self._journal.event(
+                "info",
+                "efficiency_learned_applied",
+                f"battery {config.id}: using learned round trip {round_trip:.3f}",
+                detail,
+            )
+        else:
+            self._journal.event(
+                "info",
+                "efficiency_learned_rejected",
+                f"battery {config.id}: keeping the typed round trip {round_trip:.3f}",
                 detail,
             )
 
@@ -1845,6 +1978,11 @@ class Engine:
             # to trust; the same numbers are exposed flat on the record for tests/clients.
             capacity_info = self.capacity_status(config.id)
             effective_kwh, effective_status = self.effective_capacity(config)
+            # SPEC 5: the same story for the round trip.  A plan's money, break-even and wear all
+            # come from this efficiency, so the card states the seed, the estimate and the value
+            # actually in force.
+            efficiency_info = self.efficiency_status(config.id)
+            (eta_charge, eta_discharge), efficiency_effective = self.effective_efficiency(config)
             views.append(
                 {
                     "config": _battery_view(config),
@@ -1871,6 +2009,24 @@ class Engine:
                         "stale": bool(capacity_info.get("stale")),
                         "confident": bool(capacity_info.get("confident")),
                         "applied": bool(effective_status.get("applied")),
+                    },
+                    # Additive (0.31.0): the learned round trip, its evidence and what is in force.
+                    "efficiency_round_trip": round(eta_charge * eta_discharge, 6),
+                    "efficiency_learned_round_trip": efficiency_info.get("learned_round_trip"),
+                    "efficiency_samples": int(efficiency_info.get("samples") or 0),
+                    "efficiency_updated_at": efficiency_info.get("updated_at"),
+                    "efficiency_reason": efficiency_effective.get("reason"),
+                    "efficiency": {
+                        "source": config.capacity_source,
+                        "configured_round_trip": round(float(config.round_trip_efficiency), 6),
+                        "learned_round_trip": efficiency_info.get("learned_round_trip"),
+                        "samples": int(efficiency_info.get("samples") or 0),
+                        "updated_at": efficiency_info.get("updated_at"),
+                        "effective_round_trip": round(eta_charge * eta_discharge, 6),
+                        "reason": efficiency_effective.get("reason"),
+                        "stale": bool(efficiency_info.get("stale")),
+                        "confident": bool(efficiency_info.get("confident")),
+                        "applied": bool(efficiency_effective.get("applied")),
                     },
                     "maintenance": maintenance.get(config.id)
                     or {

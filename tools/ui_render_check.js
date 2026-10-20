@@ -200,6 +200,18 @@ function classTokens(text) {
     /Configured 12\.00 kWh/.test(capacityText) && /effective 9\.60 kWh/.test(capacityText),
     capacityText.slice(0, 240),
   );
+  // SPEC 5 (0.31.0): the round trip is learned the same way, and the card says so with evidence.
+  check(
+    "the batteries card states the learned round trip and its evidence",
+    /Learned from measured cycles: 81\.3 % round trip/.test(capacityText)
+      && /4 accepted charge\/discharge pair/.test(capacityText),
+    capacityText.slice(0, 240),
+  );
+  check(
+    "the batteries card states the configured seed next to the effective round trip",
+    /Round trip 90\.0 % configured/.test(capacityText) && /81\.3 % effective/.test(capacityText),
+    capacityText.slice(0, 240),
+  );
 
   /* ---------- 1a2. cell-voltage protection on the Batteries card (SPEC 9.3) ---------- */
   console.log("\n1a2. batteries card: cell voltage and the guard");

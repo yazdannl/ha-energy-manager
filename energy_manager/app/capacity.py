@@ -1,8 +1,9 @@
 """Self-learning battery capacity (SPEC.md section 5).
 
-A new pack rarely holds what its label promises, and an aged one holds less. Every battery can
-therefore be configured with ``capacity_source="learned"``: ``capacity_kwh`` stays the seed/fallback
-and the planner uses the value measured from the pack's own cycles once it is confident.
+A new pack rarely holds what its label promises, and an aged one holds less. Every battery
+therefore carries ``capacity_source``: ``auto`` (the default) keeps ``capacity_kwh`` as the
+seed/fallback and lets the planner use the value measured from the pack's own cycles once it is
+confident; ``pinned`` always uses the typed value.
 
 The estimate is derived from the persisted 5-minute measurement rows only (``sources/measure.py``),
 never from user settings: each *window* is a maximal run of same-direction AC power whose SoC moved
@@ -33,10 +34,16 @@ from .models import BatteryConfig, from_iso, to_iso, utcnow
 __all__ = [
     "DEFAULT_SAMPLE_MINUTES",
     "MAX_KEPT_WINDOWS",
+    "MAD_LIMIT",
+    "mad_filter",
+    "mad_inliers",
+    "POWER_ROLES",
+    "SOC_ROLE",
     "MIN_ACCEPTED_WINDOWS",
     "MIN_DSOC_PCT",
     "MIN_POWER_FRACTION",
     "PROFILE_KIND",
+    "SCHEMA",
     "REASON_APPLIED",
     "REASON_LOW_CONFIDENCE",
     "REASON_MANUAL",
@@ -54,6 +61,12 @@ __all__ = [
 
 #: Store ``learning_profiles`` kind for the per-battery estimate; the key is the battery id.
 PROFILE_KIND = "battery_capacity"
+
+#: Payload schema (0.31.0 raises it to 2).  The AC energy of a window used to be read from the
+#: signed ``battery_power`` role -- the ``power_setpoint_entity`` *command* -- and is now the measured
+#: charge/discharge pair, so a payload written by the old formula measured partly the setpoint and is
+#: not trusted (the typed seed stands until the next maintenance relearn rewrites it).
+SCHEMA = 2
 
 #: A window's SoC must move at least this many points to be trusted.
 MIN_DSOC_PCT = 10.0
@@ -77,6 +90,7 @@ MAD_SCALE = 1.4826
 MAD_LIMIT = 3.5
 
 #: Stable reason slugs reported wherever the effective capacity is exposed (SPEC 5/10).
+#: ``REASON_MANUAL`` is the pinned/typed case (the pre-0.31.0 name is kept: the slug is a contract).
 REASON_MANUAL = "capacity_manual"
 REASON_APPLIED = "capacity_learned"
 REASON_STALE = "capacity_learned_stale"
@@ -85,6 +99,10 @@ REASON_UNAVAILABLE = "capacity_learned_unavailable"
 
 _POWER_ROLES = ("battery_power", "battery_charge", "battery_discharge")
 _SOC_ROLE = "battery_soc"
+
+#: Public aliases: :mod:`app.efficiency` reads the same measurement vocabulary.
+POWER_ROLES = _POWER_ROLES
+SOC_ROLE = _SOC_ROLE
 
 
 def _finite(value: Any) -> float | None:
@@ -95,23 +113,47 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def mad_filter(values: Iterable[float], limit: float = MAD_LIMIT) -> list[bool]:
+    """Mask of the values a median-absolute-deviation filter keeps (aligned with ``values``).
+
+    A zero MAD (more than half the values agree exactly, or a single value) keeps every value: the
+    filter is never allowed to empty the set.  A non-finite value is dropped (``False``).
+    ``app.efficiency`` needs the mask itself, because its weights belong to the surviving pairs.
+    """
+    numbers = [_finite(value) for value in values]
+    finite = [value for value in numbers if value is not None]
+    if not finite:
+        return [False] * len(numbers)
+    middle = statistics.median(finite)
+    mad = statistics.median([abs(value - middle) for value in finite])
+    if mad <= 0:
+        return [value is not None for value in numbers]
+    cutoff = float(limit) * MAD_SCALE * mad
+    keep = [value is not None and abs(value - middle) <= cutoff for value in numbers]
+    return keep if any(keep) else [value is not None for value in numbers]
+
+
+def mad_inliers(values: Iterable[float], limit: float = MAD_LIMIT) -> list[float]:
+    """The values left after a median-absolute-deviation filter (a stable order, finite only).
+
+    Shared with :mod:`app.efficiency`, which needs the surviving set and not only its median.
+    """
+    numbers = list(values)
+    mask = mad_filter(numbers, limit)
+    return [
+        value
+        for value, keep in zip(numbers, mask)
+        if keep and _finite(value) is not None
+    ]
+
+
 def robust_median(values: Iterable[float]) -> float | None:
     """Median after dropping outliers by median absolute deviation; ``None`` when empty.
 
     A zero MAD (more than half the windows agree exactly, or a single window) keeps every value.
     """
-    finite = [value for value in (_finite(v) for v in values) if value is not None]
-    if not finite:
-        return None
-    middle = statistics.median(finite)
-    deviations = [abs(value - middle) for value in finite]
-    mad = statistics.median(deviations)
-    if mad > 0:
-        limit = MAD_LIMIT * MAD_SCALE * mad
-        inliers = [value for value in finite if abs(value - middle) <= limit]
-        if inliers:
-            finite = inliers
-    return statistics.median(finite)
+    inliers = mad_inliers(values)
+    return statistics.median(inliers) if inliers else None
 
 
 def extract_windows(
@@ -126,7 +168,8 @@ def extract_windows(
     """Turn ``(ts, ac_power_w, soc_pct)`` samples into accepted capacity windows.
 
     Returns ``(accepted, rejected)``. Each accepted window is
-    ``{kind, capacity_kwh, dsoc_pct, mean_power_w, samples}``. A run is broken (and never joined
+    ``{kind, capacity_kwh, dsoc_pct, mean_power_w, samples, ac_kwh, start, end}``. A run is broken
+    (and never joined
     across the break) by a direction change, a zero/invalid power sample or a gap longer than one
     sample, so a missing measurement can only shorten a window, never bridge it.
     """
@@ -180,6 +223,11 @@ def extract_windows(
                 "dsoc_pct": round(dsoc, 3),
                 "mean_power_w": round(mean_power, 1),
                 "samples": current["count"],
+                # The raw facts a round-trip estimate needs (``app.efficiency``): the AC energy
+                # the window really moved and when it did (the cycle order and its age).
+                "ac_kwh": ac_kwh,
+                "start": current["start_ts"],
+                "end": current["end_ts"],
             }
         )
 
@@ -208,11 +256,14 @@ def extract_windows(
                 "sign": sign,
                 "start_soc": soc_start,
                 "end_soc": soc_end,
+                "start_ts": t0,
+                "end_ts": t1,
                 "ac_kwh": 0.0,
                 "power_abs": 0.0,
                 "count": 0,
             }
         run["end_soc"] = soc_end
+        run["end_ts"] = t1
         run["ac_kwh"] += abs(power) * gap / 60.0 / 1000.0
         run["power_abs"] += abs(power)
         run["count"] += 1
@@ -254,6 +305,7 @@ def estimate_capacity(
         "samples": samples_count,
         "windows": [round(value, 4) for value in values[-MAX_KEPT_WINDOWS:]],
         "rejected": rejected,
+        "schema": SCHEMA,
         "updated_at": to_iso(now or utcnow()),
     }
 
@@ -279,7 +331,10 @@ def capacity_status(
     except (TypeError, ValueError):
         count = 0
     updated = from_iso(payload.get("updated_at"))
-    if value is None or count < MIN_ACCEPTED_WINDOWS:
+    if _finite(payload.get("schema")) != float(SCHEMA):
+        # An estimate from an older measurement formula is reported but never applied.
+        reason = REASON_LOW_CONFIDENCE
+    elif value is None or count < MIN_ACCEPTED_WINDOWS:
         reason = REASON_LOW_CONFIDENCE
     elif updated is None:
         reason = REASON_STALE
@@ -316,10 +371,14 @@ def samples_from_rows(
 ) -> list[tuple[datetime, float, float]]:
     """Collapse measurement rows into one ``(ts, ac_power_w, soc_pct)`` sample per bucket.
 
-    The signed ``battery_power:<id>`` role wins; otherwise the measured pair is
-    ``battery_charge:<id> - battery_discharge:<id>`` (a missing side counts as 0), the same
-    AC-side convention as :mod:`app.sources.measure`. A bucket without both power and SoC is
-    skipped rather than half-read.
+    The **measured** AC pair ``battery_charge:<id> - battery_discharge:<id>`` wins (a missing side
+    counts as 0, the same AC-side convention as :mod:`app.sources.measure`); the signed
+    ``battery_power:<id>`` role is only a fallback.  That role is the ``power_setpoint_entity`` --
+    a command written to the device (``app.sources.measure.role_entities``), and a command that the
+    pack/BMS did not fully follow (a taper, a manager still ramping) would inflate the AC energy and
+    so the learned capacity.  Learning must integrate what the pack really moved, exactly like the
+    savings ledger refuses an unconfirmed command (SPEC 5/10).  A bucket without both power and SoC
+    is skipped rather than half-read.
     """
     buckets: dict[str, dict[str, float]] = {}
     for row in rows:
@@ -337,10 +396,10 @@ def samples_from_rows(
         soc = values.get(_SOC_ROLE)
         if soc is None:
             continue
-        if "battery_power" in values:
-            power = values["battery_power"]
-        elif "battery_charge" in values or "battery_discharge" in values:
+        if "battery_charge" in values or "battery_discharge" in values:
             power = values.get("battery_charge", 0.0) - values.get("battery_discharge", 0.0)
+        elif "battery_power" in values:
+            power = values["battery_power"]
         else:
             continue
         moment = from_iso(key)
@@ -372,11 +431,16 @@ def learn_capacity(
     *,
     days: float = 45.0,
     sample_minutes: float = DEFAULT_SAMPLE_MINUTES,
+    eta_charge: float | None = None,
+    eta_discharge: float | None = None,
 ) -> dict[str, Any] | None:
     """Estimate one battery from its persisted measurement rows and store the payload.
 
     Returns the stored payload, or ``None`` when there is no store/rows. A store failure is
     swallowed on purpose: learning is an optimisation, and the manual capacity stays correct.
+    ``eta_charge``/``eta_discharge`` default to the battery's configured values and are overridden
+    with the learned round trip when one is available (SPEC 5): capacity and efficiency then come
+    from the same measurement, so they cannot contradict each other.
     """
     reader = getattr(store, "measurements_range", None)
     writer = getattr(store, "profile_put", None)
@@ -393,8 +457,8 @@ def learn_capacity(
         samples_from_rows(rows, battery.id),
         max_charge_w=battery.max_charge_w,
         max_discharge_w=battery.max_discharge_w,
-        eta_charge=battery.eta_charge,
-        eta_discharge=battery.eta_discharge,
+        eta_charge=battery.eta_charge if eta_charge is None else float(eta_charge),
+        eta_discharge=battery.eta_discharge if eta_discharge is None else float(eta_discharge),
         sample_minutes=sample_minutes,
         now=moment,
     )

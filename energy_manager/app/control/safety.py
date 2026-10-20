@@ -33,6 +33,15 @@ from ..models import (
     utcnow,
 )
 
+
+def _finite(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
+
+
 #: Per-battery AC power step limit per tick (SPEC 9.3 clause 8).
 RAMP_LIMIT_W = 1000.0
 EPS_W = 0.5
@@ -280,8 +289,18 @@ def check(
     *,
     cell_voltage_latch: Mapping[str, Mapping[str, Any]] | None = None,
     sell_floor_eur_per_kwh: float | None = None,
+    plan_track: Mapping[str, Any] | None = None,
 ) -> SafetyDecision:
-    """Apply SPEC 9.3 and return the write that is allowed (``block`` = nothing)."""
+    """Apply SPEC 9.3 and return the write that is allowed (``block`` = nothing).
+
+    ``plan_track`` (SPEC 9.3 clause 5b, 0.31.0) is the active slot's own SoC trajectory as
+    ``{energy_kwh, until, power_w}``: the aggregate pack energy the plan expects at the end of the
+    slot and the moment that slot ends.  It lets the guard land the pack *on* the plan instead of
+    running a whole slot at its modelled power: a pack that is faster than the model (a capacity or
+    efficiency mismatch) has its setpoint cut to zero the moment the trajectory is reached, so a
+    95 % terminal target stays 95 % instead of drifting on to 100 %.  It only ever tightens a
+    bound -- never raises one -- and a hold slot (power 0) is untouched.
+    """
     moment = now or utcnow()
     get = settings.get
     states = {s.id: s for s in getattr(state, "batteries", []) or []}
@@ -412,6 +431,33 @@ def check(
     if soc_lo > p_min + EPS_W:
         soc_floor_binding = True
 
+    # 5b. Plan SoC tracking (SPEC 9.3 clause 5b): the plan's own trajectory for this slot bounds the
+    #     tick, so the pack lands where the plan says instead of at whatever the hardware can absorb
+    #     in the slot.  Only the direction the plan is running in is tracked, and the bound is
+    #     clamped at zero: tracking never turns a charge into a discharge (or the other way round).
+    track_hi_binding = track_lo_binding = False
+    if plan_track and dt_hours > 0:
+        track_target = _finite(plan_track.get("energy_kwh"))
+        track_until = plan_track.get("until")
+        track_power = _finite(plan_track.get("power_w"))
+        if track_target is not None and isinstance(track_until, datetime) and track_power:
+            remaining_hours = (track_until - moment).total_seconds() / 3600.0
+            if remaining_hours <= 0:
+                # The slot boundary is here or past: only this tick is left.
+                remaining_hours = dt_hours
+            if track_power > 0 and eta_chg > 0:
+                track_hi = max(0.0, (track_target - e_now) / (remaining_hours * eta_chg) * 1000.0)
+                if track_hi < soc_hi - 1e-9:
+                    soc_hi = track_hi
+                    track_hi_binding = True
+            elif track_power < 0 and eta_dis > 0:
+                track_lo = min(
+                    0.0, (track_target - e_now) * eta_dis / remaining_hours * 1000.0
+                )
+                if track_lo > soc_lo + 1e-9:
+                    soc_lo = track_lo
+                    track_lo_binding = True
+
     # 6. Power clamp: aggregated device limits (per-battery limits are applied after allocation).
     power_hi_binding = soc_hi > p_max - EPS_W
     power_lo_binding = soc_lo < p_min + EPS_W
@@ -517,6 +563,10 @@ def check(
         reasons.append(Reason.SELL_FLOOR)
 
     # Attribute reasons: every bound the result sits on, plus every unusable battery.
+    if track_hi_binding and abs(allowed - soc_hi) <= EPS_W and target > 0:
+        reasons.append(Reason.PLAN_TARGET)
+    if track_lo_binding and abs(allowed - soc_lo) <= EPS_W and target < 0:
+        reasons.append(Reason.PLAN_TARGET)
     if soc_ceiling_binding and abs(allowed - soc_hi) <= EPS_W and target > 0:
         reasons.append(Reason.SOC_CEILING)
     if soc_floor_binding and abs(allowed - soc_lo) <= EPS_W and target < 0:

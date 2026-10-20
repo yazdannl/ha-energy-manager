@@ -434,7 +434,7 @@
         price_eur: MOCK_PRICE_EUR,
         cycle_life: MOCK_CYCLE_LIFE,
         control_path: "auto",
-        capacity_source: "learned",
+        capacity_source: "auto",
         mapping: {
           power_setpoint_entity: "number.example_battery_input_limit",
           mode_select_entity: "select.example_battery_mode",
@@ -459,7 +459,7 @@
       discovery: discoveryCandidates("battery"),
       // SPEC 5 learned capacity: the effective value the planner uses, the estimate's evidence and
       // a stable reason slug. Synthetic, so the card and the render check exercise every branch.
-      capacity_source: "learned",
+      capacity_source: "auto",
       capacity_kwh: CAP_KWH,
       capacity_learned_kwh: 9.6,
       capacity_samples: 5,
@@ -467,13 +467,32 @@
       effective_capacity_kwh: 9.6,
       capacity_reason: "capacity_learned",
       capacity: {
-        source: "learned",
+        source: "auto",
         configured_kwh: CAP_KWH,
         learned_kwh: 9.6,
         samples: 5,
         updated_at: iso(Date.now() - 2 * 86400000),
         effective_kwh: 9.6,
         reason: "capacity_learned",
+        stale: false,
+        confident: true,
+        applied: true
+      },
+      // SPEC 5 learned round trip (0.31.0): the same evidence shape as the capacity, and the value
+      // the planner, break-even and wear really use.
+      efficiency_round_trip: 0.8125,
+      efficiency_learned_round_trip: 0.8125,
+      efficiency_samples: 4,
+      efficiency_updated_at: iso(Date.now() - 2 * 86400000),
+      efficiency_reason: "efficiency_learned",
+      efficiency: {
+        source: "auto",
+        configured_round_trip: MOCK_ROUND_TRIP_PCT / 100,
+        learned_round_trip: 0.8125,
+        samples: 4,
+        updated_at: iso(Date.now() - 2 * 86400000),
+        effective_round_trip: 0.8125,
+        reason: "efficiency_learned",
         stale: false,
         confident: true,
         applied: true

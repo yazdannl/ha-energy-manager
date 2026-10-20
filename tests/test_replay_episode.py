@@ -1044,7 +1044,12 @@ def test_the_as_of_rule_takes_the_value_recorded_before_the_window(tmp_path: Pat
             (
                 capacity_learning.PROFILE_KIND,
                 BATTERY.id,
-                {"capacity_kwh": 4.0, "samples": 6, "updated_at": to_iso(START - timedelta(days=1))},
+                {
+                    "capacity_kwh": 4.0,
+                    "samples": 6,
+                    "schema": capacity_learning.SCHEMA,
+                    "updated_at": to_iso(START - timedelta(days=1)),
+                },
                 START - timedelta(days=1),
             )
         ],
@@ -1237,7 +1242,12 @@ def test_effective_configs_freeze_the_learned_capacity_and_manual_limits(tmp_pat
             (
                 capacity_learning.PROFILE_KIND,
                 BATTERY.id,
-                {"capacity_kwh": 4.2, "samples": 6, "updated_at": to_iso(START - timedelta(days=1))},
+                {
+                    "capacity_kwh": 4.2,
+                    "samples": 6,
+                    "schema": capacity_learning.SCHEMA,
+                    "updated_at": to_iso(START - timedelta(days=1)),
+                },
                 START - timedelta(days=1),
             )
         ],

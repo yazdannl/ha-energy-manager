@@ -448,7 +448,16 @@ def test_batteries_view_carries_flat_capabilities_and_cycles(wired):
         "effective_capacity_kwh",
         "capacity_reason",
     } <= set(record)
-    assert record["capacity_source"] in ("manual", "learned")
+    assert record["capacity_source"] in ("auto", "pinned")
+    # SPEC 5: the learned round trip travels with the capacity, same shape, same evidence.
+    assert {
+        "efficiency",
+        "efficiency_round_trip",
+        "efficiency_learned_round_trip",
+        "efficiency_samples",
+        "efficiency_updated_at",
+        "efficiency_reason",
+    } <= set(record)
     assert record["config"]["capacity_source"] == record["capacity_source"]
     assert record["effective_capacity_kwh"] == record["config"]["capacity_kwh"] or record["capacity"]["applied"]
     note(f"batteries: capabilities keys={sorted(capabilities)} cycles={record['cycles']}")
@@ -456,22 +465,41 @@ def test_batteries_view_carries_flat_capabilities_and_cycles(wired):
 
 def test_capacity_source_round_trips_and_has_no_fabricated_estimate(wired):
     status, _headers, body = wired.json(
-        "PATCH", "/api/v1/batteries/example_battery_1", {"patch": {"capacity_source": "learned"}}
+        "PATCH", "/api/v1/batteries/example_battery_1", {"patch": {"capacity_source": "pinned"}}
     )
-    assert status == 200 and body["config"]["capacity_source"] == "learned"
+    assert status == 200 and body["config"]["capacity_source"] == "pinned"
     status, _headers, body = wired.json("GET", "/api/v1/batteries")
     assert status == 200
     record = next(item for item in body["batteries"] if item["config"]["id"] == "example_battery_1")
-    assert record["capacity_source"] == "learned"
+    assert record["capacity_source"] == "pinned"
     # No measurement history in this fixture: the seed is used, never an invented estimate.
     assert record["capacity_learned_kwh"] is None
     assert record["capacity_samples"] == 0
     assert record["effective_capacity_kwh"] == 5.0
-    assert record["capacity_reason"] == "capacity_learned_unavailable"
-    status, _headers, body = wired.json(
-        "PATCH", "/api/v1/batteries/example_battery_1", {"patch": {"capacity_source": "manual"}}
-    )
-    assert status == 200 and body["config"]["capacity_source"] == "manual"
+    assert record["capacity_reason"] == "capacity_manual"
+
+
+def test_capacity_source_auto_round_trips_and_keeps_the_typed_values_as_seeds(wired):
+    """0.31.0: ``auto`` is the default, and the pre-0.31.0 spellings still mean auto."""
+    for value in ("auto", "learned", "manual"):
+        status, _headers, body = wired.json(
+            "PATCH", "/api/v1/batteries/example_battery_1", {"patch": {"capacity_source": value}}
+        )
+        assert status == 200, body
+        # ``learned``/``manual`` are normalised on the way in so the API has one spelling.
+        assert body["config"]["capacity_source"] == "auto"
+        status, _headers, body = wired.json("GET", "/api/v1/batteries")
+        assert status == 200
+        record = next(item for item in body["batteries"] if item["config"]["id"] == "example_battery_1")
+        assert record["capacity_source"] == "auto"
+        # No measurement history: the seed stands, and nothing is invented for the round trip.
+        assert record["capacity_learned_kwh"] is None
+        assert record["effective_capacity_kwh"] == 5.0
+        assert record["efficiency_learned_round_trip"] is None
+        assert record["efficiency_samples"] == 0
+        typed = record["config"]["eta_charge"] * record["config"]["eta_discharge"]
+        assert record["efficiency_round_trip"] == pytest.approx(typed)
+    # An unknown value is still refused instead of being silently rewritten.
     status, _headers, body = wired.json(
         "PATCH", "/api/v1/batteries/example_battery_1", {"patch": {"capacity_source": "nonsense"}}
     )

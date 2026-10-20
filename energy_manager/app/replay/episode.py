@@ -19,6 +19,7 @@ from typing import Any, Mapping, Sequence
 
 from .. import capacity as capacity_learning
 from .. import cost_basis as cost_basis_ledger
+from .. import efficiency as efficiency_learning
 from .. import full_charge
 from ..config import Settings
 from ..engine import ACTUALS_MINUTES, MIN_REPLAN_GAP_S
@@ -1169,12 +1170,20 @@ def _truncate(
 def _effective_configs(
     settings: Settings, profiles: Mapping[tuple[str, str], Any], start: datetime
 ) -> tuple[BatteryConfig, ...]:
-    """The battery configs as of ``start``: learned capacity and manual caps, never today's."""
+    """The battery configs as of ``start``: learned values and manual caps, never today's."""
     limits = clean_manual_limits(settings.get("manual_limits", {}))
     out: list[BatteryConfig] = []
     for config in settings.battery_list():
         updates: dict[str, Any] = {}
-        if config.capacity_source == "learned":
+        if config.learns_from_measurements:
+            # The round trip first: it needs no capacity, and the capacity learner used it too.
+            efficiency_status = efficiency_learning.round_trip_status(
+                profiles.get((efficiency_learning.PROFILE_KIND, config.id)), start
+            )
+            eta = efficiency_status.get("eta_charge")
+            if eta is not None and 0.0 < float(eta) <= 1.0:
+                updates["eta_charge"] = float(eta)
+                updates["eta_discharge"] = float(eta)
             status = capacity_learning.capacity_status(
                 profiles.get((capacity_learning.PROFILE_KIND, config.id)), start
             )

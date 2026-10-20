@@ -384,6 +384,7 @@
     battery_unavailable: "Blocked: battery unavailable",
     soc_floor: "Blocked: SoC floor",
     soc_ceiling: "Blocked: SoC ceiling",
+    plan_soc_target: "Plan SoC reached: setpoint cut to the plan's trajectory",
     power_clamp: "Power clamped to limits",
     grid_import_limit: "Blocked: grid import limit",
     grid_export_limit: "Blocked: grid export limit",
@@ -3645,7 +3646,10 @@
   function capacitySummary(record) {
     var config = (record && record.config) || {};
     var info = (record && record.capacity) || {};
-    var source = String(config.capacity_source || info.source || "manual");
+    // ``auto`` learns from the pack's own cycles; ``pinned`` always uses what was typed.  The
+    // pre-0.31.0 ``manual``/``learned`` spellings both mean auto (the server normalises them too).
+    var source = String(config.capacity_source || info.source || "auto");
+    if (source !== "pinned") source = "auto";
     function pick(infoKey, recordKey) {
       if (isNum(info[infoKey])) return info[infoKey];
       if (record && isNum(record[recordKey])) return record[recordKey];
@@ -3663,14 +3667,42 @@
       updated: info.updated_at || (record && record.capacity_updated_at) || null,
       reason: String((record && record.capacity_reason) || info.reason || ""),
       stale: !!info.stale,
-      applied: source !== "learned" || !!info.applied
+      applied: !!info.applied
+    };
+  }
+
+  /** SPEC 5 learned round trip: the same shape as the capacity summary, never a guess. */
+  function efficiencySummary(record) {
+    var config = (record && record.config) || {};
+    var info = (record && record.efficiency) || {};
+    var source = String(config.capacity_source || info.source || "auto");
+    if (source !== "pinned") source = "auto";
+    function pick(infoKey, recordKey) {
+      if (isNum(info[infoKey])) return info[infoKey];
+      if (record && isNum(record[recordKey])) return record[recordKey];
+      return null;
+    }
+    var typed = batteryEfficiency(config);
+    var configured = pick("configured_round_trip", null);
+    if (configured == null && typed) configured = typed.round_trip;
+    var samples = pick("samples", "efficiency_samples");
+    return {
+      source: source,
+      configured: configured,
+      learned: pick("learned_round_trip", "efficiency_learned_round_trip"),
+      effective: pick("effective_round_trip", "efficiency_round_trip"),
+      samples: samples == null ? 0 : samples,
+      updated: info.updated_at || (record && record.efficiency_updated_at) || null,
+      reason: String((record && record.efficiency_reason) || info.reason || ""),
+      stale: !!info.stale,
+      applied: !!info.applied
     };
   }
 
   /** One truthful sentence about where a battery's capacity comes from (SPEC 5). */
   function capacityLearningText(cap) {
-    if (cap.source !== "learned") {
-      return "Capacity source: manual — the configured " + fmtKwh(cap.configured) + " kWh is used everywhere.";
+    if (cap.source === "pinned") {
+      return "Capacity source: pinned — the configured " + fmtKwh(cap.configured) + " kWh is used everywhere and the estimate is ignored.";
     }
     if (cap.learned == null) {
       return "Learned capacity: no published estimate yet (" + cap.samples + " of 3 accepted windows). The configured " + fmtKwh(cap.configured) + " kWh seed is used meanwhile.";
@@ -3679,6 +3711,36 @@
       return "Learned capacity ignored (" + (cap.reason || "rejected") + "); the configured " + fmtKwh(cap.configured) + " kWh seed is used. Estimate was " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " window(s).";
     }
     return "Learned from measured cycles: " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " accepted window(s), last learned " + timeAgo(cap.updated) + ". Effective capacity " + fmtKwh(cap.effective) + " kWh.";
+  }
+
+  /** One truthful sentence about where a battery's round trip comes from (SPEC 5). */
+  function efficiencyLearningText(eff) {
+    function asPct(value) { return isNum(value) ? fmtPct(value * 100) : "--"; }
+    if (eff.source === "pinned") {
+      return "Round-trip efficiency: pinned — the configured " + asPct(eff.configured) + " is used everywhere and the estimate is ignored.";
+    }
+    if (eff.learned == null) {
+      return "Learned round trip: no published estimate yet (" + eff.samples + " of 3 accepted charge/discharge pairs). The configured " + asPct(eff.configured) + " seed is used meanwhile.";
+    }
+    if (!eff.applied) {
+      return "Learned round trip ignored (" + (eff.reason || "rejected") + "); the configured " + asPct(eff.configured) + " seed is used. Estimate was " + asPct(eff.learned) + " from " + eff.samples + " pair(s).";
+    }
+    return "Learned from measured cycles: " + asPct(eff.learned) + " round trip from " + eff.samples + " accepted charge/discharge pair(s), last learned " + timeAgo(eff.updated) + ". Effective round trip " + asPct(eff.effective) + ".";
+  }
+
+  /** The config the card's economics must use: the learned round trip when it is in force (SPEC 5). */
+  function effectiveEfficiencyConfig(record) {
+    var config = (record && record.config) || {};
+    var info = (record && record.efficiency) || {};
+    var roundTrip = isNum(info.effective_round_trip) ? info.effective_round_trip : null;
+    if (roundTrip == null || !(roundTrip > 0 && roundTrip <= 1)) return config;
+    var split = Math.sqrt(roundTrip);
+    var copy = {};
+    Object.keys(config).forEach(function (key) { copy[key] = config[key]; });
+    copy.eta_charge = split;
+    copy.eta_discharge = split;
+    copy.round_trip_efficiency_pct = roundTrip * 100;
+    return copy;
   }
 
   function mappingList(config, resolved) {
@@ -3758,12 +3820,14 @@
     var capabilities = record.capabilities || {};
     var cycles = batteryCycleCount(st);
     var cap = capacitySummary(record);
-    var eff = batteryEfficiency(config);
+    var effInfo = efficiencySummary(record);
+    var econConfig = effectiveEfficiencyConfig(record);
+    var eff = batteryEfficiency(econConfig);
     var wearOverride = isNum(cycleCost) ? cycleCost : 0;
-    var wear = batteryWear(config, wearOverride);
+    var wear = batteryWear(econConfig, wearOverride);
     var buy = isNum(status.price_now) ? status.price_now : null;
-    var storedCost = storedKwhCostEur(buy, config, wear);
-    var breakEven = breakEvenSellEur(buy, config, wear);
+    var storedCost = storedKwhCostEur(buy, econConfig, wear);
+    var breakEven = breakEvenSellEur(buy, econConfig, wear);
     var canTest = status.mode === "auto" && !status.dry_run;
     var cellVoltage = st.extra && isNum(st.extra.cell_voltage_v) ? st.extra.cell_voltage_v : null;
     var guardRow = null;
@@ -3845,12 +3909,15 @@
     ]);
 
     var detailsBlocks = [
-      // SPEC 5: where the effective capacity comes from, with the estimate's own evidence.
+      // SPEC 5: where the effective capacity and round trip come from, with the estimates' own
+      // evidence.  The plan's money, break-even and wear all come from these two numbers.
       el("details", { class: "disclosure" }, [
-        el("summary", { text: "Capacity learning" }),
+        el("summary", { text: "Learned values" }),
         el("div", { class: "disclosure-body" }, [
           el("p", { class: "field-help", text: capacityLearningText(cap) }),
-          el("p", { class: "field-help", text: "Configured " + fmtKwh(cap.configured) + " kWh · effective " + fmtKwh(cap.effective) + " kWh" + (cap.samples ? " · " + cap.samples + " accepted measurement window(s)" : "") + (cap.updated ? " · last learned " + timeAgo(cap.updated) : "") + ". Switch between manual and learned in Edit → Capacity source." })
+          el("p", { class: "field-help", text: "Configured " + fmtKwh(cap.configured) + " kWh · effective " + fmtKwh(cap.effective) + " kWh" + (cap.samples ? " · " + cap.samples + " accepted measurement window(s)" : "") + (cap.updated ? " · last learned " + timeAgo(cap.updated) : "") + ". Switch between auto and pinned in Edit → Learned values." }),
+          el("p", { class: "field-help", text: efficiencyLearningText(effInfo) }),
+          el("p", { class: "field-help", text: "Round trip " + fmtPct(effInfo.configured == null ? null : effInfo.configured * 100) + " configured · " + fmtPct(effInfo.effective == null ? null : effInfo.effective * 100) + " effective" + (effInfo.samples ? " · " + effInfo.samples + " accepted charge/discharge pair(s)" : "") + (effInfo.updated ? " · last learned " + timeAgo(effInfo.updated) : "") + ". A pair is one measured charge followed by one measured discharge, so the round trip is measured without trusting any capacity figure." })
         ])
       ]),
       economics,
@@ -3973,9 +4040,10 @@
       // Which write path the driver must use.  "auto" keeps the shipped behaviour (the Zendure
       // manager when its entities are mapped), so an older saved battery is unaffected.
       control_path: ["auto", "manager", "device"].indexOf(String(source.control_path)) >= 0 ? String(source.control_path) : "auto",
-      // SPEC 5: manual (default) uses the typed capacity; learned uses the measured estimate and
-      // keeps the typed value as the seed/fallback.
-      capacity_source: String(source.capacity_source) === "learned" ? "learned" : "manual"
+      // SPEC 5: auto (default) learns the capacity and round trip from the pack's own cycles and
+      // keeps the typed values as seeds/fallbacks; pinned always uses what was typed.  The
+      // pre-0.31.0 spellings manual/learned both mean auto.
+      capacity_source: String(source.capacity_source) === "pinned" ? "pinned" : "auto"
     };
     var mapping = {};
     Object.keys(source.mapping || {}).forEach(function (key) { mapping[key] = String(source.mapping[key]); });
@@ -4037,15 +4105,15 @@
 
     var capacitySourceSelect = el("select", { id: "battery-capacity-source" });
     [
-      ["manual", "Manual — use the capacity I typed"],
-      ["learned", "Learned — measure the pack's real usable capacity"]
+      ["auto", "Auto — learn capacity and round trip from the pack's own cycles (recommended)"],
+      ["pinned", "Pinned — always use the capacity and round trip I typed"]
     ].forEach(function (option) {
       var node = el("option", { value: option[0], text: option[1] });
       if (option[0] === fields.capacity_source) node.selected = true;
       capacitySourceSelect.appendChild(node);
     });
     inputs.capacity_source = capacitySourceSelect;
-    var capacitySourceNote = el("p", { class: "field-help", text: "Learned keeps the typed capacity as the seed/fallback and uses the estimate measured from this battery's own 5-minute power and SoC history: only windows with at least a 10-point SoC move and at least 20 % of the battery's own power limit count, and at least three accepted windows are needed before it is used. The estimate is ignored once it is older than 30 days or while it is not confident." });
+    var capacitySourceNote = el("p", { class: "field-help", text: "Auto keeps the typed values as seeds/fallbacks and uses what the battery's own 5-minute power and SoC history measures: the usable capacity from windows with at least a 10-point SoC move and at least 20 % of the battery's own power limit, and the round trip from charge/discharge pairs (the capacity cancels, so the efficiency is measured without trusting any capacity). At least three accepted samples are needed, and an estimate older than 30 days is ignored. Pinned uses exactly what you typed." });
 
     var identity = el("div", { class: "fields" }, [
       textRow("id", "Battery id (slug)", fields.id, editing),
@@ -4056,7 +4124,7 @@
       mqttDriverNote,
       nativeDriverNote,
       fieldRow("capacity_kwh", "Capacity (kWh, usable AC side)", fields.capacity_kwh, "0.1", "0.1"),
-      el("label", { class: "field", for: "battery-capacity-source" }, [el("span", { text: "Capacity source" }), capacitySourceSelect]),
+      el("label", { class: "field", for: "battery-capacity-source" }, [el("span", { text: "Learned values" }), capacitySourceSelect]),
       capacitySourceNote,
       fieldRow("min_soc_pct", "Minimum SoC (%)", fields.min_soc_pct, "1", "0", "100"),
       fieldRow("max_soc_pct", "Maximum SoC (%)", fields.max_soc_pct, "1", "0", "100"),
@@ -4385,7 +4453,7 @@
         max_discharge_w: Number(inputs.max_discharge_w.value),
         price_eur: Number(inputs.price_eur.value),
         cycle_life: Number(inputs.cycle_life.value),
-        capacity_source: capacitySourceSelect.value === "learned" ? "learned" : "manual",
+        capacity_source: capacitySourceSelect.value === "pinned" ? "pinned" : "auto",
         mapping: {},
         enabled: !!inputs.enabled.checked
       };

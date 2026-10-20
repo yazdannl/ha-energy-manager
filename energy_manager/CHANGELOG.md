@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.31.0
+
+- **Fix: the pack stops charging where the plan says, not where the hardware says.** The plan already
+  ended on its terminal target (live: a final 648 W slot landed on 95 %, then 0 W), but dispatch only
+  clamped against `max_soc_pct` (100 %), so every tick ran the slot's modelled power and the pack
+  reached 100 %. The guard now follows the active slot's own SoC trajectory (SPEC 9.3 clause 5b): the
+  allowed power is at most what still lands on the slot's end-of-slot energy, cut to zero in the
+  plan's direction, so a pack that is faster than the model simply stops at the plan's target
+  (`plan_soc_target`). Tracking never reverses the direction, and a hold slot is not tracked.
+- **Learned values are the default.** `capacity_source` is now `auto` (learn the capacity *and* the
+  round trip from the pack's own cycles, typed values as seeds/fallbacks) or `pinned` (opt-out). The
+  old `manual`/`learned` spellings still load and both mean `auto`; they are normalised on load, on
+  write and in every API/UI view. Before this, the shipped default was `manual`, so the estimate that
+  explains the 95 % → 100 % overshoot was never used unless the toggle was flipped by hand (and the
+  battery dialog silently coerced anything that was not exactly `learned` back to `manual`).
+- **New: the round-trip efficiency is learned too** (`app/efficiency.py`). It is the last number every
+  plan decision depended on and the only one still typed in. It is measured from charge/discharge
+  *pairs* of the same accepted windows, where the capacity cancels exactly
+  (`eta_c·eta_d = Ed·dSoc_c / (Ec·dSoc_d)`), weighted by the SoC move, MAD-filtered, combined with a
+  weighted median, published after 3 accepted pairs and stale after 30 days; learned values are split
+  evenly into `eta_charge`/`eta_discharge` like a typed round trip, so the DP, wear, break-even, cost
+  basis and the UI read one number. Round-trip learning runs before capacity learning because the
+  capacity estimate consumes it.
+- **Fix: the capacity learner integrated a command, not a measurement.** It preferred the signed
+  `battery_power` role, which for the Zendure integration is `power_setpoint_entity` — a value the BMS
+  need not follow (tapering, a manager still ramping) — so the learned capacity came out above the
+  pack's real capacity (live: ~2.09 kWh learned against a 1.92 kWh nominal) and the plan under-modelled
+  the SoC gained per slot. The measured `battery_charge`/`battery_discharge` pair now wins; the signed
+  role is only a fallback.
+- **UI:** the batteries card shows the learned round trip next to the learned capacity (both with their
+  evidence, the configured seed and the effective value), prices the economics with the effective round
+  trip instead of the typed one, and the battery dialog offers `Auto` (recommended) / `Pinned` with a
+  note explaining what is measured and when it is ignored.
+- **Replay:** a replayed episode reconstructs the learned capacity *and* round trip as of the replant
+  moment, exactly like the live engine, so a replay still never sees today's estimates.
+
 ## 0.30.2
 
 - **Fix: the one day 0.30.0 poisoned is repaired at startup.** Migration 7 deletes today's
