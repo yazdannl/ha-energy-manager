@@ -1824,6 +1824,38 @@ moved to `pv_charge`, which is the efficiency change reaching the optimiser rath
 What is *not* verified from here: the add-on's `/api/v1/batteries` record (learned value, sample
 count and reason slug) and the battery card, because the add-on is ingress-only.
 
+### 8.27 One pack, one capacity (0.32.0)
+
+Requested: "our capacity should not be different for charge and discharge, we have one capacity, it
+is just that when we discharge we do not get all of the capacity we put in because we have an
+efficiency loss, so please fix this."
+
+That is exactly right, and the learner was doing the opposite. It produced one capacity per *window*
+and mixed both directions into a single median, so the published number carried a bias that depended
+on the charge/discharge mix of the retained rows. Measured on the live pack: charge legs implied
+1.97 kWh (2.5 % above the 1.92 nameplate), discharge legs 2.10 (9 % high). Not two capacities -- one
+capacity read through two different SoC scales, because the pack's reported SoC drops about 53.6
+points per kWh while discharging and rises about 47 while charging.
+
+The fix is a rule, not a weight: **the capacity is measured while charging**. Charging measures what
+the pack accepts with its loss applied; the discharge side then delivers that same capacity minus the
+round trip, which `app/efficiency.py` measures separately from the AC energies (0.31.2). Discharge
+windows are used only when fewer than 3 charge windows exist, the payload always reports which side it
+used (`basis`), and the other side is reported as a diagnostic that is never applied. `capacity.SCHEMA`
+is 4, so a payload from the mixed median is reported but not applied and the next maintenance run
+relearns.
+
+Covered by `tests/test_capacity_learning.py`: charge and discharge windows from one pack publish a
+single charging-side value while the diagnostic keeps the other side visible; a discharge side that
+reads ~9 % high cannot drag the estimate (a mixed median would have inflated it, and the test asserts
+against that median); discharge is a fallback only when the charging side is too thin to publish; the
+batteries view exposes `capacity.basis`. The Batteries card states the capacity was learned from
+measured charging cycles.
+
+Not redeployed-verified yet at the time of writing: the add-on's `/api/v1/batteries` record is
+ingress-only, so the live confirmation is the plan feed — the modelled capacity implied by its SoC
+trajectory should drop from ~2.10 kWh toward ~1.97 kWh, with the round trip unchanged near 0.845.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)

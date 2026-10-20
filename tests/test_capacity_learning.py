@@ -116,6 +116,62 @@ def test_outlier_is_dropped_by_the_mad_filter():
     assert payload["capacity_kwh"] == payload["median_kwh"]
 
 
+def test_one_pack_reports_one_capacity_from_its_charging_side():
+    """Charge and discharge windows are one capacity, not two: the charging side defines it.
+
+    A pack holds one number of kWh.  If the discharge number comes out higher it is the SoC scale
+    (a discharge drops more points than the energy it gives back), not extra capacity -- so the
+    estimate is taken from charging alone and the discharge side only ever discounts it.
+    """
+    samples: list[tuple[datetime, float, float]] = []
+    for index in range(4):
+        samples += _window(T0 + timedelta(hours=index), 40.0, 60.0, 500.0)
+    # The same 20-point swing discharging a touch more energy per point (0.5 kWh vs 0.47).
+    for index in range(4):
+        samples += _window(T0 + timedelta(hours=6 + index), 70.0, 50.0, -470.0)
+    payload = _estimated(samples)
+    charge_kwh = 0.5 * EFFICIENCY / 0.20
+    assert payload["basis"] == "charge"
+    assert payload["samples"] == 4  # the four charge windows only
+    assert payload["capacity_kwh"] == pytest.approx(charge_kwh, rel=1e-6)
+    assert payload["median_kwh"] == pytest.approx(charge_kwh, rel=1e-6)
+    # The other side is reported as evidence, and is never what the pack is run with.
+    assert payload["discharge_kwh"] == pytest.approx(0.47 / EFFICIENCY / 0.20, rel=1e-6)
+    assert payload["discharge_kwh"] != pytest.approx(payload["capacity_kwh"], rel=1e-3)
+    status = capacity_status(payload, T0 + timedelta(hours=12))
+    assert status["applied"] is True and status["basis"] == "charge"
+
+
+def test_discharge_is_a_fallback_only_when_charging_is_too_thin_to_publish():
+    """Two charge windows cannot publish a confident estimate, so the discharge side may speak."""
+    samples: list[tuple[datetime, float, float]] = []
+    for index in range(2):
+        samples += _window(T0 + timedelta(hours=index), 40.0, 60.0, 500.0)
+    for index in range(4):
+        samples += _window(T0 + timedelta(hours=6 + index), 70.0, 50.0, -500.0)
+    payload = _estimated(samples)
+    assert payload["basis"] == "discharge"
+    assert payload["samples"] == 4
+    assert payload["capacity_kwh"] == pytest.approx(0.5 / EFFICIENCY / 0.20, rel=1e-6)
+
+
+def test_a_discharge_side_that_reads_low_does_not_lower_the_capacity():
+    """The same pack, one capacity: a biased discharge SoC cannot drag the estimate with it."""
+    samples: list[tuple[datetime, float, float]] = []
+    for index in range(3):
+        samples += _window(T0 + timedelta(hours=index), 40.0, 60.0, 500.0)
+    # Discharges that appear to give back 9 % more energy per SoC point (a compressed top range).
+    for index in range(6):
+        samples += _window(T0 + timedelta(hours=6 + index), 70.0, 50.0, -545.0)
+    payload = _estimated(samples)
+    assert payload["basis"] == "charge"
+    assert payload["capacity_kwh"] == pytest.approx(0.5 * EFFICIENCY / 0.20, rel=1e-6)
+    mixed_median = robust_median(
+        [0.5 * EFFICIENCY / 0.20] * 3 + [0.545 / EFFICIENCY / 0.20] * 6
+    )
+    assert payload["capacity_kwh"] < mixed_median  # mixing would have inflated it
+
+
 def test_insufficient_windows_is_not_published():
     """Below three accepted windows the estimate is kept as evidence but never applied."""
     samples = _window(T0, 40.0, 60.0, 500.0) + _window(T0 + timedelta(hours=1), 40.0, 60.0, 500.0)
@@ -320,6 +376,7 @@ def put_estimate(store, battery_id: str, *, kwh: float | None, samples: int, now
         "median_kwh": kwh,
         "samples": samples,
         "windows": [kwh] * samples if kwh is not None else [],
+        "basis": "charge",
         "schema": SCHEMA,
         "updated_at": to_iso(now),
     }
@@ -473,3 +530,5 @@ def test_batteries_view_exposes_the_capacity_payload():
     assert record["capacity_updated_at"] == to_iso(clock.now)
     assert record["effective_capacity_kwh"] == pytest.approx(LEARNED_KWH)
     assert record["capacity"]["applied"] is True
+    # One pack, one capacity: the record says which side of the cycle measured it.
+    assert record["capacity"]["basis"] == "charge"

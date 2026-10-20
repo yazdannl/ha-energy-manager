@@ -10,13 +10,24 @@ never from user settings: each *window* is a maximal run of same-direction AC po
 enough and fast enough to be trusted, and the window's capacity is the energy moved divided by the
 SoC it moved
 
-* charging:   ``capacity = AC_charge_kWh * eta_charge / dSoC``
-* discharging: ``capacity = AC_discharge_kWh / eta_discharge / |dSoC|``
+    charging:   ``capacity = AC_charge_kWh * eta_charge / dSoC``
+    discharging: ``capacity = AC_discharge_kWh / eta_discharge / |dSoC|``
 
 so the direction of each efficiency matches the AC-side convention in :mod:`app.models` (the same
 formula falls out of ``stored = AC * eta`` while charging and ``AC = stored * eta`` while
-discharging). Estimates are combined with a median after a median-absolute-deviation outlier
-filter, clamped to a plausible range and published only after at least three accepted windows.
+discharging).
+
+**One pack, one capacity.** The two formulas are the same statement read in opposite directions, and
+they only agree when the pack's reported SoC is proportional to the energy it holds. On a real pack it
+is not (the BMS compresses the top of its range, so a discharge drops a few more points than it gives
+back), and mixing both directions then produces two populations that are ~5-10 % apart -- which is a
+SoC-scale artifact, not a second capacity. The estimate is therefore taken from the **charging** side
+alone: what the pack accepts per SoC point, with the charging loss applied, is the capacity; whatever
+the discharge delivers is that capacity *less* the round-trip loss (:mod:`app.efficiency` measures it).
+Discharge windows are only a fallback when too few charge windows exist to publish, and the payload
+always says which side it used (``basis``). Estimates are combined with a median after a
+median-absolute-deviation outlier filter, clamped to a plausible range and published only after at
+least three accepted windows.
 
 Everything in this module is pure except :func:`learn_capacity`, which writes the profile through the
 store it is handed; a missing or unreadable store is not an error, only "no estimate yet".
@@ -64,10 +75,12 @@ PROFILE_KIND = "battery_capacity"
 
 #: Payload schema.  Schema 2 (0.31.0) reads a window's AC energy from the measured
 #: charge/discharge pair instead of the signed ``battery_power`` *command*; schema 3 (0.31.1) books
-#: energy only for the sample pairs that moved the SoC, which removes the phantom edge sample that used
-#: to inflate short windows.  A payload from an older schema is reported but not trusted -- the typed
-#: seed stands until the next maintenance relearn rewrites it.
-SCHEMA = 3
+#: only the SoC-moving sample pairs except a run's trailing plateau (the phantom edge sample used to
+#: inflate short windows); schema 4 (0.32.0) takes the capacity from the **charging side only**, so one
+#: pack reports one capacity instead of a charge population and a discharge population a few percent
+#: apart.  A payload from an older schema is reported but not trusted -- the typed seed stands until
+#: the next maintenance relearn rewrites it.
+SCHEMA = 4
 
 #: A window's SoC must move at least this many points to be trusted.
 MIN_DSOC_PCT = 10.0
@@ -296,6 +309,29 @@ def extract_windows(
     return accepted, rejected
 
 
+def _capacity_basis(
+    accepted: Sequence[Mapping[str, Any]],
+) -> tuple[list[float], str]:
+    """The window values a single capacity is built from, and which side they came from.
+
+    A pack holds one capacity, so the estimate never mixes directions: the charging side measures
+    what the pack accepts (with its loss applied) and the discharge side only delivers that minus the
+    round-trip loss, which :mod:`app.efficiency` measures separately.  Discharge windows are used
+    only when there are too few charge windows to publish a confident estimate.
+    """
+    charge = [float(w["capacity_kwh"]) for w in accepted if w.get("kind") == "charge"]
+    discharge = [float(w["capacity_kwh"]) for w in accepted if w.get("kind") == "discharge"]
+    if len(charge) >= MIN_ACCEPTED_WINDOWS or not discharge:
+        return charge, "charge"
+    if len(discharge) >= MIN_ACCEPTED_WINDOWS:
+        return discharge, "discharge"
+    # Neither side can publish a confident estimate; report the better-evidenced one and stay
+    # unapplied (``capacity_status`` refuses it below :data:`MIN_ACCEPTED_WINDOWS`).
+    if len(discharge) >= len(charge):
+        return discharge, "discharge"
+    return charge, "charge"
+
+
 def estimate_capacity(
     samples: Sequence[tuple[datetime, float, float]],
     *,
@@ -319,7 +355,7 @@ def estimate_capacity(
         eta_discharge=eta_discharge,
         sample_minutes=sample_minutes,
     )
-    values = [window["capacity_kwh"] for window in accepted]
+    values, basis = _capacity_basis(accepted)
     median = robust_median(values)
     if median is not None and not (MIN_PLAUSIBLE_KWH <= median <= MAX_PLAUSIBLE_KWH):
         median = None
@@ -328,6 +364,14 @@ def estimate_capacity(
         "capacity_kwh": median if samples_count >= MIN_ACCEPTED_WINDOWS else None,
         "median_kwh": median,
         "samples": samples_count,
+        # Which side of the pack the number came from: one capacity, measured while charging.
+        "basis": basis,
+        # Diagnostics only, never a second capacity and never applied: the same pack read from the
+        # discharge side, which its SoC scale biases by a few percent (module docstring).
+        "charge_kwh": robust_median(w["capacity_kwh"] for w in accepted if w["kind"] == "charge"),
+        "discharge_kwh": robust_median(
+            w["capacity_kwh"] for w in accepted if w["kind"] == "discharge"
+        ),
         "windows": [round(value, 4) for value in values[-MAX_KEPT_WINDOWS:]],
         "rejected": rejected,
         "schema": SCHEMA,
@@ -348,8 +392,9 @@ def capacity_status(
     rejected.
     """
     moment = now if now.tzinfo else now.replace(tzinfo=utcnow().tzinfo)
+    basis = (str(payload.get("basis") or "") or None) if payload else None
     if not payload:
-        return _status(None, 0, None, REASON_UNAVAILABLE, moment)
+        return _status(None, 0, None, REASON_UNAVAILABLE, moment, basis=None)
     value = _finite(payload.get("capacity_kwh"))
     try:
         count = int(payload.get("samples") or 0)
@@ -366,7 +411,7 @@ def capacity_status(
     else:
         age = (moment - updated).total_seconds()
         reason = REASON_STALE if age > stale_after_days * 86400.0 else REASON_APPLIED
-    return _status(value, count, updated, reason, moment)
+    return _status(value, count, updated, reason, moment, basis=basis)
 
 
 def _status(
@@ -375,6 +420,8 @@ def _status(
     updated: datetime | None,
     reason: str,
     now: datetime,
+    *,
+    basis: str | None = None,
 ) -> dict[str, Any]:
     applied = reason == REASON_APPLIED
     age_days = None if updated is None else max(0.0, (now - updated).total_seconds() / 86400.0)
@@ -385,6 +432,9 @@ def _status(
         "updated_at": to_iso(updated),
         "age_days": None if age_days is None else round(age_days, 3),
         "stale": reason == REASON_STALE,
+        # A pack has one capacity; this says which side of the cycle measured it (``charge`` unless
+        # only discharge windows were available).
+        "basis": basis,
         "confident": value is not None and count >= MIN_ACCEPTED_WINDOWS,
         "applied": applied,
         "reason": reason,

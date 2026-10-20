@@ -2003,6 +2003,9 @@ class Engine:
                         "configured_kwh": float(config.capacity_kwh),
                         "learned_kwh": capacity_info.get("learned_kwh"),
                         "samples": int(capacity_info.get("samples") or 0),
+                        # Which side of the cycle measured it: one capacity, learned while charging
+                        # (a discharge only delivers that capacity minus the round-trip loss).
+                        "basis": capacity_info.get("basis"),
                         "updated_at": capacity_info.get("updated_at"),
                         "effective_kwh": effective_kwh,
                         "reason": effective_status.get("reason"),

@@ -418,7 +418,20 @@ default because a typed capacity is a guess while an estimate is a measurement.
 
 The capacity estimate pairs AC energy with SoC change over 5-minute rows (SPEC 7.3): for a charge
 window ``capacity = AC_charge_kWh * eta_charge / dSoC`` and for a discharge window
-``capacity = AC_discharge_kWh / eta_discharge / |dSoC|`` (each efficiency sits on its own leg). A
+``capacity = AC_discharge_kWh / eta_discharge / |dSoC|`` (each efficiency sits on its own leg).
+
+A pack has **one** capacity, so the estimate is taken from the **charging side only** (0.32.0). The two
+formulas are the same statement read in opposite directions and only agree if the reported SoC were
+proportional to the energy held; a real BMS compresses the top of its range, so the discharge reading
+gives up a few more points than the energy it returns and a mixed median would drift toward whichever
+direction happened to dominate the retained rows (live: 1.97 kWh from charging against 2.10 from
+discharging, on a 1.92 kWh pack). Charging is authoritative because it measures what the pack accepts
+with its loss applied; the discharge side then delivers exactly that capacity *less* the round trip,
+which is measured separately by the energy balance below. Discharge windows are a fallback only when
+fewer than 3 charge windows exist, and the payload always names the side it used (``basis``);
+``charge_kwh``/``discharge_kwh`` are diagnostics and are never applied.
+
+A
 window is accepted only with ``|dSoC| >= 10`` points, ``mean |power| >= 20 %`` of that battery's own
 limit for the direction, finite values and no gap longer than one sample; the window's energy is
 every same-direction sample pair except the *trailing* ones that left the SoC where it was (a pack
@@ -2968,6 +2981,18 @@ round, with the reason:
   partial window by its SoC-delta ratio (exactly the extrapolation this removes), and requiring the
   discharge to close to the *point* (the live daily pattern charges to the ceiling and discharges past
   where the charge began, so a strict closure would reject nearly every real cycle).
+
+- **§5 (one pack, one capacity; requested 2026-10-20, "our capacity should not be different for
+  charge and discharge, we have one capacity, it is just that when we discharge we do not get all of
+  the capacity we put in because we have an efficiency loss")** — the estimator produced one value per
+  *window* and mixed both directions in a single median, so the reported capacity carried a bias that
+  depended on the charge/discharge mix of the retained rows: on the live pack the charge legs implied
+  1.97 kWh (2.5 % above the 1.92 nameplate) and the discharge legs 2.10 (9 % high), because the pack's
+  reported SoC falls a few more points per kWh than it rises (about 53.6 points per kWh discharging
+  against 47 charging). Those were never two capacities. The estimate now takes the **charging side**,
+  which measures what the pack accepts with its loss applied, and leaves the discharge deficit where it
+  belongs: in the round trip, which is measured independently. Fewer than 3 charge windows falls back
+  to the discharge side (``basis`` says so), and the other side is reported as a diagnostic only.
 
 - **§5/§7.3 (the learned round trip is an energy balance, and the live gap is closed; requested
   2026-10-20, "chase it down, I need accurate figures")** — 0.31.1 learned 0.9057 on the live pack

@@ -3664,6 +3664,9 @@
       configured: isNum(config.capacity_kwh) ? config.capacity_kwh : null,
       learned: pick("learned_kwh", "capacity_learned_kwh"),
       samples: samples == null ? 0 : samples,
+      // Which side of the pack the number was measured from ("charge" unless only discharge
+      // windows existed); it is still one capacity, never two.
+      basis: String(info.basis || (record && record.capacity_basis) || "") || null,
       updated: info.updated_at || (record && record.capacity_updated_at) || null,
       reason: String((record && record.capacity_reason) || info.reason || ""),
       stale: !!info.stale,
@@ -3710,7 +3713,9 @@
     if (!cap.applied) {
       return "Learned capacity ignored (" + (cap.reason || "rejected") + "); the configured " + fmtKwh(cap.configured) + " kWh seed is used. Estimate was " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " window(s).";
     }
-    return "Learned from measured cycles: " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " accepted window(s), last learned " + timeAgo(cap.updated) + ". Effective capacity " + fmtKwh(cap.effective) + " kWh.";
+    // One pack, one capacity: measured while charging, because the discharge side delivers that
+    // capacity *less* the round-trip loss rather than a second capacity.
+    return "Learned from measured" + (cap.basis === "discharge" ? " discharge" : " charging") + " cycles: " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " accepted window(s), last learned " + timeAgo(cap.updated) + ". Effective capacity " + fmtKwh(cap.effective) + " kWh.";
   }
 
   /** One truthful sentence about where a battery's round trip comes from (SPEC 5). */

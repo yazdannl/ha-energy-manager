@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.32.0
+
+- **Fix: one pack, one capacity.** The learner produced one value per window and mixed both
+  directions in the same median, so the published capacity carried a bias that depended on the
+  charge/discharge mix of the retained rows: on the live pack the charge legs implied 1.97 kWh (2.5 %
+  above the 1.92 nameplate) and the discharge legs 2.10 (9 % high). Those were never two capacities.
+  A discharge gives back *less* than the charge put in because of the round-trip loss, so the capacity
+  is now taken from the **charging side only** — what the pack accepts per SoC point with its loss
+  applied — and the discharge deficit stays where it belongs, in the learned round trip, which is
+  measured independently by the energy balance.
+- The charging side is authoritative because a real BMS compresses the top of its range: the reported
+  SoC drops a few more points per kWh discharging than it rises charging, which is what made the
+  discharge legs read high. Discharge windows are a fallback only when fewer than 3 charge windows
+  exist; the payload always reports the side it used (`basis`) and the other side is a diagnostic
+  (`charge_kwh`/`discharge_kwh`) that is never applied.
+- **API/UI:** `/api/v1/batteries` gains `capacity.basis`, and the Batteries card says the capacity was
+  learned from measured charging cycles.
+- **Schema:** `capacity.SCHEMA` is 4, so a payload built by a mixed-direction median is reported but
+  never applied and the next maintenance run relearns (a restart triggers maintenance).
+
 ## 0.31.2
 
 - **Fix: the learned round trip is an energy balance, not a per-SoC-point ratio.** 0.31.1 learned
