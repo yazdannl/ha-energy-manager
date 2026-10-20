@@ -1852,9 +1852,19 @@ against that median); discharge is a fallback only when the charging side is too
 batteries view exposes `capacity.basis`. The Batteries card states the capacity was learned from
 measured charging cycles.
 
-Not redeployed-verified yet at the time of writing: the add-on's `/api/v1/batteries` record is
-ingress-only, so the live confirmation is the plan feed — the modelled capacity implied by its SoC
-trajectory should drop from ~2.10 kWh toward ~1.97 kWh, with the round trip unchanged near 0.845.
+Deployed and observed live (2026-10-20T13:37Z, add-on **0.32.0**, `state: started`). The add-on's
+`/api/v1/batteries` record is ingress-only, so the check is the plan feed: it now models **one**
+capacity in both directions. Reading the implied capacity out of every slot transition
+(`|power| × h × eta / |dSoC|`) gives 2.045 kWh while charging and 2.050 while discharging -- the same
+number, the 0.25 % spread being the feed's two-decimal SoC rounding, and the mixed median it replaced
+was 2.097. The round trip is unchanged at 0.8473 (0.32.0 did not touch that estimator) and wear
+re-derived to 0.02062 EUR/kWh from the new capacity.
+
+The learned 2.05 kWh still sits ~7 % above the 1.92 nameplate, and that is expected rather than a
+second bug: the model's capacity is *energy per reported SoC point* (what the DP needs to turn power
+into a trajectory), while the nameplate is the manufacturer's usable AC figure and the BMS does not
+hand out 100 points of it. What changed is that the number no longer depends on which direction the
+retained rows happened to favour.
 
 ---
 
