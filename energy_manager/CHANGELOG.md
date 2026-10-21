@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.33.2
+
+- **Fix: an unresolvable Zonneplan provider no longer aborts the price chain.** With
+  `price.provider = zonneplan` and a Zonneplan integration that is installed but unavailable (re-auth
+  pending, integration wedged), `_locate_zonneplan_entity` raised out of `load_price_forecast` —
+  before the fallback chain ran — so the whole 30 h price forecast disappeared while the day-ahead
+  source was healthy. Live 2026-10-21: `sensor.sem_chart_price` was `empty` and the plan
+  `hold/no_forecast_slots` for ~40 minutes for exactly this reason. The provider is now left
+  unresolved, so `zonneplan_entity` records the resolution reason (it is what `/providers` and the UI
+  show) and `energy_charts` supplies the market curve, marked degraded. SPEC 4.1: a broken source
+  never aborts the fallback.
+
 ## 0.33.1
 
 - **Fix: a failing forecast is visible in the log.** `Engine._fetch` and the price provider chain

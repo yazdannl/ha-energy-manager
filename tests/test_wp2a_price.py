@@ -817,6 +817,34 @@ def test_zonneplan_grid_preference_matches_the_contract():
     assert hourly_id == "sensor.zonneplan_example_hour" and hourly_note == ""
 
 
+def test_an_unresolvable_zonneplan_provider_falls_back_to_the_market():
+    # 0.33.2, live 2026-10-21: the Zonneplan integration went unavailable, so `price.provider =
+    # zonneplan` could not locate a tariff sensor. That resolution error aborted the whole chain and
+    # the 30 h price forecast -- and every plan with it -- disappeared while the day-ahead source was
+    # healthy. SPEC 4.1: a broken source never aborts the fallback.
+    unavailable = {
+        "entity_id": "sensor.zonneplan_example_quarter",
+        "state": "unavailable",
+        "attributes": {"unit_of_measurement": "\u20ac/kWh"},
+    }
+    client = StateClient([unavailable])
+    market = slot_provider(buy=0.19, slots=8)
+    forecast, statuses = load_price_forecast(
+        _zonneplan_settings("dynamic_quarter_hourly"),
+        client,
+        now=NOW,
+        providers={"zonneplan_entity": fetch_zonneplan_entity, "energy_charts": market, "static": market},
+    )
+    assert forecast.source != "zonneplan_entity"
+    assert forecast.degraded is True
+    assert forecast.slots and len(forecast.slots) >= 4
+    by_name = {status.name: status for status in statuses}
+    # The reason survives on the provider status (it is what /providers and the UI show).
+    assert "no compatible electricity tariff sensor" in (by_name["zonneplan_entity"].last_error or "")
+    assert by_name["zonneplan_entity"].ok is False
+    assert "fell back" in " ".join(forecast.notes)
+
+
 def test_zonneplan_falls_back_to_the_other_grid_with_a_note():
     # Only the hourly grid exists; a quarter-hourly contract must use it AND note it (never silent).
     hourly = zonneplan_state("sensor.zonneplan_example_hour", minutes=60, count=8, shape="hourly")

@@ -1142,25 +1142,42 @@ def effective_price_source(settings: Any) -> str:
 
 def _resolve_source(
     settings: Any, client: Any, now: datetime, tz: Any
-) -> tuple[str, Any, list[str], bool]:
+) -> tuple[str, Any, list[str], bool, str | None]:
     """Resolve ``price.provider`` + ``price.contract`` to ``(source, settings, notes, no_fallback)``.
 
     ``settings`` is the view the providers read (an overlay injects the located Zonneplan entity id),
     ``notes`` are resolution notes to attach when the resolved provider succeeds, and
     ``no_fallback`` forces a single-element chain (the fixed provider must never fall back to the
-    market). The default ``entity`` provider keeps the pre-0.3.0 path exactly.
+    market). The default ``entity`` provider keeps the pre-0.3.0 path exactly. The fifth element is
+    set when the configured provider could not be resolved *and* the chain may still try the next
+    source.
     """
     provider = str(settings.get("price.provider", "entity") or "entity").strip()
     contract = str(settings.get("price.contract", "dynamic_hourly") or "dynamic_hourly").strip()
     if provider == "zonneplan":
-        entity_id, note = _locate_zonneplan_entity(client, settings, now, tz, contract)
+        try:
+            entity_id, note = _locate_zonneplan_entity(client, settings, now, tz, contract)
+        except ProviderError as err:
+            # 0.33.2: an unresolvable Zonneplan provider must not abort the chain (SPEC 4.1: a
+            # broken source never aborts the fallback). Live 2026-10-21: the Zonneplan integration
+            # went unavailable, `price.provider = zonneplan` could not locate a tariff sensor, and
+            # the whole 30 h price forecast -- and with it every plan -- disappeared even though the
+            # day-ahead source was healthy. The provider stays unresolved, so `zonneplan_entity`
+            # records the reason and `energy_charts` still supplies the market curve.
+            return "zonneplan_entity", settings, [], False, str(err)
         overlay = _SettingsOverlay(settings, {"price.entity": entity_id})
-        return "zonneplan_entity", overlay, ([note] if note else []), False
+        return "zonneplan_entity", overlay, ([note] if note else []), False, None
     if provider == "day_ahead":
-        return "energy_charts", settings, [], False
+        return "energy_charts", settings, [], False, None
     if provider == "fixed":
-        return "fixed_tariff", settings, [], True
-    return str(settings.get("price.source", "zonneplan_entity") or "zonneplan_entity"), settings, [], False
+        return "fixed_tariff", settings, [], True, None
+    return (
+        str(settings.get("price.source", "zonneplan_entity") or "zonneplan_entity"),
+        settings,
+        [],
+        False,
+        None,
+    )
 
 
 # --------------------------------------------------------------------------------------------
@@ -1510,7 +1527,7 @@ def load_price_forecast(
     """
     moment = now or utcnow()
     registry = dict(providers or PROVIDERS)
-    configured, effective_settings, resolve_notes, no_fallback = _resolve_source(
+    configured, effective_settings, resolve_notes, no_fallback, resolve_error = _resolve_source(
         settings, client, moment, tz
     )
     if configured not in registry:
@@ -1540,26 +1557,31 @@ def load_price_forecast(
             continue
         attempts.append(name)
         status = statuses[name]
+
+        def _failed(reason: str) -> None:
+            # A provider that could not even be *resolved* keeps the resolution reason: it is the
+            # most useful text for /providers and the UI, and the provider's own error would only
+            # describe the symptom ("price.entity is not configured").
+            status.last_error = resolve_error if (name == configured and resolve_error) else reason
+            # On stdout too (0.33.1): the add-on log is the only place an operator can see why the
+            # price chart is empty, and this chain used to report it to the SQLite journal only.
+            log.warning("price provider %s failed: %s", name, status.last_error)
+
         try:
             forecast = func(client, effective_settings, now=moment, http=http, tz=tz)
             if not any(start <= slot.t < end for slot in forecast.slots):
                 # SPEC.md section 4: a forecast with no future slot in the requested horizon is a
                 # provider failure, no matter how the provider signalled it (raised or returned).
-                status.last_error = f"{name}: no future price slots in the requested horizon"
-                log.warning("price provider %s: %s", name, status.last_error)
+                _failed(f"{name}: no future price slots in the requested horizon")
                 continue
         except (RateLimited, ProviderError, HAError) as err:
-            status.last_error = str(err)
             http_status = getattr(err, "status", None)
             if isinstance(http_status, int):
                 status.detail["http_status"] = http_status
-            # On stdout too (0.33.1): the add-on log is the only place an operator can see why the
-            # price chart is empty, and this chain used to report it to the SQLite journal only.
-            log.warning("price provider %s failed: %s", name, status.last_error)
+            _failed(str(err))
             continue
         except Exception as err:  # noqa: BLE001 - a broken provider must never abort the chain
-            status.last_error = f"{type(err).__name__}: {err}"
-            log.warning("price provider %s failed: %s", name, status.last_error)
+            _failed(f"{type(err).__name__}: {err}")
             continue
         status.ok = True
         status.last_success = moment

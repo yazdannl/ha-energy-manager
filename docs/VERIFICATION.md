@@ -1928,6 +1928,30 @@ only extends the block.
 Covered by `tests/test_wp2a_price.py`: a wider window that raises a plain `ProviderError` falls back
 and still yields a forecast, and a `RateLimited` wider window stops after exactly one request.
 
+### 8.30 An unresolvable price provider falls back instead of emptying the forecast (0.33.2)
+
+Live 2026-10-21, found by the 0.33.1 logging: the add-on reported
+
+```
+WARNING app.engine: price forecast failed: zonneplan: no compatible electricity tariff sensor found
+```
+
+The Zonneplan integration was installed but every tariff entity had been `unavailable` since 12:47
+(re-auth pending), so `_locate_zonneplan_entity` raised `ProviderError` *out of* `load_price_forecast`
+— before the fallback chain was built — and the app produced no price forecast at all: `empty` chart,
+`unknown` `sensor.sem_price_now`, plan `hold` / `no_forecast_slots`. The day-ahead source was healthy
+the whole time; SPEC 4.1 says a broken source never aborts the fallback.
+
+`_resolve_source` now returns the resolution error instead of raising (`no_fallback` still keeps
+`fixed` at a single-element chain), so `zonneplan_entity` fails inside the chain like any other
+provider — carrying the resolution reason on its `ProviderStatus.last_error`, which is what
+`/providers` and the UI render — and `energy_charts` supplies the market curve with
+`degraded = True` and a "fell back to …" note.
+
+Covered by `tests/test_wp2a_price.py::test_an_unresolvable_zonneplan_provider_falls_back_to_the_market`
+(an `unavailable` tariff state → the chain returns the market curve, degraded, with
+"no compatible electricity tariff sensor" kept on the zonneplan status). Full suite: **1629 passed**.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
