@@ -2413,6 +2413,11 @@ class Engine:
         with self._lock:
             tick_state = copy.copy(self._state)
             tick_state.batteries = list(self._state.batteries)
+        # Judge a live discharge against the floor the *plan* was solved with (0.33.0): the ledger
+        # floor capped at the cheapest-refill break-even. The uncapped ledger floor would clamp
+        # exactly the fresh cheap cycle the optimiser was allowed to schedule. A plan without a
+        # summary (older store, or a plan made before the field existed) keeps the ledger floor.
+        plan_floor = getattr(getattr(plan, "summary", None), "sell_floor_eur_per_kwh", None)
         outcome = self._dispatcher.tick(
             moment,
             state=tick_state,
@@ -2421,7 +2426,9 @@ class Engine:
             measurements=measurements,
             battery_states=live,
             cell_voltage_latch=self._cell_voltage_latch,
-            sell_floor_eur_per_kwh=self.fleet_sell_floor(),
+            sell_floor_eur_per_kwh=(
+                plan_floor if plan_floor is not None else self.fleet_sell_floor()
+            ),
         )
         self._apply_cell_voltage(outcome.guard, moment)
         with self._lock:

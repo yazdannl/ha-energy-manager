@@ -437,7 +437,11 @@ def test_energy_charts_parsing_vat_and_coverage_gap():
         return payload
 
     forecast = fetch_energy_charts(None, settings(**{"price.vat_pct": 21.0}), now=NOW, http=fake_http)
-    assert calls == ["https://api.energy-charts.info/price?bzn=NL"]
+    # The window is today + tomorrow (0.33.0): the default window answers for today only, and a
+    # 30 h plan horizon reaches past midnight.
+    assert calls == [
+        "https://api.energy-charts.info/price?bzn=NL&start=2026-01-05&end=2026-01-06"
+    ]
     assert forecast.slots[0].buy == pytest.approx(0.1 * 1.21)
     assert forecast.source == "energy_charts"
     # today only (8 slots = 2 h): coverage gap is degraded + stale tail, never a provider failure
@@ -449,6 +453,29 @@ def test_energy_charts_parsing_vat_and_coverage_gap():
 
     with pytest.raises(ProviderError):
         fetch_energy_charts(None, settings(), now=NOW, http=lambda url, **kw: {"unix_seconds": seconds, "price": [1.0] * 8})
+
+
+def test_energy_charts_falls_back_to_the_today_only_window_before_the_auction():
+    seconds = [int((NOW + timedelta(minutes=15 * index)).timestamp()) for index in range(8)]
+    payload = {"unit": "EUR / MWh", "unix_seconds": seconds, "price": [100.0] * 8}
+    calls: list[str] = []
+
+    def fake_http(url, **kwargs):
+        calls.append(url)
+        if "start=" in url:
+            # Tomorrow's auction is not published yet: the API answers 404.
+            raise ProviderError("provider request failed with HTTP 404", status=404)
+        return payload
+
+    forecast = fetch_energy_charts(None, settings(), now=NOW, http=fake_http)
+    assert calls == [
+        "https://api.energy-charts.info/price?bzn=NL&start=2026-01-05&end=2026-01-06",
+        "https://api.energy-charts.info/price?bzn=NL",
+    ]
+    assert forecast.slots and forecast.source == "energy_charts"
+    # The uncovered tail is still degraded and stale, never a provider failure.
+    assert forecast.slots[-1].stale is True
+    assert forecast.degraded is True
 
 
 def test_energy_charts_invalid_zone_is_explicit():

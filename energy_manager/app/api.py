@@ -307,6 +307,12 @@ def plan_summary_dict(summary: PlanSummary) -> dict[str, Any]:
     # Additive (0.18.0): the cost-basis sell floor the DP enforced (SPEC 5). ``None`` when the
     # setting is off or no ledger exists yet; a summary restored from an older store yields null.
     payload["sell_floor_eur_per_kwh"] = getattr(summary, "sell_floor_eur_per_kwh", None)
+    # Additive (0.33.0): the ledger's own average-basis floor, before the cheapest-refill cap. The
+    # enforced ``sell_floor_eur_per_kwh`` above is the lower of the two, so a plan may sell below
+    # this and still be profitable: the horizon can replace that energy more cheaply.
+    payload["ledger_sell_floor_eur_per_kwh"] = getattr(
+        summary, "ledger_sell_floor_eur_per_kwh", None
+    )
     # Additive (0.17.0): scheduled full-charge maintenance.  ``None`` when a summary was restored
     # from a store written before the field existed, or when no battery is due in this horizon.
     payload["maintenance"] = getattr(summary, "maintenance", None)

@@ -1203,20 +1203,47 @@ def fetch_energy_charts(
 ) -> PriceForecast:
     """Keyless day-ahead prices from energy-charts.info (EUR/MWh, ex-VAT, ex-tax).
 
-    The legacy endpoint returns today only (96 quarter-hour slots); tomorrow 404s until the auction
-    result is published, so the uncovered tail is marked stale/degraded rather than failing the
-    provider (SPEC appendix A).
+    The window is **today + tomorrow** (``start``/``end``): a plan horizon of 30 h reaches past
+    midnight, and the default window answers for today only, so asking for one day left the whole
+    second day filled flat from the last known price (`price_stale`), which hides every overnight
+    cheap slot and every next-evening peak from the optimiser (live 2026-10-21). Tomorrow 404s
+    until the auction result is published, so the today-only window is the fallback and an
+    uncovered tail is still marked stale/degraded rather than failing the provider (SPEC appendix A).
     """
     moment = now or utcnow()
     zone = str(settings.get("price.bzn", "NL") or "NL").strip()
-    try:
-        payload = (http or http_get_json)(f"{ENERGY_CHARTS_URL}?bzn={zone}")
-    except ProviderError as err:
-        if err.status == 400:
-            raise ProviderError(
-                f"energy_charts: bidding zone {zone!r} was rejected by the API", status=400
-            ) from None
-        if err.status == 404:
+    day = moment.astimezone(_zone(tz or settings.get("timezone"))).date()
+    urls = (
+        f"{ENERGY_CHARTS_URL}?bzn={zone}&start={day.isoformat()}"
+        f"&end={(day + timedelta(days=1)).isoformat()}",
+        f"{ENERGY_CHARTS_URL}?bzn={zone}",
+    )
+    http_get = http or http_get_json
+    payload: Any = None
+    missing: ProviderError | None = None
+    for url in urls:
+        try:
+            candidate = http_get(url)
+        except ProviderError as err:
+            if err.status == 400:
+                raise ProviderError(
+                    f"energy_charts: bidding zone {zone!r} was rejected by the API", status=400
+                ) from None
+            if err.status != 404:
+                raise
+            # 404: tomorrow's auction is not published yet (or, on the today-only window, this
+            # zone has no prices at all). Either way the next window is the fallback.
+            missing = err
+            continue
+        if not isinstance(candidate, Mapping):
+            raise ProviderError("energy_charts: unexpected response shape")
+        if not (candidate.get("unix_seconds") or candidate.get("price")):
+            missing = None
+            continue
+        payload = candidate
+        break
+    if payload is None:
+        if missing is not None:
             # A valid zone for which this source publishes nothing (e.g. NL returns 404 "no
             # content available"). Keep the legible message on the provider status so
             # explain_forecast can name the zone and point at the alternatives.
@@ -1225,9 +1252,9 @@ def fetch_energy_charts(
                 "day-ahead prices for it (no content available)",
                 status=404,
             ) from None
-        raise
-    if not isinstance(payload, Mapping):
-        raise ProviderError("energy_charts: unexpected response shape")
+        raise ProviderError(
+            f"energy_charts: publishes no day-ahead prices for bidding zone {zone!r} (empty payload)"
+        )
     unit_text = payload.get("unit")
     declared = unit_and_divisor(unit_text)
     if declared is None:

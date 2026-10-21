@@ -1868,6 +1868,48 @@ retained rows happened to favour.
 
 ---
 
+### 8.28 The plan never freezes on a dear pack, and the price horizon reaches past midnight (0.33.0)
+
+Reported: "Why do we have no charging discharging plan?" The live plan was 120 slots of `hold`,
+reason `sell_floor`, `power_w = 0` in every one. Two independent causes:
+
+1. **The sell floor was above every price in the horizon.** The ledger held 1.31 kWh bought at
+   33.1 ct/kWh; with the learned 0.847 round trip and 2.06 ct wear the floor is
+   `0.3308 / 0.8473 + 0.0206 = 0.411` EUR/kWh. The whole 30 h horizon topped out at 0.315, so the DP
+   removed every discharge/export transition -- and with no discharge possible it refused to charge
+   too (`Reason.ARBITRAGE_CHARGE` needs a sale that pays). Reproduced offline against the live
+   slots: floor 0.411 gave 0 kWh charged / 0 kWh discharged, floor `None` gave 0.6 kWh PV charge and
+   1.71 kWh discharge at the peaks, so the floor was the only blocker.
+2. **The day-ahead fetch only ever asked for today.** `fetch_energy_charts` requested
+   `/price?bzn=NL` with no window, which answers for today only (96 slots); the plan horizon is 30 h,
+   so 83 of 120 live slots carried a flat forward-filled 0.1871 and `price_stale = 1`.
+   `docs/EXTERNAL_APIS.md` already documented `start`/`end`; the code never used them. Verified live
+   that `start=2026-10-21&end=2026-10-22` returns 192 slots with tomorrow's auction (max 28.7 ct
+   wholesale) while a bare request returns 96 today-only slots.
+
+Fix 1 is the floor cap (`dp.effective_sell_floor_eur_per_kwh`): the fleet floor never sits above
+`aggregate_break_even_sell_eur_per_kwh(cheapest buy in the horizon) + margin`, the marginal cost of a
+sale, applied to both the sweep and the terminal-value sufficiency check; `PlanSummary`
+`sell_floor_eur_per_kwh` reports the enforced number and the live dispatch clamp now judges a planned
+discharge against that value instead of the uncapped ledger floor (which would have clamped the very
+cycle the plan was allowed to schedule). The ledger's own average-basis floor is unchanged in
+`/status.cost_basis` and `sensor.sem_battery_value`. Fix 2 requests `start=today&end=tomorrow` and
+falls back to the today-only window when tomorrow 404s before the auction.
+
+Covered by `tests/test_cost_basis.py` (a lossy pack still refuses a discharge below the refill
+break-even; a 0.411 floor over a horizon with a 0.19 slot caps to `0.19/0.81 + 0.02 = 0.2546` and the
+plan charges then discharges, with the margin riding on the cap; the export leg still reports
+`sell_floor`) and `tests/test_wp2a_price.py` (the window is `start=today&end=tomorrow`; a 404 on the
+window falls back to the bare URL and keeps the degraded/stale tail).
+
+Offline replay of the live 2026-10-21 horizon with tomorrow's real published prices and the live
+aggregate (2.05 kWh, 0.8473 round trip, 0.0206 wear): enforced floor 0.164 instead of 0.411, and the
+plan schedules 4.85 kWh charged / 5.32 kWh discharged -- PV charging through the midday surplus,
+discharge into both evening peaks (17:15-20:00 today at 0.29-0.30, 17:45-20:15 tomorrow at
+0.29-0.33), and an overnight grid charge at 0.12-0.14 that the stale flat tail had hidden.
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:

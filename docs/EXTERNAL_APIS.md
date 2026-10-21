@@ -133,8 +133,11 @@ deprecated     false
 
 * Default window = **today only** (`start` defaults to today, `end` defaults to `start`). Request
   another day with `start=YYYY-MM-DD&end=YYYY-MM-DD` (v2 documents ISO-8601 day strings and unix
-  seconds; the legacy endpoint accepted `YYYY-MM-DD` live). Tomorrow's prices before the auction
-  result: **404 with a plain-text body `no content available`**. **[V]** (live)
+  seconds; the legacy endpoint accepted `YYYY-MM-DD` live). **The add-on asks for `start=today` and
+  `end=tomorrow`** (0.33.0): a 30 h plan horizon reaches past midnight, and the default window would
+  leave the whole second day filled flat from the last known price. Tomorrow's prices before the
+  auction result: **404 with a plain-text body `no content available`**, which makes the fetch fall
+  back to the today-only window. **[V]** (live)
 * Invalid `bzn` -> **400 plain text** (`'ZZ' is not the code for an available bidding zone...`), not
   JSON. **[V]** (live)
 * `bzn=NL` is the Netherlands and is explicitly in the CC-BY/redistributable list; the v2 enum

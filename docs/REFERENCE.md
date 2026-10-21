@@ -1393,6 +1393,23 @@ whose *value leg* is below the floor is removed: the leg is the slot's `sell` wh
 floor reports `sell_floor`; charging, SoC-floor holds and everything outside `auto` are untouched,
 and with the floor `None` the schedule is bit-for-bit the pre-0.18.0 one.
 
+**The floor never sits above the cheapest refill (0.33.0).** The average-basis floor applied to
+every transition also refused a cycle that buys the horizon's cheapest kWh and sells them at a
+later peak, so one expensive charge froze the pack: with a 33.1 ct basis, 2.06 ct wear and a 0.847
+round trip the floor is 41.1 ct, and a 31.5 ct peak held all 30 h while nothing was ever cheap
+enough to charge for (live 2026-10-21). The fleet floor the DP enforces is therefore capped at
+`aggregate_break_even_sell_eur_per_kwh(cheapest_buy_in_horizon) + optimizer.sell_floor_margin_eur_per_kwh`
+-- the marginal cost of a sale -- while the ledger's own average-basis floor stays what it is in
+`/status.cost_basis` and `sensor.sem_battery_value`. The cap is applied in one place
+(`dp.effective_sell_floor_eur_per_kwh`, used by both the sweep and the terminal-value sufficiency
+check) and `PlanSummary.sell_floor_eur_per_kwh` reports the number that was enforced: the plan
+above enforced 0.164 EUR/kWh (cheapest buy 0.1216) instead of 0.411 and scheduled PV charging plus
+discharges into both evening peaks. `/plan` reports both numbers -- `sell_floor_eur_per_kwh` (the
+enforced one) and the additive `ledger_sell_floor_eur_per_kwh` (the average-basis floor that was
+capped) -- so a sale below the ledger floor is visibly explained rather than hidden. The live
+dispatch clamp judges a planned discharge against the
+same enforced floor (the plan's own summary value), never the uncapped ledger floor.
+
 The floor restricts discharge only (0.19.0): in a slot whose `base = load - pv` is negative (a PV
 surplus) the lower bound is `max(grid_lo, -max(0.0, base)) = 0`, so the surplus keeps exporting and
 the pack is never forced to swallow it; only a deficit caps the discharge at the house's own demand

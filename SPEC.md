@@ -613,6 +613,28 @@ basis is cleared and the floor is inactive until energy above the reserve is cha
 Everything else -- slice boundaries, measured energy, price attribution, the stall marker and the
 reconciliation reset -- is unchanged.
 
+**0.33.0 amendment (the floor never sits above the cheapest refill).** The floor prices a sale of
+what the pack already holds at the average price that energy was charged at, and the DP applies it
+to *every* discharge/export transition. Applied that way it also refused a cycle that buys cheap
+energy inside this very horizon and sells it at a later peak: a single expensive charge froze the
+pack until the market cleared that charge's break-even, and because no discharge was possible the
+DP refused to charge either, so the plan was ``hold`` everywhere (live 2026-10-21: a 33.1 ct basis
+with a 2.06 ct wear and a 0.847 round trip gives a 41.1 ct floor, against a 31.5 ct peak over the
+whole 30 h horizon). The fleet floor the DP enforces is now capped at
+``aggregate_break_even_sell_eur_per_kwh(cheapest_buy_in_horizon) + margin``: the break-even of the
+cheapest energy this horizon can actually put back into the pack, which is the marginal cost of a
+sale, while the ledger's own average-basis floor stays what it was (``/status.cost_basis``,
+``sensor.sem_battery_value``). Both the sweep and the terminal-value sufficiency check use the same
+capped number, and ``PlanSummary.sell_floor_eur_per_kwh`` reports the floor that was enforced, so
+``/plan`` and the UI can state it, and the additive
+``PlanSummary.ledger_sell_floor_eur_per_kwh`` keeps the average-basis number beside it so a sale
+below the ledger floor is visible rather than unexplained. The live dispatch clamp (SPEC 9.3) judges a *planned* discharge
+against that same enforced floor -- the plan's own summary value -- instead of the uncapped ledger
+floor, which would otherwise clamp exactly the fresh cheap cycle the optimiser was allowed to
+schedule. With a lossless pack (round trip 1, no wear) the cap equals the cheapest buy and the
+floor no longer blocks any house-serving discharge; with the setting off, or no basis yet, nothing
+changes.
+
 Runtime discovery is mandatory for `driver: zendure`: find candidate entities by asking HA for the
 entity registry entries whose `platform` is `zendure_ha` (or `unique_id` prefix `zendure_ha.`) and
 matching **translation keys** (`input_limit`, `output_limit`, `electric_level`,
@@ -1836,8 +1858,12 @@ warning. Response keys are `result.watts`, `result.watt_hours_period`, `result.w
 12 requests/hour/IP. Azimuth is compass−180 (0 = south), declination 0–90 (90 = vertical). Never log
 `message.info`, it contains the coordinates.
 
-**Energy-Charts price** — returns **today only** (96 × 15-min slots, `unit: "EUR / MWh"`); tomorrow's data
-404s until early afternoon CET. Prices are ex-tax wholesale, so apply the configured VAT and energy tax
+**Energy-Charts price** — the default window is **today only** (96 × 15-min slots, `unit: "EUR / MWh"`), so the
+provider must ask for `start`/`end` and cover **today + tomorrow** (0.33.0): a 30 h plan horizon reaches past
+midnight, and a today-only window leaves the whole second day filled flat and `price_stale`, which hides every
+overnight cheap slot and next-evening peak from the optimiser. Tomorrow 404s until early afternoon CET, so the
+today-only window is the fallback and the uncovered tail stays degraded. Prices are ex-tax wholesale, so apply
+the configured VAT and energy tax
 adders, do not add them twice for `zonneplan_entity`. Attribution is required in the README/DOCS
 (CC BY 4.0, Bundesnetzagentur | SMARD.de).
 

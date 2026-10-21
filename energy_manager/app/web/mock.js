@@ -327,7 +327,9 @@
         round_trip_efficiency: roundTrip,
         wear_eur_per_kwh: MOCK_WEAR,
         break_even_sell_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR,
+        // The demo plan does not cap the ledger floor, so both numbers are the same here.
         sell_floor_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR,
+        ledger_sell_floor_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR,
         maintenance: MOCK_MAINTENANCE,
         feed_in_mode: null,
         feed_in_export_allowed: null,

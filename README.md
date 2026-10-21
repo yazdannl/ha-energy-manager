@@ -471,8 +471,9 @@ an outbound dependency.)
   coordinates and the plane geometry you configured (kWp, tilt, azimuth, damping) — that is what the
   service needs to estimate production. No entity data, no consumption data, no identifiers, no
   account.
-- **`api.energy-charts.info`** (day-ahead prices; `api.energy-charts.info/price?bzn=...`): the
-  request carries only the bidding zone code (for example `NL`). No personal data is sent to it.
+- **`api.energy-charts.info`** (day-ahead prices; `api.energy-charts.info/price?bzn=...&start=...&end=...`):
+  the request carries only the bidding zone code (for example `NL`) and the two dates of the
+  published day-ahead window. No personal data is sent to it.
 - **`power.larc.nasa.gov`** (NASA POWER observed irradiance, on by default for the capacity and
   meter-derived solar sources): the request carries your site coordinates and a recent date window —
   that is what a point irradiance lookup needs. No entity data, no consumption data, no identifiers,

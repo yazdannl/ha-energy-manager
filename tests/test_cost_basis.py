@@ -636,14 +636,24 @@ def _slots(buy_high: float = 0.50, sell_low: float = 0.05, load_kw: float = 0.5)
     ]
 
 
-def _solve(options: dp.OptimizerOptions, *, floor: float | None, slots=None, start_kwh: float = 3.0):
-    config = battery(min_soc_pct=0.0, capacity_kwh=4.0, eta_charge=1.0, eta_discharge=1.0)
+def _solve(
+    options: dp.OptimizerOptions,
+    *,
+    floor: float | None,
+    slots=None,
+    start_kwh: float = 3.0,
+    eta: float = 1.0,
+    wear: float = 0.0,
+):
+    config = battery(
+        min_soc_pct=0.0, capacity_kwh=4.0, eta_charge=eta, eta_discharge=eta
+    )
     aggregate = dp.BatteryAggregate.from_configs([config], 0.0)
     return dp.solve(
         slots if slots is not None else _slots(),
         aggregate=aggregate,
         start_kwh=start_kwh,
-        options=options,
+        options=replace(options, wear_eur_per_kwh=wear),
         generated_at=T0,
         sell_floor_eur_per_kwh=floor,
     )
@@ -651,31 +661,65 @@ def _solve(options: dp.OptimizerOptions, *, floor: float | None, slots=None, sta
 
 def test_dp_floor_blocks_a_loss_making_discharge():
     options = dp.OptimizerOptions(slot_minutes=60, power_steps=24, wear_eur_per_kwh=0.0)
-    baseline = _solve(options, floor=None)
-    assert baseline.slots[0].power_w < 0  # the high slot discharges to serve the house
-    assert baseline.summary.sell_floor_eur_per_kwh is None
-
-    floored = _solve(options, floor=0.60)
+    # A lossy pack: the cheapest recharge in the horizon breaks even at 0.19/0.81 + 0.02, which
+    # the refill cap turns into the enforced floor (0.33.0). Both slots buy below it, so every
+    # discharge is refused at the floor's own reason.
+    slots = [
+        dp.SlotInput(t=T0, pv_kw=0.0, load_kw=0.5, buy=0.19, sell=0.05),
+        dp.SlotInput(t=T0 + timedelta(hours=1), pv_kw=0.0, load_kw=0.5, buy=0.18, sell=0.05),
+    ]
+    capped = 0.18 / 0.81 + 0.02
+    floored = _solve(options, floor=0.80, slots=slots, eta=0.9, wear=0.02)
     assert floored.slots[0].power_w == 0.0
     assert floored.slots[0].reason == Reason.SELL_FLOOR
     assert floored.slots[0].action == Action.HOLD
-    assert floored.slots[1].power_w > 0  # charging is never blocked
-    assert floored.summary.sell_floor_eur_per_kwh == pytest.approx(0.60)
+    assert floored.summary.sell_floor_eur_per_kwh == pytest.approx(capped, abs=1e-6)
+
+
+def test_dp_floor_is_capped_at_the_cheapest_refill_break_even():
+    # The live 2026-10-21 freeze: a 41 ct basis floor against a 31.5 ct peak held all 30 h. The
+    # horizon's own cheap slot (0.19) makes the floor 0.19/0.81 + 0.02 = 0.2546, below the peak,
+    # so the pack cycles fresh energy instead of holding.
+    options = dp.OptimizerOptions(slot_minutes=60, power_steps=24, wear_eur_per_kwh=0.0)
+    slots = [
+        dp.SlotInput(t=T0, pv_kw=0.0, load_kw=0.5, buy=0.19, sell=0.05),
+        dp.SlotInput(t=T0 + timedelta(hours=1), pv_kw=0.0, load_kw=0.5, buy=0.30, sell=0.05),
+    ]
+    refill = 0.19 / 0.81 + 0.02
+    plan = _solve(options, floor=0.411, slots=slots, start_kwh=0.5, eta=0.9, wear=0.02)
+    assert plan.summary.sell_floor_eur_per_kwh == pytest.approx(refill, abs=1e-6)
+    assert plan.slots[0].power_w > 0  # cheap slot charges
+    assert plan.slots[1].power_w < 0  # peak discharges, above the capped floor
+    assert Reason.SELL_FLOOR not in {slot.reason for slot in plan.slots}
+    # The configured margin rides on the cap instead of being silently dropped.
+    margined = _solve(
+        replace(options, sell_floor_margin_eur_per_kwh=0.01),
+        floor=0.411,
+        slots=slots,
+        start_kwh=0.5,
+        eta=0.9,
+        wear=0.02,
+    )
+    assert margined.summary.sell_floor_eur_per_kwh == pytest.approx(refill + 0.01, abs=1e-6)
 
 
 def test_dp_floor_allows_a_discharge_at_or_above_it():
     options = dp.OptimizerOptions(slot_minutes=60, power_steps=24, wear_eur_per_kwh=0.0)
-    # The house-serving leg is the slot's buy (0.50): a 0.40 floor leaves it alone.
-    below_buy = _solve(options, floor=0.40)
+    # The house-serving leg is the slot's buy (0.50): a 0.40 floor leaves it alone. The horizon's
+    # cheapest buy (0.45) keeps the refill cap above the floor, so the floor is the binding rule.
+    slots = [
+        dp.SlotInput(t=T0, pv_kw=0.0, load_kw=0.5, buy=0.50, sell=0.05),
+        dp.SlotInput(t=T0 + timedelta(hours=1), pv_kw=0.0, load_kw=0.5, buy=0.45, sell=0.05),
+    ]
+    below_buy = _solve(options, floor=0.40, slots=slots, eta=0.9, wear=0.02)
     assert below_buy.slots[0].power_w == pytest.approx(-500.0, abs=1.0)  # only the house's own load
-    # An export slot compares with sell (0.05): a 0.40 floor refuses the export entirely.
+    # An export slot compares with sell (0.05): the capped floor (0.05/0.81 + 0.02 = 0.0817) still
+    # sits above it, so the export is refused at the floor's own reason.
     export_slots = [
         dp.SlotInput(t=T0, pv_kw=0.0, load_kw=0.0, buy=0.50, sell=0.05),
         dp.SlotInput(t=T0 + timedelta(hours=1), pv_kw=0.0, load_kw=0.5, buy=0.05, sell=0.05),
     ]
-    baseline = _solve(options, floor=None, slots=export_slots)
-    assert baseline.slots[0].power_w < 0
-    floored = _solve(options, floor=0.40, slots=export_slots)
+    floored = _solve(options, floor=0.40, slots=export_slots, eta=0.9, wear=0.02)
     assert floored.slots[0].power_w == 0.0
     assert floored.slots[0].reason == Reason.SELL_FLOOR
 
@@ -1329,6 +1373,13 @@ def test_status_and_plan_summary_carry_the_cost_basis():
     assert empty["batteries"][0]["cost_basis_eur_per_kwh"] is None
     assert plan_summary_dict(PlanSummary())["sell_floor_eur_per_kwh"] is None
     assert plan_summary_dict(PlanSummary(sell_floor_eur_per_kwh=0.25))["sell_floor_eur_per_kwh"] == pytest.approx(0.25)
+    # 0.33.0: the ledger's own floor travels beside the enforced (capped) one.
+    assert plan_summary_dict(PlanSummary())["ledger_sell_floor_eur_per_kwh"] is None
+    ledger_floor = PlanSummary(sell_floor_eur_per_kwh=0.16)
+    ledger_floor.ledger_sell_floor_eur_per_kwh = 0.411
+    summary = plan_summary_dict(ledger_floor)
+    assert summary["sell_floor_eur_per_kwh"] == pytest.approx(0.16)
+    assert summary["ledger_sell_floor_eur_per_kwh"] == pytest.approx(0.411)
 
 
 def test_engine_update_cost_bases_advances_the_ledger_from_the_store(tmp_path):

@@ -38,7 +38,7 @@ from .notify import Notifier
 
 log = logging.getLogger("app.main")
 
-APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.32.0"
+APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.33.0"
 COMMIT = os.environ.get("SEM_COMMIT") or os.environ.get("GITHUB_SHA") or ""
 DEFAULT_PORT = 8099
 DEFAULT_OPTIONS = "/data/options.json"

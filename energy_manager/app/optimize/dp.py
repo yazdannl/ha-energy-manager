@@ -178,6 +178,9 @@ class OptimizerOptions:
     #: configured margin. ``None`` = no floor (setting off, or no ledger yet) and today's plan.
     #: The engine derives it from the ledger and passes it in; the DP never reads the store.
     sell_floor_eur_per_kwh: float | None = None
+    #: ``optimizer.sell_floor_margin_eur_per_kwh`` (SPEC 3/5): the margin the fleet floor was built
+    #: with, so the cheapest-refill cap below carries the same requirement instead of loosening it.
+    sell_floor_margin_eur_per_kwh: float = 0.0
     #: Optimizer v2 stage 1b (docs/OPTIMIZER_V2.md section 2.3): the feed-in contract refused the
     #: battery-sourced export leg for this plan.  A planning-only bound: no flow below the
     #: house's own demand may export, while the forced PV surplus still exports and is priced at
@@ -215,6 +218,7 @@ class OptimizerOptions:
                 get("optimizer.pv_charge_preference", "auto")
             ),
             target_soc_pct_end=get("optimizer.target_soc_pct_end", None),
+            sell_floor_margin_eur_per_kwh=float(get("optimizer.sell_floor_margin_eur_per_kwh", 0.0) or 0.0),
             terminal_mode=normalize_terminal_mode(get("optimizer.terminal_mode", "salvage")),
             terminal_tail_hours=float(get("optimizer.terminal_tail_hours", 24.0) or 24.0),
             terminal_tail_minutes=float(get("optimizer.terminal_tail_minutes", 60.0) or 60.0),
@@ -1042,6 +1046,55 @@ def _sell_floor_blocks(slot: SlotInput, opts: OptimizerOptions) -> bool:
     return base > 0.0 and float(slot.buy) < floor  # even serving the house cannot pay for it
 
 
+def refill_break_even_eur_per_kwh(
+    slots: Sequence[SlotInput], agg: BatteryAggregate, opts: OptimizerOptions
+) -> float | None:
+    """Break-even of the cheapest energy the horizon can put back into the pack (0.33.0).
+
+    A pack holding dear energy is not frozen: buying the horizon's cheapest kWh and selling them
+    at a peak is profitable on its own, whatever the sunk basis is.  ``None`` for an empty plan.
+    """
+    cheapest: float | None = None
+    for slot in slots:
+        if slot.buy is None:
+            continue
+        price = float(slot.buy)
+        if cheapest is None or price < cheapest:
+            cheapest = price
+    if cheapest is None:
+        return None
+    wear = opts.wear_eur_per_kwh if opts.wear_eur_per_kwh > 0.0 else agg.wear_eur_per_kwh
+    return aggregate_break_even_sell_eur_per_kwh(
+        agg.eta_charge, agg.eta_discharge, cheapest, wear
+    )
+
+
+def effective_sell_floor_eur_per_kwh(
+    floor: float | None,
+    slots: Sequence[SlotInput],
+    agg: BatteryAggregate,
+    opts: OptimizerOptions,
+) -> float | None:
+    """The ledger floor, capped at the cheapest-refill break-even plus the configured margin.
+
+    The cost-basis floor prices a *sale of what the pack already holds* at the average price that
+    energy was charged at.  Applied to every discharge transition it also refuses a cycle that
+    buys cheap energy inside this very horizon and sells it at a peak, so one expensive charge
+    freezes the battery until the market clears that charge's break-even -- live 2026-10-21: a
+    33.1 ct basis against a 31.5 ct peak held all 30 h, and the plan could never charge either
+    (nothing to charge for).  The floor therefore never sits above what refilling at the horizon's
+    cheapest buy costs, which keeps the intent (never sell held energy at a loss) while letting
+    fresh cheap energy cycle.
+    """
+    if floor is None:
+        return None
+    refill = refill_break_even_eur_per_kwh(slots, agg, opts)
+    if refill is None:
+        return float(floor)
+    margin = max(0.0, float(opts.sell_floor_margin_eur_per_kwh or 0.0))
+    return min(float(floor), refill + margin)
+
+
 def _round_trip_blocks_arbitrage(
     slot: SlotInput, cheapest_buy: float, agg: BatteryAggregate, opts: OptimizerOptions
 ) -> bool:
@@ -1398,8 +1451,10 @@ def solve(
     exactly the user's setting: a non-due battery never distorts the schedule.
 
     ``sell_floor_eur_per_kwh`` is the engine's cost-basis floor (SPEC 5, 0.18.0): when set, no
-    discharge/export transition may carry a value leg below it. ``None`` keeps the schedule
-    bit-for-bit as before.
+    discharge/export transition may carry a value leg below it.  It is capped at the break-even of
+    the cheapest energy this horizon can put back into the pack (0.33.0), so a pack holding
+    expensive energy still cycles fresh cheap energy instead of holding for the whole horizon.
+    ``None`` keeps the schedule bit-for-bit as before.
 
     ``now`` is the moment the plan is made (0.20.1, SPEC 8.16): when it falls inside the first
     slot, that slot is modelled with only the minutes left in its clock window (a 1-minute floor
@@ -1414,13 +1469,21 @@ def solve(
     """
     moment = generated_at or utcnow()
     sources = dict(source_names or {})
-    if sell_floor_eur_per_kwh is not None:
-        options = replace(options, sell_floor_eur_per_kwh=float(sell_floor_eur_per_kwh))
     if options.wear_eur_per_kwh <= 0.0 and aggregate.wear_eur_per_kwh > 0.0:
         # Zero means "derive it": the aggregate already carries the fleet's delivered-energy-weighted mean
         # of the per-battery derived wear (SPEC 5). A non-zero setting is the advanced override
         # and wins. Resolved here so every caller (API recompute, tests, selfcheck) agrees.
         options = replace(options, wear_eur_per_kwh=aggregate.wear_eur_per_kwh)
+    floor = sell_floor_eur_per_kwh if sell_floor_eur_per_kwh is not None else options.sell_floor_eur_per_kwh
+    if floor is not None:
+        # 0.33.0: the floor is capped at the cheapest-refill break-even, so a dear charge cannot
+        # freeze a pack that could cycle fresh cheap energy (see ``effective_sell_floor...``).
+        options = replace(
+            options,
+            sell_floor_eur_per_kwh=effective_sell_floor_eur_per_kwh(
+                float(floor), slots, aggregate, options
+            ),
+        )
     active_maintenance: dict[str, Any] | None = None
     target_soc_pct_end = options.target_soc_pct_end
     if maintenance and maintenance.get("active"):
@@ -1637,12 +1700,6 @@ def solve_from_forecasts(
     """
     moment = now or utcnow()
     options = OptimizerOptions.from_settings(settings)
-    if sell_floor_eur_per_kwh is not None:
-        # The ledger floor is passed in, not stored in the settings (SPEC 5).  Apply it here as
-        # well as inside :func:`solve` so the terminal-value sufficiency check prices the tail
-        # with exactly the floor the sweep will apply -- a check against a disabled floor would
-        # pass tails that the sweep then refuses to discharge.
-        options = replace(options, sell_floor_eur_per_kwh=float(sell_floor_eur_per_kwh))
     hours = int(clamp(options.horizon_hours, 12, 48))
     start = quarter_floor(moment, options.slot_minutes)
     slots = align_slots(
@@ -1650,6 +1707,18 @@ def solve_from_forecasts(
     )
     reserve = float(settings.get("optimizer.reserve_soc_pct", 0.0) or 0.0)
     aggregate = BatteryAggregate.from_configs(battery_configs, reserve)
+    if sell_floor_eur_per_kwh is not None:
+        # The ledger floor is passed in, not stored in the settings (SPEC 5).  Apply it here as
+        # well as inside :func:`solve` so the terminal-value sufficiency check prices the tail
+        # with exactly the floor the sweep will apply -- a check against a disabled floor would
+        # pass tails that the sweep then refuses to discharge.  Capped at the cheapest-refill
+        # break-even for the same reason (0.33.0): one number, shared by both.
+        options = replace(
+            options,
+            sell_floor_eur_per_kwh=effective_sell_floor_eur_per_kwh(
+                float(sell_floor_eur_per_kwh), slots, aggregate, options
+            ),
+        )
     sources = {"price": price.source, "solar": solar.source, "load": load.source}
     flattened = bool(slots) and all(s.price_stale for s in slots)
     if flattened:
@@ -1738,13 +1807,17 @@ def solve_from_forecasts(
         mode=mode,
         dry_run=dry_run,
         maintenance=maintenance,
-        sell_floor_eur_per_kwh=sell_floor_eur_per_kwh,
+        sell_floor_eur_per_kwh=options.sell_floor_eur_per_kwh,
         # The horizon start stays floored to the slot grid, so the first slot can begin before
         # ``moment``; passing it lets the solver model that slot with only its remaining minutes
         # (0.20.1, SPEC 8.16).
         now=moment,
         terminal=terminal_plan,
     )
+    if sell_floor_eur_per_kwh is not None:
+        # Additive (0.33.0): the ledger's own average-basis floor, kept beside the enforced (capped)
+        # one so /plan and the UI can state both instead of implying the cap away.
+        plan.summary.ledger_sell_floor_eur_per_kwh = float(sell_floor_eur_per_kwh)
     if result is not None:
         # Additive (stage 1b): the contract decision rides on the plan and its summary the same way
         # the eta/floor/maintenance context does, so /plan, /status and the ledger see it without a
