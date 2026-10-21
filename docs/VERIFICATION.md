@@ -1987,6 +1987,16 @@ self-consumption plan, a dispatched 1.2 kW charge target, `plan_updated` journal
 `tests/test_wp2a_price.py` (strict by default → `PriceUnavailable` naming the Zonneplan reason; opt-in
 → the market chain, degraded). Full suite: **1643 passed**.
 
+**0.34.1 correction, found live 18:25 UTC right after the 0.34.0 deploy.** 0.34.0 applied
+`no_fallback` only when the tariff sensor could not be *located*. The located entity came from the
+module cache (found before the outage), its state was `unavailable`, so the *fetch* failed inside the
+chain and `energy_charts` took over again — `sensor.sem_chart_price` still reported `source:
+energy_charts` and the plan carried wholesale prices. `no_fallback` now applies to the resolved path
+too, so "Zonneplan only" means exactly one provider: no price → the zero-export plan above, with the
+fetch error left on `/providers`. Covered by
+`test_a_zonneplan_sensor_that_resolves_but_cannot_price_stays_strict` and
+`test_the_market_fallback_opt_in_also_covers_a_failing_fetch`. Full suite: **1645 passed**.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)

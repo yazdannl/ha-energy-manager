@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.34.1
+
+- **Fix: `zonneplan` strictness covers the whole provider, not just the resolution error.** 0.34.0
+  made `price.market_fallback` decide the chain only when the tariff sensor could not be *located*.
+  Live 2026-10-21 18:25 UTC, right after the 0.34.0 deploy: the located entity came from the module
+  cache (found before the outage), its state was `unavailable`, so the *fetch* failed inside the
+  chain and `energy_charts` supplied the market curve again — the chart showed `source:
+  energy_charts` and a plan priced on wholesale. `no_fallback` now applies to the resolved path too,
+  so Zonneplan-only means one provider: no price → zero-export self-consumption (0.34.0's planner),
+  with the fetch error on `/providers`.
+
 ## 0.34.0
 
 - **Zonneplan prices are never faked.** With `price.provider = zonneplan`, a day-ahead curve plus

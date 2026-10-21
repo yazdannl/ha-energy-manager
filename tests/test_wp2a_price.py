@@ -873,6 +873,47 @@ def test_market_fallback_opt_in_restores_the_day_ahead_chain():
     assert "fell back" in " ".join(forecast.notes)
 
 
+def test_a_zonneplan_sensor_that_resolves_but_cannot_price_stays_strict():
+    # 0.34.1, live 2026-10-21: the tariff sensor was located (from the module cache, left over from
+    # before the outage) but its entity is `unavailable`, so the *fetch* failed -- inside the chain,
+    # which still fell back to day-ahead and published a plan priced on the wholesale curve. Strict
+    # means strict for the whole provider: `no_fallback` now covers this path too.
+    market = slot_provider(buy=0.19, slots=8)
+
+    def failing(_client, _settings, now=None, http=None, tz=None):
+        raise ProviderError("zonneplan_entity: sensor is unavailable")
+
+    with pytest.raises(PriceUnavailable) as err:
+        load_price_forecast(
+            _zonneplan_settings("dynamic_quarter_hourly"),
+            StateClient([zonneplan_state("sensor.zonneplan_example_quarter", minutes=15, count=8)]),
+            now=NOW,
+            providers={"zonneplan_entity": failing, "energy_charts": market, "static": market},
+        )
+    assert "zonneplan_entity: sensor is unavailable" in str(err.value)
+
+
+def test_the_market_fallback_opt_in_also_covers_a_failing_fetch():
+    market = slot_provider(buy=0.19, slots=8)
+
+    def failing(_client, _settings, now=None, http=None, tz=None):
+        raise ProviderError("zonneplan_entity: sensor is unavailable")
+
+    forecast, _statuses = load_price_forecast(
+        settings(
+            **{
+                "price.provider": "zonneplan",
+                "price.contract": "dynamic_quarter_hourly",
+                "price.market_fallback": True,
+            }
+        ),
+        StateClient([zonneplan_state("sensor.zonneplan_example_quarter", minutes=15, count=8)]),
+        now=NOW,
+        providers={"zonneplan_entity": failing, "energy_charts": market, "static": market},
+    )
+    assert forecast.source != "zonneplan_entity" and forecast.slots
+
+
 def test_zonneplan_falls_back_to_the_other_grid_with_a_note():
     # Only the hourly grid exists; a quarter-hourly contract must use it AND note it (never silent).
     hourly = zonneplan_state("sensor.zonneplan_example_hour", minutes=60, count=8, shape="hourly")

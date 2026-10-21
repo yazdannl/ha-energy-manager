@@ -1158,7 +1158,10 @@ def _resolve_source(
         # 0.34.0 (SPEC 4.1): a Zonneplan consumer tariff is all-in -- VAT, energy tax and the
         # supplier's own fees are baked into the sensor's price.  The wholesale curve plus typed
         # adders reproduces it only if every component is configured, so substituting it silently
-        # misprices the plan.  ``price.market_fallback`` (off by default) is the opt-in.
+        # misprices the plan.  ``price.market_fallback`` (off by default) is the opt-in, and it
+        # applies to the whole provider -- both an unresolvable integration *and* a tariff sensor
+        # that resolves but then cannot produce a price -- because either one would otherwise swap
+        # a Zonneplan all-in price for a wholesale one without saying so.
         strict = not bool(settings.get("price.market_fallback", False))
         try:
             entity_id, note = _locate_zonneplan_entity(client, settings, now, tz, contract)
@@ -1173,7 +1176,7 @@ def _resolve_source(
             # plans zero-export self-consumption from PV and load.
             return "zonneplan_entity", settings, [], strict, str(err)
         overlay = _SettingsOverlay(settings, {"price.entity": entity_id})
-        return "zonneplan_entity", overlay, ([note] if note else []), False, None
+        return "zonneplan_entity", overlay, ([note] if note else []), strict, None
     if provider == "day_ahead":
         return "energy_charts", settings, [], False, None
     if provider == "fixed":
