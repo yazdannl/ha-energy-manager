@@ -139,6 +139,11 @@ class Reason:
     #: threshold, or an unconfirmed tax component), so the battery-sourced export leg is refused
     #: rather than priced at a guessed rate. Forced PV export keeps its own conservative floor.
     UNPRICED_EXPORT = "unpriced_export"
+    #: 0.34.0 (SPEC 8.31): no tariff resolved for the horizon at all (a Zonneplan-only contract
+    #: while the integration is down), so the plan is a zero-export self-consumption schedule built
+    #: from PV and load only.  Slot reasons stay the physical ones (``pv_surplus_charge``,
+    #: ``self_consumption``); this slug names the plan as a whole in the alert and journal.
+    NO_PRICE_SELF_CONSUMPTION = "no_price_self_consumption"
     IDEMPOTENT_SKIP = "idempotent_skip"
     # cell-voltage protection (0.16.0): a battery latched below its cutoff may not discharge and
     # is charged out of danger; a stale reading keeps the previous latch.

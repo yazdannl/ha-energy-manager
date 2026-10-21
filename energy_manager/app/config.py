@@ -94,6 +94,11 @@ DEFAULTS: dict[str, Any] = {
     "price.provider": "entity",
     "price.contract": "dynamic_hourly",
     "price.source": "zonneplan_entity",
+    # Whether provider `zonneplan` may paper over a broken integration with day-ahead + adders
+    # (SPEC 4.1, 0.34.0).  Off by default: an all-in consumer tariff is not reconstructible from
+    # the wholesale curve, so a plan priced that way is silently wrong.  With no price the engine
+    # plans zero-export self-consumption instead (`optimize/selfconsumption.py`).
+    "price.market_fallback": False,
     "price.entity": "",
     "price.static_schedule": [],
     "price.import_fee_eur_per_kwh": 0.0,
@@ -394,6 +399,7 @@ SETTINGS_META: dict[str, _Meta] = {
     "price.provider": _Meta("choice", "price", "Price provider", "Where prices come from. entity = a sensor you pick (advanced); zonneplan = the Zonneplan integration's tariff sensor found in Home Assistant; day_ahead = energy_charts wholesale day-ahead prices for the bidding zone; fixed = a flat or day/night tariff.", _PRICE_PROVIDER_CHOICES),
     "price.contract": _Meta("choice", "price", "Contract type", "dynamic_quarter_hourly / dynamic_hourly = market prices per quarter hour or per hour; fixed_single = one rate all day; fixed_day_night = two rates split by the day window below. Dynamic providers pick their own grid, so this only matters for a fixed tariff.", _PRICE_CONTRACT_CHOICES, advanced=True),
     "price.source": _Meta("choice", "price", "Price source", "Only used by the entity provider: configured source with fallback to energy_charts then static.", _PRICE_SOURCE_CHOICES, advanced=True),
+    "price.market_fallback": _Meta("bool", "price", "Market fallback", "Provider 'zonneplan' only: when the Zonneplan integration cannot resolve, also use day-ahead market prices (plus the configured adders) instead of planning without a price. Off = Zonneplan prices only; with no price the battery runs zero-export self-consumption from the PV and load forecasts.", advanced=True),
     "price.entity": _Meta("str", "price", "Price entity", "Runtime-picked HA sensor entity id.", advanced=True),
     "price.fixed_price_eur_per_kwh": _Meta("float", "price", "Fixed rate", "Consumer price incl. VAT and tax, EUR/kWh. Unset = read the entity below.", minimum=-1.0, maximum=5.0, nullable=True),
     "price.fixed_day_price_eur_per_kwh": _Meta("float", "price", "Day rate", "Consumer price incl. VAT and tax for the day window, EUR/kWh.", minimum=-1.0, maximum=5.0, nullable=True),

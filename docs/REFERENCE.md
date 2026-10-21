@@ -403,7 +403,7 @@ a hidden field holding a non-default value is still surfaced):
 | Selector | Visible extra keys | Note shown |
 | --- | --- | --- |
 | `price.provider=entity` | `price.source`, `price.entity`, `price.static_schedule` | — |
-| `price.provider=zonneplan` | — (source found structurally) | tariff sensor located automatically from its price-list attribute and slot spacing |
+| `price.provider=zonneplan` | — (source found structurally) | tariff sensor located automatically from its price-list attribute and slot spacing; `price.market_fallback` turns the day-ahead fallback back on |
 | `price.provider=day_ahead` | `price.bzn` | wholesale, ex-VAT/ex-tax; zone coverage may legitimately be empty |
 | `price.provider=fixed` | single: `price.fixed_price_eur_per_kwh`(entity); day/night: day+night rates/entities and the two window hours | fixed prices fail loudly, never guessed from the market; DST follows the window |
 | `solar.source=forecast_solar` | `solar.planes`, `solar.api_key` | per-plane geometry; keyless is single-plane hourly |
@@ -548,6 +548,7 @@ is the authority for the `advanced` classification (the test suite asserts the e
 | `price.provider` | choice `entity\|zonneplan\|day_ahead\|fixed` | `entity` | — | **Price provider** — where prices come from |
 | `price.contract` | choice `dynamic_quarter_hourly\|dynamic_hourly\|fixed_single\|fixed_day_night` | `dynamic_hourly` | — | **Contract type** *(advanced)* — slot granularity; day/night windows for fixed |
 | `price.source` | choice `zonneplan_entity\|energy_charts\|entity_forecast\|static` | `zonneplan_entity` | — | **Price source** *(advanced)* — entity provider only, with energy_charts then static fallback |
+| `price.market_fallback` | bool | `false` | — | **Market fallback** *(advanced)* — provider `zonneplan` only: use day-ahead prices when the Zonneplan integration cannot resolve (off = Zonneplan prices only; with no price the battery runs zero-export self-consumption) |
 | `price.entity` | str | `""` | — | **Price entity** *(advanced)* — runtime-picked HA sensor |
 | `price.static_schedule` | json | `[]` | — | **Static price schedule** *(advanced)* — list of `{from_hour, to_hour, price_eur_per_kwh, days}` |
 | `price.import_fee_eur_per_kwh` | float | `0.0` | −10…10 | **Import fee** *(advanced)* — supplier markup on buy |
@@ -963,7 +964,7 @@ reported as a short tail. For HA consumer sensors
 | `price.provider` | Resolves to | Allowed contracts |
 | --- | --- | --- |
 | `entity` | `price.source` + `price.entity`, chain configured → energy_charts → static | any |
-| `zonneplan` | a Zonneplan tariff sensor found structurally: an attribute holding a fixed-point price list (`price_tax_included` / `price_tax_excluded`, `value_factor 1e-7`) whose own state agrees with its current slot | `dynamic_*` |
+| `zonneplan` | a Zonneplan tariff sensor found structurally: an attribute holding a fixed-point price list (`price_tax_included` / `price_tax_excluded`, `value_factor 1e-7`) whose own state agrees with its current slot. **Zonneplan only** (0.34.0): an unresolvable integration leaves the chain at one element, and `price.market_fallback` (default off) is the opt-in to the day-ahead curve | `dynamic_*` |
 | `day_ahead` | `energy_charts` for `price.bzn` (keyless) | `dynamic_*` |
 | `fixed` | the configured flat or day/night tariff; **no market fallback** | `fixed_*` |
 
@@ -1298,6 +1299,18 @@ maintenance target        : while a tracked battery is due, the higher of
   target goes through this same path, so charging slots keep the stable `terminal_target` reason.
 - Grid-limit violations found in the reconstructed plan yield
   `infeasible_reason: grid_limits_infeasible`. No slots yields `no_forecast_slots`.
+
+**No price at all → zero-export self-consumption (0.34.0, SPEC 8.4)** — `app/optimize/selfconsumption.py`
+replaces the DP when the price forecast is missing but PV and load are known (a `zonneplan` install
+whose integration is down, and `price.market_fallback` off). It is greedy by construction, because a
+zero-export objective has no price signal to look ahead with: charge
+`min(pv - load, p_charge, headroom)` while the pack has room, discharge
+`min(load - pv, p_discharge, available)` down to the aggregate floor, hold otherwise. Slots carry
+`buy = sell = 0.0` with `price_stale: true` and `price_source: "none"`, the summary claims no cost,
+baseline or saving, and `sources` reads `{"plan": "self_consumption", "price": "none", …}` — `0.0`
+means *unpriced*, never *free*. The dispatcher executes it (both the stale-price refusal and the
+cost-basis sell floor are skipped for that marker) while ramp, grid limits, SoC bounds and the
+cell-voltage guard still apply. Missing PV or load still means no plan at all.
 
 **Arbitrage feasibility** — an arbitrage pair is planned only when the sale clears the round-trip
 break-even:

@@ -28,6 +28,7 @@ from ..models import (
     utcnow,
 )
 from ..optimize.allocate import allocate_power, headroom_w
+from ..optimize.selfconsumption import is_self_consumption_plan
 from . import safety
 from .drivers.base import BatteryDriver
 from .safety import RAMP_LIMIT_W
@@ -146,7 +147,10 @@ class Dispatcher:
         age = (moment - plan.generated_at).total_seconds()
         if age > bound:
             return f"plan is {age / 60.0:.0f} min old (> {bound / 60.0:.0f} min)"
-        if slot.price_stale:
+        if slot.price_stale and not is_self_consumption_plan(plan):
+            # A zero-export self-consumption plan (0.34.0, SPEC 8.31) has no price by definition:
+            # its slots are marked stale so the UI draws no tariff line, and refusing to execute it
+            # would defeat the whole fallback.
             return "the slot's price forecast is stale"
         return None
 

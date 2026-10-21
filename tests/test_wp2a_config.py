@@ -565,6 +565,7 @@ ADVANCED_KEYS = {
     "log_level",
     "price.source",
     "price.entity",
+    "price.market_fallback",
     "price.contract",
     "price.bzn",
     "price.unit",

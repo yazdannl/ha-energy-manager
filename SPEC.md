@@ -330,7 +330,7 @@ resolves the concrete source, and reports what it resolved to.
 | `price.provider` | resolves to | allowed contracts |
 | --- | --- | --- |
 | `entity` (default) | the pre-0.3.0 explicit path: `price.source` + `price.entity`, chain `configured → energy_charts → static` | any |
-| `zonneplan` | a Zonneplan tariff sensor **found in Home Assistant**: an entity whose attribute holds a fixed-point price list (`price_tax_included`/`price_tax_excluded` dicts, `value_factor 1e-7`) and whose own state agrees with its current slot (the existing scale check). The grid is detected structurally, from the slot spacing, never from the entity name: `dynamic_quarter_hourly` prefers the 15-minute grid, `dynamic_hourly` the hourly one, and falling back to the other grid is recorded as a note, never silent | `dynamic_*` |
+| `zonneplan` | a Zonneplan tariff sensor **found in Home Assistant**: an entity whose attribute holds a fixed-point price list (`price_tax_included`/`price_tax_excluded` dicts, `value_factor 1e-7`) and whose own state agrees with its current slot (the existing scale check). The grid is detected structurally, from the slot spacing, never from the entity name: `dynamic_quarter_hourly` prefers the 15-minute grid, `dynamic_hourly` the hourly one, and falling back to the other grid is recorded as a note, never silent. **Zonneplan only (0.34.0)**: when the integration cannot resolve, the chain stays at `zonneplan_entity` and the plan is built without a price (§8.4). `price.market_fallback` (default off) restores the 0.33.2 behaviour `zonneplan → energy_charts → static`, and a day-ahead curve plus adders is then marked degraded | `dynamic_*` |
 | `day_ahead` | `energy_charts` for `price.bzn` (keyless wholesale day-ahead) | `dynamic_*` |
 | `fixed` | the configured flat or day-night tariff (`fixed_tariff` source) on local-time windows. **No market fallback**: a fixed contract whose price is missing fails loudly instead of silently planning against market prices | `fixed_*` |
 
@@ -355,7 +355,6 @@ the UI must be able to say so.
 A provider/contract combination outside the table above is a **warning, not a failure**: it is
 reported as `price_warnings` in `/api/v1/config` and the engine keeps the configured provider, because
 refusing to plan is worse than planning with a stated mismatch.
-
 ### 4.2 Feed-in price (0.6.0)
 
 The sell price is **EUR/kWh received**. It resolves in this order, once per forecast, in
@@ -1198,6 +1197,38 @@ capacity — never an aggregate-only constraint, or a nearly empty pack gets dra
 a fuller one is untouched. `reserve_soc_pct` is a parameter of the allocation helpers and every caller
 (dispatcher, engine) must pass it; the end-to-end path is covered by a test, not just the helper.
 
+### 8.4 No price: zero-export self-consumption (0.34.0)
+
+The DP needs a tariff to choose between charging, holding and discharging. It must not *guess*
+one: a Zonneplan consumer price is all-in (VAT, energy tax and the supplier's own fees baked into the
+sensor), so a wholesale curve plus typed adders is a different number, and §4.1 therefore keeps a
+`zonneplan` install on Zonneplan prices only. That leaves a real state — **no price at all** — which
+the add-on has to handle physically instead of idling.
+
+With no price forecast but a PV and a load forecast, the engine plans **zero-export
+self-consumption** (`optimize/selfconsumption.py`) rather than pausing to a 0 W hold:
+
+* `surplus = max(0, pv − load)` charges at `min(surplus, p_charge, headroom)` — the battery catches
+the redelivery the house cannot use, and **never imports to charge**;
+* `deficit = max(0, load − pv)` discharges at `min(deficit, p_discharge, available)` — the house runs
+on the pack down to its floor (`max(min_soc_pct, reserve_soc_pct)`);
+* every slot is bounded by the aggregate ceiling and floor, so a full pack stops charging (its
+surplus is exported, which is unavoidable) and an empty one stops discharging;
+* the greedy rule is the optimum of a zero-export objective with no price signal — energy not caught
+now is gone, and caught energy is worth the same in any later slot — so no look-ahead is needed.
+
+What the plan must **not** claim: a tariff. Its slots carry `buy = sell = 0.0` with `price_stale =
+true` and `price_source = "none"`, its summary reports zero cost, zero baseline and zero saving, and
+`plan.sources` reads `{"plan": "self_consumption", "price": "none", ...}`. `0.0` there means *not
+priced*, never *free*. The dispatcher recognises that marker and skips both gates that assume a
+tariff exists — the stale-price refusal (§9.1) and the cost-basis sell floor (§5) — because the slot
+is not selling anything.
+
+Which provider failure leads here: any `PriceUnavailable` from the configured chain (`/providers`
+names the reason). A missing **PV or load** forecast is a different case and keeps the documented
+behaviour: no plan, the active plan is dropped and the battery holds. The fallback is a *pricing*
+fallback, not a forecast substitute.
+
 ---
 
 ## 9. Control loop, drivers, safety
@@ -1940,6 +1971,24 @@ than by weakening `tools/audit.sh`.
 ---
 
 ## 16. Amendment log (why the spec changed)
+
+**0.34.0 — a price-less horizon is planned, not paused; Zonneplan prices are never faked.** Two
+requirements changed together, and they are the same requirement read twice. Live 2026-10-21: the
+Zonneplan integration went down (vendor maintenance) while `price.provider = zonneplan`. 0.33.2 kept
+the plan alive by substituting the day-ahead curve plus the configured adders — but a Zonneplan
+consumer price is all-in, so that plan was silently priced wrong; 0.33.1's day-ahead extension had
+removed the *empty* failure and replaced it with a *mispriced* one. §4.1 therefore makes `zonneplan`
+strict by default: the chain is Zonneplan only, `price.market_fallback` (off) is the explicit opt-in
+to the market curve, and the resolution error stays visible on `/providers`. A strict install then has
+no price at all, which used to mean no plan and a 0 W hold that let every surplus kWh out of the
+meter. New §8.4 states the fallback instead: with no price the engine plans **zero-export
+self-consumption** from the PV and load forecasts (`optimize/selfconsumption.py`) — charge the surplus
+the house cannot use, serve the load from the pack down to its floor, never import to charge — and
+marks the horizon as *unpriced* (`price_stale`, `price_source: "none"`, `sources.plan:
+"self_consumption"`, zero cost/saving) so nothing reads 0.0 EUR/kWh as free electricity. The
+dispatcher skips exactly two tariff-shaped gates for that plan (the stale-price refusal and the
+cost-basis sell floor); the SoC floor/ceiling, ramp, grid limits and the cell-voltage guard still
+bind, and a missing PV or load forecast still means no plan at all.
 
 **0.30.0 — savings are counted per interval, not per day.** No requirement changed; §11's "one gap
 makes the day unknown" rule produced a savings panel that read `unknown` on a live system where the

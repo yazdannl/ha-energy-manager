@@ -1948,9 +1948,44 @@ provider — carrying the resolution reason on its `ProviderStatus.last_error`, 
 `/providers` and the UI render — and `energy_charts` supplies the market curve with
 `degraded = True` and a "fell back to …" note.
 
-Covered by `tests/test_wp2a_price.py::test_an_unresolvable_zonneplan_provider_falls_back_to_the_market`
+Covered by `tests/test_wp2a_price.py::test_market_fallback_opt_in_restores_the_day_ahead_chain`
 (an `unavailable` tariff state → the chain returns the market curve, degraded, with
-"no compatible electricity tariff sensor" kept on the zonneplan status). Full suite: **1629 passed**.
+"no compatible electricity tariff sensor" kept on the zonneplan status). 0.34.0 kept the mechanism
+and moved it behind `price.market_fallback` (default off), see §8.31. Full suite: **1629 passed**.
+
+### 8.31 A price-less horizon plans zero export, and Zonneplan prices are never faked (0.34.0)
+
+Same incident, one step further. 0.33.2's fallback kept a plan alive by pricing it off the day-ahead
+curve — which is **not** a Zonneplan consumer price (VAT, energy tax and the supplier's fees are
+baked into the sensor's `price_tax_included`), so the plan was silently wrong rather than visibly
+absent. Two changes:
+
+* `price.market_fallback` (bool, advanced, **default off**) is consulted by `_resolve_source` for
+  `price.provider = zonneplan` only: off keeps the chain at `zonneplan_entity`, so an unresolvable
+  integration raises `PriceUnavailable` with the reason intact; on restores 0.33.2's
+  `zonneplan → energy_charts → static`. `day_ahead`/`entity`/`fixed` are untouched.
+* With no price forecast the engine no longer pauses to a 0 W hold. `optimize/selfconsumption.py`
+  builds a zero-export plan from the PV and load forecasts (SPEC §8.4): charge
+  `min(surplus, p_charge, headroom)`, discharge `min(deficit, p_discharge, available)`, bounded by the
+  aggregate SoC floor and ceiling. `_replan` publishes and dispatches it through
+  `_publish_self_consumption_plan` (no cost-basis ledger, no feed-in settlement, no terminal value,
+  no saving claimed), and the dispatcher skips the stale-price refusal and the sell floor for a plan
+  whose `sources["plan"] == "self_consumption"`.
+
+What the plan must never say: a price. Every slot carries `buy = sell = 0.0`, `price_stale = true`,
+`price_source = "none"`; the summary reports `cost_estimate_eur = baseline_cost_eur = saved_eur =
+0.0` and `sell_floor_eur_per_kwh = None`; `sources` reads `{"plan": "self_consumption", "price":
+"none", …}`. A missing PV or load forecast still yields no plan at all.
+
+Covered by `tests/test_self_consumption.py` (13 cases: surplus fully caught and never exported, the
+surplus only leaving once the pack is at its ceiling, the pack serving the load down to the floor and
+delivering only the 190 W it may when 0.05 kWh above it, both forecasts required, the horizon
+following the optimiser's slot grid, unpriced slots not refused by `_stale_input_reason`, a priced
+plan still refused when stale, and the engine end to end: a failing price provider → a published
+self-consumption plan, a dispatched 1.2 kW charge target, `plan_updated` journalled, the
+`no_price_self_consumption` alert, and a priced engine unchanged) and by
+`tests/test_wp2a_price.py` (strict by default → `PriceUnavailable` naming the Zonneplan reason; opt-in
+→ the market chain, degraded). Full suite: **1643 passed**.
 
 ---
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.34.0
+
+- **Zonneplan prices are never faked.** With `price.provider = zonneplan`, a day-ahead curve plus
+  the configured adders is *not* a Zonneplan consumer price (VAT, energy tax and the supplier's fees
+  are baked into the sensor), so 0.33.2's fallback replaced a visible outage with a silently
+  mispriced plan. The chain is now Zonneplan-only; the new advanced setting `price.market_fallback`
+  (default **off**) restores `zonneplan -> energy_charts -> static` for anyone who wants it, and the
+  resolution reason stays on `/providers` either way. SPEC 4.1.
+- **New: no price means zero-export self-consumption, not a 0 W hold.** When no price forecast
+  resolves but the PV and load forecasts do, the engine plans `optimize/selfconsumption.py`: charge
+  the surplus the house cannot use (never import to charge), serve the load from the pack down to its
+  SoC floor, bounded by the pack ceiling. The horizon is marked *unpriced* (`price_stale`,
+  `price_source: none`, `sources.plan: self_consumption`, zero cost/baseline/saving) so 0.0 EUR/kWh
+  never reads as free electricity, and the dispatcher skips the stale-price refusal and the
+  cost-basis sell floor for it while every physical and safety gate still applies. SPEC 8.4.
+
 ## 0.33.2
 
 - **Fix: an unresolvable Zonneplan provider no longer aborts the price chain.** With

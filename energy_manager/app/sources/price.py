@@ -1155,6 +1155,11 @@ def _resolve_source(
     provider = str(settings.get("price.provider", "entity") or "entity").strip()
     contract = str(settings.get("price.contract", "dynamic_hourly") or "dynamic_hourly").strip()
     if provider == "zonneplan":
+        # 0.34.0 (SPEC 4.1): a Zonneplan consumer tariff is all-in -- VAT, energy tax and the
+        # supplier's own fees are baked into the sensor's price.  The wholesale curve plus typed
+        # adders reproduces it only if every component is configured, so substituting it silently
+        # misprices the plan.  ``price.market_fallback`` (off by default) is the opt-in.
+        strict = not bool(settings.get("price.market_fallback", False))
         try:
             entity_id, note = _locate_zonneplan_entity(client, settings, now, tz, contract)
         except ProviderError as err:
@@ -1163,8 +1168,10 @@ def _resolve_source(
             # went unavailable, `price.provider = zonneplan` could not locate a tariff sensor, and
             # the whole 30 h price forecast -- and with it every plan -- disappeared even though the
             # day-ahead source was healthy. The provider stays unresolved, so `zonneplan_entity`
-            # records the reason and `energy_charts` still supplies the market curve.
-            return "zonneplan_entity", settings, [], False, str(err)
+            # records the reason; with the fallback on, `energy_charts` still supplies the market
+            # curve, and with it off (the default) the engine keeps its Zonneplan-only promise and
+            # plans zero-export self-consumption from PV and load.
+            return "zonneplan_entity", settings, [], strict, str(err)
         overlay = _SettingsOverlay(settings, {"price.entity": entity_id})
         return "zonneplan_entity", overlay, ([note] if note else []), False, None
     if provider == "day_ahead":
@@ -1513,7 +1520,10 @@ def load_price_forecast(
     ``price.provider`` + ``price.contract`` resolve to a concrete source and chain:
 
     * ``entity`` (default) keeps the pre-0.3.0 path ``price.source -> energy_charts -> static``.
-    * ``zonneplan``/``day_ahead`` resolve first, then fall back to energy_charts (if not already the
+    * ``zonneplan`` resolves first, then falls back to energy_charts and static only when
+      ``price.market_fallback`` is on (0.34.0: Zonneplan-only by default, because an all-in
+      consumer tariff cannot be rebuilt from the wholesale curve).
+    * ``day_ahead`` resolves first, then falls back to energy_charts (if not already the
       resolved source) and static.
     * ``fixed`` uses ``fixed_tariff`` **only** — a fixed contract never falls back to the market.
 

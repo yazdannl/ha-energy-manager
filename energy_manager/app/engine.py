@@ -60,6 +60,7 @@ from .models import (
 )
 from .notify import Notifier
 from .optimize import dp
+from .optimize import selfconsumption
 from .optimize.allocate import allocate_power
 from .optimize.dp import align_slots
 
@@ -2418,6 +2419,14 @@ class Engine:
         # exactly the fresh cheap cycle the optimiser was allowed to schedule. A plan without a
         # summary (older store, or a plan made before the field existed) keeps the ledger floor.
         plan_floor = getattr(getattr(plan, "summary", None), "sell_floor_eur_per_kwh", None)
+        if selfconsumption.is_self_consumption_plan(plan):
+            # A zero-export self-consumption plan is not selling anything (0.34.0): its discharge
+            # serves the house, so the cost-basis floor must not clamp it -- and there is no tariff
+            # to compare it with anyway.
+            plan_floor = None
+            floor = None
+        else:
+            floor = plan_floor if plan_floor is not None else self.fleet_sell_floor()
         outcome = self._dispatcher.tick(
             moment,
             state=tick_state,
@@ -2426,9 +2435,7 @@ class Engine:
             measurements=measurements,
             battery_states=live,
             cell_voltage_latch=self._cell_voltage_latch,
-            sell_floor_eur_per_kwh=(
-                plan_floor if plan_floor is not None else self.fleet_sell_floor()
-            ),
+            sell_floor_eur_per_kwh=floor,
         )
         self._apply_cell_voltage(outcome.guard, moment)
         with self._lock:
@@ -3400,6 +3407,19 @@ class Engine:
         authoritative = self._ensure_battery_reading(now)
         self._refresh_forecasts(now)
         price, solar, load = self._price, self._solar, self._load
+        configs = self.effective_battery_configs()
+        start_kwh = self._live_energy_kwh(configs)
+        mode = str(self.snapshot().mode)
+        if price is None:
+            # No tariff at all (0.34.0, SPEC 8.31): a Zonneplan-only install whose integration is
+            # down has nothing to optimise against, but the physical objective is still clear --
+            # catch the redelivery.  Plan zero-export self-consumption from PV and load instead of
+            # pausing to a 0 W hold that lets every surplus kWh out of the meter.
+            self_consumption = self._self_consumption_plan(now, solar, load, configs, start_kwh)
+            if self_consumption is not None:
+                return self._publish_self_consumption_plan(
+                    self_consumption, configs, now, reason, authoritative
+                )
         if price is None or load is None:
             self._journal.event(
                 "warning",
@@ -3419,9 +3439,6 @@ class Engine:
             self._note_replan_outcome(None)
             return None
 
-        configs = self.effective_battery_configs()
-        start_kwh = self._live_energy_kwh(configs)
-        mode = str(self.snapshot().mode)
         # While a full charge is due inside this horizon the plan aims for the maintenance target in
         # the cheapest slots; otherwise the user's own terminal target is untouched (SPEC 8.1).
         maintenance = self.full_charge_status(now).get("plan")
@@ -3547,6 +3564,94 @@ class Engine:
                 "plan_changed",
                 "Smart Energy Manager",
                 f"New plan: expected saving {plan.summary.saved_eur:.2f} EUR over the horizon.",
+            )
+        self._note_replan_outcome(plan)
+        return plan
+
+    # ------------------------------------------------- zero-export fallback (SPEC 8.31)
+
+    def _self_consumption_plan(
+        self,
+        now: datetime,
+        solar: Any,
+        load: Any,
+        configs: Sequence[BatteryConfig],
+        start_kwh: float,
+    ) -> Plan | None:
+        """A zero-export schedule for a horizon without a price, or ``None`` when unusable.
+
+        Only the PV and load forecasts are required: the plan never imports to charge and never
+        sells while the pack has room, so it needs no tariff to be correct.
+        """
+        try:
+            return selfconsumption.plan_self_consumption(
+                solar=solar,
+                load=load,
+                battery_configs=configs,
+                start_kwh=start_kwh,
+                settings=self._settings,
+                now=now,
+                mode=str(self.snapshot().mode),
+                dry_run=bool(self.snapshot().dry_run),
+            )
+        except ValueError as exc:
+            log.debug("self-consumption plan unavailable: %s", exc)
+            return None
+
+    def _publish_self_consumption_plan(
+        self,
+        plan: Plan,
+        configs: Sequence[BatteryConfig],
+        now: datetime,
+        reason: str,
+        authoritative: bool,
+    ) -> Plan:
+        """Publish/dispatch the zero-export plan in place of a price-driven one.
+
+        Deliberately narrower than the priced path: no cost-basis ledger, no feed-in settlement, no
+        terminal value and no saving -- there is no tariff to price any of them, and inventing one
+        would be the very guess this feature exists to avoid.
+        """
+        if not authoritative:
+            self._journal_pending_plan(reason)
+            return plan
+        plan.batteries = self._plan_battery_snapshot(plan, configs, now)
+        changed = self._plan_changed(self._plan, plan)
+        with self._lock:
+            self._plan = plan
+            self._state.active_plan = plan
+            self._state.last_plan_at = plan.generated_at
+            # No price, so neither a cheap nor an expensive window exists to advertise.
+            self._state.next_cheap_window = None
+            self._state.next_expensive_window = None
+            self._plan_inputs = self._fingerprint()
+            self._plan_applied_notified = False
+            self._state.price_now = None
+        self._store_call("save_plan", plan)
+        captured = sum(1 for slot in plan.slots if slot.action == Action.PV_CHARGE)
+        self._journal.event(
+            "info",
+            "plan_updated",
+            "self-consumption plan (no price forecast): catching PV surplus",
+            {
+                "reason": reason,
+                "plan": selfconsumption.PLAN_SOURCE,
+                "pv_charge_kwh": plan.summary.pv_charge_kwh,
+                "discharged_kwh": plan.summary.discharged_kwh,
+                "charge_slots": captured,
+            },
+        )
+        self._alert_once(
+            Reason.NO_PRICE_SELF_CONSUMPTION,
+            "no price forecast: running zero-export self-consumption instead",
+            {"solar": plan.sources.get("solar"), "load": plan.sources.get("load")},
+        )
+        if changed:
+            self._notifier.send(
+                "plan_changed",
+                "Smart Energy Manager",
+                "No price forecast: catching PV surplus for self-consumption "
+                f"({plan.summary.pv_charge_kwh:.1f} kWh planned).",
             )
         self._note_replan_outcome(plan)
         return plan
