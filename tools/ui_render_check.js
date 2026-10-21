@@ -527,6 +527,35 @@ function classTokens(text) {
     `${partialWindows.length} windows, ${partialWindows[0] && partialWindows[0].minutes} min`);
   check("a window states its grid flow and what it earns",
     /Grid cost/.test(labels) && /exports 1\.00 kWh/.test(facts[4].value) && /earns/.test(facts[4].value), facts[4] ? facts[4].value : "no grid fact");
+  // 0.34.2 (SPEC 8.4): a horizon with no tariff must say so. "0.0 ct/kWh" would read as free
+  // electricity, and "-- → --" as a rendering bug.
+  const unpricedPlan = {
+    slot_minutes: 60,
+    feasible: true,
+    summary: { eta_charge: 0.95, eta_discharge: 0.95, round_trip_efficiency: 0.9025, wear_eur_per_kwh: 0.02 },
+    sources: { plan: "self_consumption", price: "none" },
+    slots: [
+      slotAt(0, { buy: 0.0, sell: 0.0, price_source: "none", price_stale: true, action: "pv_charge", reason: "pv_surplus_charge" }),
+      slotAt(1, { buy: 0.0, sell: 0.0, price_source: "none", price_stale: true, soc_pct: 60.0 }),
+    ],
+  };
+  const unpricedWindows = A.planActionWindows(unpricedPlan, { slots: [] });
+  const unpricedFacts = A.windowFacts(unpricedWindows[0], ctx);
+  check("an unpriced window says it has no price instead of 0.0 ct/kWh",
+    /no price forecast/.test(unpricedFacts[0].value) && /needs a price/.test(unpricedFacts[1].value),
+    `${unpricedFacts[0].value} / ${unpricedFacts[1].value}`);
+  const unpricedFlags = A.planFlags(unpricedPlan);
+  check("an unpriced plan is flagged as such, not as stale prices",
+    unpricedFlags.flags.length === 1
+      && unpricedFlags.flags[0].title === "No price forecast"
+      && /zero-export self-consumption/.test(unpricedFlags.flags[0].text)
+      && !unpricedFlags.flags.some((flag) => /stale/i.test(flag.title)),
+    unpricedFlags.flags.map((flag) => flag.title).join(","));
+  check("an unpriced plan is recognised from its marker or its slots",
+    A.planIsUnpriced(unpricedPlan) === true
+      && A.planIsUnpriced({ sources: { plan: "self_consumption" }, slots: [] }) === true
+      && A.planIsUnpriced(syntheticPlan) === false
+      && A.planIsUnpriced(null) === false);
   check("the join lands the dispatch and the measurement on the right window",
     discharge.dispatch && discharge.dispatch.clamped === true && discharge.dispatchSlots === 1
     && discharge.actual && Math.abs(discharge.measured_discharged_kwh - 0.175) < 1e-9

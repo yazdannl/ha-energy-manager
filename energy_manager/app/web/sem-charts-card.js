@@ -231,6 +231,19 @@
         );
         return;
       }
+      // Slot-based charts only: savings and accuracy publish ranges/days, not slots, so an empty
+      // `slots` there is not an empty feed.
+      var slotKinds = { plan: 1, mini: 1, price: 1, solar: 1, load: 1 };
+      if (slotKinds[kind] && !(attributes.slots || []).length) {
+        // An empty feed is a fact (0.34.2): a missing price forecast is named as such instead of
+        // drawing an empty chart that looks broken (SPEC 8.4).
+        this._message(
+          kind === "price"
+            ? "No price forecast: no tariff provider resolved for this horizon. The plan runs zero-export self-consumption meanwhile."
+            : "No data published for this chart yet."
+        );
+        return;
+      }
       this._body.textContent = "";
       this._body.appendChild(this._host);
       var palette = this._dark() ? PALETTES.dark : PALETTES.light;
@@ -242,7 +255,11 @@
       }
       var meta = document.createElement("p");
       meta.className = "card-meta";
-      meta.textContent = "Source: " + this._entityId() + " \u00b7 " + (state.state || "unknown");
+      // 0.34.2 (SPEC 8.4): an unpriced plan feed says so, so a plan with no price line cannot be
+      // mistaken for a chart that failed to load.
+      var unpriced = attributes.priced === false;
+      meta.textContent = "Source: " + this._entityId() + " \u00b7 " + (state.state || "unknown") +
+        (unpriced ? " \u00b7 no price forecast (zero-export self-consumption)" : "");
       this._body.appendChild(meta);
     }
 

@@ -82,22 +82,28 @@ def plan_feed(
     round_trip: float | None = None,
     wear_eur_per_kwh: float | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """The plan timeline: price, break-even inputs, SoC and the planned battery power."""
+    """The plan timeline: price, break-even inputs, SoC and the planned battery power.
+
+    A slot with no tariff behind it (``price_source == "none"``, the zero-export self-consumption
+    plan of SPEC 8.4) publishes ``null`` for buy and sell instead of ``0.0``: the chart must draw a
+    gap, never a free 0 EUR/kWh bar, and ``priced`` tells a client the whole horizon is unpriced.
+    """
     slots = list(getattr(plan, "slots", None) or [])
     if plan is None or not slots:
         return "empty", {"schema": SCHEMA, "slots": []}
+    unpriced = [str(getattr(slot, "price_source", "") or "") == "none" for slot in slots]
     rows = [
         [
             _epoch(slot.t),
-            _round(slot.buy, 4),
-            _round(slot.sell, 4),
+            None if unpriced[index] else _round(slot.buy, 4),
+            None if unpriced[index] else _round(slot.sell, 4),
             _round(slot.soc_pct, 1),
             _round(slot.pv_kw, 3),
             _round(slot.load_kw, 3),
             _round(slot.power_w, 0),
             1 if getattr(slot, "price_stale", False) else 0,
         ]
-        for slot in slots[:MAX_SLOTS]
+        for index, slot in enumerate(slots[:MAX_SLOTS])
     ]
     attributes = {
         "schema": SCHEMA,
@@ -107,6 +113,10 @@ def plan_feed(
         "slot_minutes": int(getattr(plan, "slot_minutes", 0) or 0),
         "feasible": bool(getattr(plan, "feasible", False)),
         "infeasible_reason": getattr(plan, "infeasible_reason", None),
+        # Additive (0.34.2): whether any slot carries a tariff at all. ``False`` means the plan is
+        # a zero-export self-consumption schedule and every price cell above is ``null``.
+        "priced": not all(unpriced),
+        "price_source": str(getattr(slots[0], "price_source", "") or ""),
         # The aggregate the plan assumed, so a card draws the same break-even line as the SPA:
         # buy / round_trip + wear (SPEC 13).
         "round_trip": _num(round_trip),

@@ -84,6 +84,31 @@ def test_plan_feed_is_empty_without_a_plan():
     assert state == "empty" and attributes["slots"] == []
 
 
+def test_an_unpriced_plan_publishes_null_prices_not_zeros():
+    """0.34.2 (SPEC 8.4): no tariff means no price cell, never a 0 EUR/kWh bar."""
+    plan = _plan(slots=4)
+    for slot in plan.slots:
+        slot.buy = 0.0
+        slot.sell = 0.0
+        slot.price_source = "none"
+        slot.price_stale = True
+    state, attributes = feeds.plan_feed(plan, NOW, round_trip=0.9, wear_eur_per_kwh=0.02)
+    assert state == "ready"
+    assert attributes["priced"] is False
+    assert attributes["price_source"] == "none"
+    assert [row[1] for row in attributes["slots"]] == [None] * 4
+    assert [row[2] for row in attributes["slots"]] == [None] * 4
+    # The rest of the row is unaffected: SoC and the planned power still draw.
+    assert attributes["slots"][0][3] == 55.5 and attributes["slots"][0][6] == 1234.0
+
+
+def test_a_priced_plan_reports_that_it_is_priced():
+    _state, attributes = feeds.plan_feed(_plan(slots=4), NOW, round_trip=0.9, wear_eur_per_kwh=0.02)
+    assert attributes["priced"] is True
+    assert attributes["price_source"] == ""
+    assert attributes["slots"][0][1] == 0.1234
+
+
 def test_forecast_feeds_carry_their_own_columns():
     price = PriceForecast(source="zonneplan", generated_at=NOW)
     price.slots = [PriceSlot(t=NOW + timedelta(minutes=15 * i), buy=0.2, sell=0.1, stale=i == 1) for i in range(10)]

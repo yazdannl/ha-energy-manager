@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.34.2
+
+- **Fix: no price is drawn as no price, not as 0 EUR/kWh.** A zero-export self-consumption plan
+  (0.34.0) carries `buy = sell = 0.0` internally, which every surface happily rendered as a flat
+  0.000 EUR/kWh line: the plan chart drew a price series, the price panel showed a zero, a window
+  said "0.0 ct/kWh → 0.0 ct/kWh" and the summary claimed "0.00 EUR saved". An unpriced plan now
+  publishes no price at all: `/api/v1/plan` sends `buy: null`/`sell: null`, the plan chart feed sends
+  `null` cells with `priced: false` and `price_source: "none"`, the plan chart drops its price axis
+  (drawing the SoC path and the battery power only), the price panel and card say "no price forecast:
+  no tariff provider resolved" instead of drawing an empty chart, the window facts read "no price
+  forecast (unpriced plan)" / "needs a price", and the horizon answer reads "not priced (no price
+  forecast)" rather than a money figure. A priced plan is unchanged. SPEC 8.4/12.1.
+
 ## 0.34.1
 
 - **Fix: `zonneplan` strictness covers the whole provider, not just the resolution error.** 0.34.0

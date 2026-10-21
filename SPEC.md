@@ -1220,7 +1220,10 @@ now is gone, and caught energy is worth the same in any later slot — so no loo
 What the plan must **not** claim: a tariff. Its slots carry `buy = sell = 0.0` with `price_stale =
 true` and `price_source = "none"`, its summary reports zero cost, zero baseline and zero saving, and
 `plan.sources` reads `{"plan": "self_consumption", "price": "none", ...}`. `0.0` there means *not
-priced*, never *free*. The dispatcher recognises that marker and skips both gates that assume a
+priced*, never *free* — and no client ever sees that `0.0`: `/api/v1/plan` publishes `buy: null` and
+`sell: null` for those slots, the chart feed publishes `null` cells with `priced: false` (§12.1), and
+the UI names the missing forecast instead of drawing a 0 ct/kWh bar or a "0.00 EUR saved" result.
+The dispatcher recognises that marker and skips both gates that assume a
 tariff exists — the stale-price refusal (§9.1) and the cost-basis sell floor (§5) — because the slot
 is not selling anything.
 
@@ -1635,7 +1638,7 @@ wrong column — the schema is bumped only for an incompatible row shape:
 ```
 sensor.sem_chart_plan      slots: [t, buy, sell, soc_pct, pv_kw, load_kw, power_w, stale(0|1)]
                            + horizon_start/end, slot_minutes, feasible, infeasible_reason,
-                             round_trip, wear_eur_per_kwh
+                             round_trip, wear_eur_per_kwh, priced (added 0.34.2), price_source
 sensor.sem_chart_price     slots: [t, buy, sell, stale(0|1)]
 sensor.sem_chart_solar     slots: [t, pv_kw, uncertainty_pct]
 sensor.sem_chart_load      slots: [t, load_kw, p10_kw, p90_kw]
@@ -1651,6 +1654,11 @@ at 400 rows, and forecast feeds at 36 h. The entity state names the data, not a 
 plus the source for forecasts, `infeasible` for a plan the optimizer could not make feasible, `empty`
 when there is nothing to draw, and the number of scored days for accuracy. `plan_feed`,
 `forecast_feed`, `savings_feed` and `accuracy_feed` in `feeds.py` are the only writers.
+
+An unpriced plan (the zero-export self-consumption plan of §8.4) publishes **no price at all**: its
+`buy`/`sell` cells are `null` (a gap, never a bar at 0 EUR/kWh) and the feed adds `priced: false` with
+`price_source: "none"`, so a card can name the missing forecast instead of drawing a free tariff.
+`priced` is additive to schema 1: absent/`true` on a priced plan, so an older card keeps working.
 
 ### 12.2 The dashboard card (added 0.28.0)
 

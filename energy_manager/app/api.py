@@ -382,8 +382,11 @@ def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dic
         "slots": [
             {
                 "t": to_iso(slot.t),
-                "buy": slot.buy,
-                "sell": slot.sell,
+                # 0.34.2 (SPEC 8.4): an unpriced slot (the zero-export self-consumption plan) reports
+                # no price at all. A 0.0 here would be drawn as a free 0 ct/kWh tariff and would
+                # price the whole plan at nothing.
+                "buy": None if slot.price_source == "none" else slot.buy,
+                "sell": None if slot.price_source == "none" else slot.sell,
                 "pv_kw": slot.pv_kw,
                 "load_kw": slot.load_kw,
                 "load_p10": slot.load_p10_kw,

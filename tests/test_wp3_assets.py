@@ -1394,6 +1394,16 @@ const wrongSchema = new Card();
 wrongSchema.setConfig({ chart: "solar" });
 wrongSchema.hass = feed("sensor.sem_chart_solar", { schema: 2, slots: [] });
 results.wrongSchema = { calls: [], message: wrongSchema._body.textContent, theme: wrongSchema.attrs["data-theme"] };
+// 0.34.2 (SPEC 8.4): an unpriced plan publishes null prices with priced:false, and an empty price
+// feed must be named rather than drawn as an empty chart.
+const unpriced = new Card();
+unpriced.setConfig({ chart: "plan" });
+unpriced.hass = feed("sensor.sem_chart_plan", { schema: 1, priced: false, price_source: "none", slots: [[1700000000, null, null, 55.5, 1.234, 0.876, 421, 1]] });
+results.unpriced = { calls: chartCalls(), message: unpriced._body.textContent };
+const emptyPrice = new Card();
+emptyPrice.setConfig({ chart: "price" });
+emptyPrice.hass = feed("sensor.sem_chart_price", { schema: 1, slots: [] });
+results.emptyPrice = { calls: chartCalls(), message: emptyPrice._body.textContent };
 console.log(JSON.stringify(results));
 """
 
@@ -1453,6 +1463,17 @@ def test_the_card_maps_every_feed_row_into_the_chart_api():
         "baseline_cost_eur": 13.5,
     }
     accuracy = data["accuracy"]["calls"][0]
+    # 0.34.2: a null price reaches charts.js as null (a gap), never as 0.0, and the meta line says
+    # why there is no price line at all.
+    unpriced = data["unpriced"]
+    assert [entry["fn"] for entry in unpriced["calls"]] == ["plan"]
+    assert unpriced["calls"][0]["data"]["slots"][0]["buy"] is None
+    assert unpriced["calls"][0]["data"]["slots"][0]["sell"] is None
+    assert unpriced["calls"][0]["data"]["slots"][0]["soc_pct"] == 55.5
+    assert "no price forecast" in unpriced["message"]
+    empty_price = data["emptyPrice"]
+    assert empty_price["calls"] == [], "an empty price feed must not draw a chart"
+    assert "No price forecast" in empty_price["message"]
     assert accuracy["fn"] == "accuracy"
     assert accuracy["data"]["pv"]["series"] == [
         {"day": "2023-11-14T22:13:20.000Z", "mape_pct": 12.5},

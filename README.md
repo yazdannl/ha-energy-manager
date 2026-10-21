@@ -295,7 +295,7 @@ is served behind ingress). Six compact feeds carry the series a chart actually n
 
 | Entity | What it carries |
 | --- | --- |
-| `sensor.sem_chart_plan` | Plan timeline slots: time, buy/sell price, SoC %, PV kW, load kW, battery power, stale flag — plus horizon, slot length, feasibility, round trip and wear |
+| `sensor.sem_chart_plan` | Plan timeline slots: time, buy/sell price, SoC %, PV kW, load kW, battery power, stale flag — plus horizon, slot length, feasibility, round trip, wear and whether the horizon is priced at all (an unpriced plan publishes `null` prices, never `0`) |
 | `sensor.sem_chart_price` | Price forecast slots: time, buy, sell, stale |
 | `sensor.sem_chart_solar` | Solar forecast slots: time, kW, uncertainty % |
 | `sensor.sem_chart_load` | Load forecast slots: time, kW, p10, p90 |

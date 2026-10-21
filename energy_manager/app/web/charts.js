@@ -586,6 +586,10 @@
       var slotBuy = num(s.buy);
       breakEven.push(showBreakEven && slotBuy != null ? slotBuy / eff.round_trip + wear : null);
     });
+    // 0.34.2 (SPEC 8.4): a zero-export self-consumption plan carries no tariff at all. Drawing an
+    // empty price axis (or a 0 EUR/kWh bar) would claim a price that does not exist, so the price
+    // series and its axis are left out entirely and the caption says why.
+    var priced = buy.some(function (value) { return value != null; });
 
     var unitFmt = function (digits, unit) {
       return function (u, v) { return fmt(v, digits, unit); };
@@ -614,11 +618,17 @@
     }
     seriesA.push(Object.assign(line(p.soc), { label: "Charge level", scale: "soc", value: unitFmt(1, "%") }));
     dataA.push(soc);
+    if (!priced) {
+      seriesA = [seriesA[0], seriesA[seriesA.length - 1]];
+      dataA = [xs, soc];
+    }
 
     var narrow = narrowHost(host);
     var optsA = baseOpts(p, {
       scales: { x: { time: true }, y: { auto: true }, soc: { auto: true } },
-      axes: [timeAxis(p), axisFor("y", "EUR/kWh", 3, p, narrow, "price"), axisFor("soc", "%", 1, p, narrow, "pct")],
+      axes: priced
+        ? [timeAxis(p), axisFor("y", "EUR/kWh", 3, p, narrow, "price"), axisFor("soc", "%", 1, p, narrow, "pct")]
+        : [timeAxis(p), axisFor("soc", "%", 1, p, narrow, "pct")],
       series: seriesA,
       cursor: { y: false, x: true, points: { show: true, size: 5 }, sync: { key: SYNC_KEY, setSeries: false } },
       plugins: [decorPlugin({ palette: p, now: now }), tooltipPlugin()]
@@ -626,8 +636,12 @@
 
     var drawA = function (el) {
       mount(el, optsA, dataA, 200, drawA,
-        "Plan timeline: buy and sell price, the break-even price after round-trip loss, and battery charge over the horizon.",
-        "Price in EUR/kWh (left axis) and battery charge in % (right axis). The dotted line is the break-even after round-trip loss; below it, discharging loses money.");
+        priced
+          ? "Plan timeline: buy and sell price, the break-even price after round-trip loss, and battery charge over the horizon."
+          : "Plan timeline without prices: battery charge over the horizon for a zero-export self-consumption plan (no price forecast).",
+        priced
+          ? "Price in EUR/kWh (left axis) and battery charge in % (right axis). The dotted line is the break-even after round-trip loss; below it, discharging loses money."
+          : "Battery charge in %. No price forecast is available, so this plan is not priced: the battery catches the PV surplus and serves the load down to its floor.");
     };
     drawA(host);
 
@@ -667,28 +681,50 @@
       price.push(num(s.buy));
       soc.push(num(s.soc_pct));
     });
+    // No tariff anywhere in the horizon (0.34.2): draw the charge level alone rather than an empty
+    // price axis (SPEC 8.4).
+    var priced = price.some(function (value) { return value != null; });
     var narrow = narrowHost(host);
+    var series = priced
+      ? [
+          {},
+          Object.assign(line(p.price), { label: "Buy price", scale: "y", fill: gradientFill(p.price, 0.22, 0.02), value: function (u, v) { return fmt(v, 4, "EUR/kWh"); } }),
+          Object.assign(area(p.soc, 0.3, 0.02), { label: "Charge level", scale: "soc", value: function (u, v) { return fmt(v, 1, "%"); } })
+        ]
+      : [
+          {},
+          Object.assign(area(p.soc, 0.3, 0.02), { label: "Charge level", scale: "soc", value: function (u, v) { return fmt(v, 1, "%"); } })
+        ];
     var opts = baseOpts(p, {
       scales: { x: { time: true }, y: { auto: true }, soc: { auto: true } },
-      axes: [timeAxis(p), axisFor("y", "EUR/kWh", 3, p, narrow, "price"), axisFor("soc", "%", 1, p, narrow, "pct")],
-      series: [
-        {},
-        Object.assign(line(p.price), { label: "Buy price", scale: "y", fill: gradientFill(p.price, 0.22, 0.02), value: function (u, v) { return fmt(v, 4, "EUR/kWh"); } }),
-        Object.assign(area(p.soc, 0.3, 0.02), { label: "Charge level", scale: "soc", value: function (u, v) { return fmt(v, 1, "%"); } })
-      ],
+      axes: priced
+        ? [timeAxis(p), axisFor("y", "EUR/kWh", 3, p, narrow, "price"), axisFor("soc", "%", 1, p, narrow, "pct")]
+        : [timeAxis(p), axisFor("soc", "%", 1, p, narrow, "pct")],
+      series: series,
       plugins: [decorPlugin({ palette: p, now: Date.now() / 1000 }), tooltipPlugin()]
     });
     var draw = function (el) {
-      mount(el, opts, [xs, price, soc], 150, draw,
-        "Next 24 hours: energy buy price in EUR per kWh and battery charge in percent.",
-        "Buy price in EUR/kWh (left axis) and battery charge in % (right axis).");
+      mount(el, opts, priced ? [xs, price, soc] : [xs, soc], 150, draw,
+        priced
+          ? "Next 24 hours: energy buy price in EUR per kWh and battery charge in percent."
+          : "Next 24 hours: battery charge in percent (no price forecast).",
+        priced
+          ? "Buy price in EUR/kWh (left axis) and battery charge in % (right axis)."
+          : "Battery charge in %. No price forecast is available, so no price is drawn.");
     };
     draw(host);
   }
 
   function forecastChart(host, kind, payload, options) {
     var slots = payload && Array.isArray(payload.slots) ? payload.slots : [];
-    if (!hasRows(slots)) { fallback(host, "No forecast slots returned."); return; }
+    if (!hasRows(slots)) {
+      // An empty price feed is a fact, not a rendering gap (0.34.2): say so, so a missing tariff
+      // reads as "the provider has not resolved" instead of "the app is broken" (SPEC 8.4).
+      fallback(host, kind === "price"
+        ? "No price forecast: no tariff provider resolved for this horizon."
+        : "No forecast slots returned.");
+      return;
+    }
     if (!chartsReady(host)) return;
     var p = palette(options && options.palette);
     var now = Date.now() / 1000;

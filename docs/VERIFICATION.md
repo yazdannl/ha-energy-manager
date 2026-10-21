@@ -1997,6 +1997,41 @@ fetch error left on `/providers`. Covered by
 `test_a_zonneplan_sensor_that_resolves_but_cannot_price_stays_strict` and
 `test_the_market_fallback_opt_in_also_covers_a_failing_fetch`. Full suite: **1645 passed**.
 
+### 8.32 No price is shown as no price (0.34.2)
+
+The unpriced plan of 8.31 carried `buy = sell = 0.0`, and every surface rendered that number: the
+plan chart drew a flat 0.000 EUR/kWh series, the price panel and the card drew an empty chart with no
+reason, a window read `0.0 ct/kWh → 0.0 ct/kWh` and the horizon answer claimed `0.00 EUR saved`.
+That is the *guess this feature exists to avoid*, spelled as a measured zero. 0.34.2 publishes the
+absence instead, at each layer that had been inventing a number:
+
+* `feeds.plan_feed` writes `null` for `buy`/`sell` on a slot whose `price_source` is `none`, and adds
+  `priced` (false when no slot has a tariff) plus `price_source` to the attributes. `priced` is
+  additive to schema 1, so an older card still works.
+* `api.plan_dict` writes `null` for `buy`/`sell` in the same slots, so the SPA cannot re-derive a
+  price either. `planActionWindows` already treats a non-numeric price as 0 for its energy/cost
+  arithmetic, so nothing else changes.
+* `charts.js`: `planChart` and `miniChart` detect an unpriced horizon (`buy` all `null`) and drop the
+  price series *and* the EUR/kWh axis, keeping the SoC path and the battery power (an all-null y-axis
+  would scale to NaN); `forecastChart` names the missing forecast for an empty price feed.
+* `app.js`: `planIsUnpriced(plan)` (marker `sources.plan == self_consumption`, or every slot
+  `price_source == none`), `planFlags` reports "No price forecast" *instead of* the stale-price flag
+  (the slots are `price_stale` by definition, and the plan is executed), `windowFacts` reads "no price
+  forecast (unpriced plan)" and "needs a price", `windowPriceText` says the slot is planned on PV and
+  load alone, `windowSummary` drops the grid-cost figure, and `renderPlanSummary` prints "not priced
+  (no price forecast)" for the saving and the cost stats.
+* `sem-charts-card.js`: an empty feed is named ("No price forecast: no tariff provider resolved…")
+  and the meta line appends "no price forecast (zero-export self-consumption)" for an unpriced plan.
+
+Covered by `tests/test_chart_feeds.py` (an unpriced plan publishes `null` price cells with
+`priced: false` and keeps its SoC/power columns; a priced plan still reports `priced: true` and its
+numbers) and by `tools/ui_render_check.js` (an unpriced window states no price and no break-even, an
+unpriced plan is flagged as "No price forecast" and *not* as stale prices, and `planIsUnpriced`
+recognises the marker, the all-`none` slots and neither a priced plan nor `null`), and by
+`tests/test_wp3_assets.py` (the card still calls `charts.plan` with `buy`/`sell` as `null` for an
+unpriced feed and names the missing forecast, and an empty price feed draws no chart at all). Full
+suite: **1647 passed**, `ui_render_check` 164/0, audit clean over 173 files.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)

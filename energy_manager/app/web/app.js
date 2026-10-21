@@ -1959,10 +1959,22 @@
 
   function planFlags(plan) {
     var slots = plan.slots || [];
+    var unpriced = planIsUnpriced(plan);
     var stale = slots.filter(function (s) { return s.price_stale; }).length;
     var flags = [];
     if (!plan.feasible) flags.push({ level: "error", title: "Plan is infeasible", text: plan.infeasible_reason || "The optimiser could not satisfy the constraints; the battery is held safe." });
-    if (stale) {
+    if (unpriced) {
+      // 0.34.2 (SPEC 8.4): a horizon with no tariff at all is not "stale prices" -- there is no
+      // optimiser price to treat as flat, and the plan is still executed. Say what it is instead.
+      flags.push({
+        level: "warn",
+        title: "No price forecast",
+        text: "No tariff resolved for this horizon, so the plan is not priced: it is a zero-export " +
+          "self-consumption schedule built from the PV and load forecasts. The battery catches the " +
+          "surplus the house cannot use and serves the load down to its floor; nothing is bought " +
+          "or sold on a guessed price."
+      });
+    } else if (stale) {
       var fresh = slots.length - stale;
       flags.push({
         level: "warn",
@@ -1977,7 +1989,16 @@
       if (slots[0].price_source) sources.push("price: " + slots[0].price_source);
       if (slots[0].pv_source) sources.push("PV: " + slots[0].pv_source);
     }
-    return { flags: flags, sources: sources };
+    return { flags: flags, sources: sources, unpriced: unpriced };
+  }
+
+  // A plan with no tariff behind it (SPEC 8.4): the engine marks it on the plan, and every slot
+  // carries price_source "none". Either signal is enough, so a partial payload still reads right.
+  function planIsUnpriced(plan) {
+    if (!plan) return false;
+    if (plan.sources && plan.sources.plan === "self_consumption") return true;
+    var slots = plan.slots || [];
+    return slots.length > 0 && slots.every(function (s) { return s.price_source === "none"; });
   }
 
   function renderPlanSummary(body, data) {
@@ -1989,16 +2010,23 @@
     // The plan reports the wear it actually assumed; the configured value is only a fallback for
     // older payloads (the advanced override is already baked into the reported value).
     var wear = isNum(s.wear_eur_per_kwh) ? s.wear_eur_per_kwh : cycleCost;
+    // A plan with no tariff behind it claims no money at all (0.34.2, SPEC 8.4): "0.00 EUR saved"
+    // would read as a measured result instead of "nothing was priced".
+    var unpriced = planIsUnpriced(plan);
     // The horizon's answer first: saving (or loss) against the do-nothing baseline. A loss is a
     // result, never a stale reading (UI_REVIEW §3.6/§3.7).
-    var savingKnown = isNum(s.saved_eur);
-    var savingText = savingKnown
-      ? (s.saved_eur < 0 ? "a loss of " + fmtEur(Math.abs(s.saved_eur)) : fmtEur(s.saved_eur) + " saved")
-      : "not reported for this horizon";
+    var savingKnown = isNum(s.saved_eur) && !unpriced;
+    var savingText = unpriced
+      ? "not priced (no price forecast)"
+      : savingKnown
+        ? (s.saved_eur < 0 ? "a loss of " + fmtEur(Math.abs(s.saved_eur)) : fmtEur(s.saved_eur) + " saved")
+        : "not reported for this horizon";
     body.appendChild(el("p", { class: "plan-answer" }, [
       "Estimated over this horizon: ",
       el("strong", { class: savingKnown && s.saved_eur < 0 ? "answer-loss" : "answer-gain", text: savingText }),
-      " against doing nothing (the same consumption and tariffs, battery idle)."
+      unpriced
+        ? " — the battery runs zero-export self-consumption from the PV and load forecasts, because no tariff provider resolved."
+        : " against doing nothing (the same consumption and tariffs, battery idle)."
     ]));
     // A maintenance plan says why it charges to the ceiling before the summary numbers (SPEC 8.1).
     var maintenance = maintenancePlanText(plan.maintenance || (plan.summary && plan.summary.maintenance));
@@ -2009,9 +2037,9 @@
     }
     var stats = [
       // "Net" because it can be negative: an export-heavy horizon earns more than it spends.
-      ["Estimated net cost", fmtEur(s.cost_estimate_eur)],
-      ["Baseline net cost (no battery)", fmtEur(s.baseline_cost_eur)],
-      ["Saving vs baseline", fmtEur(s.saved_eur)],
+      ["Estimated net cost", unpriced ? "not priced" : fmtEur(s.cost_estimate_eur)],
+      ["Baseline net cost (no battery)", unpriced ? "not priced" : fmtEur(s.baseline_cost_eur)],
+      ["Saving vs baseline", unpriced ? "not priced" : fmtEur(s.saved_eur)],
       ["Energy charged", fmtKwh(s.charged_kwh)],
       ["Energy discharged", fmtKwh(s.discharged_kwh)],
       ["Cycles", isNum(s.cycles) ? s.cycles.toFixed(2) + " cycles" : "--"],
@@ -2031,7 +2059,7 @@
         return (b.name || b.id) + " " + fmtPower(b.share_w);
       }).join(" · ") + "." }));
     }
-    if (s.saved_eur < 0) {
+    if (s.saved_eur < 0 && !unpriced) {
       body.appendChild(el("p", { class: "field-error", text: "The plan is more expensive than doing nothing over this horizon; check the price source and settings." }));
     }
     // Worked examples and model assumptions are evidence behind a named disclosure, not the first
@@ -2210,6 +2238,7 @@
     ctx = ctx || {};
     var facts = [];
     var margin = null;
+    var unpriced = win.first && win.first.price_source === "none";
     var breakEven = planBreakEvenEur(win.buy, ctx.efficiency, ctx.wear);
     if (isNum(breakEven) && isNum(win.sell)) margin = win.sell - breakEven;
     var energy = [];
@@ -2221,16 +2250,22 @@
       : win.grid_import_kwh > 0 && win.grid_export_kwh <= 0
         ? "imports " + fmtKwh(win.grid_import_kwh)
         : "imports " + fmtKwh(win.grid_import_kwh) + ", exports " + fmtKwh(win.grid_export_kwh);
+    // 0.34.2 (SPEC 8.4): no tariff behind this window, so no price and no break-even -- never a
+    // 0.0 ct/kWh that reads as free electricity.
     facts.push({
       label: "Buy → sell",
-      value: fmtCt(win.buy) + " → " + fmtCt(win.sell) +
-        (isNum(win.spread) ? " (" + (win.spread >= 0 ? "+" : "−") + fmtCt(Math.abs(win.spread)) + ")" : "")
+      value: unpriced || (!isNum(win.buy) && !isNum(win.sell))
+        ? "no price forecast (unpriced plan)"
+        : fmtCt(win.buy) + " → " + fmtCt(win.sell) +
+          (isNum(win.spread) ? " (" + (win.spread >= 0 ? "+" : "−") + fmtCt(Math.abs(win.spread)) + ")" : "")
     });
     facts.push({
       label: "Break-even",
-      value: isNum(breakEven)
-        ? fmtCt(breakEven) + (isNum(margin) ? " · " + (margin >= 0 ? "+" : "−") + fmtCt(Math.abs(margin)) + " clear" : "")
-        : "efficiency not reported"
+      value: unpriced || (!isNum(win.buy) && !isNum(win.sell))
+        ? "needs a price"
+        : isNum(breakEven)
+          ? fmtCt(breakEven) + (isNum(margin) ? " · " + (margin >= 0 ? "+" : "−") + fmtCt(Math.abs(margin)) + " clear" : "")
+          : "efficiency not reported"
     });
     facts.push({ label: "Battery", value: energy.length ? energy.join(" · ") : "no battery energy" });
     facts.push({
@@ -2294,7 +2329,8 @@
   function windowPriceText(win, ctx) {
     ctx = ctx || {};
     var parts = [];
-    if (win.stale) parts.push("no fresh price for this slot: the optimiser treats it as flat, and it is never dispatched");
+    if (win.first && win.first.price_source === "none") parts.push("no price forecast: this slot is planned on PV and load alone (zero-export self-consumption)");
+    else if (win.stale) parts.push("no fresh price for this slot: the optimiser treats it as flat, and it is never dispatched");
     else parts.push("price from " + (win.first && win.first.price_source ? win.first.price_source : "unknown source"));
     var provider = ctx.priceProvider;
     if (provider) {
@@ -2321,7 +2357,11 @@
       windows.length + (windows.length === 1 ? " window" : " windows"),
       fmtKwh(discharged) + " out",
       fmtKwh(charged) + " in",
-      cost < 0 ? "earns " + fmtEur(Math.abs(cost)) + " on the grid" : "costs " + fmtEur(cost) + " on the grid"
+      // No tariff behind the horizon (0.34.2, SPEC 8.4): a "costs 0.00 EUR" line would claim a
+      // priced result for a plan that was never priced.
+      ctx.unpriced
+        ? "no price forecast, so no grid cost is estimated"
+        : cost < 0 ? "earns " + fmtEur(Math.abs(cost)) + " on the grid" : "costs " + fmtEur(cost) + " on the grid"
     ];
     var progress = ctx.progress;
     if (progress && isNum(progress.measured_discharged_kwh)) {
@@ -2346,6 +2386,7 @@
     }
     ctx = ctx || {};
     ctx.minutes = planSlotMinutes(plan);
+    ctx.unpriced = ctx.unpriced != null ? ctx.unpriced : planIsUnpriced(plan);
     ctx.buyValues = ctx.buyValues || (plan.slots || []).map(function (slot) { return slot.buy; });
     ctx.nowMs = Date.now();
     ctx.horizon = ctx.horizon || planHorizonBounds(plan.slots, ctx.minutes);
@@ -2355,7 +2396,9 @@
     var list = el("ul", { class: "window-list" });
     windows.forEach(function (win) { list.appendChild(windowCard(win, ctx)); });
     body.appendChild(list);
-    body.appendChild(el("p", { class: "legend-note", text: "Windows merge only while the action, reason, power and staleness stay the same, so every change is visible; each slot's full figures are in All slots. A stale slot has no fresh price, so the dispatcher refuses it rather than acting on a flat price." }));
+    body.appendChild(el("p", { class: "legend-note", text: ctx.unpriced
+      ? "Windows merge only while the action, reason, power and staleness stay the same, so every change is visible; each slot's full figures are in All slots. No price forecast was available, so this plan is a zero-export self-consumption schedule: it is priced nowhere and its discharges are not blocked by a sell floor."
+      : "Windows merge only while the action, reason, power and staleness stay the same, so every change is visible; each slot's full figures are in All slots. A stale slot has no fresh price, so the dispatcher refuses it rather than acting on a flat price." }));
   }
 
   // The panel's headline: the icon states that this is the horizon's own answer, and the sentence
@@ -6515,6 +6558,8 @@
     planSlotMinutes: planSlotMinutes,
     planActionWindows: planActionWindows,
     windowFacts: windowFacts,
+    planFlags: planFlags,
+    planIsUnpriced: planIsUnpriced,
     windowStatusText: windowStatusText,
     windowPriceText: windowPriceText,
     windowSummary: windowSummary,
