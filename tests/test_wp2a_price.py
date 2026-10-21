@@ -15,7 +15,7 @@ if str(ROOT / "energy_manager") not in sys.path:
 from app.config import DEFAULTS, Settings  # noqa: E402
 from app.harest import HAError  # noqa: E402
 from app.models import PriceForecast, PriceSlot  # noqa: E402
-from app.sources import ProviderError  # noqa: E402
+from app.sources import ProviderError, RateLimited  # noqa: E402
 from app.sources.price import (  # noqa: E402
     PROVIDERS,
     PriceUnavailable,
@@ -485,6 +485,40 @@ def test_energy_charts_invalid_zone_is_explicit():
     with pytest.raises(ProviderError) as err:
         fetch_energy_charts(None, settings(**{"price.bzn": "ZZ"}), now=NOW, http=fake_http)
     assert "bidding zone" in str(err.value) and err.value.status == 400
+
+
+def test_energy_charts_falls_back_when_the_wider_window_breaks():
+    # 0.33.1: only a rejected zone and a rate limit justify giving up on the provider. Any other
+    # failure of the today+tomorrow window (a timeout, a 5xx, an unexpected body) degrades to the
+    # today-only window instead of emptying the price chart -- live 2026-10-21, when the extended
+    # window failed inside the add-on and the whole 30 h forecast disappeared without a log line.
+    seconds = [int((NOW + timedelta(minutes=15 * index)).timestamp()) for index in range(8)]
+    payload = {"unit": "EUR / MWh", "unix_seconds": seconds, "price": [100.0] * 8}
+    calls: list[str] = []
+
+    def fake_http(url, **kwargs):
+        calls.append(url)
+        if "start=" in url:
+            raise ProviderError("provider request failed: URLError")
+        return payload
+
+    forecast = fetch_energy_charts(None, settings(), now=NOW, http=fake_http)
+    assert len(calls) == 2
+    assert forecast.slots and forecast.source == "energy_charts"
+
+
+def test_energy_charts_does_not_retry_a_rate_limited_window():
+    # A 429 is about the caller, not the window: the today-only call would be refused too, and a
+    # second request only extends the block.
+    calls: list[str] = []
+
+    def fake_http(url, **kwargs):
+        calls.append(url)
+        raise RateLimited("provider rate limited (HTTP 429)", retry_after_s=30.0)
+
+    with pytest.raises(RateLimited):
+        fetch_energy_charts(None, settings(), now=NOW, http=fake_http)
+    assert len(calls) == 1
 
 
 def test_static_schedule_uses_the_resolved_timezone():

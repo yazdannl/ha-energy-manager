@@ -1229,10 +1229,14 @@ def fetch_energy_charts(
                 raise ProviderError(
                     f"energy_charts: bidding zone {zone!r} was rejected by the API", status=400
                 ) from None
-            if err.status != 404:
+            if isinstance(err, RateLimited):
+                # Respect the limit instead of spending a second request in the same window: the
+                # today-only call would be refused too and only extend the block (live 2026-10-21).
                 raise
-            # 404: tomorrow's auction is not published yet (or, on the today-only window, this
-            # zone has no prices at all). Either way the next window is the fallback.
+            # Any other failure of the *wider* window -- 404 before the auction, a timeout, a 5xx,
+            # an unexpected payload -- must not take the provider down: the today-only window is the
+            # documented fallback and still covers the plan's first half (0.33.1). Only a rejected
+            # zone and a rate limit are worth giving up on: those would fail identically on retry.
             missing = err
             continue
         if not isinstance(candidate, Mapping):
@@ -1542,15 +1546,20 @@ def load_price_forecast(
                 # SPEC.md section 4: a forecast with no future slot in the requested horizon is a
                 # provider failure, no matter how the provider signalled it (raised or returned).
                 status.last_error = f"{name}: no future price slots in the requested horizon"
+                log.warning("price provider %s: %s", name, status.last_error)
                 continue
         except (RateLimited, ProviderError, HAError) as err:
             status.last_error = str(err)
             http_status = getattr(err, "status", None)
             if isinstance(http_status, int):
                 status.detail["http_status"] = http_status
+            # On stdout too (0.33.1): the add-on log is the only place an operator can see why the
+            # price chart is empty, and this chain used to report it to the SQLite journal only.
+            log.warning("price provider %s failed: %s", name, status.last_error)
             continue
         except Exception as err:  # noqa: BLE001 - a broken provider must never abort the chain
             status.last_error = f"{type(err).__name__}: {err}"
+            log.warning("price provider %s failed: %s", name, status.last_error)
             continue
         status.ok = True
         status.last_success = moment

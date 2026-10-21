@@ -3858,6 +3858,10 @@ class Engine:
             result = source(now)
         except Exception as exc:
             self._mark_provider(kind, str(getattr(source, "__name__", kind)), ok=False, error=str(exc))
+            # Also on stdout (0.33.1): the journal lives in the add-on's SQLite file, so a failing
+            # provider used to be invisible in `docker logs` / the add-on log tab -- exactly the
+            # place an operator looks first (live 2026-10-21: an empty price chart with no reason).
+            log.warning("%s forecast failed: %s", kind, str(exc)[:300])
             self._journal.event(
                 "warning", "forecast_unavailable", f"{kind} forecast failed: {str(exc)[:160]}"
             )
@@ -3869,6 +3873,7 @@ class Engine:
             forecast, statuses = result
         if forecast is None:
             self._mark_provider(kind, kind, ok=False, error="provider returned no forecast")
+            log.warning("%s forecast: the provider returned no forecast", kind)
             return None
         setattr(self, f"_{attribute}", forecast)
         self._mark_provider(

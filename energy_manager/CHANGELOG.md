@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.33.1
+
+- **Fix: a failing forecast is visible in the log.** `Engine._fetch` and the price provider chain
+  recorded a failure only in the SQLite journal, so an empty price chart showed nothing in the
+  add-on log — the one place an operator looks first. Both now log a warning naming the provider and
+  its error (the journal event is unchanged).
+- **Fix: the wider day-ahead window no longer takes the whole provider down.** Only a rejected
+  bidding zone (400) and a rate limit (429) abort `fetch_energy_charts`; a timeout, a 5xx or an
+  unexpected body on the today+tomorrow window now degrades to the today-only window (marked
+  stale/degraded) instead of emptying the 30 h price forecast. A 429 is deliberately not retried:
+  the smaller window would be refused too and a second request only extends the block.
+
 ## 0.32.0
 
 - **Fix: one pack, one capacity.** The learner produced one value per window and mixed both

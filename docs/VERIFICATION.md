@@ -1908,6 +1908,26 @@ plan schedules 4.85 kWh charged / 5.32 kWh discharged -- PV charging through the
 discharge into both evening peaks (17:15-20:00 today at 0.29-0.30, 17:45-20:15 tomorrow at
 0.29-0.33), and an overnight grid charge at 0.12-0.14 that the stale flat tail had hidden.
 
+### 8.29 A failing forecast is visible, and a broken wider window degrades instead of emptying (0.33.1)
+
+Live 2026-10-21 after the 0.33.0 deploy: `sensor.sem_chart_price` was `empty`, `sensor.sem_price_now`
+`unknown` and the plan `hold` / `no_forecast_slots` for ~40 minutes. The add-on log said nothing at
+all about it, because `Engine._fetch` and the price provider chain recorded a failure in the SQLite
+journal only — the one place an operator does not look first. Two changes:
+
+* `_fetch` and every failing leg of `load_price_forecast` now also `log.warning` the provider name and
+  its error (the journal event and the `ProviderStatus.last_error` the UI reads are unchanged).
+* `fetch_energy_charts` only aborts on a rejected bidding zone (400) and on a rate limit (429). A
+  timeout, a 5xx or an unexpected body on the today+tomorrow window now falls through to the
+  today-only window (degraded + stale tail) instead of failing the provider outright, which is what
+  took the whole 30 h forecast — and with it every plan — down to nothing.
+
+A 429 is deliberately *not* retried: the today-only call would be refused too and the second request
+only extends the block.
+
+Covered by `tests/test_wp2a_price.py`: a wider window that raises a plain `ProviderError` falls back
+and still yields a forecast, and a `RateLimited` wider window stops after exactly one request.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
