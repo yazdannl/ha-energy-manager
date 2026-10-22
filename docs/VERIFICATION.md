@@ -2081,7 +2081,15 @@ charges the wear; `off` reproduces the single solve slot for slot; the compariso
 the winner, the margin, the tie case and "nothing is sold below the cost basis"), and by
 `tools/variant_report.py` rerun on the live feeds. Two replay accounting tests pin
 `optimizer.plan_variants = off` to keep their discharging fixture on a flat-0.25 recording, where
-holding is the profitable plan. Full suite: **1657 passed**, `ui_render_check` 168/0, audit clean.
+holding is the profitable plan.
+
+**0.35.1** publishes the choice where a live instance can be inspected without the API:
+`sensor.sem_plan_action` carries `plan_variant`, `plan_variant_net_eur`, `plan_variant_margin_eur`,
+`replacement_eur_per_kwh` and `plan_variant_tie` (`Engine._plan_variant_attributes`, absent rather
+than fabricated on a plan restored from the store, which keeps its slots but not the comparison).
+Live 2026-10-22 06:08 UTC: the sensor read `export`, reason `self_consumption`, -800 W at 23.3 % SoC
+with real Zonneplan prices (0.351 -> 0.3486 -> holds at the 10 % floor) -- the sensor path, not a
+claim about the sweep. Full suite: **1658 passed**, `ui_render_check` 168/0, audit clean 176 files.
 
 ---
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.35.1
+
+- `sensor.sem_plan_action` now says which plan candidate won (`plan_variant`), what it nets after the
+  stored energy it spends or keeps (`plan_variant_net_eur`, `replacement_eur_per_kwh`), by how much it
+  beat the next one (`plan_variant_margin_eur`) and whether they tied (`plan_variant_tie`). The
+  attributes are absent, never faked, on a plan restored from the store. No behaviour change.
+
 ## 0.35.0
 
 - **New: the plan is the most profitable of several candidates, and the money is measured honestly.**
