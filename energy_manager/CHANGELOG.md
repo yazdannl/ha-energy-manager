@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.35.0
+
+- **New: the plan is the most profitable of several candidates, and the money is measured honestly.**
+  Selling stored energy below its cost basis is only a gain when the horizon can put that energy
+  back more cheaply -- the round trip loses part of it and the wear is paid per delivered kWh. The
+  reported "saved vs baseline" is cash only, so a schedule that empties the pack always looked
+  better. The optimizer now solves three candidates -- the refill-aware floor (0.33.0), the literal
+  ledger floor ("never sell below what it cost") and a charge-only pack ("just top up cheaply") --
+  scores each on `cash - wear + stored energy it ends with, marked at the refill cost`, and keeps
+  the winner. Doing nothing scores exactly 0, ties keep the incumbent rule, an infeasible candidate
+  never wins, and the comparison rides on `/plan` (`variants`, `net_eur`, `plan_variant`) and the UI
+  ("Net after the stored energy ... most profitable of 3 candidates: ... , 0.31 EUR ahead of ..."),
+  including whether anything was sold below the cost basis. `optimizer.plan_variants = off` keeps
+  the single solve. SPEC 5.
+
 ## 0.34.2
 
 - **Fix: no price is drawn as no price, not as 0 EUR/kWh.** A zero-export self-consumption plan

@@ -646,6 +646,7 @@ dashboard's own roles beside it, and a `Use the Energy dashboard` button clears 
 | `optimizer.target_soc_pct_end` | float, nullable | `null` | 0…100 | **End SoC target %** *(advanced)* — unset = no hard terminal target |
 | `optimizer.sell_floor_enabled` | bool | `true` | — | **Sell floor** — refuse a discharge or export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at). Off, or before a basis exists, behaves exactly as before |
 | `optimizer.sell_floor_margin_eur_per_kwh` | float | `0.0` | 0…1 | **Sell floor margin** *(advanced)* — require this much above the break-even before a sale is allowed |
+| `optimizer.plan_variants` | choice `best\|off` | `best` | — | **Plan variants** — solve the candidate floor policies (the refill-aware floor, the literal ledger floor that never sells below what the energy cost, and a charge-only pack), score each on `cash - wear + the stored energy it ends with, marked at the refill cost`, and keep the most profitable; the comparison rides on `/plan` and the UI. `off` = one solve with today's floor, bit-for-bit as before |
 | `optimizer.feed_in_wiring` | choice `off\|shadow\|on` | `off` | — | **Feed-in wiring** — how the optimizer consumes the contract-correct settlement (`price.feed_in_mode`). `off` = today's behaviour and the settlement is never called; `shadow` = settle and record a plan diff (learning profile + journal) while v1 stays dispatched; `on` = dispatch the settlement plan. An unpriceable contract never re-prices with the derived formula: planning holds instead. Requires a supported `price.feed_in_mode` before turning it on |
 
 #### Control
@@ -1425,6 +1426,30 @@ enforced one) and the additive `ledger_sell_floor_eur_per_kwh` (the average-basi
 capped) -- so a sale below the ledger floor is visibly explained rather than hidden. The live
 dispatch clamp judges a planned discharge against the
 same enforced floor (the plan's own summary value), never the uncapped ledger floor.
+
+**The plan is the most profitable candidate (0.35.0, `optimizer.plan_variants` = `best`).** Allowing
+a below-basis sale is only defensible if the cheaper refill really pays for the round trip and the
+wear, and `saved_eur` (cash against the idle baseline) cannot answer that: a schedule that empties
+the pack always looks better. `app/optimize/variants.py` therefore solves three candidates --
+`refill_floor` (the capped floor above), `ledger_floor` (the literal basis, the "never sell below the
+floor" rule) and `hold_pack` (`p_discharge_kw = 0`: charge cheaply and keep it) -- and scores each
+with one metric:
+
+```
+net = (baseline_cost - cost) - summary.cycle_cost_eur + (end_kwh - start_kwh) * replacement
+replacement = cheapest_buy_in_horizon / eta_charge        # EUR per *stored* kWh
+```
+
+Units matter: the sell floor is per delivered AC kWh (`cheapest_buy / round_trip + wear`), while a
+stored kWh is worth what it costs to put it back (`cheapest_buy / eta_charge`). Doing nothing scores
+exactly `0`; a tie keeps the candidate order (so an unchanged horizon never flips); a candidate the
+solver reports infeasible never wins. The winner carries `plan.variants` (`chosen`, `margin_eur`,
+`tie`, `replacement_eur_per_kwh`, one row per candidate with `net_eur`, `cash_saved_eur`,
+`wear_eur`, `stored_value_eur`, `energy_delta_kwh`, `end_soc_kwh`, `sell_floor_eur_per_kwh`,
+`sold_below_basis_kwh`, `feasible`) plus the additive summary fields `plan_variant`,
+`plan_variant_label`, `net_eur`, `stored_value_eur`, `energy_delta_kwh`,
+`replacement_eur_per_kwh` and `plan_variant_margin_eur`. With no ledger basis, or no price at all,
+there is no policy to vary and the sweep is a no-op.
 
 The floor restricts discharge only (0.19.0): in a slot whose `base = load - pv` is negative (a PV
 surplus) the lower bound is `max(grid_lo, -max(0.0, base)) = 0`, so the surplus keeps exporting and

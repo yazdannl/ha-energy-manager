@@ -527,6 +527,45 @@ function classTokens(text) {
     `${partialWindows.length} windows, ${partialWindows[0] && partialWindows[0].minutes} min`);
   check("a window states its grid flow and what it earns",
     /Grid cost/.test(labels) && /exports 1\.00 kWh/.test(facts[4].value) && /earns/.test(facts[4].value), facts[4] ? facts[4].value : "no grid fact");
+  // 0.35.0 (SPEC 5): the plan states what it did to the pack, which candidate won and by how much.
+  const variantPlan = {
+    slot_minutes: 60,
+    feasible: true,
+    summary: {
+      saved_eur: 0.4232, net_eur: 0.3356, energy_delta_kwh: -0.36,
+      replacement_eur_per_kwh: 0.2435, plan_variant: "refill_floor",
+      plan_variant_label: "Refill-aware floor", plan_variant_margin_eur: 0.31,
+    },
+    variants: {
+      chosen: "refill_floor", chosen_label: "Refill-aware floor", net_eur: 0.3356,
+      margin_eur: 0.31, tie: false,
+      candidates: [
+        { id: "refill_floor", label: "Refill-aware floor", net_eur: 0.3356, sold_below_basis_kwh: 0.42 },
+        { id: "ledger_floor", label: "Never below the ledger floor", net_eur: 0.0256, sold_below_basis_kwh: 0.0 },
+        { id: "hold_pack", label: "Charge only, never discharge", net_eur: -0.0058, sold_below_basis_kwh: 0.0 },
+      ],
+    },
+    slots: [slotAt(0)],
+  };
+  const netText = A.planNetText(variantPlan);
+  check("the plan states the net after the stored energy and which candidate won",
+    /Net after the stored energy/.test(netText) && /0\.34 EUR/.test(netText)
+    && /0\.36 kWh less in the pack/.test(netText)
+    && /Most profitable of 3 candidates: Refill-aware floor/.test(netText)
+    && /0\.31 EUR ahead of/.test(netText), netText);
+  check("the plan says when it sold below the cost basis -- and when it did not",
+    /discharges 0\.42 kWh below the pack's cost basis/.test(netText));
+  const tiePlan = Object.assign({}, variantPlan, {
+    summary: Object.assign({}, variantPlan.summary, { plan_variant_margin_eur: 0.0, energy_delta_kwh: 0.0 }),
+    variants: Object.assign({}, variantPlan.variants, { tie: true, margin_eur: 0.0 }),
+  });
+  const tieText = A.planNetText(tiePlan);
+  check("a tie is stated as a tie, and an unchanged pack as an unchanged pack",
+    /tied with/.test(tieText) && /the pack ends where it started/.test(tieText)
+    && !/ahead of/.test(tieText), tieText);
+  check("a plan without a comparison says nothing about one",
+    A.planNetText({ slots: [], summary: {} }) === "" && A.planNetText(null) === "");
+
   // 0.34.2 (SPEC 8.4): a horizon with no tariff must say so. "0.0 ct/kWh" would read as free
   // electricity, and "-- → --" as a rendering bug.
   const unpricedPlan = {

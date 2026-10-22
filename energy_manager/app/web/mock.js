@@ -298,6 +298,8 @@
     }
     var roundTrip = round(MOCK_ETA * MOCK_ETA, 6);
     var terminalKwh = slots.length ? slots[slots.length - 1].soc_kwh : 0;
+    var startKwh = slots.length ? slots[0].soc_kwh : 0;
+    var savedCash = round(baseline - cost, 2);
     return {
       generated_at: iso(startMs),
       horizon_start: slots.length ? slots[0].t : iso(startMs),
@@ -311,7 +313,7 @@
       summary: {
         cost_estimate_eur: costs,
         baseline_cost_eur: round(baseline, 2),
-        saved_eur: round(baseline - cost, 2),
+        saved_eur: savedCash,
         charged_kwh: 6.4,
         discharged_kwh: 5.9,
         grid_charge_kwh: 2.1,
@@ -330,6 +332,16 @@
         // The demo plan does not cap the ledger floor, so both numbers are the same here.
         sell_floor_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR,
         ledger_sell_floor_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR,
+        // 0.35.0 (SPEC 5): the candidate sweep. The demo plan is the refill-aware winner, tied with
+        // the literal ledger floor because the demo's floor never binds; its net is the cash saved
+        // minus the wear it spends plus the stored energy it ends with, marked at the refill cost.
+        plan_variant: "refill_floor",
+        plan_variant_label: "Refill-aware floor",
+        net_eur: round(savedCash - cycleCost + (terminalKwh - startKwh) * (medianBuy / MOCK_ETA), 2),
+        stored_value_eur: round((terminalKwh - startKwh) * (medianBuy / MOCK_ETA), 2),
+        energy_delta_kwh: round(terminalKwh - startKwh, 2),
+        replacement_eur_per_kwh: round(medianBuy / MOCK_ETA, 4),
+        plan_variant_margin_eur: 0,
         maintenance: MOCK_MAINTENANCE,
         feed_in_mode: null,
         feed_in_export_allowed: null,
@@ -659,6 +671,7 @@
     ["optimizer.pv_charge_preference", "str", "auto", "PV charge preference", "How the plan values PV energy it charges into the pack: auto = the export price it forgoes (default), prefer_pv = free (absorb the surplus before buying anything), avoid_pv = the slot's buy price (export the PV and charge from the grid in the cheapest hours). A shadow price for planning only: the reported plan money stays the true grid cost.", "optimizer", ["auto", "prefer_pv", "avoid_pv"]],
     ["optimizer.sell_floor_enabled", "bool", true, "Sell floor", "Refuse a discharge or export below the break-even of the energy actually in the pack (the cost-basis ledger, learned from measured charge intervals and the prices they were charged at).", "optimizer", null],
     ["optimizer.sell_floor_margin_eur_per_kwh", "float", 0.0, "Sell floor margin", "Require this much above the break-even before a sale is allowed.", "optimizer", null],
+    ["optimizer.plan_variants", "str", "best", "Plan variants", "best = solve the candidate floor policies (the refill-aware floor, the ledger floor that never sells below what the energy cost, and charge-only), score each on the cash it saves plus the stored energy it ends with, and keep the most profitable; the comparison rides on the plan so the UI can state why. off = one solve with today's floor, bit-for-bit as before.", "optimizer", ["best", "off"]],
     ["optimizer.feed_in_wiring", "str", "off", "Feed-in wiring", "How the optimizer consumes the contract-correct feed-in settlement (price.feed_in_mode). off = today's behaviour and the settlement is never called; shadow = settle and record a plan diff while v1 stays dispatched; on = dispatch the settlement plan. An unpriceable contract never re-prices with the derived formula: planning holds instead.", "optimizer", ["off", "shadow", "on"]],
     ["optimizer.target_soc_pct_end", "float", null, "End SoC target %", "Unset = no hard terminal target.", "optimizer", null],
     ["optimizer.terminal_mode", "str", "salvage", "Terminal value", "How the plan values the energy still in the pack at the end of the horizon. salvage = a stored kWh is worth the median buy price discounted by the discharge efficiency (today's behaviour). vector = a constrained tail solve over the price feed's tail and a periodic profile beyond it, used only when the omitted state provably cannot change the tail's optimal value (the cost-basis sell floor is off or never binds on any reachable path, and the contract's marginal credit rate is exogenous over the tail). Otherwise the plan uses salvage and reports the reason. Off by default: it is an experiment until the replay harness shows a net benefit.", "optimizer", ["salvage", "vector"]],

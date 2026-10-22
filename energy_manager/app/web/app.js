@@ -1942,6 +1942,49 @@
       " before the deadline, in the cheapest slots, so the BMS can balance the cells.";
   }
 
+  // 0.35.0 (SPEC 5): the candidate sweep, in one sentence. The cash saving above says what the
+  // grid did; this says what the pack gave up for it, which policy won, and by how much -- so an
+  // "it sold below my cost basis" plan can be judged instead of argued about.
+  function planNetText(plan) {
+    var block = plan && plan.variants;
+    var summary = (plan && plan.summary) || {};
+    if (!block || !Array.isArray(block.candidates) || !isNum(summary.net_eur)) return "";
+    var parts = [];
+    var delta = summary.energy_delta_kwh;
+    var replacement = summary.replacement_eur_per_kwh;
+    parts.push("Net after the stored energy: " +
+      (summary.net_eur < 0 ? "a loss of " + fmtEur(Math.abs(summary.net_eur)) : fmtEur(summary.net_eur)));
+    if (isNum(delta) && isNum(replacement) && Math.abs(delta) >= 0.005) {
+      parts.push(fmtKwh(Math.abs(delta)) + (delta < 0 ? " less" : " more") + " in the pack, marked at " +
+        fmtEur(replacement) + "/kWh stored");
+    } else {
+      parts.push("the pack ends where it started");
+    }
+    var chosen = block.chosen_label || block.chosen;
+    var count = block.candidates.length;
+    var text = parts.join(" \u00b7 ") + ". Most profitable of " + count + " candidate" +
+      (count === 1 ? "" : "s") + ": " + chosen;
+    var best = null;
+    block.candidates.forEach(function (row) {
+      if (!row || row.id === block.chosen || !isNum(row.net_eur)) return;
+      if (!best || row.net_eur > best.net_eur) best = row;
+    });
+    if (block.tie) text += ", tied with " + ((best && (best.label || best.id)) || "the alternatives") + "";
+    else if (isNum(block.margin_eur) && best) {
+      text += ", " + fmtEur(block.margin_eur) + " ahead of " + (best.label || best.id);
+    }
+    var below = null;
+    block.candidates.forEach(function (row) {
+      if (row && row.id === block.chosen && isNum(row.sold_below_basis_kwh)) below = row.sold_below_basis_kwh;
+    });
+    if (isNum(below) && below > 0.005) {
+      text += ". It discharges " + fmtKwh(below) + " below the pack's cost basis, which the refill inside this horizon pays for";
+    } else if (below != null) {
+      text += ". Nothing is sold below the pack's cost basis";
+    }
+    return text + ".";
+  }
+
   // The per-battery maintenance state as one plain sentence ("due in N days / active / last
   // completed / overdue"), never colour alone (SPEC 13.1).
   function maintenanceText(row) {
@@ -2035,11 +2078,18 @@
         badge("maintenance plan", "info"), " ", maintenance
       ]));
     }
+    // 0.35.0 (SPEC 5): the cash figure above ignores what the plan does to the pack, so a schedule
+    // that empties it always looked best. State both, and say which candidate won and by how much.
+    var netLine = planNetText(plan);
+    if (netLine) body.appendChild(el("p", { class: "legend-note", text: netLine }));
     var stats = [
       // "Net" because it can be negative: an export-heavy horizon earns more than it spends.
       ["Estimated net cost", unpriced ? "not priced" : fmtEur(s.cost_estimate_eur)],
       ["Baseline net cost (no battery)", unpriced ? "not priced" : fmtEur(s.baseline_cost_eur)],
       ["Saving vs baseline", unpriced ? "not priced" : fmtEur(s.saved_eur)],
+      // 0.35.0: the saving *after* the stored energy the plan spends or keeps, which is the number
+      // that decides between two schedules (SPEC 5).
+      ["Net after the stored energy", unpriced || !isNum(s.net_eur) ? (unpriced ? "not priced" : "not reported") : fmtEur(s.net_eur)],
       ["Energy charged", fmtKwh(s.charged_kwh)],
       ["Energy discharged", fmtKwh(s.discharged_kwh)],
       ["Cycles", isNum(s.cycles) ? s.cycles.toFixed(2) + " cycles" : "--"],
@@ -6559,6 +6609,7 @@
     planActionWindows: planActionWindows,
     windowFacts: windowFacts,
     planFlags: planFlags,
+    planNetText: planNetText,
     planIsUnpriced: planIsUnpriced,
     windowStatusText: windowStatusText,
     windowPriceText: windowPriceText,

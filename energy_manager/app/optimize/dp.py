@@ -64,6 +64,7 @@ from ..sources.feed_in import (
 from ..sources.price import tail_sell_pricing
 from . import _fast
 from . import terminal as terminal_value
+from . import variants as variants_module
 
 log = logging.getLogger(__name__)
 
@@ -1441,6 +1442,7 @@ def solve(
     sell_floor_eur_per_kwh: float | None = None,
     now: datetime | None = None,
     terminal: terminal_value.TerminalPlan | None = None,
+    cap_floor: bool = True,
 ) -> Plan:
     """Solve the horizon and return a ``Plan`` (SPEC 8.2).  Deterministic.
 
@@ -1475,7 +1477,12 @@ def solve(
         # and wins. Resolved here so every caller (API recompute, tests, selfcheck) agrees.
         options = replace(options, wear_eur_per_kwh=aggregate.wear_eur_per_kwh)
     floor = sell_floor_eur_per_kwh if sell_floor_eur_per_kwh is not None else options.sell_floor_eur_per_kwh
-    if floor is not None:
+    if not cap_floor:
+        # 0.35.0: a literal floor (or none at all) -- the candidates the variant sweep compares.
+        options = replace(
+            options, sell_floor_eur_per_kwh=None if floor is None else float(floor)
+        )
+    elif floor is not None:
         # 0.33.0: the floor is capped at the cheapest-refill break-even, so a dear charge cannot
         # freeze a pack that could cycle fresh cheap energy (see ``effective_sell_floor...``).
         options = replace(
@@ -1814,6 +1821,58 @@ def solve_from_forecasts(
         now=moment,
         terminal=terminal_plan,
     )
+    # 0.35.0 (SPEC 5): a discharge below the pack's cost basis is only a gain when the horizon can
+    # put that energy back more cheaply. Solve the candidate floor policies, score every candidate on
+    # one metric (cash saved + the stored energy it ends with, marked at the refill cost) and keep
+    # the most profitable. ``optimizer.plan_variants = off`` keeps the single solve bit-for-bit.
+    if variants_module.normalize(settings.get("optimizer.plan_variants", "best")) == "best":
+        replacement = variants_module.replacement_value_eur_per_kwh(slots, aggregate)
+        if replacement is None:
+            candidates = []
+        else:
+            candidates = variants_module.candidates(sell_floor_eur_per_kwh)
+        if len(candidates) > 1:
+            scored = []
+            for candidate in candidates:
+                candidate_aggregate = (
+                    replace(aggregate, p_discharge_kw=0.0) if candidate.charge_only else aggregate
+                )
+                # A charge-only pack cannot reach the export the prepared tail priced, so that
+                # candidate falls back to the salvage row instead of inheriting a verdict about a
+                # reachability it does not have.
+                candidate_terminal = None if candidate.charge_only else terminal_plan
+                candidate_plan = solve(
+                    slots,
+                    aggregate=candidate_aggregate,
+                    start_kwh=start_kwh,
+                    options=options,
+                    generated_at=moment,
+                    source_names=sources,
+                    mode=mode,
+                    dry_run=dry_run,
+                    maintenance=maintenance,
+                    sell_floor_eur_per_kwh=candidate.floor_eur_per_kwh,
+                    now=moment,
+                    terminal=candidate_terminal,
+                    cap_floor=candidate.cap_floor,
+                )
+                figures = variants_module.score_plan(
+                    candidate_plan,
+                    start_kwh=start_kwh,
+                    replacement_eur_per_kwh=replacement,
+                    ledger_floor_eur_per_kwh=sell_floor_eur_per_kwh,
+                )
+                scored.append((candidate, candidate_plan, figures))
+            chosen, plan, _figures, block = variants_module.choose(
+                scored, replacement_eur_per_kwh=replacement
+            )
+            variants_module.attach(plan, block)
+            log.debug(
+                "optimizer: chose plan variant %s (net %.4f EUR of %d candidates)",
+                chosen.id,
+                block["net_eur"],
+                len(scored),
+            )
     if sell_floor_eur_per_kwh is not None:
         # Additive (0.33.0): the ledger's own average-basis floor, kept beside the enforced (capped)
         # one so /plan and the UI can state both instead of implying the cap away.

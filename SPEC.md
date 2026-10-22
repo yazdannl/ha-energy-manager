@@ -634,6 +634,45 @@ schedule. With a lossless pack (round trip 1, no wear) the cap equals the cheape
 floor no longer blocks any house-serving discharge; with the setting off, or no basis yet, nothing
 changes.
 
+**0.35.0 amendment (the plan is the most profitable candidate, measured, not assumed).** Allowing a
+below-basis sale is only defensible if the cheaper refill inside the horizon really pays for the
+round trip and the wear -- and the number a human reads (``saved_eur``, cash against the idle
+baseline) cannot answer that, because a schedule that empties the pack always looks better. So the
+plan is now chosen from **candidates scored on one metric** (``app/optimize/variants.py``,
+``optimizer.plan_variants`` = ``best`` by default):
+
+* ``refill_floor`` -- the ledger floor capped at the cheapest-refill break-even (the 0.33.0 rule);
+  it may sell below the basis, but only where a cheaper refill pays for the round trip;
+* ``ledger_floor`` -- the literal basis: never discharge or displace below what the stored energy
+  cost (the "do not sell below the floor" candidate);
+* ``hold_pack`` -- a pack that can charge but not discharge: the "just top up cheaply" candidate.
+
+All three are complete plans from the same DP, so only the floor policy (and, for ``hold_pack``, the
+``p_discharge_kw = 0`` aggregate) differs. The score is
+
+```
+net = (baseline_cost - cost) - summary.cycle_cost_eur + (end_kwh - start_kwh) * replacement
+replacement = cheapest_buy_in_horizon / eta_charge      (EUR per *stored* kWh)
+```
+
+because the stored energy is not the delivered energy: buying 1 AC kWh charges ``eta_charge`` kWh,
+so refilling one stored kWh costs ``cheapest_buy / eta_charge``, while the *sell* floor is per
+delivered AC kWh (``cheapest_buy / round_trip + wear``). Doing nothing scores exactly ``0``, so a
+candidate that cannot beat it is never dispatched; a tie keeps the incumbent order, so an unchanged
+horizon never flips the plan for a rounding error; a candidate the solver reports infeasible (or one
+that cannot be scored) is never chosen while a feasible one exists. The winner's comparison rides on
+the plan: ``plan.variants`` (``chosen``, ``margin_eur``, ``tie``, ``replacement_eur_per_kwh`` and one
+row per candidate with its cash, wear, stored-energy mark, ending SoC and
+``sold_below_basis_kwh``) plus additive summary fields ``plan_variant``, ``plan_variant_label``,
+``net_eur``, ``stored_value_eur``, ``energy_delta_kwh``, ``replacement_eur_per_kwh`` and
+``plan_variant_margin_eur``, all serialized by ``/api/v1/plan``. The UI states the net, the energy
+the plan spends or keeps, which candidate won and by how much -- or that it ties, or that nothing was
+sold below the basis. ``optimizer.plan_variants = off`` keeps the single 0.34.x solve bit-for-bit,
+and with no ledger basis (or no price at all) the sweep is a no-op because there is no policy to
+vary. The replay harness measures whatever policy its settings pin: the accounting fixtures that
+need a discharging leg on a flat-price recording pin ``off``, because holding is the profitable plan
+there.
+
 Runtime discovery is mandatory for `driver: zendure`: find candidate entities by asking HA for the
 entity registry entries whose `platform` is `zendure_ha` (or `unique_id` prefix `zendure_ha.`) and
 matching **translation keys** (`input_limit`, `output_limit`, `electric_level`,

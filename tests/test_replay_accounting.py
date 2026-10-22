@@ -343,7 +343,10 @@ def test_pairing_refuses_mismatched_windows(tmp_path: Path) -> None:
 
 
 def test_the_terminal_term_is_the_energy_delta_at_the_frozen_basis(tmp_path: Path) -> None:
-    source = recording(tmp_path)
+    # The plan-variant sweep (0.35.0) would hold this flat-0.25 recording's pack, because selling
+    # below the refill cost is a loss. This test's subject is the *accounting* of a discharging leg,
+    # so it pins the single-policy solve (``optimizer.plan_variants = off``) to keep one.
+    source = recording(tmp_path, settings_extra={"optimizer.plan_variants": "off"})
     add_cost_basis(source, 0.20, 2.75)
     leg = a_leg(tmp_path, plant=SIMULATED, source=source)
     account = account_leg(leg, limits=PLANTS)
@@ -848,7 +851,8 @@ def test_finding_8d_buckets_are_unique_and_the_settlement_length_is_checked(
 
 def test_finding_9_the_sensitivity_valuation_comes_from_the_ledger(tmp_path: Path) -> None:
     """The declared sensitivity is the ledger's own booked basis, not a copy of the headline."""
-    source = recording(tmp_path)
+    # Same reason as the terminal-term test above: pin the single solve so the leg discharges.
+    source = recording(tmp_path, settings_extra={"optimizer.plan_variants": "off"})
     add_cost_basis(source, 0.20, 2.75)
     leg = a_leg(tmp_path, plant=SIMULATED, source=source)
     declaration = WindowStartValuation(

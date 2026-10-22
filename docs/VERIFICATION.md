@@ -2032,6 +2032,57 @@ recognises the marker, the all-`none` slots and neither a priced plan nor `null`
 unpriced feed and names the missing forecast, and an empty price feed draws no chart at all). Full
 suite: **1647 passed**, `ui_render_check` 164/0, audit clean over 173 files.
 
+### 8.33 The plan is the plan that nets the most (0.35.0)
+
+Asked live 2026-10-22, with a Zonneplan plan on a 0.3049 EUR/kWh basis that discharged into the
+17:00 peak: *does selling below the floor actually pay for the cheaper refill later?* The 0.33.0 rule
+permits a below-basis sale whose refill inside the horizon covers the round trip and the wear, and
+the DP already prices that inside its objective -- but the number a human reads (`saved_eur`, cash
+against the idle baseline) cannot show it, and a plan that empties the pack always looked better.
+0.35.0 makes it a measured comparison instead of an argument.
+
+`app/optimize/variants.py` + `optimizer.plan_variants` (`best` by default) solve three complete
+candidates from the same DP -- `refill_floor` (the capped floor), `ledger_floor` (the literal basis)
+and `hold_pack` (`p_discharge_kw = 0`) -- and score each on
+`(baseline_cost - cost) - cycle_cost_eur + (end_kwh - start_kwh) * (cheapest_buy / eta_charge)`.
+Doing nothing scores exactly `0`; ties keep the candidate order; an infeasible candidate never wins;
+`off` keeps the single 0.34.x solve bit-for-bit.
+
+**Live run 2026-10-22 05:19 UTC** (`tools/variant_report.py`, then `dp.solve_from_forecasts` with the
+real 120-slot Zonneplan/solar/load feeds, the 2 kWh SolarFlow, a 0.3049 basis and 0.56 kWh stored):
+
+```
+chosen: refill_floor  net +0.3356  (tie with ledger_floor, margin 0.00)
+  refill_floor  net +0.3356  cash +0.4232  stored -0.0877  chg 1.96  dis 1.99  below_basis 0.00  floor 0.264
+  ledger_floor  net +0.3356  cash +0.4232  stored -0.0877  chg 1.96  dis 1.99  below_basis 0.00  floor 0.305
+  hold_pack     net -0.0058  cash -0.3564  stored +0.3506  chg 1.57  dis 0.00  below_basis 0.00
+  replacement 0.2435 EUR per stored kWh (cheapest buy 0.2240 / eta_charge 0.92)
+```
+
+Three findings, all of them the user's question answered:
+
+* **Nothing in that plan was sold below the basis.** `sold_below_basis_kwh` is 0.00 for every
+  candidate: the discharges are at 0.351 (06:00) and 0.43-0.478 (16:15-18:15), both above 0.3049.
+  What was *below* the basis was the enforced floor (0.264), not a sale.
+* **The cycle does pay.** The pack refills at 0.224 (10:00-11:15) and sells into the peak at
+  0.43-0.478, i.e. 0.17-0.21 EUR/kWh delivered above the refill break-even -- so selling early and
+  refilling cheaply is worth ~0.10 EUR/kWh more than holding that energy to the same peak.
+* **"Just top up and keep it" nets less.** Charge-only scores -0.0058 against the trading plan's
+  +0.3356, and a battery left idle scores 0 by definition. The cash-only figure (0.4232) overstates
+  the trading plan by the 0.0877 EUR of stored energy it spends -- which is exactly the blind spot
+  the score closes.
+
+Covered by `tests/test_plan_variants.py` (11 cases: the candidate set follows the ledger basis; a
+0.40 basis with a 0.22 refill and a 0.32 peak makes the below-basis cycle the winner *and* reports
+`sold_below_basis_kwh`; an unprofitable 0.30 -> 0.32 spread is sold by nobody and the sweep reports a
+tie; charge-only is offered and scored; the metric is worth exactly a refilled kWh per stored kWh and
+charges the wear; `off` reproduces the single solve slot for slot; the comparison reaches
+`/api/v1/plan`; an infeasible candidate never wins), by `tools/ui_render_check.js` (the net line,
+the winner, the margin, the tie case and "nothing is sold below the cost basis"), and by
+`tools/variant_report.py` rerun on the live feeds. Two replay accounting tests pin
+`optimizer.plan_variants = off` to keep their discharging fixture on a flat-0.25 recording, where
+holding is the profitable plan. Full suite: **1657 passed**, `ui_render_check` 168/0, audit clean.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)

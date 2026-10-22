@@ -313,6 +313,16 @@ def plan_summary_dict(summary: PlanSummary) -> dict[str, Any]:
     payload["ledger_sell_floor_eur_per_kwh"] = getattr(
         summary, "ledger_sell_floor_eur_per_kwh", None
     )
+    # Additive (0.35.0, SPEC 5): the candidate sweep that chose this plan. ``net_eur`` is the money
+    # the plan makes (saved cash **plus** the stored energy it ends with, marked at the refill cost),
+    # so a schedule that empties the pack cannot look better than one that keeps it.
+    payload["plan_variant"] = getattr(summary, "plan_variant", None)
+    payload["plan_variant_label"] = getattr(summary, "plan_variant_label", None)
+    payload["net_eur"] = getattr(summary, "net_eur", None)
+    payload["stored_value_eur"] = getattr(summary, "stored_value_eur", None)
+    payload["energy_delta_kwh"] = getattr(summary, "energy_delta_kwh", None)
+    payload["replacement_eur_per_kwh"] = getattr(summary, "replacement_eur_per_kwh", None)
+    payload["plan_variant_margin_eur"] = getattr(summary, "plan_variant_margin_eur", None)
     # Additive (0.17.0): scheduled full-charge maintenance.  ``None`` when a summary was restored
     # from a store written before the field existed, or when no battery is due in this horizon.
     payload["maintenance"] = getattr(summary, "maintenance", None)
@@ -375,6 +385,10 @@ def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dic
         # Additive (stage 1b): the same feed-in block as ``summary.feed_in_*`` plus the settlement
         # notes and, in shadow mode, the recorded v1-vs-v2 plan diff.
         "feed_in": getattr(plan, "feed_in", None),
+        # Additive (0.35.0): every candidate the sweep solved, why this one won, and the figures
+        # each one scored (SPEC 5). ``None`` for a plan made with ``optimizer.plan_variants = off``
+        # or restored from an older store.
+        "variants": getattr(plan, "variants", None),
         # Additive (stage 3): the prepared tail, the sufficiency verdict (``ok``, ``reason``,
         # ``detail``) and the measured stability.  Absent when the mode is off -- the summary still
         # reports ``terminal_mode`` there, so a client can tell "off" from "refused".
