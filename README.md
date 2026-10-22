@@ -269,7 +269,7 @@ The add-on writes these entities with the Home Assistant state API (no MQTT, no 
 | Entity | Unit | Attributes |
 | --- | --- | --- |
 | `sensor.sem_autopilot_state` | `off` / `advisory` / `auto` / `dry_run` | — |
-| `sensor.sem_plan_action` | action slug | `reason`, `target_power_w`, `soc_target_pct` |
+| `sensor.sem_plan_action` | action slug | `reason`, `target_power_w`, `soc_target_pct`; plus the winning candidate's `plan_variant`, `plan_variant_net_eur`, `plan_variant_margin_eur`, `replacement_eur_per_kwh` and `plan_variant_tie` (0.35.0, absent on a plan restored from the store) |
 | `sensor.sem_price_now` | EUR/kWh | `rank_pct`, `cheap_window_start`, `expensive_hour_start` |
 | `sensor.sem_pv_forecast_today` | kWh | `tomorrow_kwh`, `peak_w`, `peak_at` |
 | `sensor.sem_load_forecast_now` | kW | `today_kwh`, `confidence` |

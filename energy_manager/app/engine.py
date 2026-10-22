@@ -4504,6 +4504,28 @@ class Engine:
 
     # ------------------------------------------------------------------ HA publisher
 
+    @staticmethod
+    def _plan_variant_attributes(plan: Any) -> dict[str, Any]:
+        """The chosen plan candidate for the action sensor (0.35.0, SPEC 5), when the plan has one."""
+        summary = getattr(plan, "summary", None)
+        name = getattr(summary, "plan_variant", None)
+        if name is None:
+            return {}
+        attrs: dict[str, Any] = {"plan_variant": str(name)}
+        net = getattr(summary, "net_eur", None)
+        if net is not None:
+            attrs["plan_variant_net_eur"] = round(float(net), 4)
+        margin = getattr(summary, "plan_variant_margin_eur", None)
+        if margin is not None:
+            attrs["plan_variant_margin_eur"] = round(float(margin), 4)
+        replacement = getattr(summary, "replacement_eur_per_kwh", None)
+        if replacement is not None:
+            attrs["replacement_eur_per_kwh"] = round(float(replacement), 4)
+        block = getattr(plan, "variants", None)
+        if isinstance(block, dict) and block.get("tie") is not None:
+            attrs["plan_variant_tie"] = bool(block["tie"])
+        return attrs
+
     def publish_states(self, now: datetime | None = None) -> int:
         """Throttled, idempotent mirror of the engine state into HA (SPEC 12)."""
         moment = now or self._clock()
@@ -4581,6 +4603,7 @@ class Engine:
                     aggregate,
                 )
                 soc_target_pct = round(final_kwh / capacity * 100.0, 1)
+        variant_attrs = self._plan_variant_attributes(plan)
         pv_today, pv_tomorrow, peak_w, peak_at = self._pv_summary(now)
         load_now_kw, load_today_kwh, confidence = self._load_summary(now)
         today = self.savings_totals("day")
@@ -4607,6 +4630,9 @@ class Engine:
                     "reason": slot.reason if slot is not None else Reason.NO_SLOTS,
                     "target_power_w": round(slot.power_w, 0) if slot is not None else 0.0,
                     "soc_target_pct": soc_target_pct,
+                    # Which candidate won and by how much (0.35.0, SPEC 5). Absent on a plan
+                    # restored from the store (only the slots survive) rather than faked.
+                    **variant_attrs,
                 },
             ),
             SEM_PRICE: (

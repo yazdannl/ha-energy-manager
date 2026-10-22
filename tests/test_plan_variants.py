@@ -325,3 +325,29 @@ def test_an_infeasible_candidate_is_never_chosen():
         "refill_floor": False,
         "ledger_floor": True,
     }
+
+
+def test_the_action_sensor_says_which_candidate_won():
+    """The live action sensor names the winning variant and its edge (0.35.0, SPEC 5/12)."""
+    from app.engine import Engine
+
+    class _Summary:
+        plan_variant = "refill_floor"
+        net_eur = 4
+        plan_variant_margin_eur = 2
+        replacement_eur_per_kwh = 5
+
+    plan = type("P", (), {})()
+    plan.summary = _Summary()
+    plan.variants = {"chosen": "refill_floor", "tie": False}
+    attributes = Engine._plan_variant_attributes(plan)
+    assert attributes == {
+        "plan_variant": "refill_floor",
+        "plan_variant_net_eur": 4.0,
+        "plan_variant_margin_eur": 2.0,
+        "replacement_eur_per_kwh": 5.0,
+        "plan_variant_tie": False,
+    }
+    # A plan restored from the store keeps its slots but not the comparison: say nothing.
+    restored = type("P", (), {"summary": object(), "variants": None})()
+    assert Engine._plan_variant_attributes(restored) == {}
