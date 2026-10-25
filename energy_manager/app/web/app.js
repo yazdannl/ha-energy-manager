@@ -2655,6 +2655,151 @@
     draw(slots.slice(0, 48), false);
   }
 
+  function renderPlanHistoryDetail(body, payload) {
+    clear(body);
+    var plan = payload && payload.plan ? payload.plan : {};
+    var linkage = payload && payload.linkage ? payload.linkage : {};
+    var sources = plan.sources || {};
+    var sourceText = Object.keys(sources).sort().map(function (key) { return key + ": " + sources[key]; }).join(", ");
+    body.appendChild(el("p", { class: "legend-note", text:
+      "Plan #" + plan.plan_id + " generated " + fmtDateTime(plan.generated_at) + "; horizon " +
+      fmtDateTime(plan.horizon_start) + " – " + fmtDateTime(plan.horizon_end) + "; " +
+      (plan.mode || "unknown mode") + (plan.dry_run ? " · dry run" : "") +
+      (sourceText ? "; sources: " + sourceText : "") + "."
+    }));
+    if (plan.infeasible_reason) {
+      body.appendChild(el("p", { class: "legend-note", text: "Plan infeasible: " + plan.infeasible_reason }));
+    }
+    body.appendChild(el("p", { class: "legend-note", text:
+      (linkage.dispatch_note || "") + " " + (linkage.measurement_note || "") + " " +
+      (linkage.applied_note || "") + " " + (linkage.requested_note || "") + " " +
+      "Linked dispatch records: " + (linkage.dispatch_records || 0) +
+      "; linked rows with an invalid/mismatched slot: " + (linkage.unassigned_dispatches || 0) +
+      "; unmatched dispatch rows in this time window (not attributed): " + (linkage.unmatched_dispatch_count || 0) +
+      (linkage.unmatched_dispatch_truncated ? " (showing first 100)" : "") + "."
+    }));
+
+    var headers = ["Slot", "Planned setpoint", "Plan action / reason", "Dispatcher requested (per battery)",
+      "Driver-reported applied (per battery)", "Measured battery", "Measured grid", "Coverage", "Dispatch outcome / reason"];
+    function valuesFor(dispatch, field) {
+      if (!dispatch || !Array.isArray(dispatch.batteries) || !dispatch.batteries.length) return "No linked attempt";
+      return dispatch.batteries.map(function (battery) {
+        var last = battery.last || {};
+        return (battery.id || "battery") + ": " + fmtPower(last[field]) + " · " + fmtDateTime(last.ts) +
+          (last.dry_run ? " · dry run" : "");
+      }).join("; ");
+    }
+    function outcomeFor(dispatch) {
+      if (!dispatch || !Array.isArray(dispatch.batteries) || !dispatch.batteries.length) {
+        return "No linked dispatch attempt recorded; no dispatch reason can be attributed. Check Log for legacy/unlinked rows.";
+      }
+      return dispatch.batteries.map(function (battery) {
+        var last = battery.last || {};
+        var result = String(last.result || "unknown").replace(/_/g, " ");
+        var reason = reasonText(last.reason || last.code);
+        return (battery.id || "battery") + ": " + result + " · " + reason + " · " +
+          (last.mode || "unknown mode") + (last.dry_run ? " · dry run" : "") +
+          (last.message ? " — " + last.message : "") + " · " + fmtDateTime(last.ts);
+      }).join("; ");
+    }
+    function actualValue(actual, key, positiveEnergy, negativeEnergy, positiveLabel, negativeLabel) {
+      if (!actual || !isNum(actual[key])) return "Not measured";
+      return fmtKw(actual[key], 2) + " · " + positiveLabel + " " + fmtKwh(actual[positiveEnergy]) +
+        " · " + negativeLabel + " " + fmtKwh(actual[negativeEnergy]);
+    }
+    function coverageText(actual) {
+      if (!actual) return "No actual samples";
+      return "Battery " + fmtPct(actual.battery_coverage_pct) + " (" + (actual.battery_samples || 0) +
+        ") · grid " + fmtPct(actual.grid_coverage_pct) + " (" + (actual.grid_samples || 0) +
+        ") · rows " + (actual.samples || 0);
+    }
+    var rows = (Array.isArray(payload.slots) ? payload.slots : []).map(function (slot) {
+      var actual = slot.actual || null;
+      var dispatch = slot.dispatch || null;
+      var planReason = actionText(slot.action) + (slot.reason ? " · " + reasonText(slot.reason) : "");
+      return [
+        fmtDateTime(slot.t) + (slot.duration_known ? " · " + slot.minutes + " min" : " · duration not retained"),
+        fmtPower(slot.planned_setpoint_w),
+        planReason,
+        valuesFor(dispatch, "requested_w"),
+        valuesFor(dispatch, "applied_w"),
+        actualValue(actual, "battery_kw", "charged_kwh", "discharged_kwh", "charged", "discharged"),
+        actualValue(actual, "grid_kw", "import_kwh", "export_kwh", "imported", "exported"),
+        coverageText(actual),
+        outcomeFor(dispatch)
+      ];
+    });
+    if (!rows.length) {
+      body.appendChild(el("p", { class: "muted", text: "This saved plan has no slot rows." }));
+    } else {
+      body.appendChild(table("Per-slot evidence · local time · " + plan.slot_minutes + "-minute grid", headers, rows,
+        { numeric: [1, 5, 6] }));
+    }
+    var unmatched = Array.isArray(linkage.unmatched_dispatches) ? linkage.unmatched_dispatches : [];
+    if (!unmatched.length) return;
+    body.appendChild(el("p", { class: "legend-note", text:
+      "These persisted dispatch rows overlap the plan horizon but lack an exact plan/slot link. They are shown as unmatched, not joined to a slot."
+    }));
+    if (linkage.unmatched_dispatch_truncated) {
+      body.appendChild(el("p", { class: "muted", text: "Showing the 100 newest unmatched rows; more are retained in Log." }));
+    }
+    var unmatchedRows = unmatched.map(function (row) {
+      return [
+        fmtDateTime(row.ts),
+        row.battery_id || "unknown battery",
+        fmtPower(row.requested_w),
+        fmtPower(row.applied_w),
+        String(row.result || "unknown").replace(/_/g, " ") + " · " + reasonText(row.reason || row.code) +
+          " · " + (row.mode || "unknown mode") + (row.dry_run ? " · dry run" : ""),
+        row.message || ""
+      ];
+    });
+    body.appendChild(table("Unmatched dispatch rows · not attributed to this plan", [
+      "Time", "Battery", "Requested", "Driver-reported applied", "Result / reason", "Message"
+    ], unmatchedRows, { numeric: [2, 3] }));
+  }
+
+  function renderPlanHistory(body, payload) {
+    var plans = payload && Array.isArray(payload.plans) ? payload.plans : [];
+    if (!plans.length) {
+      body.appendChild(el("p", { class: "muted", text: "No prior saved plans are retained yet. The active plan's live execution appears above when available." }));
+      body.appendChild(el("p", { class: "legend-note", text: "History is bounded to the most recent 10 prior plans; the store retains up to 200 plan snapshots." }));
+      return;
+    }
+    var select = el("select", { id: "plan-history-select" });
+    plans.forEach(function (item) {
+      var label = "Plan #" + item.plan_id + " · " + fmtDateTime(item.generated_at) + " · " +
+        (item.mode || "unknown mode") + (item.dry_run ? " · dry run" : "") +
+        " · " + (item.slot_count || 0) + " slots";
+      select.appendChild(el("option", { value: item.plan_id, text: label }));
+    });
+    select.value = String(plans[0].plan_id);
+    var detail = el("div");
+    var request = 0;
+    function loadSelected() {
+      var id = select.value;
+      var current = ++request;
+      panelStatus(detail, "loading", "Loading saved plan evidence…");
+      get("/plan/history", { plan_id: id }).then(function (report) {
+        if (current !== request || !detail.isConnected) return;
+        clear(detail);
+        renderPlanHistoryDetail(detail, report);
+      }).catch(function (err) {
+        if (current !== request || !detail.isConnected) return;
+        panelStatus(detail, "error", "Could not load this saved plan: " + (err && err.message ? err.message : err), loadSelected);
+      });
+    }
+    select.addEventListener("change", loadSelected);
+    body.appendChild(el("p", { class: "legend-note", text:
+      "The current plan and live execution remain in the panels above when available. Choose a retained plan to compare planned setpoints, dispatch requests, driver-reported applied values, and separately measured outcomes."
+    }));
+    body.appendChild(el("div", { class: "toolbar" }, [
+      el("label", { for: "plan-history-select" }, ["Saved plan ", select])
+    ]));
+    body.appendChild(detail);
+    loadSelected();
+  }
+
   function viewPlan(host, query) {
     var hours = horizonFrom(query);
     var cached = null;
@@ -2756,6 +2901,18 @@
       renderPlanWindows(body, data.plan, data.execution, planWindowContext(data));
     });
     addPanel("All slots", function (body, data) { renderPlanSlots(body, data.plan); });
+    var historyCache = null;
+    var historyPanel = asyncPanel(host, "Plan history", {
+      load: function () {
+        if (!historyCache) historyCache = get("/plan/history", { limit: 10 }).catch(function (err) {
+          historyCache = null;
+          throw err;
+        });
+        return historyCache;
+      },
+      render: renderPlanHistory
+    });
+    panels.push(historyPanel);
 
     // Returning to the tab re-reads the plan, its execution join and the providers in place: the
     // "now" marker, the measured figures and the price age must not sit on a screen opened hours
@@ -2763,6 +2920,7 @@
     state.refresh = function () {
       if (refreshBlocked()) return;
       cached = null;
+      historyCache = null;
       panels.forEach(function (p) { p.reload(); });
     };
     return function () {

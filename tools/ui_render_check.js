@@ -711,6 +711,12 @@ function classTokens(text) {
     /nothing measured yet/.test(A.windowSummary(syntheticWindows, { progress: { slots_elapsed: 0, slots_total: 3, coverage_pct: 0 } })));
 
   await goto("/plan");
+  const historyText = allText(view());
+  check("Plan history renders separated dispatch and measured evidence, including unmatched rows",
+    historyText.includes("Plan history") && historyText.includes("Dispatcher requested")
+      && historyText.includes("Driver-reported applied") && historyText.includes("Measured battery")
+      && historyText.includes("Measured grid") && historyText.includes("Unmatched dispatch rows"),
+    historyText.slice(-800));
   const livePlanFixture = await M.handle("GET", "/api/v1/plan?hours=36");
   const executionFixture = await M.handle("GET", "/api/v1/plan/execution?hours=36");
   check("the plan payload carries its own resolution",

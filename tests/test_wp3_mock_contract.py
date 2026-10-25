@@ -63,6 +63,7 @@ DOCUMENTED_ROUTES = [
     "GET /api/v1/status",
     "GET /api/v1/plan",
     "GET /api/v1/plan/execution",
+    "GET /api/v1/plan/history",
     "POST /api/v1/plan/recompute",
     "GET /api/v1/forecast",
     "GET /api/v1/batteries",
@@ -323,6 +324,21 @@ def test_plan_payload_matches_section_10(fixtures):
         assert isinstance(slot["price_stale"], bool)
     for battery in plan["batteries"]:
         assert_fields(battery, ["id", "name", "share_w"], "plan batteries[]")
+
+
+def test_plan_history_payload_keeps_command_and_measurement_evidence_distinct(fixtures):
+    index = fixtures["fixtures"]["plan_history"]
+    assert_fields(index, ["limit", "plans"], "GET /plan/history index")
+    assert index["plans"] and index["plans"][0]["plan_id"] == 42
+    detail = fixtures["fixtures"]["plan_history_detail"]
+    assert_fields(detail, ["plan", "linkage", "slots"], "GET /plan/history detail")
+    assert_fields(detail["slots"][0], [
+        "t", "minutes", "planned_setpoint_w", "action", "reason", "dispatch", "actual"
+    ], "GET /plan/history slots[]")
+    assert detail["slots"][0]["dispatch"]["batteries"][0]["last"]["requested_w"] == 600
+    assert detail["slots"][0]["dispatch"]["batteries"][0]["last"]["applied_w"] == 550
+    assert detail["slots"][0]["actual"]["battery_kw"] == 0.52
+    assert detail["linkage"]["unmatched_dispatches"][0]["attribution"] == "unmatched"
 
 
 def test_plan_execution_payload_matches_section_10(fixtures):

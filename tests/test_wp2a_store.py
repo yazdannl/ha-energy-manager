@@ -149,8 +149,42 @@ def test_plan_roundtrip(store):
     assert [slot.reason for slot in loaded.slots] == ["peak_discharge", "reserve_hold"]
     assert loaded.slots[0].action is Action.DISCHARGE
     assert loaded.slot_minutes == 15
+    assert loaded.slots[0].minutes == 0.0
     assert store.load_plan(999) is None
     assert store.list_plans() == [plan_id]
+
+
+def test_plan_dispatch_links_and_legacy_rows_remain_unlinked(store):
+    plan = Plan(
+        generated_at=NOW,
+        horizon_start=NOW,
+        horizon_end=NOW + timedelta(minutes=15),
+        slot_minutes=15,
+        slots=[PlanSlot(
+            t=NOW, buy=0.2, sell=0.05, pv_kw=0.0, load_kw=0.5, soc_kwh=4.0,
+            power_w=500.0, action=Action.CHARGE, reason="arbitrage_charge", minutes=11.5,
+        )],
+        summary=PlanSummary(),
+    )
+    plan_id = store.save_plan(plan)
+    linked_id = store.add_dispatch(
+        ts=NOW + timedelta(minutes=1), battery_id="battery_1", requested_w=500.0,
+        applied_w=450.0, result="ok", code="ramp_limit", reason="ramp_limit",
+        plan_id=plan_id, plan_slot_ts=NOW,
+    )
+    store.add_dispatch(
+        ts=NOW + timedelta(minutes=2), battery_id="battery_1", requested_w=500.0,
+        applied_w=0.0, result="ok", code="legacy", reason="legacy",
+    )
+
+    loaded = store.load_plan(plan_id)
+    assert loaded is not None and loaded.plan_id == plan_id
+    assert loaded.slots[0].minutes == pytest.approx(11.5)
+    linked = store.dispatch_log(limit=10, plan_id=plan_id, plan_slot_ts=NOW)
+    assert [row["id"] for row in linked] == [linked_id]
+    rows = store.dispatch_log(limit=10)
+    assert rows[0]["plan_id"] is None and rows[0]["plan_slot_ts"] is None
+    assert rows[1]["plan_id"] == plan_id and rows[1]["plan_slot_ts"] == NOW.isoformat()
 
 
 def test_measurements_and_actuals_upsert(store):
@@ -638,7 +672,7 @@ def test_schema_v5_seeds_the_history_from_the_pre_upgrade_rows(tmp_path):
     conn.close()
     store = Store(path)
     try:
-        assert store.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 8
+        assert store.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 9
         seeded = store.connection.execute(
             "SELECT at, origin FROM settings_history WHERE key = 'mode'"
         ).fetchone()
@@ -722,6 +756,10 @@ def test_schema_v2_migrates_a_v1_database_and_keeps_its_rows(tmp_path):
         "INSERT INTO savings_daily(day, import_kwh, cost_eur, baseline_cost_eur, savings_eur, battery_cycles)"
         " VALUES('2026-01-01', 2.0, 0.4, 0.6, 0.2, 0.5)"
     )
+    conn.execute(
+        "INSERT INTO dispatch_log(ts, battery_id, requested_w, applied_w, mode, dry_run, result, code, message)"
+        " VALUES('2026-01-01T00:00:00+00:00', 'battery_1', 500, 0, 'advisory', 1, 'ok', 'legacy', 'old row')"
+    )
     conn.commit()
     conn.close()
     store = Store(path)
@@ -729,10 +767,12 @@ def test_schema_v2_migrates_a_v1_database_and_keeps_its_rows(tmp_path):
         row = store.savings_daily_range("2026-01-01", "2026-01-01")[0]
         assert row["savings_eur"] == 0.2 and row["battery_cycles"] == 0.5
         assert row["charged_kwh"] is None and row["battery_measured"] is None  # unknown, not 0
+        old_dispatch = store.dispatch_log(limit=1)[0]
+        assert old_dispatch["plan_id"] is None and old_dispatch["plan_slot_ts"] is None
         store.upsert_savings_daily("2026-01-02", charged_kwh=1.5, battery_measured=1)
         assert store.savings_daily_range("2026-01-02", "2026-01-02")[0]["charged_kwh"] == 1.5
         version = store.connection.execute("SELECT version FROM schema_version").fetchone()[0]
-        assert version == SCHEMA_VERSION == 8
+        assert version == SCHEMA_VERSION == 9
     finally:
         store.close()
 

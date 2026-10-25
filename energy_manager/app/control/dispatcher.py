@@ -25,6 +25,7 @@ from ..models import (
     Reason,
     SystemState,
     clamp,
+    to_iso,
     utcnow,
 )
 from ..optimize.allocate import allocate_power, headroom_w
@@ -258,6 +259,11 @@ class Dispatcher:
         state.batteries = list(outcome.battery_states)
 
         slot = plan.slot_at(moment) if plan is not None else None
+        plan_slot = slot
+        provenance = {
+            "plan_id": getattr(plan, "plan_id", None) if plan is not None else None,
+            "plan_slot_ts": plan_slot.t if plan_slot is not None else None,
+        }
         outcome.stale_input = self._stale_input_reason(plan, slot, moment)
         if outcome.stale_input is not None:
             # A plan older than the bound, or one whose prices went stale, must not keep steering
@@ -345,6 +351,7 @@ class Dispatcher:
                         dry_run=bool(state.dry_run),
                         reason=decision.reasons[0],
                         soc_pct=self._soc_of(config, live_by_id.get(config.id)),
+                        **provenance,
                     )
                 )
             self.note_tick(moment)
@@ -378,6 +385,7 @@ class Dispatcher:
                     dry_run=bool(state.dry_run),
                     reason=code,
                     soc_pct=self._soc_of(config, live),
+                    **provenance,
                 )
             )
 
@@ -467,6 +475,7 @@ class Dispatcher:
                                 mode=str(state.mode),
                                 dry_run=False,
                                 reason=Reason.DRIVER_ERROR,
+                                **provenance,
                             )
                         )
             outcome.results.append(result)
@@ -481,6 +490,7 @@ class Dispatcher:
                     dry_run=bool(state.dry_run),
                     reason=reason,
                     soc_pct=self._soc_of(config, live_by_id.get(config.id)),
+                    **provenance,
                 )
             )
 
@@ -624,6 +634,8 @@ class Dispatcher:
         dry_run: bool,
         reason: str,
         soc_pct: float | None = None,
+        plan_id: int | None = None,
+        plan_slot_ts: datetime | None = None,
     ) -> dict[str, Any]:
         outcome = "ok"
         if not result.ok:
@@ -644,5 +656,7 @@ class Dispatcher:
             "code": result.code,
             "message": result.message,
             "reason": reason,
+            "plan_id": plan_id,
+            "plan_slot_ts": to_iso(plan_slot_ts),
             "writes": list(result.writes),
         }

@@ -548,6 +548,8 @@ class Plan:
     #: Additive (0.17.0): the same scheduled-full-charge block as ``summary.maintenance``, surfaced
     #: at the top of ``GET /api/v1/plan`` for clients that read the plan but not its summary.
     maintenance: dict[str, Any] | None = None
+    #: Persistent ``plans.id`` when this plan was saved; ``None`` for an in-memory plan.
+    plan_id: int | None = None
 
     def slot_at(self, when: datetime) -> PlanSlot | None:
         for slot in self.slots:

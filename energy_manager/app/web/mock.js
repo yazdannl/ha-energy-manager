@@ -239,6 +239,60 @@
     };
   }
 
+  // Synthetic prior-plan evidence for the bounded Plan-history UI; never presented as live data.
+  function planHistoryIndex() {
+    var generated = Date.now() - 4 * SLOT_MS;
+    return {
+      limit: 10,
+      plans: [
+        { plan_id: 42, generated_at: iso(generated), horizon_start: iso(generated + SLOT_MS), horizon_end: iso(generated + 3 * SLOT_MS), slot_minutes: 60, mode: "auto", dry_run: false, feasible: true, slot_count: 2, dispatch_records: 2, sources: { price: "zonneplan_entity", solar: "capacity", load: "statistics" } },
+        { plan_id: 41, generated_at: iso(generated - 2 * SLOT_MS), horizon_start: iso(generated - SLOT_MS), horizon_end: iso(generated + SLOT_MS), slot_minutes: 60, mode: "advisory", dry_run: true, feasible: true, slot_count: 2, dispatch_records: 0, sources: { price: "zonneplan_entity", solar: "capacity", load: "statistics" } }
+      ]
+    };
+  }
+
+  function planHistoryDetail(rawId) {
+    var id = parseInt(rawId, 10) || 42;
+    var start = Date.now() - 3 * SLOT_MS;
+    var generated = start - SLOT_MS;
+    var firstTs = iso(start);
+    return {
+      plan: {
+        plan_id: id, generated_at: iso(generated), horizon_start: firstTs, horizon_end: iso(start + 2 * SLOT_MS),
+        slot_minutes: 60, mode: "auto", dry_run: false, feasible: true, infeasible_reason: null,
+        sources: { price: "zonneplan_entity", solar: "capacity", load: "statistics" }
+      },
+      linkage: {
+        dispatch: "Exact plan_id and plan_slot_ts identifiers plus a dispatch timestamp inside that slot; no time-only join.",
+        dispatch_note: "Older dispatch rows do not have these identifiers and are omitted; overlapping replans make their plan ownership unknowable.",
+        measurement_note: "Measured actuals are aligned to the slot by timestamp, not causally attributed to this plan. Missing series remain null.",
+        applied_note: "applied_w is driver-reported command/read-back evidence, not measured battery or grid flow.",
+        requested_note: "requested_w is the per-battery driver request when allocated; refusal or missing-driver paths can repeat the aggregate target, so do not sum blindly.",
+        unassigned_dispatches: 0, dispatch_records: 2, unmatched_dispatch_count: 1,
+        unmatched_dispatches: [{ id: 9001, ts: iso(start + 10 * 60000), battery_id: "battery_1", requested_w: 600,
+          applied_w: 0, result: "ok", code: "legacy", reason: "legacy", message: "Synthetic legacy row without plan/slot identifiers.",
+          mode: "advisory", dry_run: true, plan_id: null, plan_slot_ts: null, attribution: "unmatched" }],
+        unmatched_dispatch_truncated: false
+      },
+      slots: [
+        {
+          t: firstTs, minutes: 60, duration_known: true, planned_setpoint_w: 600, action: "charge", reason: "arbitrage_charge",
+          dispatch: { records: 2, batteries: [{ id: "battery_1", attempts: 2, last: {
+            ts: iso(start + 5 * 60000), requested_w: 600, applied_w: 550, result: "ok", code: "ramp_limit",
+            reason: "ramp_limit", message: "Limited by the per-tick ramp.", mode: "auto", dry_run: false
+          } }] },
+          actual: { samples: 12, coverage_pct: 100, battery_kw: 0.52, battery_samples: 10, battery_coverage_pct: 83.3,
+            grid_kw: 1.14, grid_samples: 12, grid_coverage_pct: 100, charged_kwh: 0.52, discharged_kwh: 0,
+            import_kwh: 1.14, export_kwh: 0, soc_kwh_start: 6.1, soc_kwh_end: 6.62 }
+        },
+        {
+          t: iso(start + SLOT_MS), minutes: 60, duration_known: true, planned_setpoint_w: 0, action: "hold", reason: "reserve_hold",
+          dispatch: null, actual: null
+        }
+      ]
+    };
+  }
+
   // What the dispatcher would have written for this slot in the demo's mode: advisory/dry-run
   // skip the write, auto applies the setpoint. A stale slot is refused, so it gets no attempt.
   function dispatchFor(slot) {
@@ -1402,6 +1456,9 @@
     "GET /api/v1/status": function () { return statusPayload(); },
     "GET /api/v1/plan": function (ctx) { return planPayload(ctx.params.hours); },
     "GET /api/v1/plan/execution": function (ctx) { return executionPayload(ctx.params.hours); },
+    "GET /api/v1/plan/history": function (ctx) {
+      return ctx.params.plan_id ? planHistoryDetail(ctx.params.plan_id) : planHistoryIndex();
+    },
     "POST /api/v1/plan/recompute": function () { return { queued: true }; },
     "GET /api/v1/forecast-history": function (ctx) { return forecastHistoryPayload(ctx.params); },
     "GET /api/v1/forecast": function (ctx) {
@@ -1666,6 +1723,8 @@
     out.status = routes["GET /api/v1/status"]({ params: {} });
     out.plan = routes["GET /api/v1/plan"]({ params: { hours: "36" } });
     out.plan_execution = routes["GET /api/v1/plan/execution"]({ params: { hours: "36" } });
+    out.plan_history = routes["GET /api/v1/plan/history"]({ params: {} });
+    out.plan_history_detail = routes["GET /api/v1/plan/history"]({ params: { plan_id: "42" } });
     out.price = routes["GET /api/v1/forecast"]({ params: { kind: "price", hours: "36" } });
     out.solar = routes["GET /api/v1/forecast"]({ params: { kind: "solar", hours: "36" } });
     out.load = routes["GET /api/v1/forecast"]({ params: { kind: "load", hours: "36" } });

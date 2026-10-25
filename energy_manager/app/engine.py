@@ -137,6 +137,10 @@ CLAMP_TOLERANCE_W = 1.0
 #: WebSocket command per keystroke (names change far slower than the user types).
 DEVICE_CACHE_S = 5.0
 MAX_DISCOVER_ROWS = 50
+#: The history API reads at most one plan detail and this many prior plan summaries.
+PLAN_HISTORY_MAX_PLANS = 20
+#: Matches the store's bounded dispatch-log retention.
+PLAN_HISTORY_DISPATCH_LIMIT = 20_000
 
 #: Discovery kinds accepted by ``GET /api/v1/discover`` (SPEC 10).
 DISCOVER_KINDS = ("battery", "price", "solar", "load", "grid")
@@ -206,6 +210,8 @@ class Journal:
             "dry_run": bool(entry.get("dry_run")),
             "result": entry.get("result"),
             "reason": entry.get("reason"),
+            "plan_id": entry.get("plan_id"),
+            "plan_slot_ts": entry.get("plan_slot_ts"),
             "writes": list(entry.get("writes") or []),
         }
         record = {
@@ -220,8 +226,7 @@ class Journal:
         with self._lock:
             self._dispatches.append(record)
             del self._dispatches[: max(0, len(self._dispatches) - self._max)]
-        # The dispatch_log schema has no reason column; store the decision slug as the code when
-        # nothing else went wrong, so "why didn't it charge?" is answerable from the database too.
+        # Keep the decision slug in ``code`` for legacy readers as well as the explicit reason field.
         store_code = record["code"]
         if store_code in (Reason.OK, Reason.DRY_RUN, Reason.IDEMPOTENT_SKIP) and detail["reason"]:
             store_code = str(detail["reason"])
@@ -237,6 +242,9 @@ class Journal:
             result=str(detail["result"] or ""),
             code=store_code,
             message=record["message"],
+            reason=detail["reason"],
+            plan_id=detail["plan_id"],
+            plan_slot_ts=detail["plan_slot_ts"],
         )
 
     def event(
@@ -3610,6 +3618,9 @@ class Engine:
         plan.batteries = self._plan_battery_snapshot(plan, configs, now)
         changed = self._plan_changed(self._plan, plan)
         inputs_changed = self._plan_inputs is not None and self._plan_inputs != self._fingerprint()
+        plan_id = self._store_call("save_plan", plan)
+        if plan_id is not None:
+            plan.plan_id = int(plan_id)
         with self._lock:
             self._plan = plan
             self._state.active_plan = plan
@@ -3619,7 +3630,6 @@ class Engine:
             )
             self._plan_inputs = self._fingerprint()
             self._plan_applied_notified = False
-        self._store_call("save_plan", plan)
         self._record_plan_forecasts(plan, price, solar, load)
         with self._lock:
             self._state.price_now = self._price_now(now)
@@ -3629,6 +3639,8 @@ class Engine:
             "plan_updated",
             f"plan recomputed ({label}): {plan.summary.saved_eur:.2f} EUR vs baseline",
             {
+                "plan_id": plan.plan_id,
+                "generated_at": to_iso(plan.generated_at),
                 "reason": label,
                 "feasible": plan.feasible,
                 "infeasible_reason": plan.infeasible_reason,
@@ -3700,6 +3712,9 @@ class Engine:
             return plan
         plan.batteries = self._plan_battery_snapshot(plan, configs, now)
         changed = self._plan_changed(self._plan, plan)
+        plan_id = self._store_call("save_plan", plan)
+        if plan_id is not None:
+            plan.plan_id = int(plan_id)
         with self._lock:
             self._plan = plan
             self._state.active_plan = plan
@@ -3710,13 +3725,14 @@ class Engine:
             self._plan_inputs = self._fingerprint()
             self._plan_applied_notified = False
             self._state.price_now = None
-        self._store_call("save_plan", plan)
         captured = sum(1 for slot in plan.slots if slot.action == Action.PV_CHARGE)
         self._journal.event(
             "info",
             "plan_updated",
             "self-consumption plan (no price forecast): catching PV surplus",
             {
+                "plan_id": plan.plan_id,
+                "generated_at": to_iso(plan.generated_at),
                 "reason": reason,
                 "plan": selfconsumption.PLAN_SOURCE,
                 "pv_charge_kwh": plan.summary.pv_charge_kwh,
@@ -4732,15 +4748,263 @@ class Engine:
             return [dict(row) for row in self._actuals_ring]
 
     def _execution_dispatches(self, plan: Plan) -> list[dict[str, Any]]:
-        """Dispatch rows since the plan was generated: the persistent log, else the in-memory ring.
-
-        The ring holds ``Journal(max_entries)`` rows -- a few hours of ticks -- while the store keeps
-        the whole horizon, so the store is preferred whenever it is bound.
-        """
-        rows = self._store_call("dispatch_log", limit=2000, since=plan.horizon_start)
+        """Only attempts carrying this plan's persisted ID; time-only joins can cross replans."""
+        if plan.plan_id is None:
+            return []
+        rows = self._store_call(
+            "dispatch_log", limit=PLAN_HISTORY_DISPATCH_LIMIT, plan_id=plan.plan_id
+        )
         if rows:
             return list(rows)
-        return list(self._journal.dispatch_log(limit=600))
+        return [
+            row
+            for row in self._journal.dispatch_log(limit=600)
+            if row.get("plan_id") == plan.plan_id
+        ]
+
+    def plan_history(self, limit: int = 10) -> dict[str, Any]:
+        """Bounded summaries of saved plans other than the active plan."""
+        bounded = max(1, min(PLAN_HISTORY_MAX_PLANS, int(limit)))
+        records = self._store_call("list_plan_records", limit=bounded + 1) or []
+        active = self.active_plan()
+        active_id = getattr(active, "plan_id", None) if active is not None else None
+        plans = [
+            dict(record)
+            for record in records
+            if active_id is None or record.get("plan_id") != active_id
+        ][:bounded]
+        return {"limit": bounded, "plans": plans}
+
+    def plan_history_detail(
+        self, plan_id: int, now: datetime | None = None
+    ) -> dict[str, Any] | None:
+        """One retained plan with exact linked attempts and timestamp-aligned measured actuals."""
+        plan = self._store_call("load_plan", int(plan_id))
+        if plan is None:
+            return None
+        moment = now or self._clock()
+        minutes = float(plan.slot_minutes or 0.0)
+        if minutes <= 0.0:
+            return None
+
+        actual_rows = self._execution_actuals(plan, moment)
+        unique_actuals: dict[datetime, dict[str, Any]] = {}
+        for row in actual_rows:
+            try:
+                stamp = from_iso(row.get("ts"))
+            except ValueError:
+                continue
+            if stamp is None or stamp < plan.generated_at or stamp > moment:
+                continue
+            unique_actuals[stamp] = dict(row)
+        actual_rows = [unique_actuals[stamp] for stamp in sorted(unique_actuals)]
+        measured = analytics.measured_per_slot(
+            [slot.t for slot in plan.slots],
+            minutes,
+            actual_rows,
+            bucket_minutes=float(ACTUALS_MINUTES),
+            now=moment,
+        )
+
+        dispatch_rows = self._store_call(
+            "dispatch_log", limit=PLAN_HISTORY_DISPATCH_LIMIT, plan_id=plan.plan_id
+        ) or []
+        if not dispatch_rows:
+            dispatch_rows = [
+                row
+                for row in self._journal.dispatch_log(limit=600)
+                if row.get("plan_id") == plan.plan_id
+            ]
+        unmatched_rows = self._store_call(
+            "dispatch_log", limit=PLAN_HISTORY_DISPATCH_LIMIT, since=plan.horizon_start
+        ) or []
+        if not unmatched_rows:
+            unmatched_rows = self._journal.dispatch_log(limit=600)
+        unmatched_dispatches: list[dict[str, Any]] = []
+        slot_by_ts = {slot.t: slot for slot in plan.slots}
+        known_slots = set(slot_by_ts)
+        unmatched_end = min(plan.horizon_end, moment + timedelta(minutes=ACTUALS_MINUTES))
+        for row in unmatched_rows:
+            if row.get("plan_id") not in (None, plan.plan_id):
+                continue
+            try:
+                stamp = from_iso(row.get("ts"))
+            except ValueError:
+                continue
+            if stamp is None or not plan.horizon_start <= stamp < unmatched_end:
+                continue
+            try:
+                linked_slot = from_iso(row.get("plan_slot_ts"))
+            except ValueError:
+                linked_slot = None
+            if (
+                row.get("plan_id") == plan.plan_id
+                and linked_slot in known_slots
+                and linked_slot <= stamp < linked_slot + timedelta(minutes=minutes)
+            ):
+                continue
+            unmatched_dispatches.append(
+                {
+                    "id": row.get("id"),
+                    "ts": row.get("ts"),
+                    "battery_id": row.get("battery_id"),
+                    "requested_w": row.get("requested_w"),
+                    "applied_w": row.get("applied_w"),
+                    "result": row.get("result"),
+                    "code": row.get("code") or "",
+                    "reason": row.get("reason") or row.get("code") or "",
+                    "message": row.get("message") or "",
+                    "mode": row.get("mode") or "",
+                    "dry_run": bool(row.get("dry_run")),
+                    "plan_id": row.get("plan_id"),
+                    "plan_slot_ts": row.get("plan_slot_ts"),
+                    "attribution": "unmatched",
+                }
+            )
+        # Store queries are newest-first by id; preserve their order and avoid sorting offset strings.
+        unmatched_dispatch_count = len(unmatched_dispatches)
+        unmatched_dispatches = unmatched_dispatches[:100]
+        by_slot: dict[datetime, dict[str, Any]] = {}
+        unassigned_dispatches = 0
+        for row in dispatch_rows:
+            try:
+                slot_stamp = from_iso(row.get("plan_slot_ts"))
+                dispatch_stamp = from_iso(row.get("ts"))
+            except ValueError:
+                slot_stamp = dispatch_stamp = None
+            if (
+                slot_stamp not in known_slots
+                or dispatch_stamp is None
+                or not slot_stamp <= dispatch_stamp < slot_stamp + timedelta(minutes=minutes)
+            ):
+                unassigned_dispatches += 1
+                continue
+            battery_id = str(row.get("battery_id") or "")
+            slot_entry = by_slot.setdefault(slot_stamp, {"records": 0, "batteries": {}})
+            slot_entry["records"] += 1
+            battery = slot_entry["batteries"].setdefault(
+                battery_id, {"attempts": 0, "last_id": -1, "last": None}
+            )
+            battery["attempts"] += 1
+            row_id = int(row.get("id") or 0)
+            if row_id > battery["last_id"]:
+                battery["last_id"] = row_id
+                battery["last"] = {
+                    "ts": row.get("ts"),
+                    "requested_w": row.get("requested_w"),
+                    "applied_w": row.get("applied_w"),
+                    "result": row.get("result"),
+                    "code": row.get("code") or "",
+                    "reason": row.get("reason") or row.get("code") or "",
+                    "message": row.get("message") or "",
+                    "mode": row.get("mode") or "",
+                    "dry_run": bool(row.get("dry_run")),
+                }
+
+        slots: list[dict[str, Any]] = []
+        for index, slot in enumerate(plan.slots):
+            duration = float(slot.minutes or minutes)
+            duration_known = bool(slot.minutes and slot.minutes > 0.0)
+            interval_end = slot.t + timedelta(minutes=minutes)
+            samples = [
+                row
+                for row in actual_rows
+                if (stamp := from_iso(row.get("ts"))) is not None
+                and slot.t <= stamp < interval_end
+            ]
+            actual = measured[index]
+            if actual is None:
+                actual_payload = None
+            else:
+                battery_samples = sum(row.get("battery_kw") is not None for row in samples)
+                grid_samples = sum(row.get("grid_kw") is not None for row in samples)
+                def coverage(sample_count: int) -> float | None:
+                    if not duration_known or duration <= 0.0:
+                        return None
+                    return min(100.0, 100.0 * sample_count * float(ACTUALS_MINUTES) / duration)
+
+                actual_payload = {
+                    "samples": int(actual.get("samples") or 0),
+                    "coverage_pct": coverage(int(actual.get("samples") or 0)),
+                    "battery_kw": actual.get("battery_kw"),
+                    "battery_samples": battery_samples,
+                    "battery_coverage_pct": coverage(battery_samples),
+                    "grid_kw": actual.get("grid_kw"),
+                    "grid_samples": grid_samples,
+                    "grid_coverage_pct": coverage(grid_samples),
+                    "charged_kwh": actual.get("charged_kwh") if battery_samples else None,
+                    "discharged_kwh": actual.get("discharged_kwh") if battery_samples else None,
+                    "import_kwh": actual.get("import_kwh") if grid_samples else None,
+                    "export_kwh": actual.get("export_kwh") if grid_samples else None,
+                    "soc_kwh_start": actual.get("soc_kwh_start"),
+                    "soc_kwh_end": actual.get("soc_kwh_end"),
+                }
+            dispatch = by_slot.get(slot.t)
+            slots.append(
+                {
+                    "t": to_iso(slot.t),
+                    "minutes": duration,
+                    "duration_known": duration_known,
+                    "planned_setpoint_w": float(slot.power_w),
+                    "action": slot.action.value if isinstance(slot.action, Action) else str(slot.action),
+                    "reason": slot.reason,
+                    "dispatch": None
+                    if dispatch is None
+                    else {
+                        "records": dispatch["records"],
+                        "batteries": [
+                            {
+                                "id": battery_id,
+                                "attempts": item["attempts"],
+                                "last": item["last"],
+                            }
+                            for battery_id, item in sorted(dispatch["batteries"].items())
+                        ],
+                    },
+                    "actual": actual_payload,
+                }
+            )
+
+        return {
+            "plan": {
+                "plan_id": plan.plan_id,
+                "generated_at": to_iso(plan.generated_at),
+                "horizon_start": to_iso(plan.horizon_start),
+                "horizon_end": to_iso(plan.horizon_end),
+                "slot_minutes": int(minutes),
+                "mode": plan.mode,
+                "dry_run": bool(plan.dry_run),
+                "feasible": bool(plan.feasible),
+                "infeasible_reason": plan.infeasible_reason,
+                "sources": dict(plan.sources),
+            },
+            "linkage": {
+                "dispatch": "Exact plan_id and plan_slot_ts identifiers plus a dispatch timestamp inside that slot; no time-only join.",
+                "dispatch_note": (
+                    "Older dispatch rows without exact plan/slot identifiers stay unmatched; they are "
+                    "listed separately when their timestamps fall in this horizon. Overlapping replans "
+                    "make their plan ownership unknowable."
+                ),
+                "measurement_note": (
+                    "Measured actuals are aligned to the slot by timestamp, not causally attributed "
+                    "to this plan. Missing series remain null."
+                ),
+                "applied_note": (
+                    "applied_w is driver-reported command/read-back evidence, not measured battery "
+                    "or grid flow."
+                ),
+                "requested_note": (
+                    "requested_w is the per-battery driver request when allocated; refusal or missing-"
+                    "driver paths can repeat the aggregate target, so do not sum blindly."
+                ),
+                "unassigned_dispatches": unassigned_dispatches,
+                "unmatched_dispatch_count": unmatched_dispatch_count,
+                "unmatched_dispatches": unmatched_dispatches,
+                "unmatched_dispatch_truncated": unmatched_dispatch_count > len(unmatched_dispatches),
+                "dispatch_records": len(dispatch_rows),
+            },
+            "slots": slots,
+        }
 
     # ------------------------------------------------------------------ log/export
 
@@ -5428,8 +5692,12 @@ def _dispatch_in_window(
     last_row: Mapping[str, Any] | None = None
     records = 0
     for row in rows:
-        stamp = from_iso(row.get("ts"))
-        if stamp is None or not start <= stamp < end:
+        try:
+            stamp = from_iso(row.get("ts"))
+            slot_stamp = from_iso(row.get("plan_slot_ts"))
+        except ValueError:
+            continue
+        if stamp is None or slot_stamp != start or not start <= stamp < end:
             continue
         records += 1
         latest[str(row.get("battery_id") or "")] = row

@@ -1063,12 +1063,16 @@ def test_dispatcher_auto_writes_the_allocated_power():
     journal = FakeJournal()
     dispatcher, _ = dispatcher_with(ha, cfg, journal)
     state = system_state(dry_run=False)
-    outcome = dispatcher.tick(NOW, state=state, plan=make_plan(), batteries=[cfg])
+    plan = make_plan()
+    plan.plan_id = 77
+    outcome = dispatcher.tick(NOW, state=state, plan=plan, batteries=[cfg])
     assert outcome.block is False
     assert ha.calls and ha.calls[0][0] == "number"
     assert ha.calls[0][2]["value"] == 600.0
     assert journal.dispatches[0]["result"] == "ok"
     assert journal.dispatches[0]["applied_w"] == 600.0
+    assert journal.dispatches[0]["plan_id"] == 77
+    assert journal.dispatches[0]["plan_slot_ts"] == plan.slots[0].t.isoformat()
 
 
 def test_dispatcher_ramps_from_the_live_power():

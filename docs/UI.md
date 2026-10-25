@@ -18,7 +18,7 @@ Hash routing (`app.js: splitHash()`), eight views, all rendered client-side:
 | Route | View | Purpose |
 | --- | --- | --- |
 | `#/dashboard` | `viewDashboard` | Live now-cards, alerts, 24 h mini-chart, autopilot controls |
-| `#/plan` | `viewPlan` | Aligned timeline, plan summary, per-slot table, recompute |
+| `#/plan` | `viewPlan` | Aligned timeline, plan summary, per-slot table, bounded plan history, recompute |
 | `#/forecasts` | `viewForecasts` | Price / solar / load panels, per-day totals, bounded forecast-vintage history, accuracy trend, provider health |
 | `#/batteries` | `viewBatteries` | Battery cards, discovery-based add/edit wizard, bounded test discharge |
 | `#/savings` | `viewSavings` | Range totals, savings vs baseline chart, per-bucket table, baseline definition |
@@ -118,6 +118,15 @@ marker and a legend naming each action, one card per window tinted by its action
 on a tile, a charge gauge whose fill is the level the window ends on and whose ticks are where it
 started and the floor it defends, and a glyph per fact. Every one of those cues is repeated in words
 beside it, so nothing is carried by colour or shape alone.
+The **Plan history** panel lists up to 10 retained prior plans and fetches one selected snapshot's
+slot rows at a time. Planned setpoint, dispatcher-requested watts, driver-reported applied watts,
+measured battery flow, and measured grid flow remain separate; battery/grid coverage is independent.
+Older snapshots without a stored slot duration keep sample counts but show coverage percentages as unavailable rather than guessed.
+Dispatch records link only when persisted plan ID and slot timestamp match and the event time falls inside the slot. Legacy or otherwise
+unlinked rows in the horizon are shown in a separate unmatched table, never assigned by a guessed
+time join. Actuals align by timestamp but do not establish causality to a plan, and driver-reported
+`applied_w` is not measured battery/grid flow.
+
 The view installs `state.refresh`, so returning to the tab re-reads the plan, its execution join and
 the provider freshness in place — it keeps no timer of its own. The price chart draws the **break-even line**
 (`buy / round_trip + wear`, from the aggregate the plan assumed) across the

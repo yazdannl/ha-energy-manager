@@ -495,6 +495,97 @@ def plan_execution_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def plan_history_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Bounded plan-history index; slot evidence is fetched for one selected plan at a time."""
+    return {
+        "limit": int(payload.get("limit") or 0),
+        "plans": [
+            {
+                "plan_id": int(item.get("plan_id") or 0),
+                "generated_at": item.get("generated_at"),
+                "horizon_start": item.get("horizon_start"),
+                "horizon_end": item.get("horizon_end"),
+                "slot_minutes": int(item.get("slot_minutes") or 0),
+                "mode": item.get("mode") or "",
+                "dry_run": bool(item.get("dry_run")),
+                "feasible": bool(item.get("feasible")),
+                "slot_count": int(item.get("slot_count") or 0),
+                "dispatch_records": int(item.get("dispatch_records") or 0),
+                "sources": dict(item.get("sources") or {}),
+            }
+            for item in payload.get("plans") or []
+        ],
+    }
+
+
+def plan_history_detail_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Rounded evidence for one persisted plan, keeping commands separate from measured actuals."""
+    slots: list[dict[str, Any]] = []
+    for entry in payload.get("slots") or []:
+        dispatch = entry.get("dispatch")
+        if dispatch is None:
+            rounded_dispatch = None
+        else:
+            rounded_dispatch = {
+                "records": int(dispatch.get("records") or 0),
+                "batteries": [
+                    {
+                        "id": item.get("id"),
+                        "attempts": int(item.get("attempts") or 0),
+                        "last": None
+                        if not item.get("last")
+                        else {
+                            "ts": item["last"].get("ts"),
+                            "requested_w": _round(item["last"].get("requested_w")),
+                            "applied_w": _round(item["last"].get("applied_w")),
+                            "result": item["last"].get("result"),
+                            "code": item["last"].get("code") or "",
+                            "reason": item["last"].get("reason") or "",
+                            "message": item["last"].get("message") or "",
+                            "mode": item["last"].get("mode") or "",
+                            "dry_run": bool(item["last"].get("dry_run")),
+                        },
+                    }
+                    for item in dispatch.get("batteries") or []
+                ],
+            }
+        slots.append(
+            {
+                "t": entry.get("t"),
+                "minutes": _round(entry.get("minutes")),
+                "duration_known": bool(entry.get("duration_known")),
+                "planned_setpoint_w": _round(entry.get("planned_setpoint_w")),
+                "action": entry.get("action") or "",
+                "reason": entry.get("reason") or "",
+                "dispatch": rounded_dispatch,
+                "actual": _rounded_actual(entry.get("actual")),
+            }
+        )
+    plan = dict(payload.get("plan") or {})
+    plan["sources"] = dict(plan.get("sources") or {})
+    linkage = dict(payload.get("linkage") or {})
+    linkage["unmatched_dispatches"] = [
+        {
+            "id": item.get("id"),
+            "ts": item.get("ts"),
+            "battery_id": item.get("battery_id"),
+            "requested_w": _round(item.get("requested_w")),
+            "applied_w": _round(item.get("applied_w")),
+            "result": item.get("result"),
+            "code": item.get("code") or "",
+            "reason": item.get("reason") or "",
+            "message": item.get("message") or "",
+            "mode": item.get("mode") or "",
+            "dry_run": bool(item.get("dry_run")),
+            "plan_id": item.get("plan_id"),
+            "plan_slot_ts": item.get("plan_slot_ts"),
+            "attribution": "unmatched",
+        }
+        for item in linkage.get("unmatched_dispatches") or []
+    ]
+    return {"plan": plan, "linkage": linkage, "slots": slots}
+
+
 def _rounded_dispatch(dispatch: Mapping[str, Any] | None) -> dict[str, Any] | None:
     if not dispatch:
         return None
@@ -1000,6 +1091,20 @@ class ApiServer:
                 )
             )
 
+        if route == "plan/history" and method == "GET":
+            raw_plan_id = query.get("plan_id")
+            if raw_plan_id:
+                plan_id = _history_plan_id(raw_plan_id)
+                detail = engine.plan_history_detail(plan_id, now)
+                if detail is None:
+                    raise ApiError(404, "plan_not_found", f"saved plan {plan_id} is not retained")
+                return self._json(plan_history_detail_dict(detail))
+            return self._json(
+                plan_history_dict(
+                    engine.plan_history(_history_limit(query.get("limit"), default=10))
+                )
+            )
+
         if route == "forecast" and method == "GET":
             kind = str(query.get("kind") or "price")
             if kind not in ("price", "solar", "load"):
@@ -1496,6 +1601,24 @@ def _limit(raw: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, min(1000, value))
+
+
+def _history_limit(raw: Any, default: int) -> int:
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(20, value))
+
+
+def _history_plan_id(raw: Any) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("plan_id must be a positive integer") from None
+    if value <= 0:
+        raise ValueError("plan_id must be a positive integer")
+    return value
 
 
 def _csv_cell(value: Any) -> Any:

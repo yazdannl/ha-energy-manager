@@ -177,6 +177,7 @@ def test_replan_creates_a_plan_and_records_it():
     assert plan is not None and plan.slots and plan.horizon_start == clock.now.replace(minute=0)
     assert engine.active_plan() is plan
     assert store.plans and store.plans[-1] is plan
+    assert plan.plan_id == 1
     events = [code for _, code, _, _ in [(e["level"], e["code"], e["message"], e.get("detail")) for e in store.events]]
     assert "plan_updated" in events
     assert plan.summary.charged_kwh >= 0.0
@@ -201,6 +202,10 @@ def test_advisory_mode_never_writes_and_auto_dry_run_never_writes():
     engine.tick_now()
     assert ha.service_calls == []
     assert any(entry["dry_run"] for entry in store.dispatches)
+    assert store.dispatches and all(
+        entry["plan_id"] == engine.active_plan().plan_id and entry["plan_slot_ts"]
+        for entry in store.dispatches
+    )
     engine.set_mode(Mode.AUTO.value, False)
     engine.tick_now()
     assert ha.service_calls
@@ -736,6 +741,8 @@ def test_plan_execution_joins_measured_actuals_and_dispatches():
             "code": Reason.POWER_CLAMP,
             "message": "clamped by the import limit",
             "reason": Reason.POWER_CLAMP,
+            "plan_id": plan.plan_id,
+            "plan_slot_ts": slot.t.isoformat(),
             "writes": [],
         }
     )

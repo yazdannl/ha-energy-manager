@@ -53,7 +53,7 @@ __all__ = [
     "table_exists",
 ]
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 #: One migration step: a SQL statement, or a Python step for work SQL cannot express (the history
 #: seed parses the instant it copies, and a stored ``+02:00`` offset is not a string operation).
@@ -163,6 +163,20 @@ def _create_forecast_history(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_forecast_vintages_target_issue"
         " ON forecast_vintages(target_ts, issued_at)"
+    )
+
+
+def _add_plan_dispatch_history(conn: sqlite3.Connection) -> None:
+    """Migration 9: retain slot duration and exact plan/slot links on dispatcher records."""
+    _add_columns_if_missing(conn, "plan_slots", {"minutes": "REAL"})
+    _add_columns_if_missing(
+        conn,
+        "dispatch_log",
+        {"plan_id": "INTEGER", "plan_slot_ts": "TEXT", "reason": "TEXT"},
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dispatch_log_plan_slot"
+        " ON dispatch_log(plan_id, plan_slot_ts, id)"
     )
 
 
@@ -437,6 +451,14 @@ MIGRATIONS: list[tuple[int, tuple[MigrationStep, ...]]] = [
             # PV samples, and keep an append-only solar vintage separate from the existing learned
             # forecast_archive contract. The migration is idempotent for replay scratch databases.
             _create_forecast_history,
+        ),
+    ),
+    (
+        9,
+        (
+            # Plan history keeps exact links for new dispatch attempts. Existing rows intentionally
+            # remain NULL: a timestamp-only join cannot identify which overlapping replan they used.
+            _add_plan_dispatch_history,
         ),
     ),
 ]
@@ -1082,7 +1104,7 @@ class Store:
             plan_id = int(cursor.lastrowid or 0)
             conn.executemany(
                 "INSERT INTO plan_slots(plan_id, t, buy, sell, pv_kw, load_kw, soc_kwh, power_w,"
-                " action, reason) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " action, reason, minutes) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         plan_id,
@@ -1095,6 +1117,7 @@ class Store:
                         slot.power_w,
                         slot.action.value if isinstance(slot.action, Action) else str(slot.action),
                         slot.reason,
+                        float(slot.minutes or 0.0),
                     )
                     for slot in plan.slots
                 ],
@@ -1117,6 +1140,37 @@ class Store:
         ).fetchall()
         return [int(row["id"]) for row in rows]
 
+    def list_plan_records(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Newest bounded plan provenance rows, with counts but no slot payloads."""
+        bounded = max(1, min(21, int(limit)))
+        rows = self.connection.execute(
+            "SELECT p.id, p.created_at, p.horizon_start, p.horizon_end, p.mode, p.dry_run,"
+            " p.feasible, p.summary_json,"
+            " (SELECT COUNT(*) FROM plan_slots s WHERE s.plan_id = p.id) AS slot_count,"
+            " (SELECT COUNT(*) FROM dispatch_log d WHERE d.plan_id = p.id) AS dispatch_records"
+            " FROM plans p ORDER BY p.id DESC LIMIT ?",
+            (bounded,),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            summary = _json_loads(row["summary_json"], {}) or {}
+            result.append(
+                {
+                    "plan_id": int(row["id"]),
+                    "generated_at": row["created_at"],
+                    "horizon_start": row["horizon_start"],
+                    "horizon_end": row["horizon_end"],
+                    "slot_minutes": int(summary.get("slot_minutes") or 15),
+                    "mode": row["mode"] or "advisory",
+                    "dry_run": bool(row["dry_run"]),
+                    "feasible": bool(row["feasible"]),
+                    "slot_count": int(row["slot_count"] or 0),
+                    "dispatch_records": int(row["dispatch_records"] or 0),
+                    "sources": summary.get("sources") or {},
+                }
+            )
+        return result
+
     def _plan_from_row(self, row: sqlite3.Row) -> Plan:
         summary_raw = _json_loads(row["summary_json"], {}) or {}
         infeasible_reason = summary_raw.pop("infeasible_reason", None)
@@ -1135,6 +1189,7 @@ class Store:
                 power_w=float(s["power_w"] or 0.0),
                 action=Action(s["action"]) if s["action"] else Action.HOLD,
                 reason=s["reason"] or "",
+                minutes=float(s["minutes"] or 0.0),
             )
             for s in self.connection.execute(
                 "SELECT * FROM plan_slots WHERE plan_id = ? ORDER BY t", (row["id"],)
@@ -1160,6 +1215,7 @@ class Store:
             # Additive (0.17.0): the maintenance block rides in summary_json; keep the top-level
             # field consistent for a plan restored from the store.
             maintenance=getattr(summary, "maintenance", None),
+            plan_id=int(row["id"]),
         )
 
     # ------------------------------------------------------------------ dispatch log
@@ -1176,11 +1232,15 @@ class Store:
         result: str = "",
         code: str = "",
         message: str = "",
+        reason: str | None = None,
+        plan_id: int | None = None,
+        plan_slot_ts: datetime | str | None = None,
     ) -> int:
         with _transaction(self.connection) as conn:
             cursor = conn.execute(
                 "INSERT INTO dispatch_log(ts, battery_id, requested_w, applied_w, soc_pct, mode,"
-                " dry_run, result, code, message) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " dry_run, result, code, message, reason, plan_id, plan_slot_ts)"
+                " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     _to_ts(ts, utcnow()),
                     battery_id,
@@ -1192,6 +1252,9 @@ class Store:
                     result,
                     code,
                     message,
+                    reason,
+                    plan_id,
+                    _to_ts(plan_slot_ts),
                 ),
             )
             return int(cursor.lastrowid or 0)
@@ -1203,6 +1266,9 @@ class Store:
         mode: str = "",
         soc_pct: float | None = None,
         outcome: str | None = None,
+        reason: str | None = None,
+        plan_id: int | None = None,
+        plan_slot_ts: datetime | str | None = None,
     ) -> int:
         return self.add_dispatch(
             ts=result.ts,
@@ -1215,10 +1281,18 @@ class Store:
             result=outcome if outcome is not None else ("ok" if result.ok else "error"),
             code=result.code,
             message=result.message,
+            reason=reason,
+            plan_id=plan_id,
+            plan_slot_ts=plan_slot_ts,
         )
 
     def dispatch_log(
-        self, limit: int = 100, battery_id: str | None = None, since: datetime | None = None
+        self,
+        limit: int = 100,
+        battery_id: str | None = None,
+        since: datetime | None = None,
+        plan_id: int | None = None,
+        plan_slot_ts: datetime | str | None = None,
     ) -> list[dict[str, Any]]:
         query = "SELECT * FROM dispatch_log"
         clauses: list[str] = []
@@ -1229,6 +1303,12 @@ class Store:
         if since is not None:
             clauses.append("ts >= ?")
             params.append(to_iso(since))
+        if plan_id is not None:
+            clauses.append("plan_id = ?")
+            params.append(int(plan_id))
+        if plan_slot_ts is not None:
+            clauses.append("plan_slot_ts = ?")
+            params.append(_to_ts(plan_slot_ts))
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY id DESC LIMIT ?"

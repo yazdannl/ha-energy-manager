@@ -64,7 +64,7 @@ def test_schema_v8_is_idempotent_and_adds_separate_history_tables(tmp_path):
 
     reopened = Store(path)
     try:
-        assert reopened.connection.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION == 8
+        assert reopened.connection.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION == 9
         columns = [row[1] for row in reopened.connection.execute("PRAGMA table_info(measurements)")]
         assert columns.count("entity_id") == columns.count("observed_at") == 1
         assert reopened.connection.execute(

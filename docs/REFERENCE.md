@@ -154,7 +154,7 @@ Warnings surfaced when the last control tick is older than **180 s**
 ### 2.4 Plan
 
 Panels: **Plan controls**, **Plan warnings**, **Timeline**, **Plan summary**, **Next actions**,
-**All slots**.
+**All slots**, **Plan history**.
 
 **Plan controls**
 
@@ -226,6 +226,19 @@ summary; each slot's full figures remain in **All slots**.
 energy. Rows carry `data-stale` for styling. Long plans
 render the first 48 rows with `Show all n slots` / `Show first 48 slots` toggles. Legend lists the
 action vocabulary: hold, charge, discharge, pv_charge, export, self_consumption, reserve.
+
+**Plan history** — bounded to the newest 10 prior snapshots in the store's 200-plan retention; it
+loads slot evidence for one selected plan at a time. The table keeps the planned setpoint, each
+battery's dispatcher request, the driver's reported applied value, measured battery flow, and
+measured grid flow in separate columns. Battery and grid coverage are reported separately. The
+header carries plan ID, creation/horizon timestamps, mode, dry-run state, and source provenance.
+Dispatch attempts link only by exact persisted `plan_id` plus `plan_slot_ts`, with the dispatch
+timestamp checked inside that slot. Legacy rows that fall
+inside the displayed horizon but lack an exact link remain in a separate **Unmatched dispatch rows**
+table and are never assigned to a slot; a slot with no linked attempt says so rather than inventing
+a refusal reason. Measured actuals are aligned to slot timestamps, not causally attributed to the
+saved plan. `applied_w` is driver-reported command/read-back evidence, not measured battery/grid
+flow. No new chart or optimizer behavior is introduced.
 
 ### 2.5 Forecasts
 
@@ -1942,9 +1955,23 @@ floor_soc_pct  = max(optimizer.reserve_soc_pct, every enabled battery's min_soc_
 
 A slot with no measurement reports `actual: null` and a window with no dispatch row reports
 `dispatch: null`; the UI renders "not reached yet", "no dispatch recorded" or the stale-price refusal
-from that absence rather than reading it as 0 W applied. The dispatch log is read from the store
-(everything since the plan was generated) and falls back to the in-memory journal ring, which only
-holds a few hours of ticks.
+from that absence rather than reading it as 0 W applied. Dispatch rows link only when their
+persisted `plan_id` and `plan_slot_ts` match and the dispatch timestamp falls inside the slot; older
+unlinked rows remain unmatched instead of being joined by time. The store is preferred, with the
+in-memory journal ring as a short-lived fallback.
+
+### 4.16 Bounded plan history dispatch report
+
+`GET /api/v1/plan/history` lists at most 20 prior plan summaries (the Plan view requests 10) and
+loads slot evidence for one selected retained plan. Plan/slot IDs are recorded on new dispatch rows;
+older dispatch rows are not backfilled. Historical actuals use the existing 5-minute `actuals` rows,
+matched to plan intervals by timestamp only. This is descriptive alignment, not proof that a plan
+caused the measured behavior. `requested_w` and `applied_w` remain driver-log values, not measured
+flow; battery/grid power and energy come only from the measurement rows. If an old plan did not
+retain a slot's modeled duration, sample counts remain available but percentage coverage is null.
+Unlinked rows in the horizon are returned with `attribution: "unmatched"`, outside the per-slot
+links. Plans expire under
+the existing 200-snapshot retention, and actuals/dispatch expire under their existing retention.
 
 ---
 
@@ -2010,6 +2037,7 @@ supplies it (which is why publishing a port would hand battery control to anyone
 additive 0.20.3), `manual_limits{}` (additive, 0.20.0: the raw per-direction mapping), `active_plan`, `next_cheap_window`, `next_expensive_window`, `override` (+ `seconds_left`), `alerts[]`, `provider_status[]` |
 | `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, slot_minutes, feasible, infeasible_reason, mode, dry_run, sources{}, maintenance, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh, maintenance{enabled,active,due,overdue,target_soc_pct,effective_target_soc_pct,interval_days,overdue_grace_hours,batteries[],due_batteries[],overdue_batteries[]} (additive, 0.17.0), sell_floor_eur_per_kwh (additive, 0.18.0)}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, minutes (additive 0.20.1), action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; `buy`/`sell` are `null` in an unpriced (self-consumption) plan (0.34.2); `slot_minutes` is the plan's own resolution (the UI never assumes one) and `minutes` is the duration the solver modelled for each slot (the full step, or the remaining part of the current clock slot; 0.20.1); with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` and `slot_minutes: null` |
 | `GET /api/v1/plan/execution` | `hours` | additive (0.10.0): `{generated_at, slot_minutes, now, floors{reserve_soc_pct, min_soc_pct, floor_soc_pct}, batteries[{id, name, min_soc_pct, floor_soc_pct, capacity_kwh}], progress{…}, slots[{t, minutes (additive 0.20.1), dispatch, actual}]}` — the same slot grid as `/plan`, joined with the persisted 5-minute actuals and the dispatch log. `dispatch` is the last attempt per battery in that slot (`requested_w`, `applied_w`, `ok`, `dry_run`, `clamped`, `code`, `reason`, `message`, `records`, `batteries[]`) and `actual` the measured aggregate (`samples`, `coverage_pct`, `pv_kw`, `load_kw`, `grid_kw`, `battery_kw`, `planned_kw`, `measured_kw`, `import_kwh`, `export_kwh`, `charged_kwh`, `discharged_kwh`, `soc_kwh_start`, `soc_kwh_end`). Both are `null` for a slot nothing was measured or dispatched in — never a fabricated zero |
+| `GET /api/v1/plan/history` | `limit` (1–20, default 10); optional `plan_id` selects one detail | Without `plan_id`, `{limit, plans[]}`: bounded prior plan summaries with provenance and evidence counts. With `plan_id`, `{plan, linkage, slots[]}` for one retained snapshot: each slot keeps `planned_setpoint_w`, plan/slot-ID-linked, time-validated per-battery dispatch attempts (`requested_w`, driver-reported `applied_w`, outcome/reason/attempt count), measured battery/grid actuals and independent coverage. `linkage.unmatched_dispatches[]` is explicitly `attribution: "unmatched"`; overlapping replans or legacy records are never joined by timestamp alone. Actuals are timestamp-aligned, not causal attribution. `404 plan_not_found` when the snapshot has expired from retention |
 | `POST /api/v1/plan/recompute` | — | `{queued: true}` (async; poll status) |
 | `GET /api/v1/forecast` | `kind=price\|solar\|load`, `hours` | `{kind, generated_at, source, stale, slots, provider, contract, notes[], reason, hint}`; frozen feed schema is unchanged |
 | `GET /api/v1/forecast-history` | `date=YYYY-MM-DD` (selected local date, defaults to today), `timezone` (IANA name, defaults `UTC`), `resolution=15m\|hour\|day` (defaults `15m`), `days=1…31` (day resolution only, defaults 14) | `{date, date_start, date_end, timezone, resolution, from, to, coverage, actual_provenance, series[]}`. Each row has a UTC target `start`/`end`, energy in kWh, selected forecast source/model/issue provenance, direct measured-PV source and coverage, and `error_kwh` (forecast − actual) only when both sides cover every interval. Hour/day totals sum interval kWh; partial covered sums remain separately labelled by coverage. |
