@@ -160,6 +160,31 @@ function classTokens(text) {
   historyResolution.dispatchEvent({ type: "change" });
   await sleep(220);
   check("daily history exposes a bounded 1–31 day selector", !!historyDays && !historyDays.hidden);
+  const pvScorecard = byClass(view(), "accuracy-scorecard")[0];
+  const pvScorecardText = pvScorecard ? allText(pvScorecard) : "";
+  check(
+    "Forecast accuracy shows PV energy error, signed bias and matched coverage",
+    /Archived PV forecast scorecard/.test(pvScorecardText)
+      && /PV mean absolute error/.test(pvScorecardText)
+      && /PV total absolute error/.test(pvScorecardText)
+      && /PV mean signed bias/.test(pvScorecardText)
+      && /Matched PV intervals/.test(pvScorecardText)
+      && /kWh/.test(pvScorecardText),
+    pvScorecardText.slice(0, 360),
+  );
+  check(
+    "PV scorecard defines complete direct samples and exposes period, lead-time and source breakdowns",
+    /three distinct fresh 5-minute direct pv_power samples/.test(pvScorecardText)
+      && /Local day/.test(pvScorecardText)
+      && /Forecast lead time/.test(pvScorecardText)
+      && /Forecast source/.test(pvScorecardText),
+    pvScorecardText.slice(-420),
+  );
+  check(
+    "PV scorecard does not display percentage accuracy metrics",
+    !!pvScorecard && !/MAPE|%/.test(pvScorecardText),
+    pvScorecardText.slice(0, 300),
+  );
 
   /* ---------- 1z. the dashboard-card installer (SPEC 12) ---------- */
   // The card is installed by hand from these three pieces of text: a download, a resource URL and a

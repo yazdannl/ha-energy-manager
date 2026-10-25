@@ -906,6 +906,8 @@ tbody tr:hover { background: var(--panel-2); }
 .forecast-history-vintage { margin: 0 0 var(--sp-1); }
 .forecast-history-vintage:last-child { margin-bottom: 0; }
 .forecast-history-summary { font-weight: 600; }
+.accuracy-scorecard { min-width: 0; }
+.accuracy-scorecard > h3 { margin: var(--sp-3) 0 var(--sp-2); font-size: 1rem; }
 
 /* ---------- charts ---------- */
 /* The chart surface itself lives in chart-theme.css, which the Lovelace card bundle also inlines so

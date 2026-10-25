@@ -1202,8 +1202,17 @@ class ApiServer:
 
         if route == "accuracy" and method == "GET":
             days = _limit(query.get("days"), 14)
+            timezone_name = str(query.get("timezone") or "UTC")
+            try:
+                ZoneInfo(timezone_name)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise ApiError(400, "invalid_timezone", "timezone must be a valid IANA time-zone name") from None
             reports = engine.accuracy(days)
-            return self._json({kind: accuracy_dict(report) for kind, report in reports.items()})
+            payload = {kind: accuracy_dict(report) for kind, report in reports.items()}
+            payload["pv_vintage"] = engine.forecast_vintage_scorecard(
+                days, timezone_name=timezone_name
+            )
+            return self._json(payload)
 
         if route == "log" and method == "GET":
             level = query.get("level") or None

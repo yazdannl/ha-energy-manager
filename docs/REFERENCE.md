@@ -230,8 +230,9 @@ action vocabulary: hold, charge, discharge, pv_charge, export, self_consumption,
 ### 2.5 Forecasts
 
 Panels: **Price forecast**, **Solar forecast**, **Load forecast**, **Forecast accuracy**,
-**Providers**. Each forecast panel leads with a **trust line** (`Measured error: MAPE … · bias … ·
-MAE … (unit) · N samples`, the MAE carrying the metric's own unit), then one quiet metadata line
+**Providers**. Price and load forecast panels lead with a **trust line** (`Measured error: MAPE … · bias … ·
+MAE … (unit) · N samples`, the MAE carrying the metric's own unit); the solar panel points to the
+archived PV energy scorecard instead of showing a near-zero-sensitive percentage. Each then has one quiet metadata line
 (`Source: … · provider: … · contract: … · generated …`) — badges are reserved for stale/limitation
 state — then the chart and a per-day totals table. A stale source is promoted to a visible banner;
 load confidence is neutral text; the provider's full `notes` sit behind a **Source details**
@@ -246,10 +247,14 @@ disclosure. A day with no coverage is left blank and labelled rather than zero-f
 Empty forecasts render the server's `reason` slug plus its `hint` sentence; if the server gave no
 explanation the panel says so instead of pretending the source returned nothing.
 
-**Forecast accuracy** — three cards (`PV forecast`, `Load forecast`, `Price forecast`) each showing
-MAPE over N days, `bias`, `MAE` **in that kind's unit** (kW for PV/load, EUR/kWh for price),
-`samples`; plus a 14-day MAPE trend chart with one signature per series (PV solid, load long dashes,
-price dotted) and the "not enough measured days" empty state.
+**Forecast accuracy** — the PV vintage scorecard shows signed bias and mean absolute error per
+matched 15-minute interval in kWh, matched/expected coverage, and daily local-period breakdowns;
+lead-time and selected forecast-source breakdowns are available in a disclosure. A match requires
+the latest archived PV vintage issued by interval start and three distinct fresh 5-minute direct
+`pv_power` samples from one entity; inferred, partial and mixed-entity actuals are excluded. Stale
+vintages are included and counted. Positive bias means forecast minus measured is positive.
+Load and price retain their legacy MAPE/bias/MAE cards and trend; PV MAPE is not shown because
+near-zero output makes it misleading.
 
 **Providers table** — headers: `Kind`, `Provider`, `Active`, `Healthy`, `Freshness`, `Last success`,
 `Last error`.
@@ -1840,17 +1845,29 @@ prices with the battery doing nothing. Savings = baseline cost - actual cost."*
 
 ### 4.12 Forecast accuracy
 
-`accuracy_from_samples` over the last N days (default 14):
+The legacy `accuracy_from_samples` reports remain available over the last N days (default 14):
 
 ```
-MAPE = mean( |forecast − actual| / |actual| ) * 100      (only samples with a usable actual)
-bias = mean( (forecast − actual) / |actual| ) * 100
+MAPE = mean( |forecast − actual| / |actual| ) * 100  (where |actual| > 1e-6)
+bias = mean(actual − forecast) / |mean(actual)| * 100  (where |mean(actual)| > 1e-6)
 MAE  = mean( |forecast − actual| )
 samples = number of usable samples
 ```
 
-`null` MAPE means "no data" and renders `--` (never as 0). Per-day series
-`{day, mape_pct, bias_pct}` feeds the 14-day trend chart.
+`null` MAPE means "no data" and renders `--`. The legacy daily series
+`{day, mape_pct, bias_pct}` still feeds the load/price trend and existing sensor feeds; the
+Forecasts UI no longer presents PV MAPE.
+
+The additive `pv_vintage` scorecard in `GET /api/v1/accuracy` uses the last N days, ending at the
+latest complete UTC 15-minute boundary. A matched sample is one target interval with the latest
+captured PV vintage issued no later than its start and three distinct fresh direct 5-minute
+`pv_power` readings from one entity. Inferred PV and partial/mixed-entity intervals are excluded;
+stale vintages are included and counted. For each matched interval, error is forecast kWh minus
+measured kWh; signed bias is the mean error (positive = overforecast), MAE is the mean absolute
+error, and total absolute error is the sum of absolute errors. Metrics are `null` with no matches.
+Coverage reports expected, forecasted, complete-measured and matched intervals plus direct reading
+counts. Period rows use the requested IANA timezone; lead-time bands are 0–1, 1–6, 6–24 and 24+
+hours, and source rows use the selected vintage's source.
 
 ### 4.13 Price windows and rank
 
@@ -2011,7 +2028,7 @@ additive 0.20.3), `manual_limits{}` (additive, 0.20.0: the raw per-direction map
 | `POST /api/v1/limits` | `{battery_id?, charge_w?, discharge_w?}` (`null` clears, absent = unchanged) | `{manual_limits}`; 404 unknown battery, 400 `invalid_body` below 0 or above the configured maximum |
 | `DELETE /api/v1/limits` | `battery_id?` (no id clears every entry) | `{manual_limits}`; 404 unknown battery |
 | `GET /api/v1/savings` | `range=day\|week\|month\|year\|all` | `{range, buckets[], totals{}, baseline_note}`; additive 0.13.0: buckets carry `charged_kwh`, `discharged_kwh`, `charge_cost_eur`, `discharge_value_eur` and `grid_measured`/`load_measured`/`pv_measured`/`battery_measured` flags, totals add the same flows plus `measured_buckets` counts (`null` = no confirmed measurement); additive 0.22.1: buckets carry `has_data` (false = no stored row) and totals add `measured_periods`/`baseline_periods` |
-| `GET /api/v1/accuracy` | `days=14` | `{pv, load, price: AccuracyReport}` |
+| `GET /api/v1/accuracy` | `days=14`, `timezone=UTC` | `{pv, load, price: AccuracyReport, pv_vintage}`; the additive PV scorecard includes signed kWh bias, MAE/total absolute error, matched coverage and period/lead-time/source breakdowns |
 | `GET /api/v1/log` | `limit`, `level`, `kind` | `{entries[{ts, kind, level, code, message, detail}]}` |
 | `GET /api/v1/providers` | — | `{solar[], price[], load[]}` |
 | `GET /api/v1/export` | `what=plan\|actuals\|savings`, `format=json\|csv` | file download (`Content-Disposition`) |

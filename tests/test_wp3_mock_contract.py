@@ -630,6 +630,20 @@ def test_savings_and_accuracy_payloads(fixtures):
         for point in report["series"]:
             assert_fields(point, ["day", "mape_pct", "bias_pct"], "AccuracyReport.series[]")
 
+    scorecard = accuracy["pv_vintage"]
+    assert_fields(scorecard, [
+        "days", "timezone", "window_start", "window_end", "interval_minutes", "sample_definition",
+        "matched_samples", "bias_kwh", "mae_kwh", "total_absolute_error_kwh", "coverage",
+        "periods", "by_lead_time", "by_source",
+    ], "Archived PV scorecard")
+    assert scorecard["interval_minutes"] == 15
+    assert "three distinct fresh 5-minute direct pv_power samples" in scorecard["sample_definition"]
+    assert_fields(scorecard["coverage"], [
+        "expected_intervals", "forecast_intervals", "actual_complete_intervals", "matched_intervals",
+        "direct_samples", "expected_direct_samples", "stale_forecast_intervals",
+    ], "Archived PV scorecard coverage")
+    assert scorecard["coverage"]["expected_direct_samples"] == scorecard["coverage"]["expected_intervals"] * 3
+
 
 def test_log_and_providers_payloads(fixtures):
     log = fixtures["fixtures"]["log"]

@@ -1033,12 +1033,125 @@
     return { kind: kind, days: 14, mape_pct: round(base + 1.0, 1), bias_pct: round(spread * 0.2, 1), mae: round(base / 8, 3), samples: 1344, series: series };
   }
 
-  function accuracyPayload(days) {
+  function accuracyPayload(days, timezoneName) {
+    var count = parseInt(days, 10) || 14;
+    var expected = count * 96;
+    var matched = Math.floor(expected * 0.72);
+    var periods = [];
+    for (var i = count - 1; i >= 0; i--) {
+      var day = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+      periods.push({
+        local_day: day,
+        matched_samples: Math.floor(matched / count),
+        bias_kwh: 0.0032,
+        mae_kwh: 0.0264,
+        total_absolute_error_kwh: 0.0264 * Math.floor(matched / count),
+        coverage: {
+          expected_intervals: 96,
+          forecast_intervals: 88,
+          actual_complete_intervals: 82,
+          matched_intervals: Math.floor(matched / count),
+          direct_samples: 250,
+          expected_direct_samples: 288,
+          stale_forecast_intervals: 2
+        }
+      });
+    }
     return {
-      days: parseInt(days, 10) || 14,
+      days: count,
       pv: accuracyReport("pv", 12.5, 3.0),
       load: accuracyReport("load", 9.0, 2.0),
-      price: accuracyReport("price", 4.5, 1.0)
+      price: accuracyReport("price", 4.5, 1.0),
+      pv_vintage: {
+        days: count,
+        timezone: timezoneName || "UTC",
+        window_start: new Date(Date.now() - count * 86400000).toISOString(),
+        window_end: new Date().toISOString(),
+        interval_minutes: 15,
+        sample_definition: "One 15-minute interval with the latest captured PV forecast vintage issued by its start and three distinct fresh 5-minute direct pv_power samples from the same entity. Inferred PV and partial or mixed-entity outcomes are excluded; stale vintages are included and counted.",
+        matched_samples: matched,
+        bias_kwh: 0.0032,
+        mae_kwh: 0.0264,
+        total_absolute_error_kwh: 0.0264 * matched,
+        coverage: {
+          expected_intervals: expected,
+          forecast_intervals: Math.floor(expected * 0.91),
+          actual_complete_intervals: Math.floor(expected * 0.86),
+          matched_intervals: matched,
+          direct_samples: Math.floor(expected * 2.73),
+          expected_direct_samples: expected * 3,
+          stale_forecast_intervals: 8
+        },
+        periods: periods,
+        by_lead_time: [
+          {
+            lead_time_band: "0–1 h",
+            matched_samples: Math.floor(matched * 0.4),
+            bias_kwh: 0.0018,
+            mae_kwh: 0.0182,
+            total_absolute_error_kwh: 0.0182 * Math.floor(matched * 0.4),
+            coverage: {
+              expected_intervals: Math.floor(expected * 0.38),
+              forecast_intervals: Math.floor(expected * 0.38),
+              actual_complete_intervals: Math.floor(expected * 0.36),
+              matched_intervals: Math.floor(matched * 0.4),
+              direct_samples: Math.floor(expected * 1.1),
+              expected_direct_samples: Math.floor(expected * 0.38) * 3,
+              stale_forecast_intervals: 3
+            }
+          },
+          {
+            lead_time_band: "1–6 h",
+            matched_samples: Math.floor(matched * 0.6),
+            bias_kwh: 0.0041,
+            mae_kwh: 0.0323,
+            total_absolute_error_kwh: 0.0323 * Math.floor(matched * 0.6),
+            coverage: {
+              expected_intervals: Math.floor(expected * 0.53),
+              forecast_intervals: Math.floor(expected * 0.53),
+              actual_complete_intervals: Math.floor(expected * 0.5),
+              matched_intervals: Math.floor(matched * 0.6),
+              direct_samples: Math.floor(expected * 1.55),
+              expected_direct_samples: Math.floor(expected * 0.53) * 3,
+              stale_forecast_intervals: 5
+            }
+          }
+        ],
+        by_source: [
+          {
+            source: "learned",
+            matched_samples: Math.floor(matched * 0.65),
+            bias_kwh: 0.0027,
+            mae_kwh: 0.0241,
+            total_absolute_error_kwh: 0.0241 * Math.floor(matched * 0.65),
+            coverage: {
+              expected_intervals: Math.floor(expected * 0.55),
+              forecast_intervals: Math.floor(expected * 0.55),
+              actual_complete_intervals: Math.floor(expected * 0.52),
+              matched_intervals: Math.floor(matched * 0.65),
+              direct_samples: Math.floor(expected * 1.6),
+              expected_direct_samples: Math.floor(expected * 0.55) * 3,
+              stale_forecast_intervals: 5
+            }
+          },
+          {
+            source: "forecast_solar",
+            matched_samples: Math.floor(matched * 0.35),
+            bias_kwh: 0.0041,
+            mae_kwh: 0.0307,
+            total_absolute_error_kwh: 0.0307 * Math.floor(matched * 0.35),
+            coverage: {
+              expected_intervals: Math.floor(expected * 0.36),
+              forecast_intervals: Math.floor(expected * 0.36),
+              actual_complete_intervals: Math.floor(expected * 0.34),
+              matched_intervals: Math.floor(matched * 0.35),
+              direct_samples: Math.floor(expected * 1.13),
+              expected_direct_samples: Math.floor(expected * 0.36) * 3,
+              stale_forecast_intervals: 3
+            }
+          }
+        ]
+      }
     };
   }
 
@@ -1488,7 +1601,7 @@
       return { manual_limits: limitsCopy() };
     },
     "GET /api/v1/savings": function (ctx) { return savingsPayload(ctx.params.range); },
-    "GET /api/v1/accuracy": function (ctx) { return accuracyPayload(ctx.params.days); },
+    "GET /api/v1/accuracy": function (ctx) { return accuracyPayload(ctx.params.days, ctx.params.timezone); },
     "GET /api/v1/log": function (ctx) { return logEntries(ctx.params.limit); },
     "GET /api/v1/providers": function () { return providersPayload(); },
     "POST /api/v1/notify/test": function () { return {}; }

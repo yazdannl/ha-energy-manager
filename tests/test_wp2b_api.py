@@ -332,6 +332,9 @@ class FakeEngine:
             "price": AccuracyReport(kind="price", days=days, mae=0.01, samples=5),
         }
 
+    def forecast_vintage_scorecard(self, days, *, timezone_name="UTC"):
+        return {"days": days, "timezone": timezone_name, "matched_samples": 0}
+
     def log(self, limit, level=None, kind=None):
         def entry(index):
             kind = ("dispatch", "event", "alert")[index % 3]
@@ -886,8 +889,9 @@ def test_savings_accuracy_log_and_providers_routes():
     assert call(app, "GET", "/api/v1/savings?range=example")[0] == 400
 
     status, _headers, _content, body = call(app, "GET", "/api/v1/accuracy?days=14")
-    assert status == 200 and set(body) == {"pv", "load", "price"}
+    assert status == 200 and set(body) == {"pv", "load", "price", "pv_vintage"}
     assert body["pv"]["mape_pct"] == 12.0 and body["load"]["samples"] == 0
+    assert body["pv_vintage"] == {"days": 14, "timezone": "UTC", "matched_samples": 0}
 
     status, _headers, _content, body = call(app, "GET", "/api/v1/log?limit=10")
     assert status == 200 and len(body["entries"]) == 10

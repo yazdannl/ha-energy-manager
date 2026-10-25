@@ -2810,11 +2810,11 @@
     };
   }
 
-  // Measured error of one forecast kind, or null when there is not enough measured data. MAE
-  // carries the kind's own unit — the contract does not name one (UI_REVIEW §3.6): pv/load are kW,
-  // price is EUR/kWh, so guessing across kinds is never done.
+  // Legacy load/price error is still available here. PV uses the direct-measured energy scorecard
+  // below instead of a percentage that can explode when measured output is near zero.
   function forecastAccuracyLine(report) {
     if (!report) return "not measured yet";
+    if (report.kind === "pv") return "See the archived PV energy scorecard below; PV error is reported in kWh.";
     if (!(report.samples > 0)) return "not enough measured days yet";
     var parts = ["MAPE " + (isNum(report.mape_pct) ? fmtPct(report.mape_pct) : "--") + " over " + (report.days || "?") + " days"];
     if (isNum(report.bias_pct)) parts.push("bias " + fmtPct(report.bias_pct));
@@ -2937,8 +2937,117 @@
     return details;
   }
 
+  function scorecardKwh(value, signed) {
+    if (!isNum(value)) return "--";
+    return (signed && value > 0 ? "+" : "") + value.toFixed(4) + " kWh";
+  }
+
+  function scorecardCount(value) {
+    return Number.isInteger(value) && value >= 0 ? String(value) : "--";
+  }
+
+  function scorecardPair(value, expected) {
+    return scorecardCount(value) + " / " + scorecardCount(expected);
+  }
+
+  function renderPvScorecard(body, report) {
+    var section = el("div", { class: "accuracy-scorecard" });
+    section.appendChild(el("h3", { text: "Archived PV forecast scorecard" }));
+    if (!report) {
+      section.appendChild(el("p", { class: "muted", text: "Archived PV scorecard unavailable." }));
+      body.appendChild(section);
+      return;
+    }
+
+    var coverage = report.coverage || {};
+    var matched = report.matched_samples;
+    var hasMatches = Number.isInteger(matched) && matched > 0;
+    section.appendChild(el("p", { class: "field-help", text:
+      "Trailing " + scorecardCount(report.days) + " days through the latest complete 15-minute interval; daily periods use " +
+      (report.timezone || "UTC") + ". " + (report.sample_definition || "")
+    }));
+    var coverageText = [
+      "archived forecasts " + scorecardPair(coverage.forecast_intervals, coverage.expected_intervals),
+      "complete direct PV " + scorecardPair(coverage.actual_complete_intervals, coverage.expected_intervals),
+      "direct readings " + scorecardPair(coverage.direct_samples, coverage.expected_direct_samples)
+    ];
+    if (Number.isInteger(coverage.stale_forecast_intervals) && coverage.stale_forecast_intervals > 0) {
+      coverageText.push("stale vintages " + coverage.stale_forecast_intervals);
+    }
+    section.appendChild(el("div", { class: "cards" }, [
+      statCard("PV mean absolute error", scorecardKwh(report.mae_kwh, false),
+        "per matched 15-minute interval", hasMatches ? false : "unknown"),
+      statCard("PV total absolute error", scorecardKwh(report.total_absolute_error_kwh, false),
+        "sum across matched 15-minute intervals", hasMatches ? false : "unknown"),
+      statCard("PV mean signed bias", scorecardKwh(report.bias_kwh, true),
+        "mean forecast − measured; positive means overforecast", hasMatches ? false : "unknown"),
+      statCard("Matched PV intervals", scorecardPair(matched, coverage.expected_intervals),
+        coverageText.join(" · "))
+    ]));
+
+    var periods = Array.isArray(report.periods) ? report.periods : [];
+    if (periods.length) {
+      section.appendChild(table(
+        "PV energy error by local calendar day; error metrics are per matched 15-minute interval.",
+        ["Local day", "Mean bias (kWh/interval)", "MAE (kWh/interval)", "Matched / expected", "Forecast / expected", "Complete PV / expected"],
+        periods.map(function (period) {
+          var c = period.coverage || {};
+          return [
+            period.local_day || "unknown",
+            scorecardKwh(period.bias_kwh, true),
+            scorecardKwh(period.mae_kwh, false),
+            scorecardPair(period.matched_samples, c.expected_intervals),
+            scorecardPair(c.forecast_intervals, c.expected_intervals),
+            scorecardPair(c.actual_complete_intervals, c.expected_intervals)
+          ];
+        })
+      ));
+    } else {
+      section.appendChild(el("p", { class: "muted", text: "No daily PV intervals in this reporting window." }));
+    }
+
+    var details = el("details", { class: "disclosure" }, [
+      el("summary", { text: "Break down PV scores by forecast lead time and source" })
+    ]);
+    function breakdownRows(rows, labelKey) {
+      return (Array.isArray(rows) ? rows : []).map(function (entry) {
+        var c = entry.coverage || {};
+        return [
+          entry[labelKey] || "unknown",
+          scorecardKwh(entry.bias_kwh, true),
+          scorecardKwh(entry.mae_kwh, false),
+          scorecardPair(entry.matched_samples, c.forecast_intervals),
+          scorecardPair(c.direct_samples, c.expected_direct_samples)
+        ];
+      });
+    }
+    var leadRows = breakdownRows(report.by_lead_time, "lead_time_band");
+    var sourceRows = breakdownRows(report.by_source, "source");
+    if (leadRows.length) {
+      details.appendChild(table(
+        "Forecast lead time is target start minus issue time; counts are matched / archived intervals.",
+        ["Lead time", "Mean bias (kWh/interval)", "MAE (kWh/interval)", "Matched / forecasts", "Direct readings / expected"],
+        leadRows
+      ));
+    } else {
+      details.appendChild(el("p", { class: "muted", text: "No archived forecast lead times in this window." }));
+    }
+    if (sourceRows.length) {
+      details.appendChild(table(
+        "Scores by the selected archived forecast source.",
+        ["Forecast source", "Mean bias (kWh/interval)", "MAE (kWh/interval)", "Matched / forecasts", "Direct readings / expected"],
+        sourceRows
+      ));
+    } else {
+      details.appendChild(el("p", { class: "muted", text: "No archived forecast sources in this window." }));
+    }
+    section.appendChild(details);
+    body.appendChild(section);
+  }
+
   function renderAccuracy(body, accuracy) {
-    var kinds = [["pv", "PV forecast"], ["load", "Load forecast"], ["price", "Price forecast"]];
+    renderPvScorecard(body, accuracy && accuracy.pv_vintage);
+    var kinds = [["load", "Load forecast"], ["price", "Price forecast"]];
     var cards = el("div", { class: "cards" });
     kinds.forEach(function (pair) {
       var report = accuracy && accuracy[pair[0]];
@@ -2947,7 +3056,7 @@
         return;
       }
       var value = isNum(report.mape_pct) ? fmtPct(report.mape_pct) : "--";
-      // MAE carries the kind's own unit (UI_REVIEW §3.6): power forecasts in kW, price in EUR/kWh.
+      // MAE carries the kind's own physical unit: kW for load, EUR/kWh for price.
       var maeUnit = pair[0] === "price" ? "EUR/kWh" : "kW";
       var sub = [
         "MAPE over " + (report.days || "?") + " days",
@@ -2958,14 +3067,16 @@
       cards.appendChild(statCard(pair[1], value, sub, report.samples === 0));
     });
     body.appendChild(cards);
-    if (!isNum(accuracy.pv.mape_pct) && !isNum(accuracy.load.mape_pct) && !isNum(accuracy.price.mape_pct)) {
-      body.appendChild(el("p", { class: "muted", text: "Not enough measured days yet to score the forecasts." }));
+    var load = accuracy && accuracy.load;
+    var price = accuracy && accuracy.price;
+    if (!isNum(load && load.mape_pct) && !isNum(price && price.mape_pct)) {
+      body.appendChild(el("p", { class: "muted", text: "Not enough measured load or price samples yet for a MAPE trend." }));
       return;
     }
     var chart = el("div", { class: "chart chart-sm" });
     body.appendChild(chart);
     root.SEMCharts.accuracy(chart, accuracy);
-    body.appendChild(el("p", { class: "legend-note", text: "Lower is better; every value is also in the per-kind cards above." }));
+    body.appendChild(el("p", { class: "legend-note", text: "The trend shows load and price MAPE only; PV is scored separately in kWh above." }));
   }
 
   function browserTimezone() {
@@ -3182,7 +3293,7 @@
         get("/forecast", { kind: "price", hours: 36 }),
         get("/forecast", { kind: "solar", hours: 36 }),
         get("/forecast", { kind: "load", hours: 36 }),
-        get("/accuracy", { days: 14 })
+        get("/accuracy", { days: 14, timezone: browserTimezone() })
       ]).then(function (rows) {
         return { price: rows[0], solar: rows[1], load: rows[2], accuracy: rows[3] };
       });

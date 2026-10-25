@@ -709,11 +709,17 @@ def test_savings_totals_include_the_split(wired):
 
 
 def test_accuracy_reports(wired):
-    status, _headers, body = wired.json("GET", "/api/v1/accuracy?days=14")
+    status, _headers, body = wired.json("GET", "/api/v1/accuracy?days=14&timezone=UTC")
     assert status == 200
-    assert set(body) == {"pv", "load", "price"}
-    for report in body.values():
+    assert set(body) == {"pv", "load", "price", "pv_vintage"}
+    for kind in ("pv", "load", "price"):
+        report = body[kind]
         assert {"kind", "days", "mape_pct", "bias_pct", "mae", "samples", "series"} <= set(report)
+    scorecard = body["pv_vintage"]
+    assert {"interval_minutes", "sample_definition", "matched_samples", "bias_kwh", "mae_kwh",
+            "total_absolute_error_kwh", "coverage", "periods", "by_lead_time", "by_source"} <= set(scorecard)
+    assert scorecard["interval_minutes"] == 15
+    assert scorecard["coverage"]["expected_intervals"] == 14 * 96
 
 
 def test_log_kinds_and_dispatch_detail(wired):

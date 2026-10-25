@@ -7,9 +7,11 @@ cost with the battery doing nothing, at the same prices (SPEC 11).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from .models import AccuracyReport, PriceSlot, SavingsBucket, SolarForecast, clamp, from_iso, to_iso
 
@@ -492,6 +494,172 @@ def accuracy_from_samples(
             {"day": day.isoformat(), "mape_pct": mape, "bias_pct": bias, "samples": len(group)}
         )
     return report
+
+
+def forecast_vintage_scorecard(
+    history: Mapping[str, Any],
+    *,
+    start: datetime,
+    end: datetime,
+    days: int,
+    timezone_name: str = "UTC",
+) -> dict[str, Any]:
+    """Score matched archived PV vintages against complete direct-PV outcomes.
+
+    One sample is a comparable 15-minute interval from forecast_history: a captured vintage
+    issued by the interval start plus three distinct fresh direct pv_power samples from one
+    entity. The history join owns vintage selection and measurement validation, so partial,
+    mixed-source and inferred actuals remain unscored.
+    """
+    zone = ZoneInfo(timezone_name)
+    rows = list(history.get("series") or [])
+
+    def number(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return result if math.isfinite(result) else None
+
+    def count(value: Any) -> int:
+        result = number(value)
+        return max(0, int(result)) if result is not None else 0
+
+    def forecasted(row: Mapping[str, Any]) -> bool:
+        return number(row.get("forecast_kwh")) is not None
+
+    def error(row: Mapping[str, Any]) -> float | None:
+        value = number(row.get("error_kwh"))
+        return value if row.get("comparable") is True and value is not None else None
+
+    def metrics(items: list[Mapping[str, Any]]) -> dict[str, Any]:
+        errors = [value for row in items if (value := error(row)) is not None]
+        if not errors:
+            return {
+                "matched_samples": 0,
+                "bias_kwh": None,
+                "mae_kwh": None,
+                "total_absolute_error_kwh": None,
+            }
+        absolute = [abs(value) for value in errors]
+        return {
+            "matched_samples": len(errors),
+            "bias_kwh": sum(errors) / len(errors),
+            "mae_kwh": sum(absolute) / len(absolute),
+            "total_absolute_error_kwh": sum(absolute),
+        }
+
+    def coverage(items: list[Mapping[str, Any]], expected: int) -> dict[str, int]:
+        return {
+            "expected_intervals": expected,
+            "forecast_intervals": sum(1 for row in items if forecasted(row)),
+            "actual_complete_intervals": sum(
+                1 for row in items if row.get("actual_complete") is True
+            ),
+            "matched_intervals": metrics(items)["matched_samples"],
+            "direct_samples": sum(count(row.get("actual_samples")) for row in items),
+            "expected_direct_samples": expected * 3,
+            "stale_forecast_intervals": sum(
+                1
+                for row in items
+                if forecasted(row) and bool(row.get("forecast_stale"))
+            ),
+        }
+
+    def placed(value: Any) -> datetime | None:
+        moment = from_iso(value)
+        if moment is None:
+            return None
+        return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+    raw_coverage = history.get("coverage")
+    raw_expected = raw_coverage.get("expected_intervals") if isinstance(raw_coverage, Mapping) else None
+    expected = count(raw_expected) if raw_expected is not None else len(rows)
+    summary = metrics(rows)
+    total_coverage = coverage(rows, expected)
+
+    by_day: dict[str, list[Mapping[str, Any]]] = {}
+    by_source: dict[str, list[Mapping[str, Any]]] = {}
+    by_lead: dict[str, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        target = placed(row.get("target_start") or row.get("start"))
+        day = target.astimezone(zone).date().isoformat() if target is not None else "unknown"
+        by_day.setdefault(day, []).append(row)
+        if not forecasted(row):
+            continue
+        source = str(row.get("forecast_source") or "unknown")
+        by_source.setdefault(source, []).append(row)
+
+        issued = placed(row.get("issued_at"))
+        lead_hours = (
+            (target - issued).total_seconds() / 3600.0
+            if target is not None and issued is not None
+            else None
+        )
+        if lead_hours is None or lead_hours < 0:
+            band = "Unknown"
+        elif lead_hours < 1:
+            band = "0–1 h"
+        elif lead_hours < 6:
+            band = "1–6 h"
+        elif lead_hours < 24:
+            band = "6–24 h"
+        else:
+            band = "24 h+"
+        by_lead.setdefault(band, []).append(row)
+
+    def period_rows(groups: Mapping[str, list[Mapping[str, Any]]]) -> list[dict[str, Any]]:
+        result = []
+        for label in sorted(groups):
+            items = groups[label]
+            result.append(
+                {
+                    "local_day": label,
+                    **metrics(items),
+                    "coverage": coverage(items, len(items)),
+                }
+            )
+        return result
+
+    lead_order = ("0–1 h", "1–6 h", "6–24 h", "24 h+", "Unknown")
+    lead_rows = [
+        {
+            "lead_time_band": label,
+            **metrics(by_lead[label]),
+            "coverage": coverage(by_lead[label], len(by_lead[label])),
+        }
+        for label in lead_order
+        if label in by_lead
+    ]
+    source_rows = [
+        {
+            "source": label,
+            **metrics(by_source[label]),
+            "coverage": coverage(by_source[label], len(by_source[label])),
+        }
+        for label in sorted(by_source)
+    ]
+
+    return {
+        "days": int(days),
+        "timezone": timezone_name,
+        "window_start": to_iso(start),
+        "window_end": to_iso(end),
+        "interval_minutes": 15,
+        "sample_definition": (
+            "One 15-minute interval with the latest captured PV forecast vintage issued by its "
+            "start and three distinct fresh 5-minute direct pv_power samples from the same entity. "
+            "Inferred PV and partial or mixed-entity outcomes are excluded; stale vintages are "
+            "included and counted."
+        ),
+        **summary,
+        "coverage": total_coverage,
+        "periods": period_rows(by_day),
+        "by_lead_time": lead_rows,
+        "by_source": source_rows,
+    }
 
 
 def update_bias_factors(

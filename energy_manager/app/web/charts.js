@@ -897,16 +897,16 @@
   }
 
   function accuracyChart(host, reports, options) {
-    var kinds = ["pv", "load", "price"].filter(function (k) {
+    var kinds = ["load", "price"].filter(function (k) {
       return reports && reports[k] && Array.isArray(reports[k].series) && reports[k].series.length > 0;
     });
-    if (!kinds.length) { fallback(host, "No accuracy series yet (needs at least one day of data)."); return; }
+    if (!kinds.length) { fallback(host, "No load/price accuracy series yet (needs at least one day of data)."); return; }
     if (!chartsReady(host)) return;
     var p = palette(options && options.palette);
-    var pv = reports.pv, load = reports.load, price = reports.price;
+    var load = reports.load, price = reports.price;
     var dayIndex = {};
     var xs = [];
-    var byKind = { pv: pv, load: load, price: price };
+    var byKind = { load: load, price: price };
     kinds.forEach(function (k) {
       byKind[k].series.forEach(function (d) {
         var t = ts(d.day);
@@ -928,10 +928,9 @@
       });
       return out;
     }
-    var colors = { pv: p.pv, load: p.load, price: p.price };
-    var signatures = { pv: line, load: lineDashed, price: lineDotted };
+    var colors = { load: p.load, price: p.price };
+    var signatures = { load: lineDashed, price: lineDotted };
     var labels = {
-      pv: "PV error (solid)",
       load: "Load error (long dashes)",
       price: "Price error (dotted)"
     };
@@ -950,8 +949,8 @@
     var data = [xs].concat(kinds.map(seriesFor));
     var draw = function (el) {
       mount(el, opts, data, 175, draw,
-        "Forecast accuracy trend: mean absolute percentage error per day, in percent.",
-        "Mean absolute percentage error per day (%), lower is better: PV solid, load long-dashed, price dotted.");
+        "Forecast accuracy trend: daily MAPE for load and price; PV uses the archived energy scorecard.",
+        "Mean absolute percentage error per day (%) for load and price, lower is better. PV is scored in kWh on the Forecasts view.");
     };
     draw(host);
   }

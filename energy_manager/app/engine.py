@@ -4591,6 +4591,28 @@ class Engine:
             },
         }
 
+    def forecast_vintage_scorecard(
+        self, days: int = 14, *, timezone_name: str = "UTC"
+    ) -> dict[str, Any]:
+        """Summarise completed 15-minute archived PV intervals over the trailing window."""
+        days = max(1, int(days))
+        moment = self._clock()
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        moment = moment.astimezone(timezone.utc)
+        end = moment.replace(minute=(moment.minute // SLOT_MINUTES) * SLOT_MINUTES, second=0, microsecond=0)
+        start = end - timedelta(days=days)
+        history = self.forecast_history(
+            start, end, timezone_name=timezone_name, resolution="15m"
+        )
+        return analytics.forecast_vintage_scorecard(
+            history,
+            start=start,
+            end=end,
+            days=days,
+            timezone_name=timezone_name,
+        )
+
     # ------------------------------------------------------------------ savings
 
     def savings(self, range_key: str) -> tuple[list[SavingsBucket], dict[str, Any]]:

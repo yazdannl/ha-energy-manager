@@ -140,9 +140,15 @@ entity are required for each quarter-hour, and `pv_derived_kw` is excluded. Hour
 not average power. Error is forecast minus measured and remains unknown unless all forecast and actual
 intervals in the selected rollup are complete; missing data is never rendered as zero. History
 accrues prospectively: pre-upgrade forecasts are not backfilled. Local-midnight boundaries follow the
-selected IANA zone, including 23- and 25-hour DST days. The existing accuracy panel still shows
-MAPE/bias/MAE/samples per kind plus its 14-day MAPE trend. A provider table lists active/healthy/freshness
-per provider.
+selected IANA zone, including 23- and 25-hour DST days. The existing **Forecast accuracy** panel adds a PV vintage scorecard: signed bias and mean/total
+absolute energy error in kWh, matched/expected interval and direct-sample coverage, daily local-period
+rows, plus lead-time and selected-source breakdowns. A matched sample is one 15-minute target with
+the latest archived PV vintage issued by its start and three distinct fresh 5-minute direct
+`pv_power` readings from one entity; inferred, partial and mixed-entity outcomes are excluded.
+Stale vintages remain scored and are counted. Positive bias means forecast minus measured is above
+zero (overforecast). PV MAPE is not presented because near-zero/nighttime denominators are
+misleading. The legacy load/price MAPE reports and trend remain. A provider table lists
+active/healthy/freshness per provider.
 
 **Batteries** — a card per battery: live power/SoC/energy, the **round trip** efficiency in percent
 (the input: one number, split evenly into `eta_charge`/`eta_discharge`; explicit per-direction values
@@ -262,9 +268,11 @@ lists the six `sensor.sem_chart_*` feeds for anyone writing their own card.
   dotted = a threshold. Legend text is semantic ("Load error (long dashes)"), never a colour word.
 - **Every number has a unit**: `fmtPower` (W/kW), `fmtKw` for forecast PV/load **power** (never
   `fmtKwh`, which is energy), `fmtKwh`, `fmtPrice` (EUR/kWh), `fmtEur`, `fmtPct`, `fmtDuration`, cycle
-  counts, `°C`. Forecast MAPE is shown in the metric's own unit — kW for PV/load, EUR/kWh for price.
-  Unknown values render `--`, a missing daily total is left blank and labelled as uncovered rather
-  than zero-filled, and partial baselines carry a visible "Baseline available for N of M periods".
+  counts, `°C`. Archived PV scorecard errors use kWh per 15-minute interval; PV MAPE is omitted
+  from the Forecasts UI because it is unstable near zero and at night. Legacy load/price MAPE is
+  explicitly labeled, and MAE keeps its physical unit. Unknown values render `--`, a missing daily
+  total is left blank and labelled as uncovered rather than zero-filled, and partial baselines carry
+  a visible "Baseline available for N of M periods".
 - **Stale data is visibly stale**: `staleBadge()` plus `.card-stale`/`[data-stale]` styling, and
   warnings when the last control tick is older than 180 s or HA is disconnected.
 - **Loading/error per panel**: `asyncPanel()` gives every panel its own loading text, error message
@@ -389,7 +397,9 @@ if they are absent:
   summary and the break-even line) and, in `batteries[]`, each battery's own round trip, wear and
   break-even, because per-battery values are not the aggregate mean. Slot `reason` values include
   `efficiency_loss`, which the table renders like any other reason slug.
-- `GET /api/v1/accuracy`: `series[].{day, mape_pct, bias_pct}`; `null` MAPE means "no data".
+- `GET /api/v1/accuracy`: legacy `pv/load/price` accuracy reports plus `pv_vintage`, with signed
+  kWh bias/absolute error, matched coverage, local-day and supported lead-time/source breakdowns;
+  `timezone` controls local-day grouping. Legacy `series[].{day, mape_pct, bias_pct}` remains.
 - `GET /api/v1/log`: `kind` values `dispatch`, `event`, `alert`; dispatch rows in
   `detail.{requested_w, applied_w, battery_id, mode, dry_run}`.
 - `POST /api/v1/mode` accepts partial `{mode?, dry_run?}`; the UI always sends both.
