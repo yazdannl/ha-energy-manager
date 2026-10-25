@@ -1994,7 +1994,8 @@ additive 0.20.3), `manual_limits{}` (additive, 0.20.0: the raw per-direction map
 | `GET /api/v1/plan` | `hours` | `{generated_at, horizon_start, horizon_end, slot_minutes, feasible, infeasible_reason, mode, dry_run, sources{}, maintenance, summary{…+eta_charge, eta_discharge, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh, maintenance{enabled,active,due,overdue,target_soc_pct,effective_target_soc_pct,interval_days,overdue_grace_hours,batteries[],due_batteries[],overdue_batteries[]} (additive, 0.17.0), sell_floor_eur_per_kwh (additive, 0.18.0)}, slots[{t, buy, sell, pv_kw, load_kw, load_p10, load_p90, soc_kwh, soc_pct, power_w, minutes (additive 0.20.1), action, reason, price_stale, pv_source, price_source}], batteries[{id, name, share_w, round_trip_efficiency, wear_eur_per_kwh, break_even_sell_eur_per_kwh}]}`; `buy`/`sell` are `null` in an unpriced (self-consumption) plan (0.34.2); `slot_minutes` is the plan's own resolution (the UI never assumes one) and `minutes` is the duration the solver modelled for each slot (the full step, or the remaining part of the current clock slot; 0.20.1); with no plan it returns an empty payload with `feasible: false`, `infeasible_reason: "no_plan"` and `slot_minutes: null` |
 | `GET /api/v1/plan/execution` | `hours` | additive (0.10.0): `{generated_at, slot_minutes, now, floors{reserve_soc_pct, min_soc_pct, floor_soc_pct}, batteries[{id, name, min_soc_pct, floor_soc_pct, capacity_kwh}], progress{…}, slots[{t, minutes (additive 0.20.1), dispatch, actual}]}` — the same slot grid as `/plan`, joined with the persisted 5-minute actuals and the dispatch log. `dispatch` is the last attempt per battery in that slot (`requested_w`, `applied_w`, `ok`, `dry_run`, `clamped`, `code`, `reason`, `message`, `records`, `batteries[]`) and `actual` the measured aggregate (`samples`, `coverage_pct`, `pv_kw`, `load_kw`, `grid_kw`, `battery_kw`, `planned_kw`, `measured_kw`, `import_kwh`, `export_kwh`, `charged_kwh`, `discharged_kwh`, `soc_kwh_start`, `soc_kwh_end`). Both are `null` for a slot nothing was measured or dispatched in — never a fabricated zero |
 | `POST /api/v1/plan/recompute` | — | `{queued: true}` (async; poll status) |
-| `GET /api/v1/forecast` | `kind=price\|solar\|load`, `hours` | `{kind, generated_at, source, stale, slots, provider, contract, notes[], reason, hint}` |
+| `GET /api/v1/forecast` | `kind=price\|solar\|load`, `hours` | `{kind, generated_at, source, stale, slots, provider, contract, notes[], reason, hint}`; frozen feed schema is unchanged |
+| `GET /api/v1/forecast-history` | `date=YYYY-MM-DD` (selected local date, defaults to today), `timezone` (IANA name, defaults `UTC`), `resolution=15m\|hour\|day` (defaults `15m`), `days=1…31` (day resolution only, defaults 14) | `{date, date_start, date_end, timezone, resolution, from, to, coverage, actual_provenance, series[]}`. Each row has a UTC target `start`/`end`, energy in kWh, selected forecast source/model/issue provenance, direct measured-PV source and coverage, and `error_kwh` (forecast − actual) only when both sides cover every interval. Hour/day totals sum interval kWh; partial covered sums remain separately labelled by coverage. |
 | `GET /api/v1/batteries` | — | `{batteries: [{config, state, capabilities, mapping_resolved, discovery[], capacity_source, capacity_kwh, capacity_learned_kwh, capacity_samples, capacity_updated_at, effective_capacity_kwh, capacity_reason, capacity{source,configured_kwh,learned_kwh,samples,basis,updated_at,effective_kwh,reason,stale,confident,applied} (`basis` additive 0.32.0: which side of the cycle measured the one capacity), efficiency_round_trip, efficiency_learned_round_trip, efficiency_samples, efficiency_updated_at, efficiency_reason, efficiency{source,configured_round_trip,learned_round_trip,samples,updated_at,effective_round_trip,reason,stale,confident,applied} (additive, 0.31.0), maintenance{id,watching,state,due,overdue,at_target,due_at,due_in_days,last_completed,first_seen,target_soc_pct,interval_days,soc_pct} (additive, 0.17.0)}]}` (the capacity fields are additive, SPEC 5) |
 | `POST /api/v1/batteries` | `{config}` | 201 `{config}` |
 | `PATCH /api/v1/batteries/{id}` | `{patch}` | `{config}` |
@@ -2039,8 +2040,10 @@ connection per thread.
 | Table | Contents |
 | --- | --- |
 | `plans`, `plan_slots` | what was planned (per-slot timestamp, prices, PV, load, SoC, power, action, reason) |
-| `measurements` | 5-minute bucketed raw samples per role |
-| `actuals` | per-tick ground truth (pv, load, grid, measured battery, soc, buy/sell price, plan/dispatch power) |
+| `measurements` | 5-minute bucketed raw samples per role; new rows retain `entity_id` and the HA `observed_at` timestamp, which makes direct PV provenance/freshness auditable |
+| `actuals` | per-tick ground truth (pv, load, grid, measured battery, soc, buy/sell price, plan/dispatch power); inferred `pv_derived_kw` stays separate |
+| `forecast_archive` | latest per-source/target forecast retained for the existing online learning/accuracy path |
+| `forecast_vintages` | immutable 15-minute solar vintages in kWh, keyed by target, issue time, source and model; only successful future captures are added, and absent vintages are never filled from a newer forecast |
 | `dispatch_log` | requested vs applied power, mode, dry run, result, code, message |
 | `savings_daily` | the accounting: import/export kWh, cost, revenue, baseline, savings, PV, cycles, measured charged/discharged kWh and their value, per-series coverage flags, sampled hours (total/grid/savings/battery) |
 | `learning_profiles` | PV and load corrections, derived solar capacity, and the live-write latch |
@@ -2049,10 +2052,34 @@ connection per thread.
 | `settings` | runtime settings (dotted keys) |
 | `meta` | schema version and small facts |
 
-Daily maintenance trims `measurements`/`actuals` to **400 days**, `dispatch_log` to **20 000** rows,
-`events` to **5 000**, and `plans` to `plans_rows` (**200**) most recent, with their `plan_slots`.
-Sampling reads only mapped entities and upserts into 5-minute buckets, so volume does not scale with
-the tick rate. Savings baselines are computed before trimming.
+Migration 8 adds nullable `measurements.entity_id`/`observed_at` fields and the
+`forecast_vintages(target_ts, interval_minutes, issued_at, source, model_json, forecast_kwh,
+uncertainty_pct, stale)` table. Its immutable identity is `(target_ts, issued_at, source, model_json)`;
+`interval_minutes` is fixed at 15 and `forecast_kwh` is interval energy.
+
+Daily maintenance trims `measurements`/`actuals` and both forecast archives to **400 days**,
+`dispatch_log` to **20 000** rows, `events` to **5 000**, and `plans` to `plans_rows` (**200**) most
+recent, with their `plan_slots`. Sampling reads only mapped entities and upserts into 5-minute
+buckets, so volume does not scale with the tick rate. Savings baselines are computed before trimming.
+
+### Forecast History provenance and coverage
+
+`forecast_vintages` is additive: the existing `/api/v1/forecast` payload and `forecast_archive`
+learning semantics do not change. On a successful solar refresh, the engine records each corrected
+future 15-minute slot as `max(0, pv_kw) × 15/60` kWh, with capture/issue time, source, provider model
+metadata, uncertainty and stale state. The target interval remains explicit (`start`/`end`, 15
+minutes); a later refresh creates another vintage rather than overwriting it. The API selects the
+latest recorded issue no later than the target interval start. The migration does not backfill
+pre-upgrade rows, and it never reconstructs a missing vintage from current forecast values; history
+therefore accrues prospectively.
+
+Measured PV comes only from the configured `solar.measured_entity` `pv_power` role, with the source
+entity id and HA `last_reported`/`last_updated` timestamp stored alongside new samples. A quarter
+hour has actual energy only when it contains three fresh, distinct 5-minute samples from one entity;
+each sample contributes `W ÷ 1000 × 5/60` kWh. `pv_derived_kw`, old actuals rows and missing samples
+are not substitutes. Hour/day rollups sum energy, expose partial forecast/actual coverage separately,
+and leave the error unknown unless every interval on both sides is complete. Local date boundaries
+are built in the requested IANA timezone, so 23- and 25-hour DST days are not forced to 24 hours.
 
 ---
 

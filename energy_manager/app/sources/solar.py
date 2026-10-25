@@ -1471,6 +1471,7 @@ def _learned_forecast(
         status.detail["reason"] = "model unavailable"
         forecast.notes.append(status.last_error)
         return forecast, status
+    status.detail["model"] = dict(model.metadata)
 
     try:
         capacity_wp = float(settings.get("solar.capacity_wp") or 0.0)

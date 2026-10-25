@@ -226,7 +226,9 @@ def build_sources(
                 # 5-minute measurement rows; the actuals row is written by the engine, which is
                 # the only side that knows the planned/dispatched power.
                 try:
-                    store.add_measurements(measurements)
+                    store.add_measurements(
+                        measurements, pv_observed_at=actuals.get("pv_updated_at")
+                    )
                 except Exception as exc:
                     log.warning("cannot store measurements: %s", exc)
             return {
@@ -494,7 +496,7 @@ class _FakeStore:
     def profile_put(self, kind: str, key: str, payload: Any, updated_at: Any = None) -> None:
         self.learning[(kind, key)] = (updated_at, payload)
 
-    def add_measurements(self, measurements: Any) -> int:
+    def add_measurements(self, measurements: Any, **_kwargs: Any) -> int:
         rows = list(measurements)
         self.measurements.extend(rows)
         return len(rows)

@@ -1042,6 +1042,93 @@
     };
   }
 
+  function forecastHistoryPayload(params) {
+    params = params || {};
+    var resolution = params.resolution || "15m";
+    var timezone = params.timezone || "UTC";
+    var current = new Date();
+    var dateText = params.date || current.getFullYear() + "-" + String(current.getMonth() + 1).padStart(2, "0") + "-" + String(current.getDate()).padStart(2, "0");
+    var selected = new Date(dateText + "T00:00:00");
+    var days = resolution === "day" ? clamp(parseInt(params.days, 10) || 14, 1, 31) : 1;
+    var periods = [];
+
+    function addPeriod(start, end, expected, index) {
+      var forecastIntervals = index % 7 === 0 ? Math.max(0, expected - 1) : expected;
+      var actualIntervals = index % 6 === 0 ? Math.max(0, expected - 1) : expected;
+      var samplesExpected = expected * 3;
+      var samples = actualIntervals * 3 - (index % 5 === 0 ? 1 : 0);
+      samples = Math.max(0, samples);
+      var quarterKwh = 0.18 + Math.max(0, Math.sin(index / 5)) * 0.12;
+      var forecastKwh = round(quarterKwh * forecastIntervals, 4);
+      var actualKwh = round(quarterKwh * actualIntervals * (0.92 + 0.08 * wobble(index + 11)), 4);
+      var forecastComplete = forecastIntervals === expected;
+      var actualComplete = actualIntervals === expected;
+      var comparable = forecastComplete && actualComplete;
+      return {
+        start: iso(start), end: iso(end), label: new Date(start).toLocaleString(), intervals: expected,
+        forecast_kwh: forecastKwh, forecast_intervals: forecastIntervals,
+        expected_forecast_intervals: expected, forecast_coverage_pct: round(forecastIntervals * 100 / expected, 1),
+        forecast_complete: forecastComplete, forecast_source: "capacity",
+        forecast_model: { model: "example-clear-sky", version: "mock" },
+        forecast_provenance: [{ source: "capacity", model: { model: "example-clear-sky", version: "mock" },
+          first_issued_at: iso(Date.now() - 3600000), last_issued_at: iso(Date.now() - 300000), intervals: forecastIntervals }],
+        stale_forecast_intervals: 0, actual_kwh: actualIntervals ? actualKwh : null,
+        actual_intervals: actualIntervals, expected_actual_intervals: expected,
+        actual_coverage_pct: round(actualIntervals * 100 / expected, 1), actual_complete: actualComplete,
+        actual_sources: ["sensor.example_pv_power"], actual_source: "sensor.example_pv_power",
+        actual_samples: samples, expected_actual_samples: samplesExpected,
+        actual_sample_coverage_pct: round(samples * 100 / samplesExpected, 1), actual_status: actualComplete ? "complete" : "partial",
+        comparable_intervals: comparable ? expected : Math.min(forecastIntervals, actualIntervals),
+        comparable: comparable, error_kwh: comparable ? round(forecastKwh - actualKwh, 4) : null
+      };
+    }
+
+    if (resolution === "day") {
+      var first = new Date(selected.getTime());
+      first.setDate(first.getDate() - days + 1);
+      for (var d = 0; d < days; d++) {
+        var dayStart = new Date(first.getTime());
+        dayStart.setDate(dayStart.getDate() + d);
+        var dayEnd = new Date(dayStart.getTime());
+        dayEnd.setDate(dayEnd.getDate() + 1);
+        periods.push(addPeriod(dayStart.getTime(), dayEnd.getTime(), Math.round((dayEnd - dayStart) / 900000), d));
+      }
+    } else {
+      var dayStart = new Date(selected.getTime());
+      var dayEnd = new Date(dayStart.getTime());
+      dayEnd.setDate(dayEnd.getDate() + 1);
+      var step = resolution === "hour" ? 3600000 : 900000;
+      for (var at = dayStart.getTime(), i = 0; at < dayEnd.getTime(); at += step, i++) {
+        periods.push(addPeriod(at, Math.min(at + step, dayEnd.getTime()), resolution === "hour" ? 4 : 1, i));
+      }
+    }
+    var expectedIntervals = periods.reduce(function (sum, row) { return sum + row.intervals; }, 0);
+    var forecastIntervals = periods.reduce(function (sum, row) { return sum + row.forecast_intervals; }, 0);
+    var actualIntervals = periods.reduce(function (sum, row) { return sum + row.actual_intervals; }, 0);
+    var actualSamples = periods.reduce(function (sum, row) { return sum + row.actual_samples; }, 0);
+    var comparableIntervals = periods.reduce(function (sum, row) { return sum + row.comparable_intervals; }, 0);
+    var firstDay = new Date(selected.getTime());
+    firstDay.setDate(firstDay.getDate() - days + 1);
+    var firstDayText = firstDay.getFullYear() + "-" + String(firstDay.getMonth() + 1).padStart(2, "0") + "-" + String(firstDay.getDate()).padStart(2, "0");
+    return {
+      date: dateText, date_start: resolution === "day" ? firstDayText : dateText,
+      date_end: dateText, days: days, timezone: timezone, resolution: resolution, interval_minutes: 15,
+      series: periods,
+      coverage: {
+        expected_intervals: expectedIntervals, forecast_intervals: forecastIntervals,
+        missing_forecast_intervals: expectedIntervals - forecastIntervals,
+        forecast_pct: expectedIntervals ? round(forecastIntervals * 100 / expectedIntervals, 1) : 0,
+        actual_intervals: actualIntervals, missing_actual_intervals: expectedIntervals - actualIntervals,
+        actual_pct: expectedIntervals ? round(actualIntervals * 100 / expectedIntervals, 1) : 0,
+        actual_samples: actualSamples, expected_actual_samples: expectedIntervals * 3,
+        actual_sample_pct: expectedIntervals ? round(actualSamples * 100 / (expectedIntervals * 3), 1) : 0,
+        comparable_intervals: comparableIntervals,
+        comparable_pct: expectedIntervals ? round(comparableIntervals * 100 / expectedIntervals, 1) : 0
+      },
+      actual_provenance: { kind: "direct_pv_power", entities: ["sensor.example_pv_power"], note: "Synthetic direct sample fixture; inferred PV is excluded." }
+    };
+  }
+
   function logEntries(limit) {
     var n = clamp(parseInt(limit, 10) || 100, 1, 500);
     var rows = [];
@@ -1203,6 +1290,7 @@
     "GET /api/v1/plan": function (ctx) { return planPayload(ctx.params.hours); },
     "GET /api/v1/plan/execution": function (ctx) { return executionPayload(ctx.params.hours); },
     "POST /api/v1/plan/recompute": function () { return { queued: true }; },
+    "GET /api/v1/forecast-history": function (ctx) { return forecastHistoryPayload(ctx.params); },
     "GET /api/v1/forecast": function (ctx) {
       var kind = ctx.params.kind || "price";
       var hours = ctx.params.hours;
@@ -1479,6 +1567,7 @@
       out.savings[range] = routes["GET /api/v1/savings"]({ params: { range: range } });
     });
     out.accuracy = routes["GET /api/v1/accuracy"]({ params: { days: "14" } });
+    out.forecast_history = routes["GET /api/v1/forecast-history"]({ params: { resolution: "15m", date: new Date().toISOString().slice(0, 10), timezone: "UTC" } });
     out.log = routes["GET /api/v1/log"]({ params: { limit: "50" } });
     out.providers = routes["GET /api/v1/providers"]({ params: {} });
     return out;

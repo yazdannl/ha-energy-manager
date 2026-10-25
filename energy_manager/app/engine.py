@@ -22,8 +22,9 @@ import logging
 import math
 import threading
 from dataclasses import asdict, dataclass, fields, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from . import analytics
 from . import capacity as capacity_learning
@@ -3992,6 +3993,8 @@ class Engine:
             ):
                 self._solar = analytics.apply_pv_bias(solar, self._pv_factors, now)
             self._archive_forecast("solar", self._solar, now)
+            if solar is not None:
+                self._archive_solar_history(self._solar, now)
         if self._load_source is not None:
             self._fetch("load", "load", now, self._load_source)
             self._archive_forecast("load", self._load, now)
@@ -4039,6 +4042,74 @@ class Engine:
             self._store.archive_forecast(rows)
         except Exception as exc:  # noqa: BLE001 - archiving must never break the control loop
             log.warning("archiving the %s forecast failed: %s", kind, exc)
+
+    def _archive_solar_history(self, forecast: Any, now: datetime) -> None:
+        """Append the corrected 15-minute vintage without changing the learning archive."""
+        slots = getattr(forecast, "slots", None) or []
+        if not slots:
+            return
+        source = str(getattr(forecast, "source", "") or "solar")
+        model = getattr(forecast, "model", None)
+        if model is None:
+            model_rows = []
+            for status in getattr(forecast, "sources", None) or []:
+                name = str(getattr(status, "name", "solar"))
+                detail = getattr(status, "detail", None) or {}
+                candidate = detail.get("model") if isinstance(detail, Mapping) else None
+                row = {"source": name, "model": candidate or {"name": name}}
+                weight = getattr(status, "weight", None)
+                if weight is not None:
+                    row["weight"] = weight
+                model_rows.append(row)
+            if model_rows:
+                model = {"sources": model_rows}
+            else:
+                with self._lock:
+                    status = self._provider_status.get(("solar", source))
+                detail = getattr(status, "detail", None) or {}
+                candidate = detail.get("model") if isinstance(detail, Mapping) else None
+                model = dict(candidate) if isinstance(candidate, Mapping) else candidate
+            if model is None:
+                model = {"name": source}
+            if isinstance(model, dict):
+                planes = getattr(forecast, "planes", None) or []
+                if planes and "planes" not in model:
+                    model["planes"] = planes
+                correction = getattr(forecast, "correction_applied", None)
+                if correction is not None:
+                    model.setdefault("correction_applied", correction)
+        try:
+            model_json = json.dumps(model, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError):
+            model_json = "null"
+
+        rows = []
+        for slot in slots:
+            target = getattr(slot, "t", None)
+            value = getattr(slot, "pv_kw", None)
+            if target is None or value is None or target <= now:
+                continue
+            if target.minute % SLOT_MINUTES or target.second or target.microsecond:
+                continue
+            try:
+                power_kw = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(power_kw):
+                continue
+            rows.append(
+                (
+                    target,
+                    now,
+                    source,
+                    model_json,
+                    max(0.0, power_kw) * SLOT_MINUTES / 60.0,
+                    getattr(slot, "uncertainty_pct", None),
+                    bool(getattr(forecast, "stale", False)),
+                )
+            )
+        if rows:
+            self._store_call("archive_forecast_vintages", rows)
 
     def _fetch(self, kind: str, attribute: str, now: datetime, source: Callable) -> Any:
         try:
@@ -4214,6 +4285,310 @@ class Engine:
         return {
             kind: analytics.accuracy_from_samples(kind, items, days, now)
             for kind, items in samples.items()
+        }
+
+    def forecast_history(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        timezone_name: str = "UTC",
+        resolution: str = "15m",
+    ) -> dict[str, Any]:
+        """Compare immutable solar vintages with complete, direct five-minute PV samples."""
+        if resolution not in {"15m", "hour", "day"}:
+            raise ValueError(f"unknown forecast history resolution: {resolution!r}")
+        zone = ZoneInfo(timezone_name)
+
+        def utc(moment: datetime) -> datetime:
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            return moment.astimezone(timezone.utc)
+
+        def iso(moment: datetime) -> str:
+            return utc(moment).isoformat()
+
+        start_utc, end_utc = utc(start), utc(end)
+        if end_utc <= start_utc:
+            raise ValueError("forecast history end must be after start")
+
+        vintage_rows = self._store_call("forecast_vintages_range", start_utc, end_utc) or []
+        measurement_rows = (
+            self._store_call(
+                "measurements_range", start_utc, end_utc, roles=["pv_power"]
+            )
+            or []
+        )
+
+        selected: dict[datetime, dict[str, Any]] = {}
+        for row in vintage_rows:
+            target, issued = from_iso(row.get("target_ts")), from_iso(row.get("issued_at"))
+            if target is None or issued is None or utc(issued) > utc(target):
+                continue
+            target_utc = utc(target)
+            previous = selected.get(target_utc)
+            rank = (utc(issued), str(row.get("source", "")), str(row.get("model_json", "")))
+            previous_rank = (
+                utc(from_iso(previous["issued_at"])),
+                str(previous.get("source", "")),
+                str(previous.get("model_json", "")),
+            ) if previous else None
+            if previous is None or rank > previous_rank:
+                selected[target_utc] = row
+
+        samples_by_bucket: dict[datetime, dict[str, Any]] = {}
+        observed_sources: set[str] = set()
+        for row in measurement_rows:
+            if row.get("entity_role") != "pv_power" or row.get("unit") != "W":
+                continue
+            bucket, observed = from_iso(row.get("ts")), from_iso(row.get("observed_at"))
+            entity_id = str(row.get("entity_id") or "").strip()
+            if bucket is None or observed is None or not entity_id:
+                continue
+            bucket_utc, observed_utc = utc(bucket), utc(observed)
+            if bucket_utc.second or bucket_utc.microsecond or bucket_utc.minute % ACTUALS_MINUTES:
+                continue
+            age_at_next_sample = (
+                bucket_utc + timedelta(minutes=ACTUALS_MINUTES) - observed_utc
+            ).total_seconds()
+            if age_at_next_sample > LIVE_PV_MAX_AGE_S or age_at_next_sample < -LIVE_PV_FUTURE_SKEW_S:
+                continue
+            try:
+                value_w = float(row.get("value"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(value_w) or value_w < 0.0:
+                continue
+            samples_by_bucket[bucket_utc] = {
+                "entity_id": entity_id,
+                "observed_at": observed_utc,
+                "value_w": value_w,
+            }
+            observed_sources.add(entity_id)
+
+        quarters: list[dict[str, Any]] = []
+        target = start_utc
+        while target + timedelta(minutes=SLOT_MINUTES) <= end_utc:
+            target_end = target + timedelta(minutes=SLOT_MINUTES)
+            vintage = selected.get(target)
+            forecast_kwh = None
+            forecast_source = forecast_model = issued_at = None
+            model_json = "null"
+            uncertainty_pct = None
+            forecast_stale = False
+            if vintage is not None:
+                try:
+                    candidate_kwh = float(vintage.get("forecast_kwh"))
+                except (TypeError, ValueError, OverflowError):
+                    candidate_kwh = math.nan
+                if math.isfinite(candidate_kwh) and candidate_kwh >= 0.0:
+                    forecast_kwh = candidate_kwh
+                    forecast_source = str(vintage.get("source") or "unknown")
+                    model_json = str(vintage.get("model_json") or "null")
+                    try:
+                        forecast_model = json.loads(model_json)
+                    except (TypeError, ValueError):
+                        forecast_model = None
+                    issue = from_iso(vintage.get("issued_at"))
+                    issued_at = iso(issue) if issue is not None else None
+                    try:
+                        uncertainty_pct = float(vintage["uncertainty_pct"])
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        uncertainty_pct = None
+                    if uncertainty_pct is not None and not math.isfinite(uncertainty_pct):
+                        uncertainty_pct = None
+                    forecast_stale = bool(vintage.get("stale", False))
+
+            interval_samples = []
+            seen_observations = set()
+            for offset in range(0, SLOT_MINUTES, ACTUALS_MINUTES):
+                sample = samples_by_bucket.get(target + timedelta(minutes=offset))
+                if sample is None:
+                    continue
+                observed_key = iso(sample["observed_at"])
+                if observed_key in seen_observations:
+                    continue
+                seen_observations.add(observed_key)
+                interval_samples.append(sample)
+            sources = sorted({sample["entity_id"] for sample in interval_samples})
+            actual_complete = len(interval_samples) == SLOT_MINUTES // ACTUALS_MINUTES and len(sources) == 1
+            actual_kwh = (
+                sum(sample["value_w"] / 1000.0 * ACTUALS_MINUTES / 60.0 for sample in interval_samples)
+                if actual_complete
+                else None
+            )
+            actual_status = (
+                "complete" if actual_complete else "mixed_source" if len(sources) > 1
+                else "partial" if interval_samples else "missing"
+            )
+            comparable = forecast_kwh is not None and actual_complete
+            error_kwh = forecast_kwh - actual_kwh if comparable else None
+            quarters.append(
+                {
+                    "start": iso(target),
+                    "end": iso(target_end),
+                    "target_start": iso(target),
+                    "target_end": iso(target_end),
+                    "interval_minutes": SLOT_MINUTES,
+                    "forecast_kwh": forecast_kwh,
+                    "forecast_source": forecast_source,
+                    "forecast_model": forecast_model,
+                    "forecast_model_json": model_json if forecast_kwh is not None else None,
+                    "issued_at": issued_at,
+                    "uncertainty_pct": uncertainty_pct,
+                    "forecast_stale": forecast_stale,
+                    "actual_kwh": actual_kwh,
+                    "actual_source": sources[0] if len(sources) == 1 else None,
+                    "actual_sources": sources,
+                    "actual_samples": len(interval_samples),
+                    "expected_actual_samples": SLOT_MINUTES // ACTUALS_MINUTES,
+                    "actual_complete": actual_complete,
+                    "actual_status": actual_status,
+                    "comparable": comparable,
+                    "error_kwh": error_kwh,
+                }
+            )
+            target = target_end
+
+        groups: dict[str, dict[str, Any]] = {}
+        for quarter in quarters:
+            target = from_iso(quarter["start"])
+            local = utc(target).astimezone(zone)
+            if resolution == "15m":
+                group_start, group_end = utc(target), utc(target) + timedelta(minutes=SLOT_MINUTES)
+                key, label = iso(group_start), local.strftime("%H:%M")
+            elif resolution == "hour":
+                local_start = local.replace(minute=0, second=0, microsecond=0)
+                group_start = utc(local_start)
+                group_end = group_start + timedelta(hours=1)
+                key = iso(group_start)
+                label = local_start.strftime("%Y-%m-%d %H:%M %z")
+            else:
+                local_day = local.date()
+                local_start = datetime.combine(local_day, datetime.min.time()).replace(tzinfo=zone)
+                local_end = datetime.combine(local_day + timedelta(days=1), datetime.min.time()).replace(tzinfo=zone)
+                group_start, group_end = utc(local_start), utc(local_end)
+                key, label = local_day.isoformat(), local_day.isoformat()
+            group = groups.get(key)
+            if group is None:
+                group = {
+                    "start": iso(group_start),
+                    "end": iso(group_end),
+                    "label": label,
+                    "quarters": [],
+                }
+                groups[key] = group
+            group["quarters"].append(quarter)
+
+        series = []
+        for group in sorted(groups.values(), key=lambda item: item["start"]):
+            items = group.pop("quarters")
+            expected = len(items)
+            forecast_items = [item for item in items if item["forecast_kwh"] is not None]
+            actual_items = [item for item in items if item["actual_complete"]]
+            comparable_items = [item for item in items if item["comparable"]]
+            forecast_sources: dict[tuple[str, str], dict[str, Any]] = {}
+            for item in forecast_items:
+                provenance_key = (item["forecast_source"], item["forecast_model_json"])
+                entry = forecast_sources.get(provenance_key)
+                if entry is None:
+                    entry = {
+                        "source": item["forecast_source"],
+                        "model": item["forecast_model"],
+                        "first_issued_at": item["issued_at"],
+                        "last_issued_at": item["issued_at"],
+                        "intervals": 0,
+                    }
+                    forecast_sources[provenance_key] = entry
+                entry["intervals"] += 1
+                if item["issued_at"] < entry["first_issued_at"]:
+                    entry["first_issued_at"] = item["issued_at"]
+                if item["issued_at"] > entry["last_issued_at"]:
+                    entry["last_issued_at"] = item["issued_at"]
+            provenance = [forecast_sources[key] for key in sorted(forecast_sources)]
+            actual_sources = sorted(
+                {source for item in items for source in item["actual_sources"]}
+            )
+            forecast_count, actual_count = len(forecast_items), len(actual_items)
+            sample_count = sum(item["actual_samples"] for item in items)
+            expected_samples = expected * (SLOT_MINUTES // ACTUALS_MINUTES)
+            forecast_complete = expected > 0 and forecast_count == expected
+            actual_complete = expected > 0 and actual_count == expected
+            comparable = forecast_complete and actual_complete
+            series.append(
+                {
+                    **group,
+                    "target_start": group["start"],
+                    "target_end": group["end"],
+                    "interval_minutes": SLOT_MINUTES if resolution == "15m" else 60 if resolution == "hour" else None,
+                    "issued_at": items[0]["issued_at"] if expected == 1 else None,
+                    "uncertainty_pct": items[0]["uncertainty_pct"] if expected == 1 else None,
+                    "forecast_stale": items[0]["forecast_stale"] if expected == 1 else False,
+                    "intervals": expected,
+                    "forecast_kwh": sum(item["forecast_kwh"] for item in forecast_items)
+                    if forecast_items else None,
+                    "forecast_intervals": forecast_count,
+                    "expected_forecast_intervals": expected,
+                    "forecast_coverage_pct": 100.0 * forecast_count / expected if expected else 0.0,
+                    "forecast_complete": forecast_complete,
+                    "forecast_source": provenance[0]["source"] if len(provenance) == 1 else None,
+                    "forecast_model": provenance[0]["model"] if len(provenance) == 1 else None,
+                    "forecast_provenance": provenance,
+                    "stale_forecast_intervals": sum(1 for item in forecast_items if item["forecast_stale"]),
+                    "actual_kwh": sum(item["actual_kwh"] for item in actual_items)
+                    if actual_items else None,
+                    "actual_intervals": actual_count,
+                    "expected_actual_intervals": expected,
+                    "actual_coverage_pct": 100.0 * actual_count / expected if expected else 0.0,
+                    "actual_complete": actual_complete,
+                    "actual_sources": actual_sources,
+                    "actual_source": actual_sources[0] if len(actual_sources) == 1 else None,
+                    "actual_samples": sample_count,
+                    "expected_actual_samples": expected_samples,
+                    "actual_sample_coverage_pct": 100.0 * sample_count / expected_samples
+                    if expected_samples else 0.0,
+                    "actual_status": "complete" if actual_complete else "partial" if actual_count or sample_count else "missing",
+                    "comparable_intervals": len(comparable_items),
+                    "comparable": comparable,
+                    "error_kwh": sum(item["error_kwh"] for item in comparable_items)
+                    if comparable else None,
+                }
+            )
+
+        expected_intervals = len(quarters)
+        forecast_intervals = sum(1 for item in quarters if item["forecast_kwh"] is not None)
+        actual_intervals = sum(1 for item in quarters if item["actual_complete"])
+        comparable_intervals = sum(1 for item in quarters if item["comparable"])
+        actual_samples = sum(item["actual_samples"] for item in quarters)
+        expected_samples = expected_intervals * (SLOT_MINUTES // ACTUALS_MINUTES)
+        return {
+            "timezone": timezone_name,
+            "resolution": resolution,
+            "interval_minutes": SLOT_MINUTES,
+            "series": series,
+            "coverage": {
+                "expected_intervals": expected_intervals,
+                "forecast_intervals": forecast_intervals,
+                "missing_forecast_intervals": expected_intervals - forecast_intervals,
+                "forecast_pct": 100.0 * forecast_intervals / expected_intervals
+                if expected_intervals else 0.0,
+                "actual_intervals": actual_intervals,
+                "missing_actual_intervals": expected_intervals - actual_intervals,
+                "actual_pct": 100.0 * actual_intervals / expected_intervals
+                if expected_intervals else 0.0,
+                "actual_samples": actual_samples,
+                "expected_actual_samples": expected_samples,
+                "actual_sample_pct": 100.0 * actual_samples / expected_samples
+                if expected_samples else 0.0,
+                "comparable_intervals": comparable_intervals,
+                "comparable_pct": 100.0 * comparable_intervals / expected_intervals
+                if expected_intervals else 0.0,
+            },
+            "actual_provenance": {
+                "kind": "direct_pv_power",
+                "entities": sorted(observed_sources),
+                "note": "Only direct pv_power measurements with source entity and fresh HA report time are used; inferred PV is excluded.",
+            },
         }
 
     # ------------------------------------------------------------------ savings

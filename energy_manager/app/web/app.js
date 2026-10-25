@@ -2968,6 +2968,214 @@
     body.appendChild(el("p", { class: "legend-note", text: "Lower is better; every value is also in the per-kind cards above." }));
   }
 
+  function browserTimezone() {
+    try {
+      var name = root.Intl && root.Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (name) return name;
+    } catch (err) { /* use UTC where Intl time-zone discovery is unavailable */ }
+    return "UTC";
+  }
+
+  function localDateValue(moment) {
+    function pad(value) { return value < 10 ? "0" + value : String(value); }
+    return moment.getFullYear() + "-" + pad(moment.getMonth() + 1) + "-" + pad(moment.getDate());
+  }
+
+  function shiftLocalDate(value, amount) {
+    var moment = new Date(value + "T12:00:00");
+    if (!isFinite(moment.getTime())) return value;
+    moment.setDate(moment.getDate() + amount);
+    return localDateValue(moment);
+  }
+
+  function historyStamp(value) {
+    var moment = parseDate(value);
+    return moment ? moment.toLocaleString([], {
+      day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", timeZoneName: "short"
+    }) : "unknown issue time";
+  }
+
+  function historyModelLabel(model) {
+    if (model == null) return "model unknown";
+    if (typeof model === "string" || typeof model === "number") return String(model);
+    var text;
+    try { text = JSON.stringify(model); } catch (err) { text = "model metadata"; }
+    return text.length > 88 ? text.slice(0, 85) + "…" : text;
+  }
+
+  function renderForecastHistory(result, payload) {
+    clear(result);
+    var coverage = payload.coverage || {};
+    var denominator = coverage.expected_intervals || 0;
+    result.appendChild(el("p", { class: "forecast-history-summary", "aria-live": "polite", text:
+      "Forecast vintages " + (coverage.forecast_intervals || 0) + "/" + denominator +
+      " intervals · complete measured PV " + (coverage.actual_intervals || 0) + "/" + denominator +
+      " · samples " + (coverage.actual_samples || 0) + "/" + (coverage.expected_actual_samples || 0) +
+      " · comparable " + (coverage.comparable_intervals || 0) + "/" + denominator
+    }));
+    var entities = payload.actual_provenance && Array.isArray(payload.actual_provenance.entities)
+      ? payload.actual_provenance.entities : [];
+    result.appendChild(el("p", { class: "field-help", text:
+      (entities.length ? "Measured entity: " + entities.join(", ") + ". " : "No trusted direct PV samples found in this range. ") +
+      "Only fresh, direct pv_power samples are used; inferred PV is excluded. Three distinct 5-minute samples from one entity are required for each 15-minute energy value."
+    }));
+
+    var chart = el("div", { class: "chart chart-md" });
+    result.appendChild(chart);
+    if (root.SEMCharts && typeof root.SEMCharts.forecastHistory === "function") {
+      root.SEMCharts.forecastHistory(chart, payload);
+    } else {
+      chart.textContent = "History chart unavailable; the table below contains the interval data.";
+    }
+
+    function vintageCell(row) {
+      var vintages = Array.isArray(row.forecast_provenance) ? row.forecast_provenance : [];
+      if (!vintages.length) return "No captured vintage";
+      return el("div", { class: "forecast-history-vintages" }, vintages.map(function (vintage) {
+        var fullModel = "";
+        try { fullModel = JSON.stringify(vintage.model); } catch (err) { fullModel = ""; }
+        var issueText = historyStamp(vintage.first_issued_at);
+        if (vintage.last_issued_at && vintage.last_issued_at !== vintage.first_issued_at) {
+          issueText += " – " + historyStamp(vintage.last_issued_at);
+        }
+        return el("p", { class: "forecast-history-vintage" }, [
+          el("strong", { text: vintage.source || "unknown source" }), " · ",
+          el("span", { title: fullModel, text: historyModelLabel(vintage.model) }),
+          el("br"), el("span", { class: "muted", text: issueText + " · " + vintage.intervals + " interval(s)" })
+        ]);
+      }));
+    }
+
+    var rows = (Array.isArray(payload.series) ? payload.series : []).map(function (row) {
+      var forecast = isNum(row.forecast_kwh)
+        ? fmtKwh(row.forecast_kwh) + (row.forecast_complete ? "" : " (covered only)") : "--";
+      var actual = isNum(row.actual_kwh)
+        ? fmtKwh(row.actual_kwh) + (row.actual_complete ? "" : " (covered only)") : "--";
+      var interval = payload.resolution === "day" ? row.label
+        : payload.resolution === "hour" ? row.label
+        : historyStamp(row.start) + " – " + historyStamp(row.end);
+      var actualSources = Array.isArray(row.actual_sources) ? row.actual_sources : [];
+      var coverageText = (row.forecast_intervals || 0) + "/" + (row.expected_forecast_intervals || 0) + " forecast intervals; " +
+        (row.actual_intervals || 0) + "/" + (row.expected_actual_intervals || 0) + " complete PV intervals; " +
+        (row.actual_samples || 0) + "/" + (row.expected_actual_samples || 0) + " samples; measured source(s): " +
+        (actualSources.length ? actualSources.join(", ") : "unknown") +
+        ((row.stale_forecast_intervals || 0) ? "; stale forecast intervals: " + row.stale_forecast_intervals : "");
+      var error = isNum(row.error_kwh)
+        ? (row.error_kwh > 0 ? "+" : "") + fmtKwh(row.error_kwh)
+        : "-- (incomplete coverage)";
+      return [interval, forecast, actual, coverageText, error, vintageCell(row)];
+    });
+    result.appendChild(table(
+      "Interval energy in kWh. Partial sums are labelled covered only; error is forecast minus measured and is shown only when both sides have complete coverage.",
+      ["Target interval", "Forecast energy", "Measured PV energy", "Coverage", "Error", "Vintage provenance"],
+      rows,
+      { numeric: [1, 2, 4] }
+    ));
+  }
+
+  function forecastHistoryPanel(host) {
+    var item = panel(host, "Forecast history");
+    var body = item.body;
+    var timezoneName = browserTimezone();
+    var today = localDateValue(new Date());
+    var state = { date: today, resolution: "15m", days: 14 };
+    var dateInput = el("input", { type: "date", id: "forecast-history-date", value: state.date, max: today });
+    var resolutionInput = el("select", { id: "forecast-history-resolution", "aria-label": "History resolution" }, [
+      el("option", { value: "15m", text: "15 minutes" }),
+      el("option", { value: "hour", text: "Hour" }),
+      el("option", { value: "day", text: "Day" })
+    ]);
+    resolutionInput.value = state.resolution;
+    var daysInput = el("input", { type: "number", id: "forecast-history-days", min: "1", max: "31", step: "1", value: state.days });
+    var daysField = el("label", { for: "forecast-history-days", class: "forecast-history-days", hidden: true }, ["Days (max 31) ", daysInput]);
+    var previous = button("Previous day", "", function () {
+      state.date = shiftLocalDate(state.date, -1);
+      dateInput.value = state.date;
+      updateNavigation();
+      load();
+    });
+    previous.setAttribute("aria-label", "Previous local day");
+    var next = button("Next day", "", function () {
+      state.date = shiftLocalDate(state.date, 1);
+      dateInput.value = state.date;
+      updateNavigation();
+      load();
+    });
+    next.setAttribute("aria-label", "Next local day");
+    var refresh = button("Refresh", "", function () { load(); });
+    var controls = el("div", { class: "forecast-history-controls" }, [
+      previous,
+      el("label", { for: "forecast-history-date" }, ["Local date ", dateInput]),
+      next,
+      el("label", { for: "forecast-history-resolution" }, ["Resolution ", resolutionInput]),
+      daysField,
+      refresh
+    ]);
+    var timezoneNote = el("p", { class: "field-help", text: "IANA timezone: " + timezoneName + ". Day boundaries follow this timezone, including daylight-saving changes." });
+    var status = el("p", { class: "muted", role: "status", "aria-live": "polite", text: "Loading forecast history…" });
+    var retry = el("div");
+    var result = el("div", { class: "forecast-history-result" });
+    body.appendChild(controls);
+    body.appendChild(timezoneNote);
+    body.appendChild(status);
+    body.appendChild(retry);
+    body.appendChild(result);
+    var request = 0;
+
+    function updateNavigation() {
+      next.disabled = state.date >= localDateValue(new Date());
+      daysField.hidden = state.resolution !== "day";
+    }
+
+    function load() {
+      var current = ++request;
+      clear(result);
+      clear(retry);
+      status.className = "panel-loading";
+      status.textContent = "Loading forecast history…";
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(state.date)) {
+        status.className = "panel-error";
+        status.textContent = "Choose a valid local calendar date.";
+        return;
+      }
+      var query = { date: state.date, timezone: timezoneName, resolution: state.resolution };
+      if (state.resolution === "day") query.days = state.days;
+      get("/forecast-history", query).then(function (payload) {
+        if (current !== request || !result.isConnected) return;
+        status.className = "muted";
+        status.textContent = "Showing " + (payload.date_start || payload.date) + " through " +
+          (payload.date_end || payload.date) + " (" + timezoneName + ").";
+        renderForecastHistory(result, payload);
+      }).catch(function (err) {
+        if (current !== request || !result.isConnected) return;
+        status.className = "panel-error";
+        status.textContent = "Could not load forecast history: " + (err && err.message ? err.message : err);
+        retry.appendChild(button("Retry", "", load));
+      });
+    }
+
+    dateInput.addEventListener("change", function () {
+      state.date = dateInput.value || state.date;
+      updateNavigation();
+      load();
+    });
+    resolutionInput.addEventListener("change", function () {
+      state.resolution = resolutionInput.value;
+      updateNavigation();
+      load();
+    });
+    daysInput.addEventListener("change", function () {
+      var value = parseInt(daysInput.value, 10);
+      if (!isFinite(value)) value = 14;
+      state.days = Math.max(1, Math.min(31, value));
+      daysInput.value = state.days;
+      load();
+    });
+    updateNavigation();
+    load();
+    return item;
+  }
+
   function viewForecasts(host) {
     var load = once(function () {
       return Promise.all([
@@ -2983,6 +3191,7 @@
     asyncPanel(host, "Price forecast", { load: load, render: function (body, data) { renderForecastPanel(body, "price", data.price, data.accuracy.price); } });
     asyncPanel(host, "Solar forecast", { load: load, render: function (body, data) { renderForecastPanel(body, "solar", data.solar, data.accuracy.pv); } });
     asyncPanel(host, "Load forecast", { load: load, render: function (body, data) { renderForecastPanel(body, "load", data.load, data.accuracy.load); } });
+    forecastHistoryPanel(host);
     asyncPanel(host, "Forecast accuracy", { load: load, render: function (body, data) { renderAccuracy(body, data.accuracy); } });
     asyncPanel(host, "Providers", {
       load: once(function () { return get("/providers"); }),

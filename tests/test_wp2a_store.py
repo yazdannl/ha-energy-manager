@@ -58,8 +58,10 @@ EXPECTED_TABLES = {
     "events",
     "settings",
     "meta",
-    # 0.22.0: what each provider predicted per slot, so forecast skill is measurable (SPEC 7.4).
+    # 0.22.0: latest forecast issue per provider/slot for online learning (SPEC 7.4).
     "forecast_archive",
+    # Forecast History MVP: immutable solar vintages, separate from the learning archive.
+    "forecast_vintages",
     # 0.27.0: the append-only as-of history for the two upsert tables a replay freezes (SPEC 11).
     "settings_history",
     "learning_profiles_history",
@@ -636,7 +638,7 @@ def test_schema_v5_seeds_the_history_from_the_pre_upgrade_rows(tmp_path):
     conn.close()
     store = Store(path)
     try:
-        assert store.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 7
+        assert store.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 8
         seeded = store.connection.execute(
             "SELECT at, origin FROM settings_history WHERE key = 'mode'"
         ).fetchone()
@@ -730,7 +732,7 @@ def test_schema_v2_migrates_a_v1_database_and_keeps_its_rows(tmp_path):
         store.upsert_savings_daily("2026-01-02", charged_kwh=1.5, battery_measured=1)
         assert store.savings_daily_range("2026-01-02", "2026-01-02")[0]["charged_kwh"] == 1.5
         version = store.connection.execute("SELECT version FROM schema_version").fetchone()[0]
-        assert version == SCHEMA_VERSION == 7
+        assert version == SCHEMA_VERSION == 8
     finally:
         store.close()
 

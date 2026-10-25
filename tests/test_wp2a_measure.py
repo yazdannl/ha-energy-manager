@@ -188,6 +188,20 @@ def test_disabled_batteries_are_skipped():
     assert actuals["soc_kwh"] is None
 
 
+def test_measured_pv_entity_and_report_time_are_persisted_for_history(store):
+    settings = Settings(None, options={"solar.measured_entity": "sensor.example_pv_power"})
+    pv = state("sensor.example_pv_power", 1250, "W")
+    pv["last_reported"] = NOW.isoformat()
+    measurements, actuals = collect(FakeClient([pv]), settings, now=NOW)
+
+    store.add_measurements(measurements, pv_observed_at=actuals["pv_updated_at"])
+    rows = store.measurements_range(NOW - timedelta(minutes=5), NOW + timedelta(minutes=5), roles=["pv_power"])
+    assert len(rows) == 1
+    assert rows[0]["entity_id"] == "sensor.example_pv_power"
+    assert rows[0]["observed_at"] == NOW.isoformat()
+    assert rows[0]["value"] == pytest.approx(1250.0)
+
+
 def test_collect_reads_only_mapped_entities_and_upserts_five_minute_buckets(store):
     settings = Settings(None, options={"load.entity": "sensor.example_load_power"})
     client = FakeClient([state("sensor.example_load_power", 400, "W")])

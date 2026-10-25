@@ -897,6 +897,15 @@ tbody tr:hover { background: var(--panel-2); }
   max-height: 12rem;
 }
 .log-filters { display: flex; flex-wrap: wrap; gap: var(--sp-2) var(--sp-3); align-items: flex-end; }
+.forecast-history-controls { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: flex-end; }
+.forecast-history-result { min-width: 0; }
+.forecast-history-controls label { display: grid; gap: var(--sp-1); color: var(--text-muted); font-size: 0.8rem; }
+.forecast-history-controls input, .forecast-history-controls select { min-height: 2.5rem; }
+.forecast-history-days[hidden] { display: none; }
+.forecast-history-vintages { min-width: 13rem; max-width: 26rem; overflow-wrap: anywhere; }
+.forecast-history-vintage { margin: 0 0 var(--sp-1); }
+.forecast-history-vintage:last-child { margin-bottom: 0; }
+.forecast-history-summary { font-weight: 600; }
 
 /* ---------- charts ---------- */
 /* The chart surface itself lives in chart-theme.css, which the Lovelace card bundle also inlines so
@@ -948,6 +957,10 @@ tbody tr:hover { background: var(--panel-2); }
 }
 
 @media (max-width: 480px) {
+  .forecast-history-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; }
+  .forecast-history-controls > label { min-width: 0; }
+  .forecast-history-controls input, .forecast-history-controls select { width: 100%; min-width: 0; }
+  .forecast-history-controls .btn { min-height: 2.5rem; }
   /* 16 px side gutters stay on a phone: text touches chrome otherwise (UI_REVIEW §3.12). */
   main { padding: var(--sp-3) var(--sp-3) var(--sp-5); }
   .topbar { padding: var(--sp-2); }

@@ -133,6 +133,34 @@ function classTokens(text) {
     }
   }
 
+  /* ---------- 1f. bounded forecast-vintage history ---------- */
+  console.log("\n1f. Forecast History: timezone, controls, coverage and table");
+  await goto("/forecasts");
+  const historyPanel = byClass(view(), "forecast-history-result")[0];
+  const historyDate = view().querySelectorAll("#forecast-history-date")[0];
+  const historyResolution = view().querySelectorAll("#forecast-history-resolution")[0];
+  const historyDays = view().querySelectorAll("#forecast-history-days")[0];
+  check(
+    "history offers a local date and 15-minute/hour/day resolutions",
+    !!historyDate && historyDate.getAttribute("type") === "date" && !!historyResolution
+      && ["15m", "hour", "day"].every((value) => historyResolution.querySelectorAll("option").some((option) => option.value === value)),
+  );
+  check(
+    "history states its IANA timezone and direct-measurement rule",
+    /IANA timezone/.test(allText(view())) && /inferred PV is excluded/.test(allText(view())),
+    allText(view()).slice(-420),
+  );
+  check(
+    "history renders a chart fallback and an accessible provenance/coverage table",
+    !!historyPanel && !!historyPanel.querySelector("table")
+      && /Vintage provenance/.test(allText(historyPanel)) && /complete coverage/.test(allText(historyPanel)),
+    historyPanel ? allText(historyPanel).slice(0, 360) : "no history result",
+  );
+  historyResolution.value = "day";
+  historyResolution.dispatchEvent({ type: "change" });
+  await sleep(220);
+  check("daily history exposes a bounded 1–31 day selector", !!historyDays && !historyDays.hidden);
+
   /* ---------- 1z. the dashboard-card installer (SPEC 12) ---------- */
   // The card is installed by hand from these three pieces of text: a download, a resource URL and a
   // card snippet. A typo here leaves the user with a dashboard tile that never appears.

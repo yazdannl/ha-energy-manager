@@ -20,10 +20,11 @@ import posixpath
 import re
 import threading
 from dataclasses import asdict, is_dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Mapping
 from urllib.parse import parse_qs, unquote, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .models import (
     AccuracyReport,
@@ -1153,6 +1154,51 @@ class ApiServer:
                     "baseline_note": BASELINE_NOTE,
                 }
             )
+
+        if route == "forecast-history" and method == "GET":
+            resolution = str(query.get("resolution") or "15m")
+            if resolution not in ("15m", "hour", "day"):
+                raise ApiError(400, "invalid_resolution", "resolution must be 15m, hour or day")
+            timezone_name = str(query.get("timezone") or "UTC")
+            try:
+                zone = ZoneInfo(timezone_name)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise ApiError(400, "invalid_timezone", "timezone must be a valid IANA time-zone name") from None
+            date_text = query.get("date")
+            if date_text and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
+                raise ApiError(400, "invalid_date", "date must be an ISO calendar date (YYYY-MM-DD)")
+            try:
+                selected_day = date.fromisoformat(date_text) if date_text else now.astimezone(zone).date()
+            except (TypeError, ValueError):
+                raise ApiError(400, "invalid_date", "date must be an ISO calendar date (YYYY-MM-DD)") from None
+            days = min(31, _limit(query.get("days"), 14)) if resolution == "day" else 1
+            try:
+                first_day = selected_day - timedelta(days=days - 1)
+                start_local = datetime.combine(first_day, time.min, tzinfo=zone)
+                end_local = datetime.combine(selected_day + timedelta(days=1), time.min, tzinfo=zone)
+                start_utc = start_local.astimezone(timezone.utc)
+                end_utc = end_local.astimezone(timezone.utc)
+            except (OverflowError, ValueError):
+                raise ApiError(400, "invalid_date", "date range is outside the supported calendar") from None
+            history = engine.forecast_history(
+                start_utc,
+                end_utc,
+                timezone_name=timezone_name,
+                resolution=resolution,
+            )
+            history.update(
+                {
+                    "date": selected_day.isoformat(),
+                    "date_start": first_day.isoformat(),
+                    "date_end": selected_day.isoformat(),
+                    "timezone": timezone_name,
+                    "resolution": resolution,
+                    "days": days,
+                    "from": to_iso(start_utc),
+                    "to": to_iso(end_utc),
+                }
+            )
+            return self._json(history)
 
         if route == "accuracy" and method == "GET":
             days = _limit(query.get("days"), 14)

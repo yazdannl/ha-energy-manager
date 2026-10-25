@@ -19,7 +19,7 @@ Hash routing (`app.js: splitHash()`), eight views, all rendered client-side:
 | --- | --- | --- |
 | `#/dashboard` | `viewDashboard` | Live now-cards, alerts, 24 h mini-chart, autopilot controls |
 | `#/plan` | `viewPlan` | Aligned timeline, plan summary, per-slot table, recompute |
-| `#/forecasts` | `viewForecasts` | Price / solar / load panels, per-day totals, accuracy trend, provider health |
+| `#/forecasts` | `viewForecasts` | Price / solar / load panels, per-day totals, bounded forecast-vintage history, accuracy trend, provider health |
 | `#/batteries` | `viewBatteries` | Battery cards, discovery-based add/edit wizard, bounded test discharge |
 | `#/savings` | `viewSavings` | Range totals, savings vs baseline chart, per-bucket table, baseline definition |
 | `#/cards` | `viewCards` | Downloadable Lovelace card, chart picker, copy-paste snippet, live preview, feed entity table |
@@ -129,8 +129,20 @@ plain links to `/api/v1/export?what=plan&format=json|csv`.
 **Forecasts** — one panel per kind with source badge, `generated_at` age, `stale`/confidence
 badges, notes, chart, per-day totals table. Price: buy bars + sell line, stale slots drawn grey.
 Solar: PV area with a ±uncertainty band and peak per day. Load: P50 line with a P10/P90 band.
-Accuracy panel shows MAPE/bias/MAE/samples per kind plus a 14-day MAPE trend. A provider table
-lists active/healthy/freshness per provider.
+
+The **Forecast history** panel queries `GET /api/v1/forecast-history` with the browser's IANA
+timezone and a local date. Previous/next controls move by local calendar day; resolution is 15 minutes,
+hour or day, with day history bounded to 31 days (14 by default). The chart plots forecast and direct
+measured-PV energy in kWh only for complete intervals; the accessible table retains covered partial
+sums, per-interval coverage, stale-vintage count, forecast issue time/source/model and the measured entity per interval. Actual energy
+uses only fresh `solar.measured_entity` `pv_power` samples: three distinct 5-minute samples from one
+entity are required for each quarter-hour, and `pv_derived_kw` is excluded. Hour/day values sum kWh,
+not average power. Error is forecast minus measured and remains unknown unless all forecast and actual
+intervals in the selected rollup are complete; missing data is never rendered as zero. History
+accrues prospectively: pre-upgrade forecasts are not backfilled. Local-midnight boundaries follow the
+selected IANA zone, including 23- and 25-hour DST days. The existing accuracy panel still shows
+MAPE/bias/MAE/samples per kind plus its 14-day MAPE trend. A provider table lists active/healthy/freshness
+per provider.
 
 **Batteries** — a card per battery: live power/SoC/energy, the **round trip** efficiency in percent
 (the input: one number, split evenly into `eta_charge`/`eta_discharge`; explicit per-direction values

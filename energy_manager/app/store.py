@@ -18,6 +18,7 @@ writing a few tens of thousands of rows. Upgrade path: add indexes only if a que
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
 import threading
@@ -52,7 +53,7 @@ __all__ = [
     "table_exists",
 ]
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 #: One migration step: a SQL statement, or a Python step for work SQL cannot express (the history
 #: seed parses the instant it copies, and a stored ``+02:00`` offset is not a string operation).
@@ -137,6 +138,32 @@ def _add_columns_if_missing(
     for name, kind in columns.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+
+
+def _create_forecast_history(conn: sqlite3.Connection) -> None:
+    """Migration 8: immutable 15-minute solar vintages plus direct-sample provenance."""
+    _add_columns_if_missing(
+        conn, "measurements", {"entity_id": "TEXT", "observed_at": "TEXT"}
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS forecast_vintages (
+            target_ts TEXT NOT NULL,
+            interval_minutes INTEGER NOT NULL CHECK(interval_minutes = 15),
+            issued_at TEXT NOT NULL,
+            source TEXT NOT NULL,
+            model_json TEXT NOT NULL,
+            forecast_kwh REAL NOT NULL,
+            uncertainty_pct REAL,
+            stale INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (target_ts, issued_at, source, model_json)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_forecast_vintages_target_issue"
+        " ON forecast_vintages(target_ts, issued_at)"
+    )
 
 
 MIGRATIONS: list[tuple[int, tuple[MigrationStep, ...]]] = [
@@ -403,6 +430,15 @@ MIGRATIONS: list[tuple[int, tuple[MigrationStep, ...]]] = [
             "DELETE FROM savings_daily WHERE day = date('now') AND total_hours IS NOT NULL",
         ),
     ),
+    (
+        8,
+        (
+            # Forecast History MVP: persist the measured entity and HA report timestamp for future
+            # PV samples, and keep an append-only solar vintage separate from the existing learned
+            # forecast_archive contract. The migration is idempotent for replay scratch databases.
+            _create_forecast_history,
+        ),
+    ),
 ]
 
 
@@ -487,6 +523,13 @@ def _to_ts(value: datetime | str | None, default: datetime | None = None) -> str
     if isinstance(value, str):
         return value
     return to_iso(value)
+
+
+def _utc_stamp(value: datetime | str) -> str:
+    moment = from_iso(value)
+    if moment is None:
+        raise ValueError("timestamp is required")
+    return _canonical_utc(moment)
 
 
 def _write_stamps(value: datetime | None) -> tuple[str, str]:
@@ -1194,13 +1237,22 @@ class Store:
         return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------ measurements / actuals
-    def add_measurements(self, measurements: Iterable[Measurement]) -> int:
+    def add_measurements(
+        self,
+        measurements: Iterable[Measurement],
+        *,
+        pv_observed_at: datetime | str | None = None,
+    ) -> int:
+        """Persist a sample bucket and its source; HA's report time is retained for direct PV."""
+        observed_at = _utc_stamp(pv_observed_at) if pv_observed_at is not None else None
         rows = [
             (
                 to_iso(item.ts),
                 item.role,
                 float(item.value),
                 item.unit,
+                getattr(item, "entity_id", None),
+                observed_at if item.role == "pv_power" else None,
             )
             for item in measurements
         ]
@@ -1208,9 +1260,10 @@ class Store:
             return 0
         with _transaction(self.connection) as conn:
             conn.executemany(
-                "INSERT INTO measurements(ts, entity_role, value, unit) VALUES(?, ?, ?, ?) "
-                "ON CONFLICT(ts, entity_role) DO UPDATE SET value = excluded.value,"
-                " unit = excluded.unit",
+                "INSERT INTO measurements(ts, entity_role, value, unit, entity_id, observed_at) "
+                "VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(ts, entity_role) DO UPDATE SET "
+                "value = excluded.value, unit = excluded.unit, entity_id = excluded.entity_id, "
+                "observed_at = excluded.observed_at",
                 rows,
             )
         return len(rows)
@@ -1299,6 +1352,64 @@ class Store:
             sql += " AND kind = ?"
             params.append(str(kind))
         rows = self.connection.execute(sql + " ORDER BY target_ts", params).fetchall()
+        return [dict(row) for row in rows]
+
+    def archive_forecast_vintages(
+        self,
+        rows: Iterable[
+            tuple[datetime | str, datetime | str, str, str, float, float | None, bool]
+        ],
+    ) -> int:
+        """Append immutable solar vintages as interval energy (kWh)."""
+        payload = []
+        for target, issued, source, model_json, value, uncertainty, stale in rows:
+            target_ts, issued_at = _utc_stamp(target), _utc_stamp(issued)
+            if from_iso(issued_at) > from_iso(target_ts):
+                continue
+            energy = float(value)
+            if not math.isfinite(energy) or energy < 0.0:
+                continue
+            uncertainty_value = None if uncertainty is None else float(uncertainty)
+            if uncertainty_value is not None and not math.isfinite(uncertainty_value):
+                uncertainty_value = None
+            payload.append(
+                (
+                    target_ts,
+                    15,
+                    issued_at,
+                    str(source or "unknown"),
+                    str(model_json or "null"),
+                    energy,
+                    uncertainty_value,
+                    int(bool(stale)),
+                )
+            )
+        if not payload:
+            return 0
+        with _transaction(self.connection) as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO forecast_vintages"
+                "(target_ts, interval_minutes, issued_at, source, model_json, forecast_kwh,"
+                " uncertainty_pct, stale) VALUES(?,?,?,?,?,?,?,?)",
+                payload,
+            )
+        return len(payload)
+
+    def forecast_vintages_range(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
+        """Return the latest captured vintage no later than each target interval start."""
+        start_ts, end_ts = _utc_stamp(start), _utc_stamp(end)
+        rows = self.connection.execute(
+            "SELECT v.* FROM forecast_vintages v "
+            "WHERE v.target_ts >= ? AND v.target_ts < ? AND v.issued_at <= v.target_ts "
+            "AND NOT EXISTS (SELECT 1 FROM forecast_vintages newer "
+            "WHERE newer.target_ts = v.target_ts AND newer.issued_at <= newer.target_ts "
+            "AND (newer.issued_at > v.issued_at OR "
+            "(newer.issued_at = v.issued_at AND "
+            "(newer.source > v.source OR "
+            "(newer.source = v.source AND newer.model_json > v.model_json))))) "
+            "ORDER BY v.target_ts",
+            (start_ts, end_ts),
+        ).fetchall()
         return [dict(row) for row in rows]
 
     def forecast_accuracy(
@@ -1526,6 +1637,7 @@ class Store:
             ("measurements", "ts", moment - timedelta(days=measurements_days)),
             ("actuals", "ts", moment - timedelta(days=actuals_days)),
             ("forecast_archive", "target_ts", moment - timedelta(days=forecast_archive_days)),
+            ("forecast_vintages", "target_ts", moment - timedelta(days=forecast_archive_days)),
         )
         removed: dict[str, int] = {}
         with _transaction(self.connection) as conn:

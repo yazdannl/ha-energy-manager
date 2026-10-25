@@ -42,6 +42,10 @@ def test_ui_renders_and_settings_ia_holds():
     # A render check that silently checks nothing is worse than no check: assert the load-bearing ones.
     for needle in (
         "every view renders from mock data",
+        "history offers a local date and 15-minute/hour/day resolutions",
+        "history states its IANA timezone and direct-measurement rule",
+        "history renders a chart fallback and an accessible provenance/coverage table",
+        "daily history exposes a bounded 1–31 day selector",
         "settingsVisible is exported for offline testing",
         "the all-settings drawer holds the full form",
         "the setup cards own the primary keys",

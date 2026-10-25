@@ -299,6 +299,7 @@
     price: function (v) { return v.toFixed(2); },
     eur: function (v) { return v.toFixed(2); },
     kw: function (v) { return v.toFixed(2); },
+    kwh: function (v) { return v.toFixed(2); },
     pct: function (v) { return Math.round(v) + "%"; },
     pctError: function (v) { return Math.round(v) + "%"; }
   };
@@ -809,6 +810,46 @@
     draw(host);
   }
 
+  function forecastHistoryChart(host, payload, options) {
+    var rows = payload && Array.isArray(payload.series) ? payload.series : [];
+    if (!hasRows(rows)) { fallback(host, "No forecast history intervals for this range."); return; }
+    var xs = rows.map(function (row) { return ts(row.start); });
+    var forecast = rows.map(function (row) {
+      return row.forecast_complete ? num(row.forecast_kwh) : null;
+    });
+    var actual = rows.map(function (row) {
+      return row.actual_complete ? num(row.actual_kwh) : null;
+    });
+    if (!forecast.concat(actual).some(function (value) { return value !== null; })) {
+      fallback(host, "No complete forecast or measured-PV intervals to plot; see the table for coverage.");
+      return;
+    }
+    if (!chartsReady(host)) return;
+    var p = palette(options && options.palette);
+    var opts = baseOpts(p, {
+      scales: { x: { time: true }, y: { auto: true } },
+      axes: [timeAxis(p), axisFor("y", "kWh", 3, p, narrowHost(host), "kwh")],
+      series: [
+        {},
+        Object.assign(line(p.pv), {
+          label: "Forecast energy (complete coverage)",
+          value: function (u, v) { return fmt(v, 2, "kWh"); }
+        }),
+        Object.assign(lineDashed(p.load), {
+          label: "Measured PV energy (complete coverage, dashed)",
+          value: function (u, v) { return fmt(v, 2, "kWh"); }
+        })
+      ],
+      plugins: [decorPlugin({ palette: p, zeroLine: true }), tooltipPlugin()]
+    });
+    var draw = function (el) {
+      mount(el, opts, [xs, forecast, actual], 185, draw,
+        "Forecast and direct measured PV energy per interval in kWh; incomplete intervals are gaps.",
+        "Forecast energy (solid) and measured PV energy (long dashes), in kWh. Incomplete coverage is not plotted.");
+    };
+    draw(host);
+  }
+
   function savingsChart(host, buckets, options) {
     if (!hasRows(buckets)) { fallback(host, "No savings buckets for this range yet."); return; }
     if (!chartsReady(host)) return;
@@ -936,6 +977,7 @@
     plan: planChart,
     mini: miniChart,
     forecast: forecastChart,
+    forecastHistory: forecastHistoryChart,
     savings: savingsChart,
     accuracy: accuracyChart,
     destroy: destroy,
