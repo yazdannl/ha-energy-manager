@@ -70,6 +70,22 @@ def wired(tmp_path):
     store.close()
 
 
+def test_sampler_forwards_the_pv_report_timestamp(wired):
+    engine, settings, _store, ha, clock = wired
+    settings.set("solar.measured_entity", "sensor.example_pv_power")
+    ha.states["sensor.example_pv_power"] = {
+        "state": "2.1",
+        "attributes": {"unit_of_measurement": "kW"},
+        "last_updated": clock.now.isoformat(),
+        "last_reported": clock.now.isoformat(),
+    }
+
+    sampled = engine._sampler(clock.now)
+
+    assert sampled["pv_w"] == pytest.approx(2100.0)
+    assert sampled["pv_updated_at"] == clock.now
+
+
 def test_plan_and_dispatch_through_the_real_store(wired):
     engine, settings, store, ha, clock = wired
     plan = engine.plan_now("integration")

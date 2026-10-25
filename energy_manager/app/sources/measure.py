@@ -49,7 +49,7 @@ import logging
 from datetime import datetime
 from typing import Any, Iterable, Mapping
 
-from ..models import BatteryConfig, Measurement, quarter_floor, utcnow
+from ..models import BatteryConfig, Measurement, from_iso, quarter_floor, utcnow
 from . import unit_and_divisor
 
 log = logging.getLogger(__name__)
@@ -223,7 +223,9 @@ def collect(
     Without an explicit ``states`` snapshot only the mapped entities are read, one targeted call
     each. ``mappings`` is the per-battery driver-resolved mapping (see :func:`role_entities`).
     Returns ``(measurements, actuals)``; the engine is the single writer of both tables
-    (``actuals`` here is the live tick value, not a row to persist).
+    (``actuals`` here is the live tick value, not a row to persist). For ``pv_power``, actuals also
+    carries Home Assistant's ``last_reported`` (or ``last_updated``) as ``pv_updated_at`` so the
+    optimizer can reject stale readings.
     """
     moment = now or utcnow()
     bucket = quarter_floor(moment, MEASUREMENT_MINUTES)
@@ -237,11 +239,20 @@ def collect(
         state_map = {}
     measurements: list[Measurement] = []
     values: dict[str, float] = {}
+    pv_updated_at: datetime | None = None
 
     for role, entity_id in role_map.items():
         state = state_map.get(entity_id)
         if state is None:
             continue
+        if role == "pv_power":
+            for timestamp_key in ("last_reported", "last_updated"):
+                try:
+                    pv_updated_at = from_iso(state.get(timestamp_key))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if pv_updated_at is not None:
+                    break
         attributes = state.get("attributes") or {}
         unit = attributes.get("unit_of_measurement")
         raw = state.get("state")
@@ -273,6 +284,7 @@ def collect(
         "ts": bucket,
         "grid_kw": _kw(grid_w),
         "pv_kw": _kw(values.get("pv_power")),
+        "pv_updated_at": pv_updated_at,
         "load_kw": _kw(values.get("load_power")),
         "battery_kw": _kw(sum(battery_power_w) if battery_power_w else None),
         "soc_kwh": soc_kwh if any(f"battery_soc:{battery.id}" in values for battery in battery_list) else None,

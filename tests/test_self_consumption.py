@@ -119,6 +119,14 @@ def _plan(solar, load, start_kwh=2.5, **overrides):
 # --------------------------------------------------------------------------------- the planner
 
 
+def test_plan_preserves_a_per_slot_live_pv_source():
+    solar = _solar(lambda i: 1.0)
+    solar.slots[0].source = "live_measurement"
+    plan = _plan(solar, _load())
+    assert plan.slots[0].pv_source == "live_measurement"
+    assert plan.slots[1].pv_source == "test"
+
+
 def test_every_surplus_kwh_is_caught_and_nothing_is_exported():
     """A short 2 kW rooftop burst against 0.4 kW of load: charge 1.6 kW, never reach the meter."""
     plan = _plan(_solar(lambda i: 2.0 if 8 <= i < 12 else 0.0), _load(0.4))

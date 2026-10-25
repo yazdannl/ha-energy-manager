@@ -27,7 +27,10 @@ from app.main import (  # noqa: E402
     _selfcheck_settings,
     _selfcheck_sources,
 )
-from app.models import BatteryConfig, BatteryState, Mode, ProviderStatus, Reason, from_iso  # noqa: E402
+from app.models import (  # noqa: E402
+    BatteryConfig, BatteryState, Mode, Plan, PlanSlot, ProviderStatus, Reason,
+    SolarForecast, SolarSlot, from_iso,
+)
 
 PUBLISHED_ENTITIES = {
     "sensor.sem_autopilot_state",
@@ -1935,6 +1938,70 @@ def test_publishing_survives_a_missing_load_forecast():
     payload = _ha.published["sensor.sem_load_forecast_now"]
     assert float(payload["state"]) == 0.0
     assert float(payload["attributes"]["today_kwh"]) == 0.0
+
+
+def test_live_pv_overrides_only_the_current_fresh_optimizer_slot():
+    engine, _store, _ha, clock, settings = build_engine()
+    settings.set("optimizer.slot_minutes", 15)
+    now = clock.now
+    solar = SolarForecast(
+        source="capacity",
+        slots=[
+            SolarSlot(t=now, pv_kw=0.4),
+            SolarSlot(t=now + timedelta(minutes=15), pv_kw=0.8),
+            SolarSlot(t=now + timedelta(minutes=30), pv_kw=1.1),
+        ],
+    )
+    engine._sampler = lambda _moment: {"pv_w": 1750.0, "pv_updated_at": now}
+    engine._sample(now)
+
+    planning_solar = engine._solar_with_live_pv(solar, now)
+
+    assert planning_solar is not solar
+    assert planning_solar.slots[0].pv_kw == pytest.approx(1.75)
+    assert planning_solar.slots[0].source == "live_measurement"
+    assert [(slot.t, slot.pv_kw) for slot in planning_solar.slots[1:]] == [
+        (slot.t, slot.pv_kw) for slot in solar.slots[1:]
+    ]
+    assert solar.slots[0].pv_kw == pytest.approx(0.4)  # baseline forecast stays untouched
+
+    engine._pv_live_at = now - timedelta(minutes=11)
+    assert engine._solar_with_live_pv(solar, now) is solar
+    engine._pv_live_at = None
+    assert engine._solar_with_live_pv(solar, now) is solar
+
+
+def test_live_pv_replans_on_availability_change_and_staleness():
+    engine, _store, _ha, clock, settings = build_engine()
+    settings.set("optimizer.slot_minutes", 15)
+    now = clock.now
+    engine._solar = SolarForecast(
+        source="capacity",
+        slots=[SolarSlot(t=now, pv_kw=0.4), SolarSlot(t=now + timedelta(minutes=15), pv_kw=0.8)],
+    )
+    plan = Plan(
+        generated_at=now,
+        horizon_start=now,
+        horizon_end=now + timedelta(minutes=15),
+        slot_minutes=15,
+        slots=[PlanSlot(
+            t=now, buy=0.2, sell=0.1, pv_kw=1.0, load_kw=0.5, soc_kwh=2.5,
+            power_w=0, action="hold", reason="test", pv_source="live_measurement",
+        )],
+    )
+    engine._pv_live_w = 1000.0
+    engine._pv_live_at = now
+    assert engine._live_pv_replan_reason(plan, now) is None
+
+    engine._pv_live_w = 1300.0
+    assert engine._live_pv_replan_reason(plan, now) == "pv_measurement_changed"
+
+    engine._pv_live_at = now - timedelta(minutes=11)
+    assert engine._live_pv_replan_reason(plan, now) == "pv_measurement_stale"
+
+    plan.slots[0].pv_source = "capacity"
+    engine._pv_live_at = now
+    assert engine._live_pv_replan_reason(plan, now) == "pv_measurement_available"
 
 
 def test_replan_loop_backs_off_instead_of_hot_spinning():

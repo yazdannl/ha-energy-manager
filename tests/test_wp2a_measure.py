@@ -135,7 +135,18 @@ def test_collect_converts_units_and_builds_actuals():
     assert actuals["battery_kw"] == pytest.approx(0.5)  # 600 W in - 100 W out, positive = charging
     assert actuals["soc_kwh"] == pytest.approx(2.5)
     assert actuals["price_buy"] == pytest.approx(0.21)
+    assert actuals["pv_updated_at"] is None  # legacy/fake states carry no HA report timestamp
     assert {"pv_kw", "load_kw", "grid_kw"} <= set(actuals)
+
+
+def test_collect_prefers_home_assistants_last_reported_for_live_pv():
+    settings = Settings(None, options={"solar.measured_entity": "sensor.example_pv_power"})
+    pv = state("sensor.example_pv_power", 1500, "W")
+    pv["last_updated"] = (NOW - timedelta(minutes=9)).isoformat()
+    pv["last_reported"] = NOW.isoformat()
+    _, actuals = collect(FakeClient([pv]), settings, now=NOW)
+    assert actuals["pv_kw"] == pytest.approx(1.5)
+    assert actuals["pv_updated_at"] == NOW
 
 
 def test_collect_never_mixes_dc_pv_input_into_battery_power():

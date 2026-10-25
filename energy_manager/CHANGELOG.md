@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.36.0
+
+- **New: live PV informs the current optimizer slot.** A fresh measured inverter-power reading
+  replaces only the active slot; later forecast slots and the forecast model remain unchanged. HA's
+  report timestamp (falling back to the state-update timestamp) gates freshness, and new, materially
+  changed, or stale readings trigger rate-limited replanning. The Solar setup card now exposes the
+  measured-PV picker for the meter-derived source too.
+
 ## 0.35.1
 
 - `sensor.sem_plan_action` now says which plan candidate won (`plan_variant`), what it nets after the

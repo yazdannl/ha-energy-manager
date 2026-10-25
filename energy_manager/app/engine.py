@@ -75,6 +75,12 @@ ACTUALS_MINUTES = 5
 #: providers in the tests: a silent divergence would make every slot lookup in ``_slot_forecast_at``
 #: miss its exact key and fall back to the previous slot, an hour of drift nobody would notice.
 SLOT_MINUTES = 15
+#: A measured PV reading older than this is not an observation of the current optimizer slot.
+LIVE_PV_MAX_AGE_S = 10.0 * 60.0
+#: Tolerate slight clock skew but reject future-dated sensor states.
+LIVE_PV_FUTURE_SKEW_S = 60.0
+#: Ignore small sensor noise; meaningful changes trigger a rate-limited replan.
+LIVE_PV_REPLAN_DELTA_KW = 0.25
 
 #: How long a learned-capacity profile read is cached in the engine (SPEC 5); maintenance rewrites
 #: it at most once a day, so a few minutes of staleness changes nothing and keeps the tick cheap.
@@ -381,6 +387,8 @@ class Engine:
         self._actuals_ring: list[dict[str, Any]] = []
         self._last_sample_at: datetime | None = None
         self._last_sample_values: dict[str, Any] = {}
+        self._pv_live_w: float | None = None
+        self._pv_live_at: datetime | None = None
         self._published: dict[str, tuple[datetime, str]] = {}
         self._discover_cache: tuple[datetime, list[dict[str, Any]]] | None = None
         self._device_cache: tuple[datetime, dict[str, dict[str, Any]]] | None = None
@@ -2963,6 +2971,16 @@ class Engine:
             self._journal.event("warning", "sampling_failed", str(exc)[:200])
             self._mark_ha(False, str(exc))
             return {}
+        if "pv_w" in values:
+            try:
+                pv_w = values.get("pv_w")
+                pv_live_w = None if pv_w is None else float(pv_w)
+                pv_live_at = from_iso(values.get("pv_updated_at"))
+            except (TypeError, ValueError, OverflowError):
+                pv_live_w, pv_live_at = None, None
+            with self._lock:
+                self._pv_live_w = pv_live_w
+                self._pv_live_at = pv_live_at
         if values:
             self._mark_ha(True)
         return values
@@ -2980,6 +2998,66 @@ class Engine:
                 self._state.price_now = price
         self._savings_tick(values, now)
         self._append_actuals_row(values, now)
+
+    def _current_live_pv_kw(self, now: datetime) -> float | None:
+        """Fresh measured PV in kW, or None when its HA-reported timestamp is stale/unknown."""
+        with self._lock:
+            watts, updated_at = self._pv_live_w, self._pv_live_at
+        if watts is None or updated_at is None or not math.isfinite(watts):
+            return None
+        age_s = (now - updated_at).total_seconds()
+        if age_s > LIVE_PV_MAX_AGE_S or age_s < -LIVE_PV_FUTURE_SKEW_S:
+            return None
+        return max(0.0, watts) / 1000.0
+
+    def _solar_with_live_pv(self, solar: Any, now: datetime) -> Any:
+        """Override the current optimizer slot only; all future solar slots stay forecast-derived."""
+        measured_kw = self._current_live_pv_kw(now)
+        if measured_kw is None or solar is None:
+            return solar
+        slot_minutes = int(self._settings.get("optimizer.slot_minutes", 60) or 60)
+        current_slot = quarter_floor(now, slot_minutes)
+        source_slots = getattr(solar, "slots", None) or []
+        if not any(getattr(slot, "t", None) == current_slot for slot in source_slots):
+            return solar
+
+        planning_solar = copy.copy(solar)
+        planning_solar.slots = []
+        for slot in source_slots:
+            if getattr(slot, "t", None) == current_slot:
+                adjusted = copy.copy(slot)
+                adjusted.pv_kw = measured_kw
+                # Both planners honor an optional per-slot source without changing the model schema.
+                adjusted.source = "live_measurement"
+                planning_solar.slots.append(adjusted)
+            else:
+                planning_solar.slots.append(slot)
+        return planning_solar
+
+    def _live_pv_replan_reason(self, plan: Plan, now: datetime) -> str | None:
+        """Replan when live PV appears, changes materially, or expires in the active slot."""
+        plan_slot = plan.slot_at(now)
+        if plan_slot is None:
+            return None
+        live_was_used = plan_slot.pv_source == "live_measurement"
+        measured_kw = self._current_live_pv_kw(now)
+        if measured_kw is None:
+            return "pv_measurement_stale" if live_was_used else None
+
+        solar = self.forecast("solar")
+        slot_minutes = int(self._settings.get("optimizer.slot_minutes", 60) or 60)
+        current_slot = quarter_floor(now, slot_minutes)
+        has_current_forecast = any(
+            getattr(slot, "t", None) == current_slot
+            for slot in (getattr(solar, "slots", None) or [])
+        )
+        if not has_current_forecast:
+            return None
+        if not live_was_used:
+            return "pv_measurement_available"
+        if abs(measured_kw - float(plan_slot.pv_kw)) >= LIVE_PV_REPLAN_DELTA_KW:
+            return "pv_measurement_changed"
+        return None
 
     def _append_actuals_row(self, values: Mapping[str, Any], now: datetime) -> None:
         plan = self.active_plan()
@@ -3378,6 +3456,9 @@ class Engine:
             return "plan_age"
         if plan.slot_at(now) is None:
             return "plan_expired"
+        live_pv_reason = self._live_pv_replan_reason(plan, now)
+        if live_pv_reason is not None:
+            return live_pv_reason
         if self._dispatcher.needs_replan(self.snapshot(), plan, self.effective_battery_configs(), now) == "soc_deviation":
             return "soc_deviation"
         return None
@@ -3407,6 +3488,7 @@ class Engine:
         authoritative = self._ensure_battery_reading(now)
         self._refresh_forecasts(now)
         price, solar, load = self._price, self._solar, self._load
+        planning_solar = self._solar_with_live_pv(solar, now)
         configs = self.effective_battery_configs()
         start_kwh = self._live_energy_kwh(configs)
         mode = str(self.snapshot().mode)
@@ -3415,7 +3497,7 @@ class Engine:
             # down has nothing to optimise against, but the physical objective is still clear --
             # catch the redelivery.  Plan zero-export self-consumption from PV and load instead of
             # pausing to a 0 W hold that lets every surplus kWh out of the meter.
-            self_consumption = self._self_consumption_plan(now, solar, load, configs, start_kwh)
+            self_consumption = self._self_consumption_plan(now, planning_solar, load, configs, start_kwh)
             if self_consumption is not None:
                 return self._publish_self_consumption_plan(
                     self_consumption, configs, now, reason, authoritative
@@ -3471,7 +3553,7 @@ class Engine:
         def solve(feed_in_arg: Any | None) -> Plan:
             return dp.solve_from_forecasts(
                 price,
-                solar if solar is not None else SolarForecast(source="unavailable"),
+                planning_solar if planning_solar is not None else SolarForecast(source="unavailable"),
                 load,
                 battery_configs=configs,
                 start_kwh=start_kwh,

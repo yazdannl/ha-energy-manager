@@ -780,6 +780,7 @@ def test_align_slots_propagates_the_provider_names():
         generated_at=T0,
         source="example_solar",
     )
+    solar.slots[0].source = "live_measurement"
     load = LoadForecast(
         slots=[LoadSlot(t=T0 + timedelta(minutes=15 * i), load_kw=0.4) for i in range(8)],
         generated_at=T0,
@@ -787,7 +788,8 @@ def test_align_slots_propagates_the_provider_names():
     )
     aligned = dp.align_slots(price, solar, load, T0, T0 + timedelta(hours=2), 15)
     assert all(slot.price_source == "example_price" for slot in aligned)
-    assert all(slot.pv_source == "example_solar" for slot in aligned)
+    assert aligned[0].pv_source == "live_measurement"
+    assert all(slot.pv_source == "example_solar" for slot in aligned[1:])
 
 
 def test_optimizer_options_default_the_horizon_to_the_shipped_setting():

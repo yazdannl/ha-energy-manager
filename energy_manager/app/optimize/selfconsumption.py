@@ -157,7 +157,11 @@ def plan_self_consumption(
                 load_p90_kw=getattr(load_slots[index], "p90_kw", None),
                 price_stale=True,
                 soc_pct=aggregate.soc_pct_for(energy),
-                pv_source=str(getattr(solar, "source", "") or ""),
+                pv_source=str(
+                    getattr(pv_slots[index], "source", "")
+                    or getattr(solar, "source", "")
+                    or ""
+                ),
                 price_source="none",
                 minutes=float(minutes),
             )

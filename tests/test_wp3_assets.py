@@ -1210,8 +1210,8 @@ def test_setup_card_keys_are_the_primary_surface():
     assert "price.contract" in data["fixedSingle"] and "price.fixed_price_eur_per_kwh" in data["fixedSingle"]
     assert "price.fixed_day_price_eur_per_kwh" in data["fixedDayNight"]
     assert "price.fixed_night_price_eur_per_kwh" in data["fixedDayNight"]
-    # derived reads the meter, so there is no measured-PV entity to pick; the other sources have one
-    assert "solar.measured_entity" not in data["dayAhead"]
+    # The measured-PV picker is independent of the forecast source, including meter-derived models.
+    assert "solar.measured_entity" in data["dayAhead"]
     assert "solar.measured_entity" in data["entity"] and "solar.measured_entity" in data["zonneplan"]
 
 

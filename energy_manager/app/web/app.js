@@ -5108,12 +5108,12 @@
    * solar.source picks the estimation model: forecast_solar is the Forecast.Solar API and needs
    * per-plane geometry, capacity estimates from the array's watt peak alone (AC-coupled arrays whose
    * geometry the user does not want to model). Which solar.* keys the form reveals follows from it,
-   * with the same two rules the price group uses: the selector and everything both sources need
+   * with the same two rules the price group uses: the selector and every field the selected source needs
    * stay visible, and renderSettings still surfaces any hidden field that holds a non-default
    * value, so a value this source ignores can never act invisibly. */
 
-  // Meaningful for both sources: the on/off switch, the selector itself, the bias learning and the
-  // measured PV entity that learning is fitted to (the accuracy of both sources improves with it).
+  // Meaningful across sources: the on/off switch, the selector itself, the bias learning and the
+  // measured PV entity that learning is fitted to (it improves input freshness and forecast calibration).
   var SOLAR_FIELDS_ALWAYS = ["solar.source", "solar.enabled", "solar.bias_correction", "solar.measured_entity", "solar.sources", "solar.merge_strategy"];
   // forecast_solar: the API call — per-plane geometry, plus the optional own key (keyless is
   // single-plane hourly, which is why planes is the field that really matters).
@@ -5138,7 +5138,7 @@
   var SOLAR_SOURCE_NOTES = {
     forecast_solar: "Per-plane geometry (kWp, tilt, azimuth): the Forecast.Solar API is asked per plane, so each plane is modelled on its own tilt and direction.",
     capacity: "Estimate from the array's total watt peak: enter the Wp and the add-on models production from the sun's position, optionally attenuated by a weather entity's cloud cover; leave tilt/azimuth unset and it assumes south-facing at 35 degrees and says so in the forecast notes.",
-    derived: "Estimate from the meter: at every moment the meter exports, the array is producing at least the exported power plus whatever the battery is charging (pv = export + battery charge). The add-on learns the array's watt peak from those moments and then models it like the capacity source. Nothing to enter — it needs the Meter card and a battery whose charge/discharge power is mapped. The house load at those moments is not subtracted, so the learned size is a conservative lower bound.",
+    derived: "Estimate from the meter: at every moment the meter exports, the array is producing at least the exported power plus whatever the battery is charging (pv = export + battery charge). The add-on learns the array's watt peak from those moments and then models it like the capacity source. It needs the Meter card and a battery whose charge/discharge power is mapped; an optional inverter AC-output sensor adds live production for the current optimizer slot and measured feedback. The house load at those moments is not subtracted, so the learned size is a conservative lower bound.",
     learned: "A model trained on 174 other Dutch rooftop arrays, applied to yours. It predicts the ratio between what physics says an array of your size should make and what an array actually makes, so one model can serve a roof it has never seen — and it needs only the array's watt peak to start, before this house has any history of its own. Set the inverter's AC limit when it is smaller than the array: past that limit the DC curve flattens and the model has to be told, or it will keep forecasting output the inverter cannot deliver. The performance ratio is not used here — the model carries its own inverter, module-temperature and soiling terms."
   };
 
@@ -5234,7 +5234,7 @@
     // that decides whether an afternoon clip shows up in the forecast at all, so both are on the card.
     if (source === "learned") keys.push("solar.capacity_wp", "solar.ac_capacity_wp");
     if (source === "forecast_solar") keys.push("solar.planes");
-    if (source !== "derived") keys.push("solar.measured_entity");
+    keys.push("solar.measured_entity");
     // The merge list and its strategy are part of the Solar card whatever the single source is.
     keys.push("solar.sources", "solar.merge_strategy");
     // The Load card carries the house meter, its optional outdoor-temperature sensor and the
@@ -5246,7 +5246,7 @@
   // Two guidance lines that live under the Solar group instead of in a field's help text, because
   // they are about the entity itself rather than the typed value: what the measured-PV learning is
   // fitted to, and what the weather entity has to support for cloud attenuation to work at all.
-  var SOLAR_MEASURED_NOTE = "solar.measured_entity must be the inverter's AC output: a meter's export register under-reports, because self-consumed energy never reaches the meter, so the learned per-hour correction would come out low. It is what makes the forecast more accurate over time.";
+  var SOLAR_MEASURED_NOTE = "solar.measured_entity should be the inverter's AC output: a meter's export register under-reports because self-consumed energy never reaches the meter. Fresh readings (reported by Home Assistant within 10 minutes) inform the current optimizer slot, and the measured history improves forecast calibration.";
   var SOLAR_WEATHER_NOTE = "solar.weather_entity must support the weather.get_forecasts action (Met.no's forecast entity does; some integrations, including the OpenWeatherMap entity on this install, only publish a current cloud_coverage and support no forecast type) — without a forecast type the add-on holds the current cloud cover flat and says so in the forecast notes, so the field is still worth setting.";
 
   // Two keys whose backend help understates the safety model: the UI states the exact
@@ -5852,11 +5852,7 @@
     function solarCard() {
       var source = String(settingValue("solar.source") || "forecast_solar");
       var children = [cardField("solar.enabled"), cardField("solar.source")];
-      if (source === "derived") {
-        children.push(el("p", { class: "field-help", text: "Uses the Meter card and the battery's charge/discharge power; nothing to enter here." }));
-      } else {
-        children.push(cardPicker("solar.measured_entity", "solar", "PV power sensor name or entity id"));
-      }
+      children.push(cardPicker("solar.measured_entity", "solar", "PV power sensor name or entity id"));
       // The input the chosen source needs to be complete: the array's watt peak for the capacity
       // estimate, the plane list for Forecast.Solar (UI_REVIEW §3.2).
       if (source === "capacity") children.push(cardField("solar.capacity_wp"));

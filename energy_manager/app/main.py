@@ -38,7 +38,7 @@ from .notify import Notifier
 
 log = logging.getLogger("app.main")
 
-APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.35.1"
+APP_VERSION = os.environ.get("SEM_VERSION") or os.environ.get("BUILD_VERSION") or "0.36.0"
 COMMIT = os.environ.get("SEM_COMMIT") or os.environ.get("GITHUB_SHA") or ""
 DEFAULT_PORT = 8099
 DEFAULT_OPTIONS = "/data/options.json"
@@ -232,6 +232,7 @@ def build_sources(
             return {
                 "grid_w": _watts(actuals.get("grid_kw")),
                 "pv_w": _watts(actuals.get("pv_kw")),
+                "pv_updated_at": actuals.get("pv_updated_at"),
                 "load_w": _watts(actuals.get("load_kw")),
                 "price_buy": actuals.get("price_buy"),
             }
@@ -744,11 +745,14 @@ def selfcheck(port: int = 0) -> int:
             except Exception as exc:
                 log.warning("selfcheck: cannot set %s: %s", key, exc)
     ha = _FakeHA()
+    # Repeated planning must see identical partial-slot durations, not a moving wall clock.
+    selfcheck_now = utcnow()
     engine = Engine(
         settings,
         store=store,
         ha=ha,
         notifier=Notifier(ha, settings),
+        clock=lambda: selfcheck_now,
         version=APP_VERSION,
         commit=COMMIT,
         **_selfcheck_sources(),
