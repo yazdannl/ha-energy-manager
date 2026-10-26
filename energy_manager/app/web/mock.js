@@ -418,8 +418,12 @@
   }
 
   function priceSlots(hours) {
-    return windowSlots(hours).map(function (s) {
-      return { t: s.t, buy: s.buy, sell: s.sell, source: "zonneplan_entity", is_actual: false, stale: s.price_stale };
+    return windowSlots(hours).map(function (s, index) {
+      // One returned slot has an explicit stale flag so the daily quality row has a representative case.
+      return {
+        t: s.t, buy: s.buy, sell: s.sell, source: "zonneplan_entity", is_actual: false,
+        stale: s.price_stale || index === 5
+      };
     });
   }
 
@@ -1223,30 +1227,41 @@
 
     function addPeriod(start, end, expected, index) {
       var forecastIntervals = index % 7 === 0 ? Math.max(0, expected - 1) : expected;
+      var staleForecastIntervals = forecastIntervals > 0 && index % 11 === 1 ? 1 : 0;
       var actualIntervals = index % 6 === 0 ? Math.max(0, expected - 1) : expected;
       var samplesExpected = expected * 3;
-      var samples = actualIntervals * 3 - (index % 5 === 0 ? 1 : 0);
-      samples = Math.max(0, samples);
+      var samples = actualIntervals * 3;
+      if (index % 5 === 0) {
+        if (actualIntervals >= expected && actualIntervals > 0) {
+          actualIntervals--;
+          samples = actualIntervals * 3 + 2;
+        } else {
+          samples += Math.min(2, (expected - actualIntervals) * 3);
+        }
+      }
       var quarterKwh = 0.18 + Math.max(0, Math.sin(index / 5)) * 0.12;
       var forecastKwh = round(quarterKwh * forecastIntervals, 4);
       var actualKwh = round(quarterKwh * actualIntervals * (0.92 + 0.08 * wobble(index + 11)), 4);
       var forecastComplete = forecastIntervals === expected;
-      var actualComplete = actualIntervals === expected;
+      var actualComplete = actualIntervals === expected && samples === samplesExpected;
       var comparable = forecastComplete && actualComplete;
+      var actualStatus = actualComplete ? "complete" : actualIntervals || samples ? "partial" : "missing";
+      var actualSources = samples ? ["sensor.example_pv_power"] : [];
+      var model = { model: "example-clear-sky", version: "mock" };
       return {
         start: iso(start), end: iso(end), label: new Date(start).toLocaleString(), intervals: expected,
-        forecast_kwh: forecastKwh, forecast_intervals: forecastIntervals,
+        forecast_kwh: forecastIntervals ? forecastKwh : null, forecast_intervals: forecastIntervals,
         expected_forecast_intervals: expected, forecast_coverage_pct: round(forecastIntervals * 100 / expected, 1),
-        forecast_complete: forecastComplete, forecast_source: "capacity",
-        forecast_model: { model: "example-clear-sky", version: "mock" },
-        forecast_provenance: [{ source: "capacity", model: { model: "example-clear-sky", version: "mock" },
-          first_issued_at: iso(Date.now() - 3600000), last_issued_at: iso(Date.now() - 300000), intervals: forecastIntervals }],
-        stale_forecast_intervals: 0, actual_kwh: actualIntervals ? actualKwh : null,
+        forecast_complete: forecastComplete, forecast_source: forecastIntervals ? "capacity" : null,
+        forecast_model: forecastIntervals ? model : null,
+        forecast_provenance: forecastIntervals ? [{ source: "capacity", model: model,
+          first_issued_at: iso(Date.now() - 3600000), last_issued_at: iso(Date.now() - 300000), intervals: forecastIntervals }] : [],
+        stale_forecast_intervals: staleForecastIntervals, actual_kwh: actualIntervals ? actualKwh : null,
         actual_intervals: actualIntervals, expected_actual_intervals: expected,
         actual_coverage_pct: round(actualIntervals * 100 / expected, 1), actual_complete: actualComplete,
-        actual_sources: ["sensor.example_pv_power"], actual_source: "sensor.example_pv_power",
+        actual_sources: actualSources, actual_source: actualSources.length ? actualSources[0] : null,
         actual_samples: samples, expected_actual_samples: samplesExpected,
-        actual_sample_coverage_pct: round(samples * 100 / samplesExpected, 1), actual_status: actualComplete ? "complete" : "partial",
+        actual_sample_coverage_pct: round(samples * 100 / samplesExpected, 1), actual_status: actualStatus,
         comparable_intervals: comparable ? expected : Math.min(forecastIntervals, actualIntervals),
         comparable: comparable, error_kwh: comparable ? round(forecastKwh - actualKwh, 4) : null
       };
@@ -1434,16 +1449,17 @@
           actual_kw: pvActual, actual_samples: solarSamples, expected_actual_samples: 3,
           actual_coverage_pct: round(solarSamples * 100 / 3, 1),
           actual_status: solarSamples === 3 ? "complete" : solarSamples ? "partial" : "missing",
-          actual_source: "sensor.example_pv_power", actual_sources: ["sensor.example_pv_power"],
+          actual_source: solarSamples ? "sensor.example_pv_power" : null,
+          actual_sources: solarSamples ? ["sensor.example_pv_power"] : [],
           derived: pvDerived,
           forecast_kw: pvForecast, forecast_source: pvForecast === null ? null : "synthetic archived solar",
-          forecast_model: { model: "mock-capacity", version: "fixture" },
-          forecast_issued_at: iso(start - 3600000), forecast_stale: i % 29 === 0
+          forecast_model: pvForecast === null ? null : { model: "mock-capacity", version: "fixture" },
+          forecast_issued_at: pvForecast === null ? null : iso(start - 3600000), forecast_stale: pvForecast === null ? null : i % 29 === 0
         },
         load: Object.assign({}, load, {
           forecast_kw: i % 21 === 5 ? null : round(0.72 + 0.28 * Math.abs(wobble(i + 3)), 3),
           forecast_source: i % 21 === 5 ? null : "synthetic archived load",
-          forecast_issued_at: iso(start - 3600000), derived: loadDerived
+          forecast_issued_at: i % 21 === 5 ? null : iso(start - 3600000), derived: loadDerived
         }),
         grid: grid,
         battery: Object.assign({}, battery, { fleet_completeness: "unknown" }),
@@ -1495,10 +1511,10 @@
       provenance: {
         solar_actual: "Synthetic direct pv_power fixture with entity and sample coverage.",
         solar_derived: "Synthetic persisted actuals.pv_derived_kw, shown separately from direct PV.",
-        solar_forecast: "Synthetic archived forecast vintage with source and issue time.",
+        solar_forecast: "Synthetic archived forecast vintage with source, issue time and stale flag.",
         load_actual: "Synthetic persisted direct actuals.load_kw fixture; source identity unavailable.",
         load_derived: "Synthetic persisted actuals.load_derived_kw, shown separately from direct load.",
-        load_forecast: "Synthetic archived load forecast fixture.",
+        load_forecast: "Synthetic archived load forecast fixture; issue time is retained but no stale flag is available, so freshness is not classified.",
         grid_actual: "Synthetic signed persisted grid actuals; source identity unavailable.",
         battery_actual: "Synthetic confirmed battery readbacks; fleet completeness unknown.",
         plan: "Synthetic retained plan snapshots; planned actions are not proof of dispatch.",

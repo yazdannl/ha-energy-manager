@@ -136,6 +136,27 @@ function classTokens(text) {
   /* ---------- 1f. bounded forecast-vintage history ---------- */
   console.log("\n1f. Forecast History: timezone, controls, coverage and table");
   await goto("/forecasts");
+  const forecastPanels = view().querySelectorAll(".panel");
+  const forecastPanelByTitle = (title) => forecastPanels.find((candidate) => {
+    const heading = candidate.querySelector("h2");
+    return heading && heading.textContent === title;
+  });
+  const priceForecastPanel = forecastPanelByTitle("Price forecast");
+  const solarForecastPanel = forecastPanelByTitle("Solar forecast");
+  const loadForecastPanel = forecastPanelByTitle("Load forecast");
+  check(
+    "live solar and load totals show the API freshness state per day",
+    !!solarForecastPanel && !!loadForecastPanel
+      && /Freshness/.test(allText(solarForecastPanel)) && /Not marked stale/.test(allText(solarForecastPanel))
+      && /Freshness/.test(allText(loadForecastPanel)) && /Not marked stale/.test(allText(loadForecastPanel)),
+  );
+  check(
+    "price daily totals identify stale slots and explain their freshness impact",
+    !!priceForecastPanel && /Stale slots/.test(allText(priceForecastPanel))
+      && /slots flagged stale/.test(allText(priceForecastPanel))
+      && /may not reflect current prices/.test(allText(priceForecastPanel)),
+    priceForecastPanel ? allText(priceForecastPanel).slice(-360) : "no price forecast panel",
+  );
   const historyPanel = byClass(view(), "forecast-history-result")[0];
   const historyDate = view().querySelectorAll("#forecast-history-date")[0];
   const historyResolution = view().querySelectorAll("#forecast-history-resolution")[0];
@@ -156,6 +177,26 @@ function classTokens(text) {
       && /Vintage provenance/.test(allText(historyPanel)) && /complete coverage/.test(allText(historyPanel)),
     historyPanel ? allText(historyPanel).slice(0, 360) : "no history result",
   );
+  const historyRows = historyPanel && historyPanel.querySelector("table")
+    ? historyPanel.querySelector("table").querySelectorAll("tbody tr") : [];
+  const missingVintageText = historyRows[0] ? allText(historyRows[0]) : "";
+  const staleVintageText = historyRows[1] ? allText(historyRows[1]) : "";
+  const partialPvText = historyRows[5] ? allText(historyRows[5]) : "";
+  check(
+    "history intervals explain missing vintages without inventing a provider failure",
+    /No archived PV vintage/.test(missingVintageText)
+      && /cause is not retained/.test(missingVintageText)
+      && /no provider failure is inferred/.test(missingVintageText)
+      && !/0\.00 kWh/.test(missingVintageText),
+    missingVintageText,
+  );
+  check(
+    "history intervals expose stale vintages and incomplete direct-PV comparison limits",
+    /stale forecast interval/.test(staleVintageText) && /not fresh forecast evidence/.test(staleVintageText)
+      && /capacity/.test(staleVintageText)
+      && /Direct PV coverage is incomplete/.test(partialPvText) && /roll-up error is withheld/.test(partialPvText),
+    staleVintageText + " · " + partialPvText,
+  );
   historyResolution.value = "day";
   historyResolution.dispatchEvent({ type: "change" });
   await sleep(220);
@@ -169,6 +210,8 @@ function classTokens(text) {
   const dailyTable = dailyResult && dailyResult.querySelector("table");
   const dailyInspectButtons = dailyTable ? dailyTable.querySelectorAll(".daily-timeline-interval") : [];
   const dailyText = dailyResult ? allText(dailyResult) : "";
+  const timelineRows = dailyTable ? dailyTable.querySelectorAll("tbody tr") : [];
+  const timelineRowText = (index) => timelineRows[index] ? allText(timelineRows[index]) : "";
   check(
     "daily timeline offers a local date selector and previous/next local-day controls",
     !!dailyDate && dailyDate.getAttribute("type") === "date"
@@ -191,6 +234,18 @@ function classTokens(text) {
       && /PV forecast/.test(dailyText) && /Load forecast/.test(dailyText)
       && /Plan buy/.test(dailyText) && /Grid/.test(dailyText),
     dailyText.slice(0, 420),
+  );
+  check(
+    "daily intervals show stale PV, partial actual impact, missing forecast cause and provenance",
+    /marked stale; not fresh forecast evidence/.test(timelineRowText(0))
+      && /PV actual: sensor\.example_pv_power/.test(timelineRowText(0))
+      && /PV forecast: synthetic archived solar/.test(timelineRowText(0))
+      && /issued /.test(timelineRowText(0))
+      && /freshness not classified/.test(timelineRowText(0))
+      && /partial \(2\/3 samples\)/.test(timelineRowText(5))
+      && /no complete PV forecast comparison/.test(timelineRowText(5))
+      && /no archived value; cause not retained/.test(timelineRowText(8)),
+    timelineRowText(0) + " · " + timelineRowText(5) + " · " + timelineRowText(8),
   );
   check("daily timeline provides a graceful chart fallback beside the accessible table",
     !!dailyResult && !!dailyResult.querySelector(".daily-timeline-chart.chart-fallback") && !!dailyTable);

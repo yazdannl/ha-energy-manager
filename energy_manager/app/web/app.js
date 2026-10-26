@@ -2953,18 +2953,19 @@
     return groups;
   }
 
-  /** Empty-panel copy: the API `hint` (one actionable sentence, e.g. naming the bidding zone
-   *  that has no day-ahead prices) is the prominent message, rendered verbatim, with the `reason`
-   *  slug kept as a small badge beside it. Only when the server sent no hint do we fall back to the
-   *  generic "source failed / empty horizon" sentence, so an explained empty panel is never vague.
+  /** The API `hint` is rendered verbatim, with the `reason` slug kept as a small badge. If neither
+   *  is present, do not guess that a provider failed: an empty horizon and a failed source differ.
    *  Pure (no DOM) so node tests can assert the preference directly. */
   function forecastEmptyState(payload) {
     var reason = payload && payload.reason != null && String(payload.reason) ? String(payload.reason) : null;
     var hint = payload && payload.hint != null && String(payload.hint) ? String(payload.hint) : null;
+    var fallback = reason
+      ? "No forecast slots returned; reason: " + reason.replace(/_/g, " ") + "."
+      : "No forecast slots returned; no reason was reported.";
     return {
       reason: reason,
       hint: hint,
-      text: hint || "No slots returned; the source failed or the horizon is empty."
+      text: hint || fallback
     };
   }
 
@@ -2983,6 +2984,10 @@
 
   function renderForecastPanel(body, kind, payload, accuracy) {
     var slots = Array.isArray(payload.slots) ? payload.slots : [];
+    var forecastStale = payload.stale === true && slots.length > 0;
+    var liveFreshness = payload.stale === true ? "Forecast marked stale; values are reused, not fresh."
+      : payload.stale === false ? "Not marked stale (API freshness flag is false)."
+      : "Freshness not reported.";
     // Source metadata is one quiet line; only a limitation (stale) keeps a badge, so ordinary
     // provider names do not read as actionable state (UI_REVIEW §3.12).
     var meta = el("p", { class: "alert-meta" }, [
@@ -2992,8 +2997,8 @@
       payload.provider ? " · provider: " + payload.provider : null,
       payload.contract ? " · contract: " + payload.contract : null,
       " · generated " + timeAgo(payload.generated_at),
-      payload.stale ? " " : null,
-      payload.stale ? badge("stale", "stale") : null,
+      forecastStale ? " " : null,
+      forecastStale ? badge("stale", "stale") : null,
       kind === "load" && payload.confidence ? " · confidence: " + payload.confidence : null,
       kind === "solar" && isNum(payload.correction_applied) ? " · bias correction ×" + payload.correction_applied.toFixed(2) : null
     ]);
@@ -3001,7 +3006,7 @@
     body.appendChild(el("p", { class: "trust-line" }, ["Measured error: ", forecastAccuracyLine(accuracy)]));
     // A material limitation stays visible; ordinary model explanation moves behind the chart's
     // Source details disclosure (UI_REVIEW §3.7).
-    if (payload.stale) {
+    if (forecastStale) {
       body.appendChild(el("div", { class: "banner banner-warn" }, [
         el("p", { class: "banner-title", text: "Using cached data" }),
         el("p", { text: "This forecast is stale: values are re-used and greyed in the chart." })
@@ -3017,7 +3022,7 @@
       var empty = forecastEmptyState(payload);
       body.appendChild(el("div", { class: "banner banner-warn" }, [
         el("p", { class: "banner-title" }, [empty.text, empty.reason ? " " : null, empty.reason ? badge(empty.reason, "warn") : null]),
-        empty.hint ? null : el("p", { class: "field-help", text: "The server did not explain why this forecast is empty; check the log for the failing source." })
+        empty.hint ? null : el("p", { class: "field-help", text: "No explanatory hint was supplied; provider status and logs may offer more context." })
       ]));
       body.appendChild(forecastNotes(payload));
       return;
@@ -3031,18 +3036,19 @@
         var buys = group.slots.map(function (s) { return numOrNull(s.buy); }).filter(isNum);
         var sells = group.slots.map(function (s) { return numOrNull(s.sell); }).filter(isNum);
         var stale = group.slots.filter(function (s) { return s.stale; }).length;
-      return [group.key,
+        return [group.key,
           buys.length ? fmtPrice(Math.min.apply(null, buys)) : "--",
           buys.length ? fmtPrice(Math.max.apply(null, buys)) : "--",
           buys.length ? fmtPrice(buys.reduce(function (a, b) { return a + b; }, 0) / buys.length) : "--",
           sells.length ? fmtPrice(sells.reduce(function (a, b) { return a + b; }, 0) / sells.length) : "--",
-          stale + " of " + group.slots.length];
+          stale + " of " + group.slots.length + " slots flagged stale" +
+            (stale ? "; may not reflect current prices" : "") +
+            (payload.stale === true && stale === 0 ? "; forecast marked stale" : "")];
       });
     } else if (kind === "solar") {
-      headers = ["Day", "Forecast energy", "Peak power", "Peak at"];
+      headers = ["Day", "Forecast energy", "Peak power", "Peak at", "Freshness"];
       rows = groups.map(function (group) {
-        // Missing values are never summed as zero: the total states how many slots it covers
-        // (UI_REVIEW §3.6).
+        // Missing values are never summed as zero: the total states how many returned slots it covers.
         var have = 0, missing = 0, total = 0;
         var peak = null;
         group.slots.forEach(function (s) {
@@ -3053,12 +3059,13 @@
           if (!peak || value > peak.value) peak = { value: value, t: s.t };
         });
         return [group.key,
-          have ? fmtKwh(total * step) + (missing ? " (over " + have + " of " + group.slots.length + " slots)" : "") : "--",
+          have ? fmtKwh(total * step) + (missing ? " (covered " + have + " of " + group.slots.length + " returned slots; missing values make this partial)" : "") : "-- (no usable values; total unknown, not zero)",
           peak ? fmtPower(peak.value * 1000) : "--",
-          peak ? fmtTime(peak.t) : "--"];
+          peak ? fmtTime(peak.t) : "--",
+          liveFreshness];
       });
     } else {
-      headers = ["Day", "P50 energy", "P10 energy", "P90 energy"];
+      headers = ["Day", "P50 energy", "P10 energy", "P90 energy", "Freshness"];
       rows = groups.map(function (group) {
         function totalFor(pick) {
           var have = 0, missing = 0, sum = 0;
@@ -3068,12 +3075,15 @@
             have++;
             sum += value;
           });
-          return have ? fmtKwh(sum * step) + (missing ? " (over " + have + " of " + group.slots.length + " slots)" : "") : "--";
+          return have
+            ? fmtKwh(sum * step) + (missing ? " (covered " + have + " of " + group.slots.length + " returned slots; missing values make this partial)" : "")
+            : "-- (no usable values; total unknown, not zero)";
         }
         return [group.key,
           totalFor(function (s) { return s.load_kw; }),
           totalFor(function (s) { return s.p10_kw; }),
-          totalFor(function (s) { return s.p90_kw; })];
+          totalFor(function (s) { return s.p90_kw; }),
+          liveFreshness];
       });
     }
     body.appendChild(table("Per-day totals (times and days in local timezone)", headers, rows));
@@ -3324,15 +3334,48 @@
         : payload.resolution === "hour" ? row.label
         : historyStamp(row.start) + " – " + historyStamp(row.end);
       var actualSources = Array.isArray(row.actual_sources) ? row.actual_sources : [];
-      var coverageText = (row.forecast_intervals || 0) + "/" + (row.expected_forecast_intervals || 0) + " forecast intervals; " +
-        (row.actual_intervals || 0) + "/" + (row.expected_actual_intervals || 0) + " complete PV intervals; " +
-        (row.actual_samples || 0) + "/" + (row.expected_actual_samples || 0) + " samples; measured source(s): " +
-        (actualSources.length ? actualSources.join(", ") : "unknown") +
-        ((row.stale_forecast_intervals || 0) ? "; stale forecast intervals: " + row.stale_forecast_intervals : "");
+      var expectedForecast = Number.isInteger(row.expected_forecast_intervals)
+        ? row.expected_forecast_intervals : Number.isInteger(row.intervals) ? row.intervals : 0;
+      var forecastIntervals = Number.isInteger(row.forecast_intervals) ? row.forecast_intervals : 0;
+      var expectedActual = Number.isInteger(row.expected_actual_intervals)
+        ? row.expected_actual_intervals : expectedForecast;
+      var actualIntervals = Number.isInteger(row.actual_intervals) ? row.actual_intervals : 0;
+      var actualSamples = Number.isInteger(row.actual_samples) ? row.actual_samples : 0;
+      var expectedSamples = Number.isInteger(row.expected_actual_samples) ? row.expected_actual_samples : 0;
+      var staleIntervals = Number.isInteger(row.stale_forecast_intervals) ? row.stale_forecast_intervals : 0;
+      var comparableIntervals = Number.isInteger(row.comparable_intervals) ? row.comparable_intervals : 0;
+      var coverageText = forecastIntervals + "/" + expectedForecast + " forecast intervals; " +
+        actualIntervals + "/" + expectedActual + " complete PV intervals; " +
+        actualSamples + "/" + expectedSamples + " samples; measured source(s): " +
+        (actualSources.length ? actualSources.join(", ") : "none recorded");
+      var quality = [];
+      if (staleIntervals > 0) {
+        quality.push(staleIntervals + " stale forecast interval(s); retained in historical scoring, but not fresh forecast evidence.");
+      }
+      if (forecastIntervals < expectedForecast) {
+        quality.push(forecastIntervals === 0
+          ? "No archived PV vintage; no forecast-to-actual comparison. The gap cause is not retained, so no provider failure is inferred."
+          : "Forecast coverage is partial; the covered sum omits gaps and cannot support a complete-period error.");
+      }
+      if (actualIntervals < expectedActual) {
+        if (row.actual_status === "mixed_source" && payload.resolution === "15m") {
+          quality.push("PV samples mix entities; no single-source actual is available for comparison.");
+        } else if (actualSamples === 0) {
+          quality.push("No direct PV readings; actual comparison and forecast error are unavailable.");
+        } else {
+          quality.push("Direct PV coverage is incomplete (" + actualIntervals + "/" + expectedActual + " complete intervals); the roll-up error is withheld.");
+        }
+      }
+      if (!quality.length && row.comparable !== true) {
+        quality.push("Only " + comparableIntervals + "/" + expectedActual + " intervals are comparable; the aggregate error is unavailable.");
+      }
+      var coverageChildren = [el("div", { text: coverageText })];
+      quality.forEach(function (message) { coverageChildren.push(el("p", { text: message })); });
+      var coverageCell = el("div", { class: "forecast-history-quality" }, coverageChildren);
       var error = isNum(row.error_kwh)
         ? (row.error_kwh > 0 ? "+" : "") + fmtKwh(row.error_kwh)
-        : "-- (incomplete coverage)";
-      return [interval, forecast, actual, coverageText, error, vintageCell(row)];
+        : "-- (" + comparableIntervals + "/" + expectedActual + " comparable; complete-period error withheld)";
+      return [interval, forecast, actual, coverageCell, error, vintageCell(row)];
     });
     result.appendChild(table(
       "Interval energy in kWh. Partial sums are labelled covered only; error is forecast minus measured and is shown only when both sides have complete coverage.",
@@ -3445,13 +3488,19 @@
     return item;
   }
 
-  function timelineMetricText(label, metric) {
+  function timelineMetricText(label, metric, gapImpact) {
     metric = metric || {};
     var samples = isNum(metric.samples) ? metric.samples : isNum(metric.actual_samples) ? metric.actual_samples : 0;
     var expected = isNum(metric.expected_samples) ? metric.expected_samples : isNum(metric.expected_actual_samples) ? metric.expected_actual_samples : 3;
+    var status = metric.status || metric.actual_status;
+    var impact = gapImpact ? "; " + gapImpact : "";
     if (isNum(metric.actual_kw)) return label + ": " + fmtKw(metric.actual_kw) + " (" + samples + "/" + expected + " samples)";
-    if (isNum(metric.covered_kw)) return label + ": covered only " + fmtKw(metric.covered_kw) + " (" + samples + "/" + expected + "); full-bin value unavailable";
-    return label + ": unavailable (" + samples + "/" + expected + " samples)";
+    if (status === "mixed_source") {
+      return label + ": mixed-source PV readings (" + samples + "/" + expected + " samples); no single-entity actual is available" + impact;
+    }
+    if (isNum(metric.covered_kw)) return label + ": covered only " + fmtKw(metric.covered_kw) + " (" + samples + "/" + expected + " samples); full-bin value unavailable" + impact;
+    if (samples > 0) return label + ": partial (" + samples + "/" + expected + " samples); full-bin value unavailable" + impact;
+    return label + ": unavailable (" + samples + "/" + expected + " samples; unknown, not zero)" + impact;
   }
 
   function timelineDerivedMetricText(label, metric) {
@@ -3459,8 +3508,29 @@
     var samples = isNum(metric.samples) ? metric.samples : 0;
     var expected = isNum(metric.expected_samples) ? metric.expected_samples : 3;
     if (isNum(metric.kw)) return label + ": " + fmtKw(metric.kw) + " (" + samples + "/" + expected + " samples; derived)";
-    if (isNum(metric.covered_kw)) return label + ": covered only " + fmtKw(metric.covered_kw) + " (" + samples + "/" + expected + "); full-bin value unavailable";
-    return label + ": unavailable (" + samples + "/" + expected + " samples)";
+    if (isNum(metric.covered_kw)) return label + ": covered only " + fmtKw(metric.covered_kw) + " (" + samples + "/" + expected + " samples); full-bin value unavailable";
+    if (samples > 0) return label + ": partial (" + samples + "/" + expected + " samples); full-bin value unavailable";
+    return label + ": unavailable (" + samples + "/" + expected + " samples; unknown, not zero)";
+  }
+
+  function timelineForecastText(label, metric) {
+    metric = metric || {};
+    var value = numOrNull(metric.forecast_kw);
+    if (value == null) return label + ": unavailable (no archived value; cause not retained; forecast comparison unavailable)";
+    var freshness = metric.forecast_stale === true
+      ? " · marked stale; not fresh forecast evidence"
+      : metric.forecast_stale === false ? " · not marked stale"
+      : " · freshness not classified";
+    return label + ": " + fmtKw(value) + freshness;
+  }
+
+  function timelineForecastProvenance(metric) {
+    metric = metric || {};
+    var source = metric.forecast_source;
+    var issued = metric.forecast_issued_at;
+    if (!source && !issued) return "source and issue time unavailable";
+    return (source || "source unavailable") +
+      (issued ? " · issued " + historyStamp(issued) : " · issue time unavailable");
   }
 
   function timelinePlanAction(plan) {
@@ -3595,22 +3665,16 @@
       if (!row) return;
       detailHost.appendChild(el("h3", { text: "Interval detail · " + row.label + " – " + row.local_end }));
       var solar = row.solar || {}, load = row.load || {}, grid = row.grid || {}, battery = row.battery || {}, plan = row.plan || {};
-      var pvForecast = isNum(solar.forecast_kw)
-        ? fmtKw(solar.forecast_kw) + " · " + (solar.forecast_source || "source unavailable") +
-          " · issued " + historyStamp(solar.forecast_issued_at) + (solar.forecast_stale ? " · stale" : "")
-        : "unavailable";
-      var loadForecast = isNum(load.forecast_kw)
-        ? fmtKw(load.forecast_kw) + " · " + (load.forecast_source || "source unavailable") +
-          " · issued " + historyStamp(load.forecast_issued_at)
-        : "unavailable";
+      var pvForecast = timelineForecastText("PV forecast", solar) + " · " + timelineForecastProvenance(solar);
+      var loadForecast = timelineForecastText("Load forecast", load) + " · " + timelineForecastProvenance(load);
       var sourceSummary = Object.keys(plan.sources || {}).map(function (key) {
         return key + ": " + plan.sources[key];
       }).join("; ") || "not retained";
       var detailRows = [
-        ["Direct PV", timelineMetricText("PV", solar) + " · entity " + (solar.actual_source || (solar.actual_sources || []).join(", ") || "unavailable")],
+        ["Direct PV", timelineMetricText("PV", solar, "no complete PV forecast comparison") + " · entity " + (solar.actual_source || (solar.actual_sources || []).join(", ") || "none recorded")],
         ["Derived PV", timelineDerivedMetricText("PV derived", solar.derived)],
         ["PV forecast", pvForecast],
-        ["Direct load", timelineMetricText("Load", load)],
+        ["Direct load", timelineMetricText("Load", load, "actual load/forecast comparison unavailable")],
         ["Derived load", timelineDerivedMetricText("Load derived", load.derived)],
         ["Load forecast", loadForecast],
         ["Measured grid", timelineMetricText("Grid (positive import / negative export)", grid)],
@@ -3652,18 +3716,21 @@
       var tableRows = rows.map(function (row, index) {
         var solar = row.solar || {}, load = row.load || {}, grid = row.grid || {}, battery = row.battery || {}, plan = row.plan || {};
         var actualLines = [
-          timelineMetricText("PV direct", solar), timelineDerivedMetricText("PV derived", solar.derived),
-          timelineMetricText("Load direct", load), timelineDerivedMetricText("Load derived", load.derived),
+          timelineMetricText("PV direct", solar, "no complete PV forecast comparison"), timelineDerivedMetricText("PV derived", solar.derived),
+          timelineMetricText("Load direct", load, "actual load/forecast comparison unavailable"), timelineDerivedMetricText("Load derived", load.derived),
           timelineMetricText("Grid", grid), timelineMetricText("Battery", battery)
         ];
         var forecastLines = [
-          "PV: " + (isNum(solar.forecast_kw) ? fmtKw(solar.forecast_kw) : "unavailable"),
-          "Load: " + (isNum(load.forecast_kw) ? fmtKw(load.forecast_kw) : "unavailable")
+          timelineForecastText("PV", solar),
+          timelineForecastText("Load", load)
         ];
         var actionLines = [timelinePlanAction(plan), timelinePlanPower(plan)];
         var priceLines = timelinePlanPrices(plan);
-        var sources = "PV forecast: " + (solar.forecast_source || "unavailable") +
-          " · Load forecast: " + (load.forecast_source || "unavailable") +
+        var actualPvSources = Array.isArray(solar.actual_sources) ? solar.actual_sources : [];
+        var actualPvSource = solar.actual_source || actualPvSources.join(", ") || "no direct source samples";
+        var sources = "PV actual: " + actualPvSource +
+          " · PV forecast: " + timelineForecastProvenance(solar) +
+          " · Load forecast: " + timelineForecastProvenance(load) +
           " · Plan: " + (plan.plan_id == null ? "unavailable" : "#" + plan.plan_id);
         var inspect = button(row.label, "daily-timeline-interval", function () {
           selectedIndex = index;

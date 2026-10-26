@@ -939,8 +939,7 @@ def test_battery_picker_keeps_usable_energy_out_of_the_capacity_role():
 
 
 def test_forecast_empty_state_prefers_the_api_hint_verbatim():
-    """An empty panel shows the server `hint` verbatim (never truncated) with the `reason` slug
-    kept beside it, and only falls back to the generic sentence when the server sent no hint."""
+    """An empty panel shows the server `hint` verbatim and never guesses a failure without a reason."""
     script = """
     const fs = require("fs");
     globalThis.location = { pathname: "/x/", search: "", hash: "" };
@@ -952,22 +951,25 @@ def test_forecast_empty_state_prefers_the_api_hint_verbatim():
       hint: "energy-charts published no day-ahead prices for bidding zone NL; pick a different zone or a supplier source."
     });
     const noHint = A.forecastEmptyState({ reason: "empty_horizon", hint: null });
+    const failedReason = A.forecastEmptyState({ reason: "provider_failed" });
     const noReason = A.forecastEmptyState({ hint: "Set price.provider to a source that has data." });
     const bare = A.forecastEmptyState({});
-    console.log(JSON.stringify({ zoneHint: zoneHint, noHint: noHint, noReason: noReason, bare: bare }));
+    console.log(JSON.stringify({ zoneHint: zoneHint, noHint: noHint, failedReason: failedReason, noReason: noReason, bare: bare }));
     """
     data = json.loads(run_node_script(script))
     # the hint is the prominent message and is passed through verbatim (equal, not truncated)
     assert data["zoneHint"]["text"] == "energy-charts published no day-ahead prices for bidding zone NL; pick a different zone or a supplier source."
     assert data["zoneHint"]["hint"] == data["zoneHint"]["text"]
     assert data["zoneHint"]["reason"] == "provider_failed", "the reason slug is kept for the small badge"
-    # no hint -> the legacy fallback sentence, reason still surfaced
-    assert data["noHint"]["text"] == "No slots returned; the source failed or the horizon is empty."
+    # Without a hint, retain a supplied reason; without either, do not guess the cause.
+    assert data["noHint"]["text"] == "No forecast slots returned; reason: empty horizon."
     assert data["noHint"]["reason"] == "empty_horizon"
-    # a hint with no reason, and a totally bare payload, still produce safe text
+    assert data["failedReason"]["text"] == "No forecast slots returned; reason: provider failed."
+    assert data["failedReason"]["reason"] == "provider_failed"
+    # A hint with no reason, and a totally bare payload, still produce safe text.
     assert data["noReason"]["reason"] is None and data["noReason"]["text"].startswith("Set price.provider")
     assert data["bare"]["reason"] is None and data["bare"]["hint"] is None
-    assert data["bare"]["text"] == "No slots returned; the source failed or the horizon is empty."
+    assert data["bare"]["text"] == "No forecast slots returned; no reason was reported."
     app = read(WEB / "app.js")
     assert "forecastEmptyState" in app and "banner banner-warn" in app, "the empty panel renders the hint in a prominent banner"
 

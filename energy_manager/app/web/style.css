@@ -905,6 +905,8 @@ tbody tr:hover { background: var(--panel-2); }
 .forecast-history-vintages { min-width: 13rem; max-width: 26rem; overflow-wrap: anywhere; }
 .forecast-history-vintage { margin: 0 0 var(--sp-1); }
 .forecast-history-vintage:last-child { margin-bottom: 0; }
+.forecast-history-quality { min-width: 14rem; max-width: 28rem; overflow-wrap: anywhere; }
+.forecast-history-quality p { margin: var(--sp-1) 0 0; }
 .forecast-history-summary { font-weight: 600; }
 .daily-timeline-result, .daily-timeline-table, .daily-timeline-selection { min-width: 0; }
 .daily-timeline-summary { font-weight: 600; }

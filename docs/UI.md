@@ -137,7 +137,11 @@ plain links to `/api/v1/export?what=plan&format=json|csv`.
 
 **Forecasts** — one panel per kind with source badge, `generated_at` age, `stale`/confidence
 badges, notes, chart, per-day totals table. Price: buy bars + sell line, stale slots drawn grey.
-Solar: PV area with a ±uncertainty band and peak per day. Load: P50 line with a P10/P90 band.
+Solar: PV area with a ±uncertainty band and peak per day. Load: P50 line with a P10/P90 band. Daily
+rows show the existing stale flag for solar/load and stale-slot counts for price; no new age threshold is
+applied. Partial totals state their returned-slot coverage. If a forecast is empty, the API reason/hint
+is shown when present; without one the UI reports that the cause was not returned rather than guessing
+that a provider failed.
 
 The **Daily energy timeline** uses `GET /api/v1/daily-timeline?date=YYYY-MM-DD&timezone=<IANA>` to
 show one selected local day in 15-minute bins. Previous/next and the date input move by local calendar
@@ -149,7 +153,11 @@ detail is loaded only on request and uses exact plan/slot links. Missing data is
 Derived PV/load never replace direct fields, the battery note states that fleet completeness is unknown,
 and planned actions/setpoints do not prove dispatch. Buy/sell context appears only from retained plan
 slots; independent historical actual prices, state of charge, and other unsupported series are explicitly
-unavailable/omitted. The view adds no telemetry sampler and no dashboard-card feed.
+unavailable/omitted. Each interval row spells out actual sample coverage, a stale PV forecast flag,
+and forecast source/issue time where available. Missing archived values state that their cause is not
+retained; current provider health is not assigned to historical bins. Load-forecast freshness is not
+classified because this timeline API does not provide a stale flag for it. The accessible table is the
+textual alternative to the chart. The view adds no telemetry sampler and no dashboard-card feed.
 
 The **Forecast history** panel queries `GET /api/v1/forecast-history` with the browser's IANA
 timezone and a local date. Previous/next controls move by local calendar day; resolution is 15 minutes,
@@ -168,8 +176,11 @@ the latest archived PV vintage issued by its start and three distinct fresh 5-mi
 `pv_power` readings from one entity; inferred, partial and mixed-entity outcomes are excluded.
 Stale vintages remain scored and are counted. Positive bias means forecast minus measured is above
 zero (overforecast). PV MAPE is not presented because near-zero/nighttime denominators are
-misleading. The legacy load/price MAPE reports and trend remain. A provider table lists
-active/healthy/freshness per provider.
+misleading. The legacy load/price MAPE reports and trend remain. Each history row names whether a
+missing vintage or incomplete direct PV coverage prevents a complete comparison; stale vintages remain
+in retrospective scoring but are identified as not fresh evidence. Archived gaps do not retain a
+provider-failure reason, so the table does not attribute them to a source. A provider table lists
+current active/healthy/freshness per provider and is not a historical per-interval failure log.
 
 **Batteries** — a card per battery: live power/SoC/energy, the **round trip** efficiency in percent
 (the input: one number, split evenly into `eta_charge`/`eta_discharge`; explicit per-direction values
