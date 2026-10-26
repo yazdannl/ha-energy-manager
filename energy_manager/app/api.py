@@ -1260,6 +1260,41 @@ class ApiServer:
                 }
             )
 
+        if route == "daily-timeline" and method == "GET":
+            timezone_name = str(query.get("timezone") or "UTC")
+            try:
+                zone = ZoneInfo(timezone_name)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise ApiError(400, "invalid_timezone", "timezone must be a valid IANA time-zone name") from None
+            date_text = query.get("date")
+            if date_text and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
+                raise ApiError(400, "invalid_date", "date must be an ISO calendar date (YYYY-MM-DD)")
+            try:
+                selected_day = date.fromisoformat(date_text) if date_text else now.astimezone(zone).date()
+            except (TypeError, ValueError):
+                raise ApiError(400, "invalid_date", "date must be an ISO calendar date (YYYY-MM-DD)") from None
+            try:
+                start_local = datetime.combine(selected_day, time.min, tzinfo=zone)
+                end_local = datetime.combine(selected_day + timedelta(days=1), time.min, tzinfo=zone)
+                start_utc = start_local.astimezone(timezone.utc)
+                end_utc = end_local.astimezone(timezone.utc)
+            except (OverflowError, ValueError):
+                raise ApiError(400, "invalid_date", "date range is outside the supported calendar") from None
+            if end_utc <= start_utc:
+                raise ApiError(400, "invalid_date", "selected local date has no representable time interval")
+            timeline = engine.daily_energy_timeline(
+                start_utc, end_utc, timezone_name=timezone_name
+            )
+            timeline.update(
+                {
+                    "date": selected_day.isoformat(),
+                    "timezone": timezone_name,
+                    "from": to_iso(start_utc),
+                    "to": to_iso(end_utc),
+                }
+            )
+            return self._json(timeline)
+
         if route == "forecast-history" and method == "GET":
             resolution = str(query.get("resolution") or "15m")
             if resolution not in ("15m", "hour", "day"):

@@ -1455,6 +1455,11 @@ GET  /api/v1/forecast?kind=price|solar|load&hours=36
                                    `no_pv_source`, `no_history`, `empty_horizon`, `unknown`) and
                                    `hint` one sentence naming the setting or condition to fix, so the
                                    UI never has to say only "the source failed".
+GET  /api/v1/daily-timeline?date=YYYY-MM-DD&timezone=Europe%2FAmsterdam
+                               -> {date, timezone, from, to, interval_minutes:15,
+                                   expected_intervals, series:[DailyTimelineInterval],
+                                   coverage, provenance, notes}
+                                   Additive, read-only, one selected IANA local day, at most 200 UTC-backed bins.
 GET  /api/v1/batteries         -> {batteries:[{config, state, capabilities, mapping_resolved,
                                                discovery:[...]}]}
 POST /api/v1/batteries         -> create  {config}
@@ -1490,6 +1495,24 @@ GET  /api/v1/web/sem-charts-card.js  -> the Lovelace card as one self-contained 
 POST /api/v1/notify/test       -> {}  (sends a test notification if enabled)
 GET  /                         -> SPA index.html (+ /app.js, /style.css, /charts.js, /vendor/*)
 ```
+
+`series[]` entries carry UTC `start`/`end`, offset-bearing local `label`/`local_end`, and distinct
+`solar`, `load`, `grid`, `battery` and `plan` objects. Direct PV and load actuals use `actual_kw`;
+load/grid/battery also expose `covered_kw` for partial-only means. `solar.derived` and `load.derived`
+contain existing inferred values with their own coverage. Forecasts retain source/issue metadata;
+plan entries retain exact slot segments, plan identity, planned setpoint and saved buy/sell prices.
+All measured/derived metrics include sample counts and status; plan fields include duration coverage.
+
+`GET /api/v1/daily-timeline` reads only existing measurements, actuals, archived forecasts and
+saved plan slots; it adds no sampler, schema, or sensor. Local-midnight boundaries are converted to
+UTC before quarter-hour bins are built, so a normal DST day has 92 or 100 bins instead of a forced
+96. Each interval keeps direct PV, derived PV/load, actuals, forecasts and saved-plan evidence in
+separate fields with coverage/status and provenance. Partial actual means are covered-only and are
+not promoted to complete values. Grid power is signed (positive import, negative export); battery
+actuals retain the confirmed aggregate but cannot establish complete fleet coverage. Plan action,
+setpoint and buy/sell prices are not proof of dispatch, and there is no independent historical actual
+price series in this route. Missing or unsupported values stay null; see `docs/UI.md` for the field
+semantics and accessible presentation.
 
 `GET /api/v1/discover` is what makes the mapping wizard possible: it lists candidate entities with a
 `suggested_role` and a `confidence` in `[0,1]`, derived from the entity registry (platform,

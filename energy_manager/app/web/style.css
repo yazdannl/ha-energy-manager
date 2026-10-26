@@ -906,6 +906,23 @@ tbody tr:hover { background: var(--panel-2); }
 .forecast-history-vintage { margin: 0 0 var(--sp-1); }
 .forecast-history-vintage:last-child { margin-bottom: 0; }
 .forecast-history-summary { font-weight: 600; }
+.daily-timeline-result, .daily-timeline-table, .daily-timeline-selection { min-width: 0; }
+.daily-timeline-summary { font-weight: 600; }
+.daily-timeline-controls { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: flex-end; }
+.daily-timeline-controls label { display: grid; gap: var(--sp-1); color: var(--text-muted); font-size: 0.8rem; }
+.daily-timeline-controls input { min-height: 2.5rem; }
+.daily-timeline-provenance { margin: var(--sp-2) 0; }
+.daily-timeline-provenance ul { margin-bottom: 0; }
+.daily-timeline-chart { min-width: 0; }
+.daily-timeline-table table { min-width: 58rem; }
+.daily-timeline-lines { min-width: 9rem; }
+.daily-timeline-lines > div { margin-bottom: var(--sp-1); }
+.daily-timeline-lines > div:last-child { margin-bottom: 0; }
+.daily-timeline-interval { white-space: nowrap; min-height: 2.5rem; }
+.daily-timeline-row-selected td { background: var(--panel-2); }
+.daily-timeline-selection { margin-top: var(--sp-3); }
+.daily-timeline-selection h3 { font-size: 1rem; }
+.daily-timeline-plan-detail { margin-top: var(--sp-2); }
 .accuracy-scorecard { min-width: 0; }
 .accuracy-scorecard > h3 { margin: var(--sp-3) 0 var(--sp-2); font-size: 1rem; }
 
@@ -960,6 +977,10 @@ tbody tr:hover { background: var(--panel-2); }
 
 @media (max-width: 480px) {
   .forecast-history-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; }
+  .daily-timeline-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; }
+  .daily-timeline-controls label { min-width: 0; }
+  .daily-timeline-controls input { width: 100%; min-width: 0; }
+  .daily-timeline-controls .btn { min-height: 2.5rem; }
   .forecast-history-controls > label { min-width: 0; }
   .forecast-history-controls input, .forecast-history-controls select { width: 100%; min-width: 0; }
   .forecast-history-controls .btn { min-height: 2.5rem; }

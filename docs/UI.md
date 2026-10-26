@@ -19,7 +19,7 @@ Hash routing (`app.js: splitHash()`), eight views, all rendered client-side:
 | --- | --- | --- |
 | `#/dashboard` | `viewDashboard` | Live now-cards, alerts, 24 h mini-chart, autopilot controls |
 | `#/plan` | `viewPlan` | Aligned timeline, plan summary, per-slot table, bounded plan history, recompute |
-| `#/forecasts` | `viewForecasts` | Price / solar / load panels, per-day totals, bounded forecast-vintage history, accuracy trend, provider health |
+| `#/forecasts` | `viewForecasts` | Daily energy timeline, price / solar / load panels, per-day totals, bounded forecast-vintage history, accuracy trend, provider health |
 | `#/batteries` | `viewBatteries` | Battery cards, discovery-based add/edit wizard, bounded test discharge |
 | `#/savings` | `viewSavings` | Range totals, savings vs baseline chart, per-bucket table, baseline definition |
 | `#/cards` | `viewCards` | Downloadable Lovelace card, chart picker, copy-paste snippet, live preview, feed entity table |
@@ -138,6 +138,18 @@ plain links to `/api/v1/export?what=plan&format=json|csv`.
 **Forecasts** — one panel per kind with source badge, `generated_at` age, `stale`/confidence
 badges, notes, chart, per-day totals table. Price: buy bars + sell line, stale slots drawn grey.
 Solar: PV area with a ±uncertainty band and peak per day. Load: P50 line with a P10/P90 band.
+
+The **Daily energy timeline** uses `GET /api/v1/daily-timeline?date=YYYY-MM-DD&timezone=<IANA>` to
+show one selected local day in 15-minute bins. Previous/next and the date input move by local calendar
+day; the API builds bins from UTC instants, so normal spring/fall DST days contain 92/100 bins.
+One power chart distinguishes direct actuals, dotted derived PV/load, dashed archived PV/load forecasts,
+signed grid power and confirmed aggregate battery power from the dotted plan setpoint. The accessible
+interval table retains unavailable vs partial coverage and opens a selected bin's provenance; saved-plan
+detail is loaded only on request and uses exact plan/slot links. Missing data is never plotted as zero.
+Derived PV/load never replace direct fields, the battery note states that fleet completeness is unknown,
+and planned actions/setpoints do not prove dispatch. Buy/sell context appears only from retained plan
+slots; independent historical actual prices, state of charge, and other unsupported series are explicitly
+unavailable/omitted. The view adds no telemetry sampler and no dashboard-card feed.
 
 The **Forecast history** panel queries `GET /api/v1/forecast-history` with the browser's IANA
 timezone and a local date. Previous/next controls move by local calendar day; resolution is 15 minutes,
@@ -406,6 +418,12 @@ if they are absent:
   summary and the break-even line) and, in `batteries[]`, each battery's own round trip, wear and
   break-even, because per-battery values are not the aggregate mean. Slot `reason` values include
   `efficiency_loss`, which the table renders like any other reason slug.
+- `GET /api/v1/daily-timeline`: one local-day `series[]` at 15-minute resolution; UTC `start`/`end`,
+  offset-bearing local labels, coverage/status and provenance. `solar` contains direct PV plus separately
+  nested `derived`; `load` contains direct/derived actuals and an archived forecast; `grid` and `battery`
+  use persisted actuals; `plan` exposes only covered saved actions, setpoints and slot buy/sell values.
+  Full actual values require three 5-minute samples, partial means stay in `covered_kw`, and unsupported
+  independent actual-price/fleet-completeness claims are absent. DST follows the selected IANA zone.
 - `GET /api/v1/accuracy`: legacy `pv/load/price` accuracy reports plus `pv_vintage`, with signed
   kWh bias/absolute error, matched coverage, local-day and supported lead-time/source breakdowns;
   `timezone` controls local-day grouping. Legacy `series[].{day, mape_pct, bias_pct}` remains.
@@ -424,6 +442,7 @@ if they are absent:
 ## Accessibility notes
 
 Skip link, `aria-current` nav, native `<dialog>` (focus trap + Esc), labelled inputs, tables with
-`scope="col"`, `aria-live` status region for write confirmations, `:focus-visible` outlines, no
+`scope="col"`, an interval selector button per daily-timeline row, `aria-live` date/load status,
+`:focus-visible` outlines, no
 animation beyond what `prefers-reduced-motion` already disables. The palette is blue/green/orange/
 purple and never encodes meaning by colour alone.

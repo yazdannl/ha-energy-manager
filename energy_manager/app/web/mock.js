@@ -796,7 +796,9 @@
     // Empty by default so ?mock=1 starts unlimited; a render-check scenario sets one.
     limits: {},
     // 0.20.4 cost-basis ledger state: "ok", "stale", "empty" or "off".
-    costBasisMode: "ok"
+    costBasisMode: "ok",
+    dailyTimelinePlanId: null,
+    dailyTimelinePlanDetail: null
   };
 
   function limitsCopy() {
@@ -1296,6 +1298,220 @@
     };
   }
 
+  function timelineDateShift(dateText, days) {
+    var value = new Date(dateText + "T00:00:00Z");
+    value.setUTCDate(value.getUTCDate() + days);
+    return value.toISOString().slice(0, 10);
+  }
+
+  function timelineMidnight(dateText, zone) {
+    var target = new Date(dateText + "T00:00:00Z").getTime();
+    var guess = target;
+    var formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"
+    });
+    for (var i = 0; i < 4; i++) {
+      var parts = {};
+      formatter.formatToParts(new Date(guess)).forEach(function (part) { parts[part.type] = part.value; });
+      var local = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+        Number(parts.hour), Number(parts.minute), Number(parts.second));
+      var difference = target - local;
+      guess += difference;
+      if (!difference) break;
+    }
+    return guess;
+  }
+
+  function timelineLocalLabel(ms, zone) {
+    var formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"
+    });
+    var parts = {};
+    formatter.formatToParts(new Date(ms)).forEach(function (part) { parts[part.type] = part.value; });
+    var local = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+      Number(parts.hour), Number(parts.minute), Number(parts.second));
+    var offset = Math.round((local - ms) / 60000);
+    var sign = offset < 0 ? "-" : "+";
+    var absolute = Math.abs(offset);
+    var zoneText = sign + String(Math.floor(absolute / 60)).padStart(2, "0") + String(absolute % 60).padStart(2, "0");
+    var clock = parts.hour + ":" + parts.minute;
+    return {
+      label: parts.year + "-" + parts.month + "-" + parts.day + " " + clock + " " + zoneText,
+      clock: clock + " " + zoneText
+    };
+  }
+
+  function dailyTimelinePayload(params) {
+    params = params || {};
+    var timezone = params.timezone || "UTC";
+    var dateText = params.date || new Date().toISOString().slice(0, 10);
+    var start = timelineMidnight(dateText, timezone);
+    var end = timelineMidnight(timelineDateShift(dateText, 1), timezone);
+    var step = 15 * 60000;
+    var series = [];
+    var planSlots = [];
+    var bucketCount = Math.max(0, Math.floor((end - start) / step));
+    for (var hour = 0; hour < Math.ceil((end - start) / 3600000); hour++) {
+      var slotStart = start + hour * 3600000;
+      var slotMinutes = Math.min(60, (end - slotStart) / 60000);
+      var daylight = Math.max(0, Math.sin(Math.PI * ((hour % 24) - 6) / 12));
+      var action = hour % 7 === 4 ? "charge" : hour % 7 === 5 ? "discharge" : "hold";
+      var powerW = action === "charge" ? 450 : action === "discharge" ? -350 : 0;
+      var buy = round(0.12 + 0.18 * (1 - daylight), 4);
+      var sell = round(Math.max(0.04, buy * 0.4), 4);
+      planSlots.push({
+        t: iso(slotStart), minutes: slotMinutes, planned_setpoint_w: powerW, action: action,
+        reason: action === "hold" ? "reserve_hold" : action === "charge" ? "arbitrage_charge" : "peak_discharge",
+        buy: buy, sell: sell, power_w: powerW
+      });
+    }
+    var generatedAt = iso(start - 3600000);
+    db.dailyTimelinePlanId = 77001;
+    db.dailyTimelinePlanDetail = {
+      plan: { plan_id: db.dailyTimelinePlanId, generated_at: generatedAt, horizon_start: iso(start),
+        horizon_end: iso(end), slot_minutes: 60, mode: "auto", dry_run: false, feasible: true,
+        sources: { price: "synthetic archived price", solar: "synthetic forecast", load: "synthetic forecast" } },
+      linkage: {
+        measurement_note: "Synthetic timestamp-aligned actuals; time alignment does not prove plan causality.",
+        unmatched_dispatches: []
+      },
+      slots: planSlots.map(function (slot, index) {
+        return {
+          t: slot.t, minutes: slot.minutes, duration_known: true,
+          planned_setpoint_w: slot.planned_setpoint_w, action: slot.action, reason: slot.reason,
+          buy: slot.buy, sell: slot.sell,
+          dispatch: index % 3 === 1 ? { records: 1, batteries: [{ id: "battery_1", attempts: 1, last: {
+            ts: iso(new Date(slot.t).getTime() + 5 * 60000), requested_w: slot.power_w,
+            applied_w: slot.power_w, result: "ok", code: "ok"
+          } }] } : null,
+          actual: { battery_kw: round(slot.power_w / 1000 + 0.06 * wobble(index), 3) }
+        };
+      })
+    };
+
+    function measured(value, index, missingEvery, partialEvery) {
+      var samples = index % missingEvery === 0 ? 0 : index % partialEvery === 0 ? 2 : 3;
+      return {
+        actual_kw: samples === 3 ? round(value, 3) : null,
+        covered_kw: samples ? round(value, 3) : null,
+        samples: samples, expected_samples: 3,
+        coverage_pct: round(samples * 100 / 3, 1),
+        status: samples === 3 ? "complete" : samples ? "partial" : "missing"
+      };
+    }
+    for (var i = 0; i < bucketCount; i++) {
+      var at = start + i * step;
+      var local = timelineLocalLabel(at, timezone);
+      var endLocal = timelineLocalLabel(at + step, timezone);
+      var hourIndex = Math.floor(i / 4);
+      var planSlot = planSlots[hourIndex];
+      var localHour = Number(local.clock.slice(0, 2));
+      var daylightAt = Math.max(0, Math.sin(Math.PI * (localHour - 6) / 12));
+      var solarSamples = i % 17 === 9 ? 0 : i % 11 === 5 ? 2 : 3;
+      var pvActual = solarSamples === 3 ? round(Math.max(0, (1.4 + 2.2 * daylightAt) * (0.93 + 0.04 * wobble(i))), 3) : null;
+      var pvForecast = i % 19 === 8 ? null : round(1.4 + 2.2 * daylightAt + 0.04 * wobble(i), 3);
+      var load = measured(0.65 + 0.35 * Math.abs(wobble(i)), i, 13, 7);
+      var loadDerivedRaw = measured(0.62 + 0.3 * Math.abs(wobble(i + 4)), i + 4, 17, 8);
+      var loadDerived = { kw: loadDerivedRaw.actual_kw, covered_kw: loadDerivedRaw.covered_kw,
+        samples: loadDerivedRaw.samples, expected_samples: loadDerivedRaw.expected_samples,
+        coverage_pct: loadDerivedRaw.coverage_pct, status: loadDerivedRaw.status };
+      var pvDerivedRaw = measured(0.3 + 0.2 * Math.abs(wobble(i + 6)), i + 6, 19, 10);
+      var pvDerived = { kw: pvDerivedRaw.actual_kw, covered_kw: pvDerivedRaw.covered_kw,
+        samples: pvDerivedRaw.samples, expected_samples: pvDerivedRaw.expected_samples,
+        coverage_pct: pvDerivedRaw.coverage_pct, status: pvDerivedRaw.status };
+      var grid = measured(0.4 + 0.3 * wobble(i), i + 2, 17, 8);
+      var battery = measured(planSlot.power_w / 1000 + 0.05 * wobble(i), i + 3, 19, 9);
+      var hasPlan = i % 23 !== 12;
+      var segments = hasPlan ? [{
+        slot_t: planSlot.t, minutes: 15, action: planSlot.action, reason: planSlot.reason,
+        power_w: planSlot.power_w, buy_eur_per_kwh: planSlot.buy, sell_eur_per_kwh: planSlot.sell
+      }] : [];
+      series.push({
+        start: iso(at), end: iso(at + step), label: local.label, local_end: endLocal.clock,
+        solar: {
+          actual_kw: pvActual, actual_samples: solarSamples, expected_actual_samples: 3,
+          actual_coverage_pct: round(solarSamples * 100 / 3, 1),
+          actual_status: solarSamples === 3 ? "complete" : solarSamples ? "partial" : "missing",
+          actual_source: "sensor.example_pv_power", actual_sources: ["sensor.example_pv_power"],
+          derived: pvDerived,
+          forecast_kw: pvForecast, forecast_source: pvForecast === null ? null : "synthetic archived solar",
+          forecast_model: { model: "mock-capacity", version: "fixture" },
+          forecast_issued_at: iso(start - 3600000), forecast_stale: i % 29 === 0
+        },
+        load: Object.assign({}, load, {
+          forecast_kw: i % 21 === 5 ? null : round(0.72 + 0.28 * Math.abs(wobble(i + 3)), 3),
+          forecast_source: i % 21 === 5 ? null : "synthetic archived load",
+          forecast_issued_at: iso(start - 3600000), derived: loadDerived
+        }),
+        grid: grid,
+        battery: Object.assign({}, battery, { fleet_completeness: "unknown" }),
+        plan: hasPlan ? {
+          plan_id: db.dailyTimelinePlanId, generated_at: generatedAt,
+          age_minutes: round((at - (start - 3600000)) / 60000, 1),
+          sources: { price: "synthetic archived price", solar: "synthetic forecast", load: "synthetic forecast" },
+          status: "complete", coverage_minutes: 15, coverage_pct: 100,
+          action_status: "complete", segments: segments,
+          planned_power_kw: round(planSlot.power_w / 1000, 4),
+          covered_power_kw: round(planSlot.power_w / 1000, 4), power_coverage_pct: 100,
+          planned_buy_eur_per_kwh: planSlot.buy, covered_buy_eur_per_kwh: planSlot.buy,
+          planned_sell_eur_per_kwh: planSlot.sell, covered_sell_eur_per_kwh: planSlot.sell,
+          buy_coverage_pct: 100, sell_coverage_pct: 100, price_coverage_pct: 100
+        } : {
+          plan_id: null, generated_at: null, age_minutes: null, sources: {},
+          status: "missing", coverage_minutes: 0, coverage_pct: 0,
+          action_status: "missing", segments: [], planned_power_kw: null,
+          covered_power_kw: null, power_coverage_pct: 0, planned_buy_eur_per_kwh: null,
+          covered_buy_eur_per_kwh: null, planned_sell_eur_per_kwh: null,
+          covered_sell_eur_per_kwh: null, buy_coverage_pct: 0, sell_coverage_pct: 0,
+          price_coverage_pct: 0
+        }
+      });
+    }
+    function counts(statuses) {
+      return {
+        complete: statuses.filter(function (status) { return status === "complete"; }).length,
+        partial: statuses.filter(function (status) { return status === "partial" || status === "mixed_source"; }).length,
+        unavailable: statuses.filter(function (status) { return status === "unavailable"; }).length,
+        missing: statuses.filter(function (status) { return status === "missing"; }).length,
+        total: statuses.length
+      };
+    }
+    return {
+      date: dateText, timezone: timezone, from: iso(start), to: iso(end),
+      interval_minutes: 15, expected_intervals: series.length, series: series,
+      coverage: {
+        solar_actual: counts(series.map(function (row) { return row.solar.actual_status; })),
+        solar_derived: counts(series.map(function (row) { return row.solar.derived.status; })),
+        solar_forecast: counts(series.map(function (row) { return row.solar.forecast_kw == null ? "missing" : "complete"; })),
+        load_actual: counts(series.map(function (row) { return row.load.status; })),
+        load_derived: counts(series.map(function (row) { return row.load.derived.status; })),
+        load_forecast: counts(series.map(function (row) { return row.load.forecast_kw == null ? "missing" : "complete"; })),
+        grid_actual: counts(series.map(function (row) { return row.grid.status; })),
+        battery_actual: counts(series.map(function (row) { return row.battery.status; })),
+        planned_action: counts(series.map(function (row) { return row.plan.action_status; }))
+      },
+      provenance: {
+        solar_actual: "Synthetic direct pv_power fixture with entity and sample coverage.",
+        solar_derived: "Synthetic persisted actuals.pv_derived_kw, shown separately from direct PV.",
+        solar_forecast: "Synthetic archived forecast vintage with source and issue time.",
+        load_actual: "Synthetic persisted direct actuals.load_kw fixture; source identity unavailable.",
+        load_derived: "Synthetic persisted actuals.load_derived_kw, shown separately from direct load.",
+        load_forecast: "Synthetic archived load forecast fixture.",
+        grid_actual: "Synthetic signed persisted grid actuals; source identity unavailable.",
+        battery_actual: "Synthetic confirmed battery readbacks; fleet completeness unknown.",
+        plan: "Synthetic retained plan snapshots; planned actions are not proof of dispatch.",
+        price: "Synthetic saved plan-slot buy/sell prices only; no independent historical actual price."
+      },
+      notes: [
+        "Partial sample bins are covered-only and are not charted as complete values; derived PV/load remain separate from direct actuals.",
+        "Plan action, price, and setpoint are synthetic fixtures; exact plan/slot timestamps are used for detail.",
+        "Daylight-saving days use the selected IANA timezone and may have a different interval count."
+      ]
+    };
+  }
+
   function logEntries(limit) {
     var n = clamp(parseInt(limit, 10) || 100, 1, 500);
     var rows = [];
@@ -1457,10 +1673,13 @@
     "GET /api/v1/plan": function (ctx) { return planPayload(ctx.params.hours); },
     "GET /api/v1/plan/execution": function (ctx) { return executionPayload(ctx.params.hours); },
     "GET /api/v1/plan/history": function (ctx) {
-      return ctx.params.plan_id ? planHistoryDetail(ctx.params.plan_id) : planHistoryIndex();
+      if (!ctx.params.plan_id) return planHistoryIndex();
+      if (db.dailyTimelinePlanDetail && Number(ctx.params.plan_id) === db.dailyTimelinePlanId) return db.dailyTimelinePlanDetail;
+      return planHistoryDetail(ctx.params.plan_id);
     },
     "POST /api/v1/plan/recompute": function () { return { queued: true }; },
     "GET /api/v1/forecast-history": function (ctx) { return forecastHistoryPayload(ctx.params); },
+    "GET /api/v1/daily-timeline": function (ctx) { return dailyTimelinePayload(ctx.params); },
     "GET /api/v1/forecast": function (ctx) {
       var kind = ctx.params.kind || "price";
       var hours = ctx.params.hours;
@@ -1740,6 +1959,7 @@
     });
     out.accuracy = routes["GET /api/v1/accuracy"]({ params: { days: "14" } });
     out.forecast_history = routes["GET /api/v1/forecast-history"]({ params: { resolution: "15m", date: new Date().toISOString().slice(0, 10), timezone: "UTC" } });
+    out.daily_timeline = routes["GET /api/v1/daily-timeline"]({ params: { date: new Date().toISOString().slice(0, 10), timezone: "UTC" } });
     out.log = routes["GET /api/v1/log"]({ params: { limit: "50" } });
     out.providers = routes["GET /api/v1/providers"]({ params: {} });
     return out;

@@ -1171,6 +1171,71 @@ class Store:
             )
         return result
 
+    def daily_timeline_plan_bins(
+        self, intervals: Iterable[tuple[datetime, datetime]]
+    ) -> list[dict[str, Any]]:
+        """Return the latest retained plan known at each bounded interval start.
+
+        This is a read-only view over the existing plan archive. Slot durations use the saved
+        ``minutes`` value, falling back only to the plan's persisted ``slot_minutes`` resolution.
+        """
+        bounded = list(intervals)
+        if len(bounded) > 200:
+            raise ValueError("daily timeline supports at most 200 intervals")
+        result: list[dict[str, Any]] = []
+        conn = self.connection
+        for start, end in bounded:
+            plan_row = conn.execute(
+                "SELECT p.id, p.created_at, p.horizon_start, p.horizon_end, p.mode, p.dry_run,"
+                " p.feasible, p.summary_json FROM plans p"
+                " WHERE julianday(p.created_at) <= julianday(?)"
+                " AND julianday(p.horizon_start) < julianday(?)"
+                " AND julianday(p.horizon_end) > julianday(?)"
+                " ORDER BY julianday(p.created_at) DESC, p.id DESC LIMIT 1",
+                (to_iso(start), to_iso(end), to_iso(start)),
+            ).fetchone()
+            if plan_row is None:
+                result.append({"start": to_iso(start), "plan": None, "slots": []})
+                continue
+            summary = _json_loads(plan_row["summary_json"], {}) or {}
+            try:
+                slot_minutes = float(summary.get("slot_minutes"))
+            except (TypeError, ValueError, OverflowError):
+                slot_minutes = 0.0
+            if not math.isfinite(slot_minutes) or slot_minutes <= 0.0:
+                slot_minutes = 0.0
+            slots = conn.execute(
+                "SELECT s.t, s.minutes, s.power_w, s.action, s.reason, s.buy, s.sell"
+                " FROM plan_slots s WHERE s.plan_id = ? AND julianday(s.t) < julianday(?)"
+                " AND ((s.minutes IS NOT NULL AND s.minutes > 0"
+                "       AND julianday(s.t) + s.minutes / 1440.0 > julianday(?))"
+                "   OR (? > 0 AND (s.minutes IS NULL OR s.minutes <= 0)"
+                "       AND julianday(s.t) + ? / 1440.0 > julianday(?)))"
+                " ORDER BY julianday(s.t), s.t LIMIT 16",
+                (
+                    int(plan_row["id"]), to_iso(end), to_iso(start),
+                    slot_minutes, slot_minutes, to_iso(start),
+                ),
+            ).fetchall()
+            result.append(
+                {
+                    "start": to_iso(start),
+                    "plan": {
+                        "plan_id": int(plan_row["id"]),
+                        "generated_at": plan_row["created_at"],
+                        "horizon_start": plan_row["horizon_start"],
+                        "horizon_end": plan_row["horizon_end"],
+                        "slot_minutes": slot_minutes or None,
+                        "mode": plan_row["mode"],
+                        "dry_run": bool(plan_row["dry_run"]),
+                        "feasible": bool(plan_row["feasible"]),
+                        "sources": summary.get("sources") if isinstance(summary.get("sources"), dict) else {},
+                    },
+                    "slots": [dict(slot) for slot in slots],
+                }
+            )
+        return result
+
     def _plan_from_row(self, row: sqlite3.Row) -> Plan:
         summary_raw = _json_loads(row["summary_json"], {}) or {}
         infeasible_reason = summary_raw.pop("infeasible_reason", None)

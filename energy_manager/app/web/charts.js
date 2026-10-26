@@ -810,6 +810,68 @@
     draw(host);
   }
 
+  function dailyTimelinePower(host, payload, options) {
+    var rows = payload && Array.isArray(payload.series) ? payload.series : [];
+    if (!hasRows(rows)) { fallback(host, "No daily timeline intervals for this local date."); return; }
+    var xs = rows.map(function (row) { return ts(row.start); });
+    function value(path) {
+      return rows.map(function (row) {
+        var item = row;
+        path.split(".").forEach(function (key) { item = item && item[key]; });
+        return num(item);
+      });
+    }
+    var pv = value("solar.actual_kw");
+    var pvDerived = value("solar.derived.kw");
+    var pvForecast = value("solar.forecast_kw");
+    var load = value("load.actual_kw");
+    var loadDerived = value("load.derived.kw");
+    var loadForecast = value("load.forecast_kw");
+    var grid = value("grid.actual_kw");
+    var battery = value("battery.actual_kw");
+    var planned = value("plan.planned_power_kw");
+    if (!pv.concat(pvDerived, pvForecast, load, loadDerived, loadForecast, grid, battery, planned).some(function (v) { return v !== null; })) {
+      fallback(host, "No complete power intervals are available to chart; the table shows missing and partial coverage.");
+      return;
+    }
+    if (!chartsReady(host)) return;
+    var p = palette(options && options.palette);
+    var narrow = narrowHost(host);
+    var unit = function (u, v) { return fmt(v, 2, "kW"); };
+    var opts = baseOpts(p, {
+      scales: { x: { time: true }, y: { auto: true } },
+      axes: [
+        Object.assign(timeAxis(p), { values: function (_u, vals) {
+          return vals.map(function (v) {
+            try { return new Date(v * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZoneName: "short" }); }
+            catch (err) { return new Date(v * 1000).toISOString(); }
+          });
+        } }),
+        axisFor("y", "kW", 3, p, narrow, "kw")
+      ],
+      series: [
+        {},
+        Object.assign(line(p.pv), { label: "Direct measured PV", value: unit }),
+        Object.assign(lineDotted(p.pv), { label: "Derived PV (inferred; dotted)", value: unit }),
+        Object.assign(lineDashed(p.pv), { label: "PV forecast (dashed)", value: unit }),
+        Object.assign(line(p.load), { label: "Direct load actual", value: unit }),
+        Object.assign(lineDotted(p.load), { label: "Derived load (inferred; dotted)", value: unit }),
+        Object.assign(lineDashed(p.load), { label: "Load forecast (dashed)", value: unit }),
+        Object.assign(line(p.baseline), { label: "Grid actual (+ import / − export)", value: unit }),
+        Object.assign(line(p.discharge), { label: "Battery actual (confirmed aggregate; fleet coverage unknown)", value: unit }),
+        Object.assign(lineDotted(p.soc), { label: "Plan setpoint (dotted; not proof of dispatch)", value: unit })
+      ],
+      cursor: { y: false, x: true, points: { show: true, size: 5 }, sync: { key: SYNC_KEY, setSeries: false } },
+      plugins: [decorPlugin({ palette: p, zeroLine: true }), tooltipPlugin()]
+    });
+    var draw = function (el) {
+      mount(el, opts, [xs, pv, pvDerived, pvForecast, load, loadDerived, loadForecast, grid, battery, planned], 220, draw,
+        "Direct and derived PV and load, signed grid and confirmed battery power, with archived forecasts and saved plan setpoint, all in kW.",
+        "Power in kW. Solid direct actuals, dotted derived values and planned setpoint, dashed forecasts; incomplete bins are gaps. Battery fleet coverage may be partial.");
+    };
+    draw(host);
+  }
+
   function forecastHistoryChart(host, payload, options) {
     var rows = payload && Array.isArray(payload.series) ? payload.series : [];
     if (!hasRows(rows)) { fallback(host, "No forecast history intervals for this range."); return; }
@@ -977,6 +1039,7 @@
     mini: miniChart,
     forecast: forecastChart,
     forecastHistory: forecastHistoryChart,
+    dailyTimelinePower: dailyTimelinePower,
     savings: savingsChart,
     accuracy: accuracyChart,
     destroy: destroy,

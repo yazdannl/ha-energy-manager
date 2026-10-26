@@ -14,7 +14,7 @@ with `<script defer>` in `index.html`.
 | `sem-charts-card.js` | The Lovelace card class (`custom:sem-charts-card`). Reads only the `sensor.sem_chart_*` feeds and maps each row shape back onto `SEMCharts`; shipped inside the bundle, never loaded by this SPA |
 | `sem-charts-card.css` | The card's chrome plus the design tokens `chart-theme.css` expects, defined on `:host` (the SPA gets them from `style.css` on `:root`) |
 | `app.js` | State, hash router, API client, all eight views (including the dashboard-card installer), the quiet-refresh lifecycle (`state.refresh`/`refreshBlocked()`), confirm + pending/confirmed write handling |
-| `charts.js` | uPlot wrappers (`SEMCharts.plan/mini/forecast/savings/accuracy`) with graceful fallbacks |
+| `charts.js` | uPlot wrappers (`SEMCharts.plan/mini/forecast/dailyTimelinePower/savings/accuracy`) with graceful fallbacks |
 | `mock.js` | Synthetic fixtures for `?mock=1`; also loadable in Node for the static test suite |
 | `vendor/bootstrap.min.css` | Vendored Bootstrap 5.3.3 CSS (MIT) - the reset, grid, utilities, form controls and design tokens. Its JavaScript is **not** vendored; interactions live in `app.js` |
 | `vendor/uPlot.min.js`, `vendor/uPlot.min.css` | Vendored uPlot 1.6.32 (MIT). See `vendor/README.md` for version, source URL, checksums and refresh steps |
@@ -33,6 +33,11 @@ appended, e.g. `…/?mock=1#/plan?hours=24`:
 
 For a plain static preview (`python3 -m http.server`), `index.html` works but API calls fail unless
 `?mock=1` is set.
+
+The Forecasts view includes a selected-local-day energy timeline backed by the additive
+`GET /api/v1/daily-timeline` route. It uses existing measurement, actual, forecast and saved-plan
+records only; it adds no sampler and is not a dashboard-card feed. Missing/partial data stays explicit
+in the interval table, and the `?mock=1` fixture exercises its plan-detail link with synthetic values.
 
 ## Dashboard card (SPEC 12)
 

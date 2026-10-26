@@ -66,6 +66,7 @@ DOCUMENTED_ROUTES = [
     "GET /api/v1/plan/history",
     "POST /api/v1/plan/recompute",
     "GET /api/v1/forecast",
+    "GET /api/v1/daily-timeline",
     "GET /api/v1/batteries",
     "POST /api/v1/batteries",
     "PATCH /api/v1/batteries/:id",
@@ -419,6 +420,20 @@ def test_plan_summary_matches_the_api_serializer(fixtures):
     assert summary["objective_eur"] == pytest.approx(expected_objective, abs=1e-9)
     # and the objective uses the same unit the UI shows: EUR, not cents
     assert abs(summary["objective_eur"]) < 100
+
+
+def test_daily_timeline_mock_contract(fixtures):
+    payload = fixtures["fixtures"]["daily_timeline"]
+    assert_fields(payload, ["date", "timezone", "from", "to", "interval_minutes", "expected_intervals", "series", "coverage", "provenance", "notes"], "GET /daily-timeline")
+    assert payload["interval_minutes"] == 15
+    assert payload["expected_intervals"] == len(payload["series"]) == 96
+    row = payload["series"][0]
+    assert_fields(row, ["start", "end", "label", "local_end", "solar", "load", "grid", "battery", "plan"], "daily timeline interval")
+    assert_fields(row["solar"], ["actual_kw", "actual_status", "actual_source", "derived", "forecast_kw", "forecast_source", "forecast_issued_at"], "daily timeline solar")
+    assert_fields(row["load"], ["actual_kw", "covered_kw", "status", "derived", "forecast_kw", "forecast_source"], "daily timeline load")
+    assert_fields(row["plan"], ["plan_id", "segments", "action_status", "planned_power_kw", "planned_buy_eur_per_kwh", "planned_sell_eur_per_kwh"], "daily timeline plan")
+    assert payload["provenance"]["price"].find("independent historical actual price") >= 0
+    assert payload["notes"] and payload["coverage"]["battery_actual"]["total"] == 96
 
 
 def test_forecast_payloads(fixtures):

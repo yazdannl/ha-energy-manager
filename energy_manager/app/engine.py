@@ -71,6 +71,8 @@ log = logging.getLogger(__name__)
 #: as ``sources.measure.MEASUREMENT_MINUTES``); the optimiser's own grid stays at
 #: ``optimizer.slot_minutes``.  A regression test pins the two together.
 ACTUALS_MINUTES = 5
+DAILY_TIMELINE_INTERVAL_MINUTES = 15
+DAILY_TIMELINE_MAX_INTERVALS = 200
 #: The cadence the load and solar providers emit slots on (``sources/load.SLOT_MINUTES``). Named here
 #: rather than imported so the engine keeps one dependency direction, and asserted against both
 #: providers in the tests: a silent divergence would make every slot lookup in ``_slot_forecast_at``
@@ -4303,6 +4305,318 @@ class Engine:
             for kind, items in samples.items()
         }
 
+    def daily_energy_timeline(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        timezone_name: str = "UTC",
+    ) -> dict[str, Any]:
+        """Align retained measured, forecast and saved-plan data into bounded 15-minute bins."""
+        zone = ZoneInfo(timezone_name)
+
+        def utc(moment: datetime) -> datetime:
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            return moment.astimezone(timezone.utc)
+
+        start_utc, end_utc = utc(start), utc(end)
+        if end_utc <= start_utc:
+            raise ValueError("daily timeline end must be after start")
+        interval = timedelta(minutes=DAILY_TIMELINE_INTERVAL_MINUTES)
+        count = int((end_utc - start_utc).total_seconds() // interval.total_seconds())
+        if count > DAILY_TIMELINE_MAX_INTERVALS:
+            raise ValueError("daily timeline is limited to 200 intervals")
+        bounds = [
+            (start_utc + interval * index, start_utc + interval * (index + 1))
+            for index in range(count)
+        ]
+        starts = {left for left, _right in bounds}
+
+        pv_history = self.forecast_history(
+            start_utc, end_utc, timezone_name=timezone_name, resolution="15m"
+        )
+        pv_by_start = {
+            moment.astimezone(timezone.utc): row
+            for row in pv_history.get("series", [])
+            if (moment := _timeline_time(row.get("start"))) is not None
+        }
+        actual_rows = self._store_call("actuals_range", start_utc, end_utc) or []
+        actual_fields = ("load_kw", "grid_kw", "battery_kw", "pv_derived_kw", "load_derived_kw")
+        actual_by_start: dict[datetime, dict[str, dict[datetime, float]]] = {
+            left: {name: {} for name in actual_fields} for left, _right in bounds
+        }
+        for row in actual_rows:
+            sample = _timeline_sample_time(row.get("ts"))
+            if sample is None:
+                continue
+            bucket = sample.replace(
+                minute=(sample.minute // DAILY_TIMELINE_INTERVAL_MINUTES)
+                * DAILY_TIMELINE_INTERVAL_MINUTES,
+                second=0,
+                microsecond=0,
+            )
+            fields = actual_by_start.get(bucket)
+            if fields is None:
+                continue
+            for name in actual_fields:
+                value = _timeline_number(row.get(name))
+                if value is not None:
+                    fields[name][sample] = value
+
+        load_forecasts: dict[datetime, dict[str, Any]] = {}
+        archive_rows = self._store_call(
+            "forecast_archive_range", start_utc, end_utc, "load"
+        ) or []
+        for row in archive_rows:
+            target, issued = _timeline_time(row.get("target_ts")), _timeline_time(row.get("issued_at"))
+            if target is None or issued is None:
+                continue
+            target, issued = utc(target), utc(issued)
+            if target not in starts or issued > target:
+                continue
+            value = _timeline_number(row.get("value"))
+            if value is None:
+                continue
+            previous = load_forecasts.get(target)
+            source = str(row.get("source") or "unknown")
+            rank = (issued, source)
+            previous_issue = _timeline_time(previous.get("issued_at")) if previous is not None else None
+            previous_rank = (
+                (utc(previous_issue), str(previous.get("source") or "unknown"))
+                if previous_issue is not None else None
+            )
+            if previous is None or previous_rank is None or rank > previous_rank:
+                load_forecasts[target] = {**row, "value": value, "source": source}
+
+        plan_rows = self._store_call("daily_timeline_plan_bins", bounds) or []
+        plans_by_start = {
+            moment.astimezone(timezone.utc): row
+            for row in plan_rows
+            if (moment := _timeline_time(row.get("start"))) is not None
+        }
+
+        def metric(samples: Mapping[datetime, float]) -> dict[str, Any]:
+            values = list(samples.values())
+            n = len(values)
+            mean = sum(values) / n if n else None
+            expected = DAILY_TIMELINE_INTERVAL_MINUTES // ACTUALS_MINUTES
+            return {
+                "actual_kw": round(mean, 6) if n == expected else None,
+                "covered_kw": round(mean, 6) if mean is not None else None,
+                "samples": n,
+                "expected_samples": expected,
+                "coverage_pct": round(100.0 * n / expected, 1),
+                "status": "complete" if n == expected else "partial" if n else "missing",
+            }
+
+        def derived_metric(samples: Mapping[datetime, float]) -> dict[str, Any]:
+            summary = metric(samples)
+            return {
+                "kw": summary["actual_kw"], "covered_kw": summary["covered_kw"],
+                "samples": summary["samples"], "expected_samples": summary["expected_samples"],
+                "coverage_pct": summary["coverage_pct"], "status": summary["status"],
+            }
+
+        def plan_values(record: Mapping[str, Any] | None, left: datetime, right: datetime) -> dict[str, Any]:
+            plan = record.get("plan") if isinstance(record, Mapping) else None
+            if not isinstance(plan, Mapping):
+                return {
+                    "plan_id": None, "generated_at": None, "age_minutes": None, "sources": {},
+                    "status": "missing", "coverage_minutes": 0.0, "coverage_pct": 0.0,
+                    "action_status": "missing", "segments": [],
+                    "planned_power_kw": None, "covered_power_kw": None, "power_coverage_pct": 0.0,
+                    "planned_buy_eur_per_kwh": None, "covered_buy_eur_per_kwh": None,
+                    "planned_sell_eur_per_kwh": None, "covered_sell_eur_per_kwh": None,
+                    "buy_coverage_pct": 0.0, "sell_coverage_pct": 0.0, "price_coverage_pct": 0.0,
+                }
+            generated = _timeline_time(plan.get("generated_at"))
+            slot_minutes = _timeline_number(plan.get("slot_minutes"))
+            duration_sums = {"power": 0.0, "buy": 0.0, "sell": 0.0}
+            duration_weights = {"power": 0.0, "buy": 0.0, "sell": 0.0}
+            action_minutes = 0.0
+            known_minutes = 0.0
+            segments = []
+            covered_until = left
+            rows = record.get("slots") if isinstance(record, Mapping) else []
+            for slot in rows if isinstance(rows, list) else []:
+                slot_start = _timeline_time(slot.get("t"))
+                if slot_start is None:
+                    continue
+                slot_start = utc(slot_start)
+                minutes = _timeline_number(slot.get("minutes"))
+                if minutes is None or minutes <= 0.0:
+                    minutes = slot_minutes
+                if minutes is None or minutes <= 0.0 or minutes > 1440.0:
+                    continue
+                slot_end = slot_start + timedelta(minutes=minutes)
+                overlap_start, overlap_end = max(left, slot_start), min(right, slot_end)
+                if overlap_start < covered_until:
+                    overlap_start = covered_until
+                if overlap_end <= overlap_start:
+                    continue
+                covered = (overlap_end - overlap_start).total_seconds() / 60.0
+                covered_until = overlap_end
+                known_minutes += covered
+                action = str(slot.get("action") or "").strip() or None
+                reason = str(slot.get("reason") or "").strip() or None
+                power_w = _timeline_number(slot.get("power_w"))
+                buy = _timeline_number(slot.get("buy"))
+                sell = _timeline_number(slot.get("sell"))
+                segments.append(
+                    {
+                        "slot_t": to_iso(slot_start), "minutes": round(covered, 3),
+                        "action": action, "reason": reason, "power_w": power_w,
+                        "buy_eur_per_kwh": buy, "sell_eur_per_kwh": sell,
+                    }
+                )
+                if action is not None:
+                    action_minutes += covered
+                for key, value in (("power", power_w), ("buy", buy), ("sell", sell)):
+                    if value is not None:
+                        duration_sums[key] += value * covered
+                        duration_weights[key] += covered
+            interval_minutes = (right - left).total_seconds() / 60.0
+            expected = interval_minutes
+
+            def average(key: str) -> float | None:
+                weight = duration_weights[key]
+                return duration_sums[key] / weight if weight else None
+
+            def complete(weight: float) -> bool:
+                return weight >= expected - 1e-6
+
+            power_coverage = duration_weights["power"]
+            buy_coverage = duration_weights["buy"]
+            sell_coverage = duration_weights["sell"]
+            known_pct = min(100.0, 100.0 * known_minutes / expected) if expected else 0.0
+            generated_iso = to_iso(generated) if generated is not None else plan.get("generated_at")
+            return {
+                "plan_id": plan.get("plan_id"), "generated_at": generated_iso,
+                "age_minutes": round(max(0.0, (left - utc(generated)).total_seconds() / 60.0), 1)
+                if generated is not None else None,
+                "sources": dict(plan.get("sources") or {}),
+                "status": "complete" if known_pct >= 100.0 else "partial" if known_minutes else "unavailable",
+                "coverage_minutes": round(known_minutes, 3), "coverage_pct": round(known_pct, 1),
+                "action_status": "complete" if complete(action_minutes) else "partial" if action_minutes else "unavailable",
+                "segments": segments,
+                "planned_power_kw": round(average("power") / 1000.0, 6)
+                if complete(power_coverage) and average("power") is not None else None,
+                "covered_power_kw": round(average("power") / 1000.0, 6) if average("power") is not None else None,
+                "power_coverage_pct": round(100.0 * power_coverage / expected, 1) if expected else 0.0,
+                "planned_buy_eur_per_kwh": round(average("buy"), 6)
+                if complete(buy_coverage) and average("buy") is not None else None,
+                "covered_buy_eur_per_kwh": round(average("buy"), 6) if average("buy") is not None else None,
+                "planned_sell_eur_per_kwh": round(average("sell"), 6)
+                if complete(sell_coverage) and average("sell") is not None else None,
+                "covered_sell_eur_per_kwh": round(average("sell"), 6) if average("sell") is not None else None,
+                "buy_coverage_pct": round(100.0 * buy_coverage / expected, 1) if expected else 0.0,
+                "sell_coverage_pct": round(100.0 * sell_coverage / expected, 1) if expected else 0.0,
+                "price_coverage_pct": round(100.0 * min(buy_coverage, sell_coverage) / expected, 1)
+                if expected else 0.0,
+            }
+
+        series = []
+        for left, right in bounds:
+            pv = pv_by_start.get(left, {})
+            actual = actual_by_start[left]
+            load_actual = metric(actual["load_kw"])
+            pv_derived = derived_metric(actual["pv_derived_kw"])
+            load_derived = derived_metric(actual["load_derived_kw"])
+            grid_actual = metric(actual["grid_kw"])
+            battery_actual = metric(actual["battery_kw"])
+            load_forecast = load_forecasts.get(left)
+            forecast_value = _timeline_number(load_forecast.get("value")) if load_forecast else None
+            forecast_issued = _timeline_time(load_forecast.get("issued_at")) if load_forecast else None
+            plan = plan_values(plans_by_start.get(left), left, right)
+            pv_forecast_kwh = _timeline_number(pv.get("forecast_kwh"))
+            pv_actual_kwh = _timeline_number(pv.get("actual_kwh"))
+            pv_actual_complete = bool(pv.get("actual_complete"))
+            pv_issue = _timeline_time(pv.get("issued_at"))
+            local_start, local_end = left.astimezone(zone), right.astimezone(zone)
+            series.append(
+                {
+                    "start": to_iso(left), "end": to_iso(right),
+                    "label": local_start.strftime("%Y-%m-%d %H:%M %z"),
+                    "local_end": local_end.strftime("%Y-%m-%d %H:%M %z"),
+                    "solar": {
+                        "actual_kw": round(pv_actual_kwh * 4.0, 6)
+                        if pv_actual_complete and pv_actual_kwh is not None else None,
+                        "actual_samples": int(pv.get("actual_samples") or 0),
+                        "expected_actual_samples": int(pv.get("expected_actual_samples") or 3),
+                        "actual_coverage_pct": round(float(pv.get("actual_sample_coverage_pct") or 0.0), 1),
+                        "actual_status": str(pv.get("actual_status") or "missing"),
+                        "actual_source": pv.get("actual_source"),
+                        "actual_sources": list(pv.get("actual_sources") or []),
+                        "derived": pv_derived,
+                        "forecast_kw": round(pv_forecast_kwh * 4.0, 6) if pv_forecast_kwh is not None else None,
+                        "forecast_source": pv.get("forecast_source"),
+                        "forecast_model": pv.get("forecast_model"),
+                        "forecast_issued_at": to_iso(pv_issue) if pv_issue is not None else None,
+                        "forecast_stale": bool(pv.get("forecast_stale")) if pv_forecast_kwh is not None else None,
+                    },
+                    "load": {
+                        **load_actual,
+                        "forecast_kw": forecast_value,
+                        "forecast_source": load_forecast.get("source") if load_forecast else None,
+                        "forecast_issued_at": to_iso(forecast_issued) if forecast_issued is not None else None,
+                        "derived": load_derived,
+                    },
+                    "grid": grid_actual,
+                    "battery": {
+                        **battery_actual,
+                        "fleet_completeness": "unknown",
+                    },
+                    "plan": plan,
+                }
+            )
+
+        def counts(statuses: list[str]) -> dict[str, int]:
+            return {
+                "complete": statuses.count("complete"),
+                "partial": statuses.count("partial") + statuses.count("mixed_source"),
+                "unavailable": statuses.count("unavailable"),
+                "missing": statuses.count("missing"),
+                "mixed_source": statuses.count("mixed_source"),
+                "total": len(statuses),
+            }
+
+        return {
+            "timezone": timezone_name,
+            "interval_minutes": DAILY_TIMELINE_INTERVAL_MINUTES,
+            "expected_intervals": len(series),
+            "series": series,
+            "coverage": {
+                "solar_actual": counts([row["solar"]["actual_status"] for row in series]),
+                "solar_derived": counts([row["solar"]["derived"]["status"] for row in series]),
+                "solar_forecast": counts(["complete" if row["solar"]["forecast_kw"] is not None else "missing" for row in series]),
+                "load_actual": counts([row["load"]["status"] for row in series]),
+                "load_derived": counts([row["load"]["derived"]["status"] for row in series]),
+                "load_forecast": counts(["complete" if row["load"]["forecast_kw"] is not None else "missing" for row in series]),
+                "grid_actual": counts([row["grid"]["status"] for row in series]),
+                "battery_actual": counts([row["battery"]["status"] for row in series]),
+                "planned_action": counts([row["plan"]["action_status"] for row in series]),
+            },
+            "provenance": {
+                "solar_actual": "Fresh, direct pv_power samples from forecast history; direct source entity and sample coverage are retained.",
+                "solar_derived": "Persisted actuals.pv_derived_kw; shown separately from direct PV measurements.",
+                "solar_forecast": "Archived solar forecast vintages; provider, model, issue time and stale flag are retained.",
+                "load_actual": "Persisted actuals.load_kw only; direct source identity and sensor freshness are not retained.",
+                "load_derived": "Persisted actuals.load_derived_kw; shown separately from direct load actuals.",
+                "load_forecast": "Archived forecast_archive load values; issue time is retained but no stale flag is available.",
+                "grid_actual": "Persisted signed actuals.grid_kw; separate import/export channels and source identity are not retained.",
+                "battery_actual": "Persisted actuals.battery_kw from confirmed non-stale readbacks; per-battery fleet completeness is not retained.",
+                "plan": "Latest retained saved plan generated no later than each interval start; planned values do not prove dispatch or application.",
+                "price": "Only saved plan-slot buy/sell prices are shown. Independent historical actual-price data is unavailable in this view.",
+            },
+            "notes": [
+                "Actual load/grid/battery and derived PV/load values require all three stored 5-minute samples for a complete bin; partial means are labeled covered-only and are not charted.",
+                "Derived PV/load values remain separate from direct actuals and never fill a missing measured series.",
+                "Plan-slot durations use the saved duration or the plan's persisted resolution; bins without resolvable slot coverage remain unavailable.",
+                "DST days follow the requested IANA timezone and may contain 92 or 100 quarter-hour bins.",
+            ],
+        }
+
     def forecast_history(
         self,
         start: datetime,
@@ -5647,6 +5961,33 @@ def _battery_view(config: BatteryConfig) -> dict[str, Any]:
     except ImportError:  # standalone engine without WP2A's config module
         return asdict(config)
     return battery_payload(config)
+
+
+def _timeline_number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _timeline_time(value: Any) -> datetime | None:
+    try:
+        return from_iso(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _timeline_sample_time(value: Any) -> datetime | None:
+    moment = _timeline_time(value)
+    if moment is None:
+        return None
+    moment = moment.astimezone(timezone.utc)
+    if moment.second or moment.microsecond or moment.minute % ACTUALS_MINUTES:
+        return None
+    return moment
 
 
 def _kw(value: Any) -> float | None:

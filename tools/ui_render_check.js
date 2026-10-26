@@ -160,6 +160,52 @@ function classTokens(text) {
   historyResolution.dispatchEvent({ type: "change" });
   await sleep(220);
   check("daily history exposes a bounded 1–31 day selector", !!historyDays && !historyDays.hidden);
+
+  console.log("\n1g. Daily energy timeline: local bins, provenance, coverage and plan detail");
+  const dailyDate = view().querySelectorAll("#daily-timeline-date")[0];
+  const dailyControls = byClass(view(), "daily-timeline-controls")[0];
+  const dailyNavLabels = dailyControls ? dailyControls.querySelectorAll("button").map((button) => button.getAttribute("aria-label")) : [];
+  const dailyResult = byClass(view(), "daily-timeline-result")[0];
+  const dailyTable = dailyResult && dailyResult.querySelector("table");
+  const dailyInspectButtons = dailyTable ? dailyTable.querySelectorAll(".daily-timeline-interval") : [];
+  const dailyText = dailyResult ? allText(dailyResult) : "";
+  check(
+    "daily timeline offers a local date selector and previous/next local-day controls",
+    !!dailyDate && dailyDate.getAttribute("type") === "date"
+      && dailyNavLabels.includes("Previous local day") && dailyNavLabels.includes("Next local day"),
+  );
+  check(
+    "daily timeline retains a timezone-labelled accessible interval table and explicit coverage",
+    !!dailyTable && dailyInspectButtons.length >= 92 && dailyInspectButtons.length <= 100
+      && dailyInspectButtons[0].getAttribute("aria-pressed") === "true"
+      && dailyInspectButtons[1].getAttribute("aria-pressed") === "false"
+      && /IANA timezone/.test(allText(view()))
+      && /Partial bins are covered-only/.test(dailyText)
+      && /unavailable/.test(dailyText) && /Data sources and limits/.test(dailyText),
+    dailyText.slice(0, 420),
+  );
+  check(
+    "daily timeline keeps direct, derived, forecast and saved-plan series separate",
+    /PV direct/.test(dailyText) && /PV derived/.test(dailyText)
+      && /load direct/.test(dailyText) && /load derived/.test(dailyText)
+      && /PV forecast/.test(dailyText) && /Load forecast/.test(dailyText)
+      && /Plan buy/.test(dailyText) && /Grid/.test(dailyText),
+    dailyText.slice(0, 420),
+  );
+  check("daily timeline provides a graceful chart fallback beside the accessible table",
+    !!dailyResult && !!dailyResult.querySelector(".daily-timeline-chart.chart-fallback") && !!dailyTable);
+  const intervalInspect = dailyTable && dailyTable.querySelector("tbody button");
+  if (intervalInspect) intervalInspect.dispatchEvent({ type: "click" });
+  const planDetailButton = dailyResult && dailyResult.querySelector(".daily-timeline-selection button");
+  if (planDetailButton) planDetailButton.dispatchEvent({ type: "click" });
+  await sleep(240);
+  check(
+    "daily interval opens exact saved-plan detail without claiming causal measured flow",
+    !!planDetailButton && /plan-slot timestamps only/i.test(dailyText + allText(dailyResult))
+      && /does not prove plan causality/.test(allText(dailyResult)),
+    dailyResult ? allText(dailyResult).slice(-420) : "no daily result",
+  );
+
   const pvScorecard = byClass(view(), "accuracy-scorecard")[0];
   const pvScorecardText = pvScorecard ? allText(pvScorecard) : "";
   check(

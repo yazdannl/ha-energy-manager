@@ -3445,6 +3445,338 @@
     return item;
   }
 
+  function timelineMetricText(label, metric) {
+    metric = metric || {};
+    var samples = isNum(metric.samples) ? metric.samples : isNum(metric.actual_samples) ? metric.actual_samples : 0;
+    var expected = isNum(metric.expected_samples) ? metric.expected_samples : isNum(metric.expected_actual_samples) ? metric.expected_actual_samples : 3;
+    if (isNum(metric.actual_kw)) return label + ": " + fmtKw(metric.actual_kw) + " (" + samples + "/" + expected + " samples)";
+    if (isNum(metric.covered_kw)) return label + ": covered only " + fmtKw(metric.covered_kw) + " (" + samples + "/" + expected + "); full-bin value unavailable";
+    return label + ": unavailable (" + samples + "/" + expected + " samples)";
+  }
+
+  function timelineDerivedMetricText(label, metric) {
+    metric = metric || {};
+    var samples = isNum(metric.samples) ? metric.samples : 0;
+    var expected = isNum(metric.expected_samples) ? metric.expected_samples : 3;
+    if (isNum(metric.kw)) return label + ": " + fmtKw(metric.kw) + " (" + samples + "/" + expected + " samples; derived)";
+    if (isNum(metric.covered_kw)) return label + ": covered only " + fmtKw(metric.covered_kw) + " (" + samples + "/" + expected + "); full-bin value unavailable";
+    return label + ": unavailable (" + samples + "/" + expected + " samples)";
+  }
+
+  function timelinePlanAction(plan) {
+    var segments = Array.isArray(plan && plan.segments) ? plan.segments : [];
+    if (!segments.length) return plan && plan.plan_id != null ? "Plan recorded; aligned action unavailable" : "Plan unavailable";
+    return segments.map(function (segment) {
+      var text = segment.action ? actionText(segment.action) : "Action unavailable";
+      if (segment.reason) text += " (" + reasonText(segment.reason) + ")";
+      text += " · " + segment.minutes + " min";
+      return text;
+    }).join("; ");
+  }
+
+  function timelinePlanPower(plan) {
+    if (isNum(plan && plan.planned_power_kw)) return "Setpoint: " + fmtKw(plan.planned_power_kw) + " interval average";
+    if (isNum(plan && plan.covered_power_kw)) return "Setpoint covered only: " + fmtKw(plan.covered_power_kw) + " (" + (plan.power_coverage_pct || 0) + "%)";
+    return "Setpoint: unavailable";
+  }
+
+  function timelinePlanPrices(plan) {
+    function value(label, full, covered, coverage) {
+      if (isNum(full)) return label + ": " + fmtPrice(full);
+      if (isNum(covered)) return label + " covered only: " + fmtPrice(covered) + " (" + (coverage || 0) + "%)";
+      return label + ": unavailable";
+    }
+    return [
+      value("Buy", plan && plan.planned_buy_eur_per_kwh, plan && plan.covered_buy_eur_per_kwh, plan && plan.buy_coverage_pct),
+      value("Sell", plan && plan.planned_sell_eur_per_kwh, plan && plan.covered_sell_eur_per_kwh, plan && plan.sell_coverage_pct)
+    ];
+  }
+
+  function renderTimelinePlanDetail(host, row, detail) {
+    var wanted = {};
+    (row.plan.segments || []).forEach(function (segment) {
+      var stamp = parseDate(segment.slot_t);
+      if (stamp) wanted[String(stamp.getTime())] = true;
+    });
+    var slots = (Array.isArray(detail.slots) ? detail.slots : []).filter(function (slot) {
+      var stamp = parseDate(slot.t);
+      return stamp && wanted[String(stamp.getTime())];
+    });
+    if (!slots.length) {
+      host.appendChild(el("p", { class: "muted", text: "No exact saved plan-slot detail matched this interval." }));
+      return;
+    }
+    var rows = slots.map(function (slot) {
+      var dispatch = slot.dispatch && Array.isArray(slot.dispatch.batteries) ? slot.dispatch.batteries : [];
+      var attempts = dispatch.map(function (battery) {
+        var last = battery.last || {};
+        return String(battery.id || "battery") + ": " +
+          (isNum(last.requested_w) ? "requested " + fmtPower(last.requested_w) : "request unavailable") +
+          " / " + (isNum(last.applied_w) ? "applied " + fmtPower(last.applied_w) : "application unavailable") +
+          " · " + String(last.result || last.code || "result unavailable");
+      });
+      var measured = slot.actual && isNum(slot.actual.battery_kw)
+        ? fmtKw(slot.actual.battery_kw) + " measured (timestamp-aligned; not causal attribution)"
+        : "measured battery flow unavailable";
+      return [
+        historyStamp(slot.t),
+        actionText(slot.action) + (slot.reason ? " · " + reasonText(slot.reason) : ""),
+        isNum(slot.planned_setpoint_w) ? fmtPower(slot.planned_setpoint_w) : "unavailable",
+        attempts.length ? attempts.join("; ") : "No linked dispatch record",
+        measured
+      ];
+    });
+    host.appendChild(table(
+      "Exact plan_id and plan-slot timestamps only; measured flow is not proof that the plan caused it.",
+      ["Plan slot", "Planned action", "Setpoint", "Linked dispatch", "Measured battery"], rows, { numeric: [] }
+    ));
+    if (detail.linkage && detail.linkage.measurement_note) {
+      host.appendChild(el("p", { class: "field-help", text: detail.linkage.measurement_note }));
+    }
+    var unmatched = detail.linkage && detail.linkage.unmatched_dispatches;
+    if (Array.isArray(unmatched) && unmatched.length) {
+      host.appendChild(el("p", { class: "field-help", text:
+        unmatched.length + " dispatch record(s) remain unmatched and are not assigned to this interval." }));
+    }
+  }
+
+  function renderDailyTimeline(result, payload) {
+    clear(result);
+    var rows = Array.isArray(payload.series) ? payload.series : [];
+    var n = rows.length;
+    var coverage = payload.coverage || {};
+    function count(key) {
+      var item = coverage[key] || {};
+      return (item.complete || 0) + "/" + (item.total || n) +
+        (item.partial ? " complete, " + item.partial + " partial" : " complete");
+    }
+    var stale = rows.filter(function (row) { return row.solar && row.solar.forecast_stale === true; }).length;
+    result.appendChild(el("p", { class: "daily-timeline-summary", role: "status", "aria-live": "polite", text:
+      n + " 15-minute bins · PV direct " + count("solar_actual") + " · PV derived " + count("solar_derived") +
+      " · load direct " + count("load_actual") + " · load derived " + count("load_derived") +
+      " · grid actual " + count("grid_actual") + " · battery actual " + count("battery_actual") +
+      " · PV/load forecasts " + count("solar_forecast") + " / " + count("load_forecast") +
+      " · saved plan actions " + count("planned_action") +
+      (stale ? " · PV forecast stale in " + stale + " bin(s)" : "")
+    }));
+    result.appendChild(el("p", { class: "field-help", text:
+      "Partial bins are covered-only in the table and gaps in the chart; missing is unavailable, not zero. Battery fleet completeness is unknown. Prices are saved-plan buy/sell only; independent historical actual prices, state of charge and per-battery flow breakdown are not available here. Planned values do not mean dispatched."
+    }));
+
+    var provenance = payload.provenance || {};
+    result.appendChild(el("details", { class: "daily-timeline-provenance" }, [
+      el("summary", { text: "Data sources and limits" }),
+      el("ul", null, Object.keys(provenance).map(function (key) {
+        return el("li", null, [el("strong", { text: key.replace(/_/g, " ") + ": " }), provenance[key]]);
+      }))
+    ]));
+    (Array.isArray(payload.notes) ? payload.notes : []).forEach(function (note) {
+      result.appendChild(el("p", { class: "field-help", text: note }));
+    });
+
+    var chart = el("div", { class: "chart chart-md daily-timeline-chart" });
+    result.appendChild(chart);
+    if (root.SEMCharts && typeof root.SEMCharts.dailyTimelinePower === "function") {
+      root.SEMCharts.dailyTimelinePower(chart, payload);
+    } else {
+      chart.textContent = "Timeline chart unavailable; the table below retains interval data.";
+    }
+
+    var tableHost = el("div", { class: "daily-timeline-table" });
+    var detailHost = el("div", { class: "daily-timeline-selection", role: "region", "aria-label": "Selected interval detail", "aria-live": "polite" });
+    result.appendChild(tableHost);
+    result.appendChild(detailHost);
+    var selectedIndex = 0;
+    var planRequest = 0;
+
+    function renderSelection() {
+      var row = rows[selectedIndex];
+      clear(detailHost);
+      if (!row) return;
+      detailHost.appendChild(el("h3", { text: "Interval detail · " + row.label + " – " + row.local_end }));
+      var solar = row.solar || {}, load = row.load || {}, grid = row.grid || {}, battery = row.battery || {}, plan = row.plan || {};
+      var pvForecast = isNum(solar.forecast_kw)
+        ? fmtKw(solar.forecast_kw) + " · " + (solar.forecast_source || "source unavailable") +
+          " · issued " + historyStamp(solar.forecast_issued_at) + (solar.forecast_stale ? " · stale" : "")
+        : "unavailable";
+      var loadForecast = isNum(load.forecast_kw)
+        ? fmtKw(load.forecast_kw) + " · " + (load.forecast_source || "source unavailable") +
+          " · issued " + historyStamp(load.forecast_issued_at)
+        : "unavailable";
+      var sourceSummary = Object.keys(plan.sources || {}).map(function (key) {
+        return key + ": " + plan.sources[key];
+      }).join("; ") || "not retained";
+      var detailRows = [
+        ["Direct PV", timelineMetricText("PV", solar) + " · entity " + (solar.actual_source || (solar.actual_sources || []).join(", ") || "unavailable")],
+        ["Derived PV", timelineDerivedMetricText("PV derived", solar.derived)],
+        ["PV forecast", pvForecast],
+        ["Direct load", timelineMetricText("Load", load)],
+        ["Derived load", timelineDerivedMetricText("Load derived", load.derived)],
+        ["Load forecast", loadForecast],
+        ["Measured grid", timelineMetricText("Grid (positive import / negative export)", grid)],
+        ["Measured battery", timelineMetricText("Battery", battery) + " · fleet completeness unknown"],
+        ["Plan snapshot", plan.plan_id != null
+          ? "#" + plan.plan_id + " · generated " + historyStamp(plan.generated_at) + " · age " + (isNum(plan.age_minutes) ? plan.age_minutes + " min" : "unknown") + " · " + sourceSummary
+          : "unavailable"],
+        ["Planned action", timelinePlanAction(plan)],
+        ["Planned setpoint", timelinePlanPower(plan)],
+        ["Plan buy/sell", timelinePlanPrices(plan).join(" · ")]
+      ];
+      detailHost.appendChild(table("Selected 15-minute interval; power values are kW interval means.", ["Series", "Value / provenance"], detailRows, { numeric: [] }));
+
+      if (plan.plan_id == null) {
+        detailHost.appendChild(el("p", { class: "muted", text: "No retained plan snapshot is available for this interval." }));
+        return;
+      }
+      var planDetailHost = el("div", { class: "daily-timeline-plan-detail", "aria-live": "polite" });
+      var loadButton = button("Load linked plan and dispatch detail", "", function () {
+        var current = ++planRequest;
+        clear(planDetailHost);
+        planDetailHost.appendChild(el("p", { class: "panel-loading", text: "Loading saved plan detail…" }));
+        get("/plan/history", { plan_id: plan.plan_id }).then(function (detail) {
+          if (current !== planRequest || !planDetailHost.isConnected) return;
+          clear(planDetailHost);
+          renderTimelinePlanDetail(planDetailHost, row, detail);
+        }).catch(function (err) {
+          if (current !== planRequest || !planDetailHost.isConnected) return;
+          clear(planDetailHost);
+          planDetailHost.appendChild(el("p", { class: "panel-error", text:
+            "Could not load linked plan detail: " + (err && err.message ? err.message : err) }));
+        });
+      });
+      detailHost.appendChild(loadButton);
+      detailHost.appendChild(planDetailHost);
+    }
+
+    function renderTable() {
+      var tableRows = rows.map(function (row, index) {
+        var solar = row.solar || {}, load = row.load || {}, grid = row.grid || {}, battery = row.battery || {}, plan = row.plan || {};
+        var actualLines = [
+          timelineMetricText("PV direct", solar), timelineDerivedMetricText("PV derived", solar.derived),
+          timelineMetricText("Load direct", load), timelineDerivedMetricText("Load derived", load.derived),
+          timelineMetricText("Grid", grid), timelineMetricText("Battery", battery)
+        ];
+        var forecastLines = [
+          "PV: " + (isNum(solar.forecast_kw) ? fmtKw(solar.forecast_kw) : "unavailable"),
+          "Load: " + (isNum(load.forecast_kw) ? fmtKw(load.forecast_kw) : "unavailable")
+        ];
+        var actionLines = [timelinePlanAction(plan), timelinePlanPower(plan)];
+        var priceLines = timelinePlanPrices(plan);
+        var sources = "PV forecast: " + (solar.forecast_source || "unavailable") +
+          " · Load forecast: " + (load.forecast_source || "unavailable") +
+          " · Plan: " + (plan.plan_id == null ? "unavailable" : "#" + plan.plan_id);
+        var inspect = button(row.label, "daily-timeline-interval", function () {
+          selectedIndex = index;
+          planRequest += 1;
+          renderTable();
+          var selectedButton = tableHost.querySelectorAll(".daily-timeline-interval")[selectedIndex];
+          if (selectedButton && selectedButton.focus) selectedButton.focus();
+          renderSelection();
+        });
+        inspect.setAttribute("aria-pressed", String(index === selectedIndex));
+        return [
+          inspect,
+          el("div", { class: "daily-timeline-lines" }, actualLines.map(function (line) { return el("div", { text: line }); })),
+          el("div", { class: "daily-timeline-lines" }, forecastLines.map(function (line) { return el("div", { text: line }); })),
+          el("div", { class: "daily-timeline-lines" }, actionLines.map(function (line) { return el("div", { text: line }); })),
+          el("div", { class: "daily-timeline-lines" }, priceLines.map(function (line) { return el("div", { text: line }); })),
+          sources
+        ];
+      });
+      var attrs = rows.map(function (_row, index) {
+        return index === selectedIndex ? { class: "daily-timeline-row-selected" } : null;
+      });
+      clear(tableHost);
+      tableHost.appendChild(table(
+        "15-minute local intervals. Actual power is measured only; forecast and plan values stay separate. Incomplete values are not plotted as zero.",
+        ["Inspect interval", "Direct / derived / actual power (kW)", "Forecast power (kW)", "Planned action / setpoint", "Plan buy/sell (EUR/kWh)", "Sources"],
+        tableRows, { numeric: [], rowAttrs: attrs }
+      ));
+    }
+
+    if (rows.length) {
+      renderTable();
+      renderSelection();
+    } else {
+      tableHost.appendChild(el("p", { class: "muted", text: "No complete 15-minute intervals exist for this local date." }));
+    }
+  }
+
+  function dailyTimelinePanel(host) {
+    var item = panel(host, "Daily energy timeline");
+    var body = item.body;
+    var timezoneName = browserTimezone();
+    var today = localDateValue(new Date());
+    var selectedDate = today;
+    var dateInput = el("input", { type: "date", id: "daily-timeline-date", value: selectedDate, max: today });
+    var status = el("p", { class: "muted", role: "status", "aria-live": "polite", text: "Loading daily timeline…" });
+    var retry = el("div");
+    var result = el("div", { class: "daily-timeline-result" });
+    var request = 0;
+    var previous = button("Previous day", "", function () {
+      selectedDate = shiftLocalDate(selectedDate, -1);
+      dateInput.value = selectedDate;
+      updateNavigation();
+      load();
+    });
+    previous.setAttribute("aria-label", "Previous local day");
+    var next = button("Next day", "", function () {
+      selectedDate = shiftLocalDate(selectedDate, 1);
+      dateInput.value = selectedDate;
+      updateNavigation();
+      load();
+    });
+    next.setAttribute("aria-label", "Next local day");
+    var refresh = button("Refresh", "", function () { load(); });
+    body.appendChild(el("div", { class: "daily-timeline-controls" }, [
+      previous,
+      el("label", { for: "daily-timeline-date" }, ["Local date ", dateInput]),
+      next,
+      refresh
+    ]));
+    body.appendChild(el("p", { class: "field-help", text: "IANA timezone: " + timezoneName + ". Bins follow local midnight and UTC instants, including daylight-saving transitions." }));
+    body.appendChild(status);
+    body.appendChild(retry);
+    body.appendChild(result);
+
+    function updateNavigation() {
+      next.disabled = selectedDate >= localDateValue(new Date());
+    }
+    function load() {
+      var current = ++request;
+      if (root.SEMCharts && root.SEMCharts.destroyTree) root.SEMCharts.destroyTree(result);
+      clear(result);
+      clear(retry);
+      status.className = "panel-loading";
+      status.textContent = "Loading daily timeline…";
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(selectedDate)) {
+        status.className = "panel-error";
+        status.textContent = "Choose a valid local calendar date.";
+        return;
+      }
+      get("/daily-timeline", { date: selectedDate, timezone: timezoneName }).then(function (payload) {
+        if (current !== request || !result.isConnected) return;
+        status.className = "muted";
+        status.textContent = "Showing " + payload.date + " in " + timezoneName + " · " +
+          payload.expected_intervals + " DST-safe 15-minute intervals.";
+        renderDailyTimeline(result, payload);
+      }).catch(function (err) {
+        if (current !== request || !result.isConnected) return;
+        status.className = "panel-error";
+        status.textContent = "Could not load daily timeline: " + (err && err.message ? err.message : err);
+        retry.appendChild(button("Retry", "", load));
+      });
+    }
+    dateInput.addEventListener("change", function () {
+      selectedDate = dateInput.value || selectedDate;
+      updateNavigation();
+      load();
+    });
+    updateNavigation();
+    load();
+    return item;
+  }
+
   function viewForecasts(host) {
     var load = once(function () {
       return Promise.all([
@@ -3457,6 +3789,7 @@
       });
     });
     routeTitle(host, "Forecasts", "How much to trust each source, then what it expects.");
+    dailyTimelinePanel(host);
     asyncPanel(host, "Price forecast", { load: load, render: function (body, data) { renderForecastPanel(body, "price", data.price, data.accuracy.price); } });
     asyncPanel(host, "Solar forecast", { load: load, render: function (body, data) { renderForecastPanel(body, "solar", data.solar, data.accuracy.pv); } });
     asyncPanel(host, "Load forecast", { load: load, render: function (body, data) { renderForecastPanel(body, "load", data.load, data.accuracy.load); } });
