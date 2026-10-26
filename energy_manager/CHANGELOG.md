@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.37.0
+
+- **New: a clearer history of forecasts, plans and energy flows.** Forecast history and PV scorecards
+  compare forecasts with measured solar output; bounded plan/dispatch history and a local-day energy
+  timeline show recent operation. Coverage, freshness and provenance cues distinguish partial or
+  unavailable data instead of filling gaps with zeroes or guessed links.
+
 ## 0.36.0
 
 - **New: live PV informs the current optimizer slot.** A fresh measured inverter-power reading

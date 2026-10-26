@@ -6,8 +6,10 @@ supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figur
 revisions described pre-audit trees and are obsolete.
 
 Verification was local and hardware-free: no real battery, no live provider call, no instance data.
-All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`, `sem_*`),
-loopback addresses and placeholder coordinates.
+No live HA deployment or post-update verification is claimed for 0.37.0. The release gates below
+were repeated from a clean checkout; optional native C-core tests skip when no compiled extension is
+present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
+`sem_*`), loopback addresses and placeholder coordinates.
 
 ---
 
@@ -15,22 +17,26 @@ loopback addresses and placeholder coordinates.
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **694 passed** (two consecutive runs) |
-| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 93 files scanned`, exit 0 |
+| Test suite | `python3 -m pytest tests -q` | **1603 passed, 83 skipped**, exit 0; C-core-specific tests skip if the optional extension is absent |
+| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 177 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
-| Headless UI render check | `node tools/ui_render_check.js` | **78 passed, 0 failed**, exit 0 |
+| Headless UI render check | `node tools/ui_render_check.js` | **186 passed, 0 failed**, exit 0 |
+| First-party JavaScript syntax | `node --check` over non-vendored app/tool JavaScript | clean, exit 0 |
+| POSIX shell syntax | `sh -n tools/audit.sh && sh -n energy_manager/run.sh` | clean, exit 0 |
+| Add-on image + entrypoint | Native `aarch64` Docker build and CI-style startup smoke | image built; startup banner observed. APK index access was unavailable, so the optional C accelerator fell back to Python; the local builder supports ARM platforms only. |
+| ShellCheck | `shellcheck -s sh tools/audit.sh energy_manager/run.sh` | skipped — not installed (optional in CI) |
 
 Frozen digest of the verified artifact (recipe in §11, normative):
 
-* **code + tests (79 files, documentation excluded)**:
-  `29a20d627034d1634d0d529b3ba1aa2d1ad1eaab3db17d335fbff5582bd2c566`
-* **path list of the same 79 files** (detects an added, removed or renamed file):
-  `999c72a0ad237efad84631e1c196871fbab19aaf4e46b1e3e55f351c7c988ad5`
+* **code + tests (155 files, documentation excluded)**:
+  `b7a90a1e0a26d25f4db1982ff16b6586fff2c4be11fe9d1362f1a6fb2e99cb50`
+* **path list of the same 155 files** (detects an added, removed or renamed file):
+  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab`
 
-The 0.10.1 tree's code + tests digest was `28fdad8a…`, 0.10.0's `784dbf04…` and 0.9.1's
-`fc5f9d44…`; 0.11.0 (§8.10) changed file contents only - it added no file, so the path-list digest
-above is the same one, which is exactly what that recipe is for.
+Historically, the 0.10.1 tree's code + tests digest was `28fdad8a…`, 0.10.0's `784dbf04…` and
+0.9.1's `fc5f9d44…`; at that point 0.11.0 (§8.10) changed file contents only and added no file, so
+that release's path-list digest remained unchanged.
 
 The recipe sorts the file list **and** the per-file manifest under `LC_ALL=C`, so the digest is
 independent of `find` order and of the locale; a single `sort` is not enough. An earlier revision of
@@ -39,11 +45,11 @@ defect in the record, not in the tree: the file lists were verified byte-identic
 so no source file had changed. Those values (`8f83a0a6…` all files, `c58e912c…` code + tests) are
 superseded by the digest above.
 
-The all-files digest (94 files) is deliberately **not** recorded here: this document is one of the 94,
-so every documentation edit would change it while the verified code stayed identical. Compute it with
-the same recipe over the full file list if you want it; the file count printed by the pipeline (94) is
-the quick cross-check. (`tools/audit.sh` prints 93 because it removes the sha-verified vendored
-stylesheet from its scan list before scanning.)
+The all-files digest (178 files) is deliberately **not** recorded here: this document is one of the
+178, so every documentation edit would change it while the verified code stayed identical. Compute it
+with the same recipe over the full file list if you want it; the file count printed by the pipeline
+(178) is the quick cross-check. (`tools/audit.sh` prints 177 because it removes the sha-verified
+vendored stylesheet from its scan list before scanning.)
 
 ---
 
@@ -2091,6 +2097,27 @@ Live 2026-10-22 06:08 UTC: the sensor read `export`, reason `self_consumption`, 
 with real Zonneplan prices (0.351 -> 0.3486 -> holds at the 10 % floor) -- the sensor path, not a
 claim about the sweep. Full suite: **1658 passed**, `ui_render_check` 168/0, audit clean 176 files.
 
+### 8.34 Forecast, plan and energy history with explicit data-quality cues (0.37.0)
+
+0.37.0 adds prospective forecast history with a PV vintage scorecard, bounded plan/dispatch history,
+and a local-day energy timeline. Freshness, provenance and coverage cues distinguish measured,
+derived, forecast and planned values, and keep partial or unavailable data explicit instead of
+filling gaps with zeroes or joining dispatches by guessed timestamps.
+
+The history has deliberate limits: forecast vintages are not backfilled; PV actuals require complete
+fresh direct samples; plan/dispatch links require exact persisted plan/slot IDs and a time-valid event;
+`applied_w` is command/read-back evidence, not measured flow. The daily timeline leaves unsupported
+series unavailable, and it does not classify load-forecast freshness because that API has no stale
+flag.
+
+Covered by `tests/test_forecast_history.py`, `tests/test_forecast_scorecards.py`,
+`tests/test_dispatch_history.py`, `tests/test_daily_timeline.py`, the clean-checkout full suite
+(1,603 passed, 83 skipped; C-core-specific cases require the optional extension), and
+`tools/ui_render_check.js`
+(186 passed, 0 failed). The local native `aarch64` image build and
+Supervisor-style startup check passed; its optional C accelerator used the Python fallback because
+APK index access was unavailable. No live HA deployment or post-update verification is claimed.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
@@ -2178,38 +2205,50 @@ Known behaviour, accepted and deliberate:
 
 ## 11. How to reproduce
 
-No network access and no hardware are needed for any command below.
+The Python, audit, selfcheck and UI gates need no HA instance or hardware. The image build needs Docker
+and access to its base image; the final release gate also repeats these checks from a fresh checkout.
 
 ```sh
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 729 passed; needs pytest and PyYAML, which only the manifest test
-#    uses — the add-on itself imports nothing outside the standard library)
+# 2. Full test suite (expect: 1603 passed, 83 skipped; C-core-specific cases skip without the extension)
+#    Needs pytest and PyYAML, which only the manifest test uses — the add-on itself imports nothing
+#    outside the standard library.
 python3 -m pytest tests -q
 
-# 3. R1 tripwire (expect: "audit: clean — 94 files scanned", exit 0)
+# 3. R1 tripwire (expect: "audit: clean — 177 files scanned", exit 0)
 sh tools/audit.sh
 
 # 4. End-to-end selfcheck (expect: 33/33 checks passed, exit 0)
 PYTHONPATH=energy_manager python3 -m app.main --selfcheck
 
-# 5. Render the front-end headless and check its structure (expect: "0 failed", exit 0; also run by
+# 5. Render the front-end headless and check its structure (expect: 186 passed, 0 failed; also run by
 #    tests/test_wp3_ui_render.py, which skips when node is absent)
 node tools/ui_render_check.js
+
+# 6. Check non-vendored first-party JavaScript syntax
+find energy_manager/app/web tools -type f -name '*.js' ! -path '*/vendor/*' -print \
+  | LC_ALL=C sort | while IFS= read -r js; do node --check "$js"; done
+
+# 7. Build the native add-on image; use the host architecture (amd64 or aarch64)
+docker build -t sem-test --build-arg BUILD_ARCH=aarch64 energy_manager/
+
+# 8. Run the Supervisor-style startup smoke in .github/workflows/validate.yml.
+#    It uses a synthetic token and requires the start banner without the missing-token error.
 ```
 
 Frozen digests — manifest digests over the file sets the two recipes select. Both stages are sorted
 under `LC_ALL=C`, which makes the value independent of `find` order and of the locale (a single `sort`
-produces a different value). The `wc -l` count is the cross-check (94 and 79).
+produces a different value). The `wc -l` count is the cross-check (178 and 155).
 
 ```sh
-# all files (94)
+# all files (178)
 find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache \
         -o -name node_modules -o -name .mypy_cache \) -prune -o -type f -print \
   | LC_ALL=C sort | xargs sha256sum | LC_ALL=C sort | sha256sum
 
-# code + tests only (79), documentation excluded
+# code + tests only (155), documentation excluded
 find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache \
         -o -name node_modules -o -name .mypy_cache -o -name '*.md' -o -name 'LICENSE*' \) -prune \
      -o -type f -print \
@@ -2223,4 +2262,4 @@ find . \( -name .git -o -name .venv -o -name venv -o -name __pycache__ -o -name 
 ```
 
 To check the selected file count on its own, run the same `find … -print | LC_ALL=C sort | wc -l`
-part of either recipe: it must print 94 (all files) or 79 (code + tests only).
+part of either recipe: it must print 178 (all files) or 155 (code + tests only).
