@@ -6,7 +6,7 @@ supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figur
 revisions described pre-audit trees and are obsolete.
 
 Verification was local and hardware-free: no real battery, no live provider call, no instance data.
-No live HA deployment or post-update verification is claimed for 0.37.0. The release gates below
+No live HA deployment or post-update verification is claimed for 0.37.1. The release gates below
 were repeated from a clean checkout; optional native C-core tests skip when no compiled extension is
 present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
 `sem_*`), loopback addresses and placeholder coordinates.
@@ -17,7 +17,7 @@ present. All synthetic values use reserved namespaces (`sensor.example_*`, `numb
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **1603 passed, 83 skipped**, exit 0; C-core-specific tests skip if the optional extension is absent |
+| Test suite | `python3 -m pytest tests -q` | **1607 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension); with the local C core built: **1690 passed, 0 skipped** |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 177 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
@@ -30,9 +30,10 @@ present. All synthetic values use reserved namespaces (`sensor.example_*`, `numb
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (155 files, documentation excluded)**:
-  `b7a90a1e0a26d25f4db1982ff16b6586fff2c4be11fe9d1362f1a6fb2e99cb50`
+  `cb500a774135e07806172297cc9fa57a482b6ee99577e108f76bfd8c36945dce`
 * **path list of the same 155 files** (detects an added, removed or renamed file):
-  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab`
+  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (unchanged from 0.37.0:
+  0.37.1 changed file contents only)
 
 Historically, the 0.10.1 tree's code + tests digest was `28fdad8a…`, 0.10.0's `784dbf04…` and
 0.9.1's `fc5f9d44…`; at that point 0.11.0 (§8.10) changed file contents only and added no file, so
@@ -2118,6 +2119,33 @@ Covered by `tests/test_forecast_history.py`, `tests/test_forecast_scorecards.py`
 Supervisor-style startup check passed; its optional C accelerator used the Python fallback because
 APK index access was unavailable. No live HA deployment or post-update verification is claimed.
 
+### 8.35 A learned capacity is capped at the pack's own reported value (0.37.1)
+
+Live 2026-10-27: the charge-side estimator published 2.2996 kWh on a 1.92 kWh pack. A full-range
+charge window (11 % → 100 %) books `AC × eta_charge / dSoC`, and the BMS compresses the top of its
+SoC range, so the same energy buys fewer SoC points there and the capacity reads 20 % high. The
+planner used it: the 19:24Z plan charged to `soc_kwh 2.1789` (113 % of the hardware's 1.92 kWh), and
+the pack sat at a reported 100 % while `input_limit` was still written at 1000 W.
+
+0.37.1 keeps the estimate visible (`learned_kwh` and `capacity.capped_kwh`) but caps the applied
+value at the capacity the pack itself reports through `capacity_entity`, because a reading above the
+hardware's own number is the SoC-scale artifact or a bad energy sample, not a second opinion. A
+below-report estimate still applies (an aged pack), and a pack with no reported capacity is
+unchanged. The plan, the SoC percentage, the floors, the published summaries and `/batteries` all read
+the capped value; the journal records the raw estimate and the ceiling once per change, and the UI
+says why the estimate was capped.
+
+Also in 0.37.1: the UI no longer says an optimal hold was "below the spread floor you set" (false
+unless `optimizer.min_spread_eur_per_kwh` is set), and the break-even card states that the floor
+refuses a loss-making sale rather than triggering one.
+
+Covered by four new cases in `tests/test_capacity_learning.py` (`cap_to_reported` bounds, the engine
+cap plus its plan/journal/view surfaces, the below-report and no-report cases), the existing
+capacity/efficiency suites, the clean-checkout full suite (1,607 passed, 83 skipped; with the local C
+core built, 1,690 passed, 0 skipped) and `node tools/ui_render_check.js` (186 passed, 0 failed). The
+learner still over-reads on this pack until it stops booking the compressed top; the cap keeps
+planning physically feasible in the meantime.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
@@ -2212,7 +2240,7 @@ and access to its base image; the final release gate also repeats these checks f
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 1603 passed, 83 skipped; C-core-specific cases skip without the extension)
+# 2. Full test suite (expect: 1607 passed, 83 skipped; C-core-specific cases skip without the extension)
 #    Needs pytest and PyYAML, which only the manifest test uses — the add-on itself imports nothing
 #    outside the standard library.
 python3 -m pytest tests -q
