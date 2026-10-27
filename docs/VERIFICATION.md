@@ -6,7 +6,7 @@ supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figur
 revisions described pre-audit trees and are obsolete.
 
 Verification was local and hardware-free: no real battery, no live provider call, no instance data.
-No live HA deployment or post-update verification is claimed for 0.37.1. The release gates below
+0.37.1 was deployed to the live instance and verified there (see §8.35); the release gates below
 were repeated from a clean checkout; optional native C-core tests skip when no compiled extension is
 present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
 `sem_*`), loopback addresses and placeholder coordinates.
@@ -2145,6 +2145,16 @@ capacity/efficiency suites, the clean-checkout full suite (1,607 passed, 83 skip
 core built, 1,690 passed, 0 skipped) and `node tools/ui_render_check.js` (186 passed, 0 failed). The
 learner still over-reads on this pack until it stops booking the compressed top; the cap keeps
 planning physically feasible in the meantime.
+
+Deployed and observed live (2026-10-27T20:22Z): `update.smart_energy_manager_update` moved the
+add-on from 0.37.0 to **0.37.1** and `/api/v1/health` reports `0.37.1`. On the real pack
+(1.92 kWh reported by `capacity_entity`) `/api/v1/batteries` now states `learned 2.2996 · effective
+1.92 · capped true · cap 1.92`, and the journal records `capacity_learned_applied` with
+`learned_kwh 2.2996, reported_kwh 1.92`. The next plan's ceiling is `soc_kwh 1.824` (95.0 % of
+1.92), where the pre-fix plan reached `soc_kwh 2.1789` (94.75 % of 2.30 = 113 % of the pack); the
+06:00Z export now starts from that 1.824 kWh instead of the phantom 2.18. No new warning or error
+event followed the update (only the normal boot `live_setpoint_recovered`/`watchdog_hold` pair while
+the first tick neutralised the previous run's writes).
 
 ---
 
