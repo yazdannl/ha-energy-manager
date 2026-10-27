@@ -463,7 +463,7 @@ def test_efficiency_loss_reason_wording():
     """
     data = json.loads(run_node_script(script))
     assert data["eff"] == "idle: sale price does not cover the round-trip loss"
-    assert data["spread"] == "below the spread floor you set"
+    assert data["spread"] == "held: this slot is not the plan's best sale (the horizon pays more later)"
     assert data["eff"] != data["spread"]
 
 

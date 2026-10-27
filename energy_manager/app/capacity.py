@@ -61,6 +61,7 @@ __all__ = [
     "REASON_STALE",
     "REASON_UNAVAILABLE",
     "STALE_AFTER_DAYS",
+    "cap_to_reported",
     "capacity_status",
     "estimate_capacity",
     "extract_windows",
@@ -377,6 +378,28 @@ def estimate_capacity(
         "schema": SCHEMA,
         "updated_at": to_iso(now or utcnow()),
     }
+
+
+def cap_to_reported(kwh: float | None, reported_kwh: float | None) -> float | None:
+    """The estimate to plan with: never more than the pack itself reports holding.
+
+    A measurement may legitimately read *below* the label (an aged pack) and the typed seed is only
+    a guess, so a downward correction always wins.  Reading *above* the pack's own reported
+    capacity is not a second opinion: it is the BMS compressing the top of its SoC range (module
+    docstring), a lagging energy sample, or a window that spans two different packs.  Planning that
+    extra kWh schedules charge the pack cannot accept and a SoC its own counters contradict, so the
+    reported value is a ceiling, not a target.  ``None``/non-positive reported values leave the
+    estimate untouched (no hardware statement, no cap).
+    """
+    if kwh is None:
+        return None
+    value = float(kwh)
+    if reported_kwh is None:
+        return value
+    reported = float(reported_kwh)
+    if reported <= 0.0 or not math.isfinite(reported):
+        return value
+    return min(value, reported)
 
 
 def capacity_status(

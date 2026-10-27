@@ -372,6 +372,9 @@ class Engine:
         # briefly because ``effective_config`` runs inside the tick, and a note is journaled only
         # when the applied value or its reason slug changes, so the tick cannot spam the log.
         self._capacity_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
+        #: The capacity each pack's own hardware reports (``capacity_entity``), last read.  A learned
+        #: estimate may correct the seed downward, but it never plans more energy than this (SPEC 5).
+        self._reported_capacity: dict[str, float] = {}
         self._capacity_notes: dict[str, str] = {}
         self._efficiency_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
         self._efficiency_notes: dict[str, str] = {}
@@ -1428,17 +1431,47 @@ class Engine:
     # ------------------------------------------------------------------ learned capacity
 
     def capacity_status(self, battery_id: str) -> dict[str, Any]:
-        """The stored learned estimate for one battery, classified (SPEC 5).
+        """The stored learned estimate for one battery, classified and capped (SPEC 5).
 
         Cached for a short time: the profile is written once a day by maintenance, so reading it
-        on every tick would be pure overhead.  A missing store/profile is ``no estimate``.
+        on every tick would be pure overhead.  A missing store/profile is ``no estimate``.  The cap
+        itself is applied after the cached classification (it depends on the live hardware reading,
+        not the profile), so a pack that starts reporting a different capacity is honoured at once.
         """
-        return self._profile_status(
+        status = self._profile_status(
             self._capacity_cache,
             battery_id,
             capacity_learning.load_estimate,
             capacity_learning.capacity_status,
         )
+        return self._cap_capacity_status(battery_id, status)
+
+    def _cap_capacity_status(
+        self, battery_id: str, status: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Clamp an applied estimate to the pack's own reported capacity, with the evidence kept.
+
+        The raw estimate (``learned_kwh``) stays visible so the UI can say what was measured and
+        why it was not planned; ``capacity_kwh`` is what the planner, the published summaries and
+        ``effective_config`` use.
+        """
+        if not status.get("applied"):
+            return dict(status)
+        learned = status.get("capacity_kwh")
+        reported = self._reported_capacity.get(battery_id)
+        capped = capacity_learning.cap_to_reported(learned, reported)
+        if learned is None or capped is None:
+            return dict(status)
+        value = float(learned)
+        if abs(capped - value) <= 1e-9:
+            return dict(status)
+        return {
+            **status,
+            "capacity_kwh": capped,
+            "capped_kwh": value,
+            "cap_kwh": float(reported),
+            "capped": True,
+        }
 
     def efficiency_status(self, battery_id: str) -> dict[str, Any]:
         """The stored learned round trip for one battery, classified (SPEC 5).
@@ -1715,7 +1748,7 @@ class Engine:
         return {"batteries": [config.id for config in configs], "updated": updated}
 
     def effective_capacity_kwh(self, config: BatteryConfig) -> float:
-        """The capacity planning/UI must use: the learned value when confident+fresh, else manual."""
+        """The capacity planning/UI must use: the learned value (capped at the pack's report), else manual."""
         return self.effective_capacity(config)[0]
 
     def effective_capacity(self, config: BatteryConfig) -> tuple[float, dict[str, Any]]:
@@ -1726,7 +1759,8 @@ class Engine:
         stale or low-confidence estimate falls back to the seed, which is never a fabricated
         number.  The pre-0.31.0 ``manual``/``learned`` spellings behave like ``auto``
         (``learns_from_measurements``), so a typed capacity is a seed until the pack proves a
-        better one.
+        better one.  An applied estimate is never above the capacity the pack itself reports
+        (:meth:`capacity_status`); it may correct the seed downward.
         """
         manual = float(config.capacity_kwh)
         if not config.learns_from_measurements:
@@ -1804,7 +1838,10 @@ class Engine:
         self, config: BatteryConfig, learned: float, status: Mapping[str, Any]
     ) -> None:
         """Journal applied/rejected learned capacity once per change, with the stable reason slug."""
-        signature = f"{status.get('reason')}:{learned:.3f}"
+        signature = (
+            f"{status.get('reason')}:{learned:.3f}:"
+            f"{status.get('cap_kwh') if status.get('capped') else ''}"
+        )
         if self._capacity_notes.get(config.id) == signature:
             return
         self._capacity_notes[config.id] = signature
@@ -1820,6 +1857,9 @@ class Engine:
             "seed_kwh": round(float(config.capacity_kwh), 4),
             "effective_kwh": round(learned, 4),
         }
+        if status.get("capped"):
+            detail["learned_kwh"] = round(float(status.get("capped_kwh") or learned), 4)
+            detail["reported_kwh"] = round(float(status.get("cap_kwh") or 0.0), 4)
         if status.get("applied"):
             self._journal.event(
                 "info",
@@ -2032,6 +2072,11 @@ class Engine:
                         "stale": bool(capacity_info.get("stale")),
                         "confident": bool(capacity_info.get("confident")),
                         "applied": bool(effective_status.get("applied")),
+                        # A measurement above the capacity the pack reports holding is capped at
+                        # that reported value (SPEC 5); the raw estimate stays visible.
+                        "capped_kwh": capacity_info.get("capped_kwh"),
+                        "cap_kwh": capacity_info.get("cap_kwh"),
+                        "capped": bool(capacity_info.get("capped")),
                     },
                     # Additive (0.31.0): the learned round trip, its evidence and what is in force.
                     "efficiency_round_trip": round(eta_charge * eta_discharge, 6),
@@ -3365,7 +3410,13 @@ class Engine:
         A transport failure recorded by a driver means HA (not the battery) is unreachable; a
         readable state means the link works.  Without this the engine only noticed a dead HA when
         the household sampler happened to raise, and /status kept saying ``ha_connected: true``.
+        The same read is the only place a pack states its own capacity: remember it for the
+        learned-capacity ceiling.
         """
+        for battery in states:
+            capacity = battery.capacity_kwh
+            if capacity is not None and capacity > 0.0 and math.isfinite(capacity):
+                self._reported_capacity[battery.id] = float(capacity)
         errors = [
             str(error)
             for battery_id in sorted(self._drivers)

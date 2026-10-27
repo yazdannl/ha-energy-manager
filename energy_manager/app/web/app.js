@@ -369,7 +369,7 @@
     self_consumption: "Self consumption",
     reserve_hold: "Reserve hold",
     grid_limit_hold: "Grid limit hold",
-    spread_below_threshold: "below the spread floor you set",
+    spread_below_threshold: "held: this slot is not the plan's best sale (the horizon pays more later)",
     efficiency_loss: "idle: sale price does not cover the round-trip loss",
     terminal_target: "Terminal target",
     battery_full: "Battery full",
@@ -1340,6 +1340,11 @@
       statCard("Average charged price", fmtPrice(model.basis, 3), "weighted average paid for the energy in the pack", isNum(model.basis) ? state : (state || "unknown")),
       statCard("Break-even sell price", fmtPrice(model.floor, 3), isNum(model.basis) ? (costBasisBreakdown(model) || "the plan did not report the round trip and wear") : "no basis yet", isNum(model.floor) ? state : (state || "unknown"))
     ]));
+    if (model.enabled) {
+      // SPEC 5: the floor only refuses a sale at a loss.  Above it the 30 h plan decides *when*,
+      // so "price is above the floor and it still holds" is the optimiser doing its job.
+      draw(el("p", { class: "field-help", text: "The break-even is a floor, not a trigger: it is the lowest price that still covers the pack's average cost. When a slot pays more than this the plan still chooses the best slot in its whole horizon, so a hold means a later slot pays more, not that this sale was refused." }));
+    }
     if (!model.enabled) {
       draw(el("p", { class: "field-help", text: "The sell floor is switched off (optimizer.sell_floor_enabled = false), so no break-even price is derived; the average charged price is still the ledger's." }));
     } else if (!model.enabledBatteries.length) {
@@ -4641,7 +4646,11 @@
       updated: info.updated_at || (record && record.capacity_updated_at) || null,
       reason: String((record && record.capacity_reason) || info.reason || ""),
       stale: !!info.stale,
-      applied: !!info.applied
+      applied: !!info.applied,
+      // SPEC 5: an estimate above the capacity the pack reports holding is capped at that report;
+      // ``learned`` stays the measurement's own number so both can be shown.
+      capped: !!info.capped,
+      capKwh: isNum(info.cap_kwh) ? info.cap_kwh : null
     };
   }
 
@@ -4686,6 +4695,9 @@
     }
     // One pack, one capacity: measured while charging, because the discharge side delivers that
     // capacity *less* the round-trip loss rather than a second capacity.
+    if (cap.capped) {
+      return "Learned from measured" + (cap.basis === "discharge" ? " discharge" : " charging") + " cycles: " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " accepted window(s), last learned " + timeAgo(cap.updated) + ". That reading is above the " + fmtKwh(cap.capKwh) + " kWh the pack itself reports holding, so it is capped there (a pack cannot store more than its own hardware says); effective capacity " + fmtKwh(cap.effective) + " kWh. Pin a value to override the cap.";
+    }
     return "Learned from measured" + (cap.basis === "discharge" ? " discharge" : " charging") + " cycles: " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " accepted window(s), last learned " + timeAgo(cap.updated) + ". Effective capacity " + fmtKwh(cap.effective) + " kWh.";
   }
 

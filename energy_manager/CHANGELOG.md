@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.37.1
+
+- **Fix: a learned capacity never plans more than the pack itself reports holding.** Live
+  2026-10-27: the charge-side learner published 2.30 kWh on a 1.92 kWh pack (a 20 % over-read: the
+  BMS compresses the top of its SoC range, so a full-range charge window credits the pack with more
+  capacity than it has). The planner used it, so the plan charged to 2.18 kWh (113 % of the pack) and
+  the pack sat at 100 % while the addon kept charging. The estimate is still reported
+  (`capacity_learned_kwh`, `capacity.capped_kwh`) but the applied capacity, the plan, the SoC, the
+  floors and the summaries are capped at the pack's own reported capacity (`capacity_entity`). A
+  below-report estimate still applies (an aged pack), and a pack with no reported capacity is
+  unchanged. `/batteries` states the cap and the reason; the journal records both numbers.
+- **Clarity: the hold reason and the break-even floor say what they mean.** A plain optimal hold no
+  longer reads "below the spread floor you set" (that label was wrong unless
+  `optimizer.min_spread_eur_per_kwh` was set), and the break-even card now says the floor only
+  refuses a sale at a loss -- above it the 30 h plan still chooses the best slot, so a hold means a
+  later slot pays more.
+- **Fix: the learned-capacity note no longer hides a cap.** The applied-capacity journal line carries
+  the raw estimate and the reported ceiling it was clamped to.
+
 ## 0.37.0
 
 - **New: a clearer history of forecasts, plans and energy flows.** Forecast history and PV scorecards

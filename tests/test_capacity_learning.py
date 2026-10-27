@@ -532,3 +532,69 @@ def test_batteries_view_exposes_the_capacity_payload():
     assert record["capacity"]["applied"] is True
     # One pack, one capacity: the record says which side of the cycle measured it.
     assert record["capacity"]["basis"] == "charge"
+
+
+# ------------------------------------------------------------------ reported-capacity ceiling
+
+
+def test_cap_to_reported_only_ever_lowers_the_estimate():
+    """SPEC 5: the pack's own reported capacity is a ceiling, never a target."""
+    from app.capacity import cap_to_reported  # noqa: PLC0415 - exercised where it is used
+
+    assert cap_to_reported(8.5, 6.0) == 6.0
+    assert cap_to_reported(5.0, 6.0) == 5.0
+    assert cap_to_reported(8.5, None) == 8.5
+    assert cap_to_reported(8.5, 0.0) == 8.5
+    assert cap_to_reported(8.5, -1.0) == 8.5
+    assert cap_to_reported(None, 6.0) is None
+
+
+def test_a_learned_estimate_above_the_reported_capacity_is_capped():
+    """0.37.x live: 2.30 kWh learned on a 1.92 kWh pack; planning must use the hardware's 1.92."""
+    engine, store, _settings, clock = build_engine(capacity_source="auto")
+    put_estimate(store, EXAMPLE_BATTERY.id, kwh=LEARNED_KWH, samples=6, now=clock.now)
+    engine._note_ha_read(  # noqa: SLF001 - the hardware reading is the input under test
+        [models.BatteryState(id=EXAMPLE_BATTERY.id, available=True, capacity_kwh=6.0)]
+    )
+    config = engine.battery_configs()[0]
+    assert engine.effective_capacity_kwh(config) == pytest.approx(6.0)
+    _value, status = engine.effective_capacity(config)
+    assert status["applied"] is True and status["reason"] == REASON_APPLIED
+    assert status["capped"] is True
+    assert status["capped_kwh"] == pytest.approx(LEARNED_KWH)  # the measurement stays visible
+    assert status["cap_kwh"] == pytest.approx(6.0)
+    # The planner, and therefore the published plan, sees the capped value.
+    assert engine.effective_battery_configs()[0].capacity_kwh == pytest.approx(6.0)
+    plan = engine.plan_now("capped-capacity-test")
+    assert plan is not None and plan.batteries
+    assert plan.batteries[0]["capacity_kwh"] == pytest.approx(6.0)
+    # The journal says both numbers instead of silently dropping the estimate.
+    applied = [e for e in store.events if e["code"] == "capacity_learned_applied"]
+    assert applied and applied[-1]["payload"]["reported_kwh"] == pytest.approx(6.0)
+    assert applied[-1]["payload"]["learned_kwh"] == pytest.approx(LEARNED_KWH)
+
+
+def test_batteries_view_exposes_the_cap_and_keeps_the_raw_estimate():
+    engine, store, _settings, clock = build_engine(capacity_source="auto")
+    put_estimate(store, EXAMPLE_BATTERY.id, kwh=LEARNED_KWH, samples=6, now=clock.now)
+    engine._note_ha_read(  # noqa: SLF001 - see above
+        [models.BatteryState(id=EXAMPLE_BATTERY.id, available=True, capacity_kwh=6.0)]
+    )
+    record = engine.batteries_view()[0]
+    assert record["capacity_learned_kwh"] == pytest.approx(LEARNED_KWH)
+    assert record["effective_capacity_kwh"] == pytest.approx(6.0)
+    assert record["capacity"]["capped"] is True
+    assert record["capacity"]["cap_kwh"] == pytest.approx(6.0)
+    assert record["capacity"]["learned_kwh"] == pytest.approx(LEARNED_KWH)
+    assert record["capacity"]["effective_kwh"] == pytest.approx(6.0)
+
+
+def test_an_estimate_below_the_reported_capacity_is_untouched():
+    engine, store, _settings, clock = build_engine(capacity_source="auto")
+    put_estimate(store, EXAMPLE_BATTERY.id, kwh=4.2, samples=6, now=clock.now)
+    engine._note_ha_read(  # noqa: SLF001 - see above
+        [models.BatteryState(id=EXAMPLE_BATTERY.id, available=True, capacity_kwh=6.0)]
+    )
+    config = engine.battery_configs()[0]
+    assert engine.effective_capacity_kwh(config) == pytest.approx(4.2)
+    assert "capped" not in engine.capacity_status(EXAMPLE_BATTERY.id)
