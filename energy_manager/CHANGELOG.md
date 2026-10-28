@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.37.2
+
+- **Fix: the plan and the state now share one capacity scale -- the root cause of "charges to 113 %".**
+  0.37.1 stopped the bleeding by capping the applied capacity at the pack's reported 1.92 kWh, but
+  the real defect was a unit mix: the charge-side learner measures AC energy per *reported* SoC point
+  (2.30 kWh/100 points on this 1.92-labelled pack, because the BMS SoC scale is not the label), while
+  the state energy came from the device's nominal kWh (62 % of 1.92). Planning 95 % of 2.30 against a
+  state on the 1.92 scale is what let the controller keep charging at 100 %. The engine now derives
+  the planning/published energy from the reported SoC and the capacity in force
+  (`soc % x capacity`), so the SoC path, the floors and the money path agree for learned, pinned and
+  nominal capacities. A device whose own kWh reading is used unchanged keeps it (the two capacities
+  agree there), and a driver that falls back to the plan's own capacity no longer feeds it back as
+  the hardware ceiling.
+- **Fix: a measured capacity is planned inside a gross-error band above the reported capacity.**
+  The reported figure is the integration's *nominal* capacity; the learner measures the AC energy
+  behind one point of the pack's own SoC scale, which can genuinely differ (live 2.30 measured on a
+  1.92-labelled pack, confirmed by the AC per SoC point). Up to 25 % above the report is planned,
+  only the excess is trimmed -- a sample that far out is a bad energy reading, not a bigger pack. A
+  below-report estimate (an aged pack) always applies. The raw estimate, the reported figure and the
+  band all stay visible on `/batteries`, in the journal and on the card.
+- **Fix: the capacity learner refuses windows that touch the clamped ends of the SoC range**
+  (schema 5). A pack held at 100 % keeps accepting charge the reported SoC cannot show, so those
+  windows over-read; they are now rejected with the `edge` reason and the next maintenance relearn
+  publishes from the trustworthy windows.
+
 ## 0.37.1
 
 - **Fix: a learned capacity never plans more than the pack itself reports holding.** Live

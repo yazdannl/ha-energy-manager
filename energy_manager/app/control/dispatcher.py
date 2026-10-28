@@ -168,6 +168,7 @@ class Dispatcher:
                 log.warning("driver %s read failed: %s", driver.id(), exc)
                 state = BatteryState(id=driver.id(), available=False, read_at=moment, stale=True)
             self._attach_cell_voltage(driver, configs.get(driver.id()), state)
+            _plan_capacity_scale(state, configs.get(driver.id()))
             states.append(state)
         return states
 
@@ -660,3 +661,25 @@ class Dispatcher:
             "plan_slot_ts": to_iso(plan_slot_ts),
             "writes": list(result.writes),
         }
+
+
+def _plan_capacity_scale(state: BatteryState, config: BatteryConfig | None) -> None:
+    """Express the pack's energy on the capacity the plan uses (SPEC 5).
+
+    A driver reports device kWh, which sit on the pack's nominal/labelled scale.  When a learned
+    capacity is in force (``effective_config``), planning those nominal kWh against the learned
+    e_min/e_max mixes two scales: live 2026-10-27 the plan charged to 113 % of the pack because
+    ``energy`` stayed at 1.19 kWh (62 % of the 1.92 label) while the ceiling was 95 % of 2.30.
+    Deriving the energy from the reported SoC and the *same* capacity makes the SoC path and the
+    money path agree.  Untouched when the two capacities agree, which is the common case and every
+    driver with no measured capacity -- a device whose kWh reading is better than SoC x capacity
+    keeps it.
+    """
+    if state.soc_pct is None or config is None:
+        return
+    applied = float(config.capacity_kwh)
+    reported = state.capacity_kwh
+    if reported is None or applied <= 0.0 or abs(float(reported) - applied) <= 1e-6:
+        return
+    state.energy_kwh = max(0.0, applied * float(state.soc_pct) / 100.0)
+    state.capacity_kwh = applied

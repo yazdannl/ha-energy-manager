@@ -18,7 +18,7 @@ from fake_ha import FakeHAFacade, FakeHAState
 
 from app.control import drivers as registry
 from app.control import safety  # noqa: E402
-from app.control.dispatcher import Dispatcher  # noqa: E402
+from app.control.dispatcher import Dispatcher, _plan_capacity_scale  # noqa: E402
 from app.control.drivers.base import (  # noqa: E402
     IDEMPOTENT_TOLERANCE_W,
     DriverError,
@@ -562,6 +562,27 @@ def test_zendure_charges_with_a_negated_raw_setpoint():
     assert MANAGER_SIGN == -1.0
 
 
+def test_learned_capacity_rescales_the_state_to_one_energy_scale():
+    """0.37.2: state kWh and the plan's e_min/e_max must share the capacity they are built on.
+
+    Live 2026-10-27: the plan charged to 113 % of the pack because the state kept the device's
+    nominal kWh (62 % of 1.92) while the ceiling used the learned 2.30.  The SoC is the authority;
+    the energy is derived from it with the same capacity.
+    """
+    cfg = config(driver="generic", capacity_kwh=2.112)
+    state = BatteryState(id=cfg.id, soc_pct=62.0, capacity_kwh=1.92, energy_kwh=1.1904)
+    _plan_capacity_scale(state, cfg)
+    assert state.energy_kwh == pytest.approx(2.112 * 0.62)
+    assert state.capacity_kwh == pytest.approx(2.112)
+    # Same scale (or no device capacity): the device's own kWh reading is kept.
+    same = BatteryState(id=cfg.id, soc_pct=62.0, capacity_kwh=2.112, energy_kwh=1.3344)
+    _plan_capacity_scale(same, cfg)
+    assert same.energy_kwh == pytest.approx(1.3344)
+    unknown = BatteryState(id=cfg.id, soc_pct=62.0, capacity_kwh=None, energy_kwh=None)
+    _plan_capacity_scale(unknown, cfg)
+    assert unknown.energy_kwh is None and unknown.capacity_kwh is None
+
+
 def test_zendure_reads_the_authoritative_soc_and_capacity():
     ha = manager_ha()
     driver = registry.create(config(driver="zendure", mapping=manager_mapping()), ha)
@@ -569,6 +590,7 @@ def test_zendure_reads_the_authoritative_soc_and_capacity():
     assert state.soc_pct == 55.0  # electric_level, not soc_status
     assert state.capacity_kwh == 5.0  # total_kwh
     assert state.energy_kwh == 2.75  # soc x total_kwh without available_kwh
+    assert state.extra["capacity_reported"] is True  # the device stated its own capacity
     ha.states["sensor.example_device_available"] = {"state": "2.2", "attributes": {"unit_of_measurement": "kWh"}}
     mapping = manager_mapping(available_kwh_entity="sensor.example_device_available")
     driver = registry.create(config(driver="zendure", mapping=mapping), ha)

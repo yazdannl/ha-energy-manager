@@ -1449,27 +1449,38 @@ class Engine:
     def _cap_capacity_status(
         self, battery_id: str, status: Mapping[str, Any]
     ) -> dict[str, Any]:
-        """Clamp an applied estimate to the pack's own reported capacity, with the evidence kept.
+        """Clamp an applied estimate to a bounded band above the pack's reported capacity.
 
         The raw estimate (``learned_kwh``) stays visible so the UI can say what was measured and
         why it was not planned; ``capacity_kwh`` is what the planner, the published summaries and
-        ``effective_config`` use.
+        ``effective_config`` use.  The reported value is the integration's nominal figure while the
+        estimate measures the AC energy behind one point of the pack's own SoC scale, so a measured
+        overshoot inside :data:`capacity.ABOVE_REPORTED_TOLERANCE` is planned; only the excess is
+        capped.  A below-report estimate (an aged pack) always applies.
         """
         if not status.get("applied"):
             return dict(status)
         learned = status.get("capacity_kwh")
         reported = self._reported_capacity.get(battery_id)
-        capped = capacity_learning.cap_to_reported(learned, reported)
+        capped = capacity_learning.cap_to_reported(
+            learned,
+            reported,
+            tolerance=capacity_learning.ABOVE_REPORTED_TOLERANCE,
+        )
         if learned is None or capped is None:
             return dict(status)
         value = float(learned)
+        reported_value = None if reported is None else float(reported)
         if abs(capped - value) <= 1e-9:
-            return dict(status)
+            if reported_value is None:
+                return dict(status)
+            return {**status, "reported_kwh": reported_value}
         return {
             **status,
             "capacity_kwh": capped,
             "capped_kwh": value,
-            "cap_kwh": float(reported),
+            "cap_kwh": capped,
+            "reported_kwh": reported_value,
             "capped": True,
         }
 
@@ -1857,9 +1868,12 @@ class Engine:
             "seed_kwh": round(float(config.capacity_kwh), 4),
             "effective_kwh": round(learned, 4),
         }
+        detail["learned_kwh"] = round(float(status.get("capped_kwh") or learned), 4)
+        if status.get("reported_kwh") is not None:
+            detail["reported_kwh"] = round(float(status["reported_kwh"]), 4)
         if status.get("capped"):
-            detail["learned_kwh"] = round(float(status.get("capped_kwh") or learned), 4)
-            detail["reported_kwh"] = round(float(status.get("cap_kwh") or 0.0), 4)
+            detail["ceiling_kwh"] = round(float(status.get("cap_kwh") or learned), 4)
+            detail["capped"] = True
         if status.get("applied"):
             self._journal.event(
                 "info",
@@ -2072,10 +2086,13 @@ class Engine:
                         "stale": bool(capacity_info.get("stale")),
                         "confident": bool(capacity_info.get("confident")),
                         "applied": bool(effective_status.get("applied")),
-                        # A measurement above the capacity the pack reports holding is capped at
-                        # that reported value (SPEC 5); the raw estimate stays visible.
+                        # A measurement is planned inside a bounded band above the capacity the
+                        # pack reports holding (SPEC 5); the raw estimate and the band stay
+                        # visible so the card can explain the ceiling it applied.
                         "capped_kwh": capacity_info.get("capped_kwh"),
                         "cap_kwh": capacity_info.get("cap_kwh"),
+                        "reported_kwh": capacity_info.get("reported_kwh"),
+                        "band_pct": round(capacity_learning.ABOVE_REPORTED_TOLERANCE * 100.0, 1),
                         "capped": bool(capacity_info.get("capped")),
                     },
                     # Additive (0.31.0): the learned round trip, its evidence and what is in force.
@@ -3414,6 +3431,10 @@ class Engine:
         learned-capacity ceiling.
         """
         for battery in states:
+            if battery.extra.get("capacity_reported", True) is False:
+                # The driver fell back to the plan's own capacity: that is not the hardware
+                # speaking, so it must never become the ceiling (0.37.2).
+                continue
             capacity = battery.capacity_kwh
             if capacity is not None and capacity > 0.0 and math.isfinite(capacity):
                 self._reported_capacity[battery.id] = float(capacity)

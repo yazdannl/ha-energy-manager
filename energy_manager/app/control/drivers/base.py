@@ -350,7 +350,8 @@ class BaseDriver:
         try:
             power = self._read_power()
             soc = self._read_soc()
-            capacity = self._read_capacity() or self.config.capacity_kwh
+            reported_capacity = self._read_capacity()
+            capacity = reported_capacity or self.config.capacity_kwh
             energy = self._read_energy(soc, capacity)
             available = self._available(power, soc)
             timestamps_seen = self._poll_timestamps()
@@ -379,6 +380,10 @@ class BaseDriver:
                     "timestamps_seen": bool(timestamps_seen),
                     "stalled_polls": self._stall_polls,
                     "frozen": frozen,
+                    # Only a capacity the pack itself states may cap a learned estimate; the
+                    # config fallback is the plan's own scale and feeding it back would let the
+                    # ceiling grow every replan (0.37.2).
+                    "capacity_reported": reported_capacity is not None,
                     # Optional mapped min-cell voltage (SPEC 9.2/9.3): per cell, never a guess.
                     "cell_voltage_v": self._mapped_cell_voltage(),
                 },

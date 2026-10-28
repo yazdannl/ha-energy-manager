@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "energy_manager"))
 
 from app.capacity import (  # noqa: E402
+    ABOVE_REPORTED_TOLERANCE,
     MAX_KEPT_WINDOWS,
     MIN_ACCEPTED_WINDOWS,
     PROFILE_KIND,
@@ -333,6 +334,7 @@ class FakeNotifier:
 
 
 LEARNED_KWH = 8.5
+TOLERANCE = ABOVE_REPORTED_TOLERANCE
 EXAMPLE_BATTERY = BatteryConfig(
     id="example_battery_1",
     name="Example Battery 1",
@@ -539,7 +541,7 @@ def test_batteries_view_exposes_the_capacity_payload():
 
 def test_cap_to_reported_only_ever_lowers_the_estimate():
     """SPEC 5: the pack's own reported capacity is a ceiling, never a target."""
-    from app.capacity import cap_to_reported  # noqa: PLC0415 - exercised where it is used
+    from app.capacity import ABOVE_REPORTED_TOLERANCE, cap_to_reported  # noqa: PLC0415
 
     assert cap_to_reported(8.5, 6.0) == 6.0
     assert cap_to_reported(5.0, 6.0) == 5.0
@@ -547,6 +549,11 @@ def test_cap_to_reported_only_ever_lowers_the_estimate():
     assert cap_to_reported(8.5, 0.0) == 8.5
     assert cap_to_reported(8.5, -1.0) == 8.5
     assert cap_to_reported(None, 6.0) is None
+    # 0.37.2: a small measured overshoot is planned (the charge-side estimate carries the unknown
+    # efficiency split), only the excess is trimmed.
+    ceiling = 6.0 * (1.0 + ABOVE_REPORTED_TOLERANCE)
+    assert cap_to_reported(6.2, 6.0, tolerance=ABOVE_REPORTED_TOLERANCE) == 6.2
+    assert cap_to_reported(8.5, 6.0, tolerance=ABOVE_REPORTED_TOLERANCE) == pytest.approx(ceiling)
 
 
 def test_a_learned_estimate_above_the_reported_capacity_is_capped():
@@ -556,21 +563,24 @@ def test_a_learned_estimate_above_the_reported_capacity_is_capped():
     engine._note_ha_read(  # noqa: SLF001 - the hardware reading is the input under test
         [models.BatteryState(id=EXAMPLE_BATTERY.id, available=True, capacity_kwh=6.0)]
     )
+    ceiling = 6.0 * (1.0 + TOLERANCE)
     config = engine.battery_configs()[0]
-    assert engine.effective_capacity_kwh(config) == pytest.approx(6.0)
+    assert engine.effective_capacity_kwh(config) == pytest.approx(ceiling)
     _value, status = engine.effective_capacity(config)
     assert status["applied"] is True and status["reason"] == REASON_APPLIED
     assert status["capped"] is True
     assert status["capped_kwh"] == pytest.approx(LEARNED_KWH)  # the measurement stays visible
-    assert status["cap_kwh"] == pytest.approx(6.0)
-    # The planner, and therefore the published plan, sees the capped value.
-    assert engine.effective_battery_configs()[0].capacity_kwh == pytest.approx(6.0)
+    assert status["cap_kwh"] == pytest.approx(ceiling)
+    assert status["reported_kwh"] == pytest.approx(6.0)
+    # The planner, and therefore the published plan, sees the bounded value.
+    assert engine.effective_battery_configs()[0].capacity_kwh == pytest.approx(ceiling)
     plan = engine.plan_now("capped-capacity-test")
     assert plan is not None and plan.batteries
-    assert plan.batteries[0]["capacity_kwh"] == pytest.approx(6.0)
+    assert plan.batteries[0]["capacity_kwh"] == pytest.approx(ceiling)
     # The journal says both numbers instead of silently dropping the estimate.
     applied = [e for e in store.events if e["code"] == "capacity_learned_applied"]
     assert applied and applied[-1]["payload"]["reported_kwh"] == pytest.approx(6.0)
+    assert applied[-1]["payload"]["ceiling_kwh"] == pytest.approx(ceiling)
     assert applied[-1]["payload"]["learned_kwh"] == pytest.approx(LEARNED_KWH)
 
 
@@ -580,13 +590,15 @@ def test_batteries_view_exposes_the_cap_and_keeps_the_raw_estimate():
     engine._note_ha_read(  # noqa: SLF001 - see above
         [models.BatteryState(id=EXAMPLE_BATTERY.id, available=True, capacity_kwh=6.0)]
     )
+    ceiling = 6.0 * (1.0 + TOLERANCE)
     record = engine.batteries_view()[0]
     assert record["capacity_learned_kwh"] == pytest.approx(LEARNED_KWH)
-    assert record["effective_capacity_kwh"] == pytest.approx(6.0)
+    assert record["effective_capacity_kwh"] == pytest.approx(ceiling)
     assert record["capacity"]["capped"] is True
-    assert record["capacity"]["cap_kwh"] == pytest.approx(6.0)
+    assert record["capacity"]["cap_kwh"] == pytest.approx(ceiling)
+    assert record["capacity"]["reported_kwh"] == pytest.approx(6.0)
     assert record["capacity"]["learned_kwh"] == pytest.approx(LEARNED_KWH)
-    assert record["capacity"]["effective_kwh"] == pytest.approx(6.0)
+    assert record["capacity"]["effective_kwh"] == pytest.approx(ceiling)
 
 
 def test_an_estimate_below_the_reported_capacity_is_untouched():
@@ -598,3 +610,16 @@ def test_an_estimate_below_the_reported_capacity_is_untouched():
     config = engine.battery_configs()[0]
     assert engine.effective_capacity_kwh(config) == pytest.approx(4.2)
     assert "capped" not in engine.capacity_status(EXAMPLE_BATTERY.id)
+
+
+def test_a_window_that_ends_at_the_clamped_soc_ceiling_is_rejected():
+    """0.37.2: a pack held at 100 % keeps accepting charge the reported SoC cannot show."""
+    at_top = _window(T0, 20.0, 100.0, 500.0, steps=20)
+    payload = _estimated(at_top)
+    assert payload["capacity_kwh"] is None
+    assert payload["rejected"]["edge"] == 1
+
+    just_below = _window(T0, 20.0, 98.0, 500.0, steps=20)
+    payload = _estimated(just_below)
+    assert payload["samples"] == 1  # accepted (one window is not yet a published estimate)
+    assert payload["rejected"]["edge"] == 0

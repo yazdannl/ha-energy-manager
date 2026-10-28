@@ -2146,8 +2146,8 @@ core built, 1,690 passed, 0 skipped) and `node tools/ui_render_check.js` (186 pa
 learner still over-reads on this pack until it stops booking the compressed top; the cap keeps
 planning physically feasible in the meantime.
 
-Deployed and observed live (2026-10-27T20:22Z): `update.smart_energy_manager_update` moved the
-add-on from 0.37.0 to **0.37.1** and `/api/v1/health` reports `0.37.1`. On the real pack
+Deployed and observed live (2026-10-27T20:22Z): the add-on's update entity moved it from 0.37.0
+to **0.37.1** and `/api/v1/health` reports `0.37.1`. On the real pack
 (1.92 kWh reported by `capacity_entity`) `/api/v1/batteries` now states `learned 2.2996 · effective
 1.92 · capped true · cap 1.92`, and the journal records `capacity_learned_applied` with
 `learned_kwh 2.2996, reported_kwh 1.92`. The next plan's ceiling is `soc_kwh 1.824` (95.0 % of

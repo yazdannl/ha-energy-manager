@@ -438,12 +438,18 @@ resting at its limit must not add phantom energy to the window, while a mid-run 
 taper doing real work and stays booked); accepted windows are
 combined with a median after a median-absolute-deviation outlier filter, kept to the last 20, clamped
 to a plausible 1..200 kWh and published only with at least 3 accepted windows. An estimate older than
-30 days is stale. The estimate is a correction, never a licence to exceed the pack (0.37.1): the
-applied value is capped at the capacity the pack itself reports (``capacity_entity``, when it
-resolves), because a reading above that is the same SoC-scale artifact or a bad energy sample, and
-planning it schedules charge the hardware cannot accept. The raw measurement stays visible
-(``learned_kwh``, ``capped_kwh``), a below-report estimate still applies (an aged pack), and a pack
-with no reported capacity is unchanged. The window's AC energy is the **measured**
+30 days is stale. The estimate is a correction, never a licence to exceed the pack (0.37.1/0.37.2):
+the applied value is planned inside a documented gross-error band above the capacity the pack itself
+reports (``capacity_entity``, when it resolves), capped beyond it (the reported figure is the
+integration's nominal capacity while the estimate measures the AC energy behind one point of the
+pack's own SoC scale, so the band must let a real measurement through),
+and always free to correct downward (an aged pack). A pack with no reported capacity is unchanged.
+The raw measurement stays visible (``learned_kwh``, ``capped_kwh``, ``cap_kwh``). Windows whose
+reported SoC touches the clamped ends of its range are refused (schema 5): the pack keeps accepting
+charge while the reported SoC cannot show it, so those windows over-read. **One scale:** the stored
+energy the planner sees is derived from the reported SoC with the capacity in force
+(``soc * capacity / 100``), never the device's nominal kWh, so a learned or pinned capacity cannot
+mix with the label. The window's AC energy is the **measured**
 ``battery_charge``/``battery_discharge``
 pair; the signed ``battery_power`` role is only a fallback because it is a command
 (``power_setpoint_entity``) that a tapering BMS need not follow. In ``auto`` a missing, stale or

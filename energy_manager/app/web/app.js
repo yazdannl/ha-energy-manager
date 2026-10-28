@@ -4647,10 +4647,12 @@
       reason: String((record && record.capacity_reason) || info.reason || ""),
       stale: !!info.stale,
       applied: !!info.applied,
-      // SPEC 5: an estimate above the capacity the pack reports holding is capped at that report;
+      // SPEC 5: an estimate is planned inside a bounded band above what the pack reports holding;
       // ``learned`` stays the measurement's own number so both can be shown.
       capped: !!info.capped,
-      capKwh: isNum(info.cap_kwh) ? info.cap_kwh : null
+      capKwh: isNum(info.cap_kwh) ? info.cap_kwh : null,
+      reportedKwh: isNum(info.reported_kwh) ? info.reported_kwh : null,
+      bandPct: isNum(info.band_pct) ? info.band_pct : null
     };
   }
 
@@ -4696,9 +4698,16 @@
     // One pack, one capacity: measured while charging, because the discharge side delivers that
     // capacity *less* the round-trip loss rather than a second capacity.
     if (cap.capped) {
-      return "Learned from measured" + (cap.basis === "discharge" ? " discharge" : " charging") + " cycles: " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " accepted window(s), last learned " + timeAgo(cap.updated) + ". That reading is above the " + fmtKwh(cap.capKwh) + " kWh the pack itself reports holding, so it is capped there (a pack cannot store more than its own hardware says); effective capacity " + fmtKwh(cap.effective) + " kWh. Pin a value to override the cap.";
+      var band = cap.bandPct != null ? "a " + cap.bandPct + " % band above" : "a small band above";
+      return "Learned from measured" + (cap.basis === "discharge" ? " discharge" : " charging") + " cycles: " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " accepted window(s), last learned " + timeAgo(cap.updated) + ". That is above the " + fmtKwh(cap.reportedKwh) + " kWh the pack reports holding, so planning allows " + band + " it and uses " + fmtKwh(cap.effective) + " kWh; the raw estimate stays visible. Pin a value to override it.";
     }
-    return "Learned from measured" + (cap.basis === "discharge" ? " discharge" : " charging") + " cycles: " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " accepted window(s), last learned " + timeAgo(cap.updated) + ". Effective capacity " + fmtKwh(cap.effective) + " kWh.";
+    var base = "Learned from measured" + (cap.basis === "discharge" ? " discharge" : " charging") + " cycles: " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " accepted window(s), last learned " + timeAgo(cap.updated) + ". Effective capacity " + fmtKwh(cap.effective) + " kWh.";
+    if (cap.reportedKwh != null && Math.abs(cap.reportedKwh - cap.effective) > 0.01) {
+      // The label and the SoC scale are different figures; say so rather than let the card look
+      // like the pack holds more than its datasheet (0.37.2).
+      return base + " The pack reports " + fmtKwh(cap.reportedKwh) + " kWh nominal: planning uses the measured SoC scale so the SoC limit and the energy budget agree.";
+    }
+    return base;
   }
 
   /** One truthful sentence about where a battery's round trip comes from (SPEC 5). */

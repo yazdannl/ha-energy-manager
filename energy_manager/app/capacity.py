@@ -79,9 +79,11 @@ PROFILE_KIND = "battery_capacity"
 #: only the SoC-moving sample pairs except a run's trailing plateau (the phantom edge sample used to
 #: inflate short windows); schema 4 (0.32.0) takes the capacity from the **charging side only**, so one
 #: pack reports one capacity instead of a charge population and a discharge population a few percent
-#: apart.  A payload from an older schema is reported but not trusted -- the typed seed stands until
-#: the next maintenance relearn rewrites it.
-SCHEMA = 4
+#: apart; schema 5 (0.37.2) refuses windows that touch the clamped ends of the reported SoC range (a
+#: pack held at 100 % keeps accepting charge the SoC cannot show, so those windows over-read).  A
+#: payload from an older schema is reported but not trusted -- the typed seed stands until the next
+#: maintenance relearn rewrites it.
+SCHEMA = 5
 
 #: A window's SoC must move at least this many points to be trusted.
 MIN_DSOC_PCT = 10.0
@@ -100,6 +102,16 @@ STALE_AFTER_DAYS = 30.0
 #: Plausible usable-capacity envelope; anything outside is a bad measurement, never a battery.
 MIN_PLAUSIBLE_KWH = 1.0
 MAX_PLAUSIBLE_KWH = 200.0
+#: Gross-error guard above the pack's own reported capacity (SPEC 5).  The reported figure is the
+#: integration's *nominal* capacity, while the learner measures the AC energy behind one point of the
+#: pack's reported SoC: the BMS SoC basis can differ from the label (live 2026-10-27: 2.30 measured
+#: on a 1.92-labelled pack, and the AC per SoC point confirms it), so a band must let a real
+#: measurement through.  Beyond it the sample is far more likely a bad energy reading than a real
+#: pack, and the excess is trimmed; the raw estimate stays visible.  Downward is never limited.
+ABOVE_REPORTED_TOLERANCE = 0.25
+#: A window whose SoC touches the clamped ends of the reported range is over-read: the pack keeps
+#: accepting charge (or delivering it) while the reported SoC has stopped moving.
+SOC_EDGE_PCT = 1.0
 #: Median-absolute-deviation outlier filter: 1.4826 turns the MAD into a sigma estimate.
 MAD_SCALE = 1.4826
 MAD_LIMIT = 3.5
@@ -192,7 +204,7 @@ def extract_windows(
     always paid for its ``dsoc_pct`` (a pack resting at its limit does not add phantom energy).
     """
     accepted: list[dict[str, Any]] = []
-    rejected = {"gaps": 0, "direction": 0, "dsoc": 0, "power": 0, "invalid": 0}
+    rejected = {"gaps": 0, "direction": 0, "dsoc": 0, "power": 0, "invalid": 0, "edge": 0}
     ordered = sorted(
         (s for s in samples if s and isinstance(s[0], datetime)), key=lambda s: s[0]
     )
@@ -212,6 +224,16 @@ def extract_windows(
             return
         if dsoc < MIN_DSOC_PCT:
             rejected["dsoc"] += 1
+            return
+        if sign > 0 and (
+            start_soc <= SOC_EDGE_PCT or end_soc >= 100.0 - SOC_EDGE_PCT
+        ):
+            rejected["edge"] += 1
+            return
+        if sign < 0 and (
+            end_soc <= SOC_EDGE_PCT or start_soc >= 100.0 - SOC_EDGE_PCT
+        ):
+            rejected["edge"] += 1
             return
         limit = float(max_charge_w if sign > 0 else max_discharge_w)
         mean_power = current["power_abs"] / max(1, current["count"])
@@ -380,7 +402,12 @@ def estimate_capacity(
     }
 
 
-def cap_to_reported(kwh: float | None, reported_kwh: float | None) -> float | None:
+def cap_to_reported(
+    kwh: float | None,
+    reported_kwh: float | None,
+    *,
+    tolerance: float = 0.0,
+) -> float | None:
     """The estimate to plan with: never more than the pack itself reports holding.
 
     A measurement may legitimately read *below* the label (an aged pack) and the typed seed is only
@@ -399,7 +426,8 @@ def cap_to_reported(kwh: float | None, reported_kwh: float | None) -> float | No
     reported = float(reported_kwh)
     if reported <= 0.0 or not math.isfinite(reported):
         return value
-    return min(value, reported)
+    ceiling = reported * (1.0 + max(0.0, float(tolerance)))
+    return min(value, ceiling)
 
 
 def capacity_status(
