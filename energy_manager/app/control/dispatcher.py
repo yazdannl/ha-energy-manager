@@ -681,5 +681,8 @@ def _plan_capacity_scale(state: BatteryState, config: BatteryConfig | None) -> N
     reported = state.capacity_kwh
     if reported is None or applied <= 0.0 or abs(float(reported) - applied) <= 1e-6:
         return
+    # Keep the pack's own figure: ``capacity_kwh`` is about to become the plan's scale, and the
+    # engine must still cap the learner against what the hardware reports (0.37.3).
+    state.extra["reported_capacity_kwh"] = float(reported)
     state.energy_kwh = max(0.0, applied * float(state.soc_pct) / 100.0)
     state.capacity_kwh = applied

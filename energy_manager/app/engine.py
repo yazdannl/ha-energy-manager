@@ -3435,7 +3435,9 @@ class Engine:
                 # The driver fell back to the plan's own capacity: that is not the hardware
                 # speaking, so it must never become the ceiling (0.37.2).
                 continue
-            capacity = battery.capacity_kwh
+            # The dispatcher may have replaced ``capacity_kwh`` with the plan's scale; the pack's
+            # own reading is preserved separately (0.37.3).
+            capacity = battery.extra.get("reported_capacity_kwh", battery.capacity_kwh)
             if capacity is not None and capacity > 0.0 and math.isfinite(capacity):
                 self._reported_capacity[battery.id] = float(capacity)
         errors = [

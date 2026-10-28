@@ -574,6 +574,7 @@ def test_learned_capacity_rescales_the_state_to_one_energy_scale():
     _plan_capacity_scale(state, cfg)
     assert state.energy_kwh == pytest.approx(2.112 * 0.62)
     assert state.capacity_kwh == pytest.approx(2.112)
+    assert state.extra["reported_capacity_kwh"] == pytest.approx(1.92)  # kept for the ceiling
     # Same scale (or no device capacity): the device's own kWh reading is kept.
     same = BatteryState(id=cfg.id, soc_pct=62.0, capacity_kwh=2.112, energy_kwh=1.3344)
     _plan_capacity_scale(same, cfg)

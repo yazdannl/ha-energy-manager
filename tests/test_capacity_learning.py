@@ -584,6 +584,26 @@ def test_a_learned_estimate_above_the_reported_capacity_is_capped():
     assert applied[-1]["payload"]["learned_kwh"] == pytest.approx(LEARNED_KWH)
 
 
+def test_the_reported_capacity_survives_the_plan_scale_rescale():
+    """0.37.3: the driver's kWh becomes the plan's scale, so the ceiling must read the saved one."""
+    engine, store, _settings, clock = build_engine(capacity_source="auto")
+    put_estimate(store, EXAMPLE_BATTERY.id, kwh=LEARNED_KWH, samples=6, now=clock.now)
+    state = models.BatteryState(
+        id=EXAMPLE_BATTERY.id,
+        available=True,
+        soc_pct=58.0,
+        capacity_kwh=3.0,  # already rescaled by the dispatcher
+        energy_kwh=1.74,
+        extra={"capacity_reported": True, "reported_capacity_kwh": 1.92},
+    )
+    engine._note_ha_read([state])
+    status = engine.capacity_status(EXAMPLE_BATTERY.id)
+    assert status["reported_kwh"] == pytest.approx(1.92)
+    assert status["capped"] is True  # 8.5 is trimmed by the 25 % band around the *reported* 1.92
+    assert status["cap_kwh"] == pytest.approx(1.92 * 1.25)
+    assert engine.effective_capacity_kwh(EXAMPLE_BATTERY) == pytest.approx(1.92 * 1.25)
+
+
 def test_batteries_view_exposes_the_cap_and_keeps_the_raw_estimate():
     engine, store, _settings, clock = build_engine(capacity_source="auto")
     put_estimate(store, EXAMPLE_BATTERY.id, kwh=LEARNED_KWH, samples=6, now=clock.now)

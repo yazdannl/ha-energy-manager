@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.37.3
+
+- **Fix: the pack's reported capacity keeps its own value through the plan-scale rescale.** 0.37.2's
+  rescale replaced the state's `capacity_kwh` with the plan's scale before the engine recorded it, so
+  `/batteries` reported the learned value as "reported" and the gross-error ceiling would have drifted
+  with every relearn. The dispatcher now preserves the driver's figure in `reported_capacity_kwh` and
+  the engine's ceiling reads that, not the rescaled one.
+
 ## 0.37.2
 
 - **Fix: the plan and the state now share one capacity scale -- the root cause of "charges to 113 %".**
