@@ -6,9 +6,9 @@ supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figur
 revisions described pre-audit trees and are obsolete.
 
 Verification was local and hardware-free: no real battery, no live provider call, no instance data.
-0.37.1 was deployed to the live instance and verified there (see §8.35); the release gates below
-were repeated from a clean checkout; optional native C-core tests skip when no compiled extension is
-present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
+0.37.1, 0.37.2 and 0.37.3 were deployed to the live instance and verified there (see §8.35 and
+§8.36); the release gates below were repeated from a clean checkout; optional native C-core tests
+skip when no compiled extension is present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
 `sem_*`), loopback addresses and placeholder coordinates.
 
 ---
@@ -17,8 +17,8 @@ present. All synthetic values use reserved namespaces (`sensor.example_*`, `numb
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **1607 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension); with the local C core built: **1690 passed, 0 skipped** |
-| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 177 files scanned`, exit 0 |
+| Test suite | `python3 -m pytest tests -q` | **1610 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension); with the local C core built: **1693 passed, 0 skipped** when the host is not saturated (the two DP-core wall-clock micro-benchmarks are host-load sensitive; see §8.36) |
+| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 180 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
 | Headless UI render check | `node tools/ui_render_check.js` | **186 passed, 0 failed**, exit 0 |
@@ -30,10 +30,10 @@ present. All synthetic values use reserved namespaces (`sensor.example_*`, `numb
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (155 files, documentation excluded)**:
-  `cb500a774135e07806172297cc9fa57a482b6ee99577e108f76bfd8c36945dce`
+  `fdb6de470ca3ea24c911f3ff5d34a66639ccad6c6585de5a963fe80d9c617e52`
 * **path list of the same 155 files** (detects an added, removed or renamed file):
   `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (unchanged from 0.37.0:
-  0.37.1 changed file contents only)
+  0.37.1-0.37.3 changed file contents only)
 
 Historically, the 0.10.1 tree's code + tests digest was `28fdad8a…`, 0.10.0's `784dbf04…` and
 0.9.1's `fc5f9d44…`; at that point 0.11.0 (§8.10) changed file contents only and added no file, so
@@ -2155,6 +2155,65 @@ to **0.37.1** and `/api/v1/health` reports `0.37.1`. On the real pack
 06:00Z export now starts from that 1.824 kWh instead of the phantom 2.18. No new warning or error
 event followed the update (only the normal boot `live_setpoint_recovered`/`watchdog_hold` pair while
 the first tick neutralised the previous run's writes).
+
+### 8.36 One capacity scale: the plan, the state and the pack (0.37.2, 0.37.3)
+
+0.37.1 capped the applied capacity at the 1.92 kWh the pack reports, yet the plan still charged to
+the pack's 100 % SoC. The estimate was not inflated -- the plan and the state were on two different
+scales. The learner measures **AC energy per point of the pack's reported SoC**:
+`capacity = AC_charge * eta_charge / dSoC`. Replaying three days of this instance's history
+(electric level, measured charge and discharge power, 5-minute sample buckets) through
+`extract_windows` gave 15 accepted windows and a charge-side median of 2.2997 kWh; trimming the SoC
+band (0-100, 5-95, 10-90, ...) moved it only between 2.27 and 2.34, and per-10-point bins covered
+2.19-2.69, so the figure is stable. The AC side confirms it: those windows delivered about 2.50 kWh
+AC per 100 SoC points, and 2.50 x 0.9205 = 2.30. The 1.92 kWh label is a *nominal* figure; the
+pack's own SoC runs on a ~2.30 scale. The DC side (`output_pack_power` about equal to
+`grid_input_power`, ~782 W mean while charging) showed no hidden DC/AC divergence.
+
+Two defects were fixed:
+
+1. **Mixed scales.** The state energy came from the device's nominal kWh (62 % x 1.92 = 1.19 kWh)
+   while the plan's ceiling was 95 % x 2.30 = 2.18 kWh. The plan therefore asked for more charge
+   than its own state could show and the controller kept charging at 100 % SoC. The dispatcher now
+   derives the state from the reported SoC with the capacity in force (`soc x capacity`), so the
+   SoC path, the floors and the money path share one scale; it is a no-op when they agree, which is
+   every driver without a measured capacity (and every pinned or nominal configuration).
+2. **Clamped-end windows.** The pack keeps accepting ~1 kW at 100 % SoC while the reported SoC
+   stops moving, so windows ending there over-read (one window 82 -> 100 % implied 2.707 kWh).
+   Schema 5 refuses windows that touch either clamped end.
+
+The 0.37.1 clamp became a documented gross-error band (25 % above the reported capacity): the label
+is nominal and a real SoC scale may exceed it, while a sample that far out is far more likely a bad
+reading; a below-report estimate (an aged pack) always applies. Live 2.3008 sits inside the band, so
+it is planned uncapped; the raw estimate, the reported figure and the band are all exposed on
+`/batteries`, in the journal and on the card.
+
+0.37.3 closes a provenance slip found in the live deploy: the 0.37.2 rescale replaced the state
+capacity before the engine recorded it, so `/batteries` showed the learned value as "reported"
+(2.3008 instead of 1.92) and the band would have drifted with every relearn. The dispatcher
+preserves the driver's figure in `reported_capacity_kwh` and the engine caps against that.
+
+Five tests cover the new behavior: an estimate inside the band is planned, one beyond it is trimmed
+(and keeps the raw value), windows touching a clamped end are rejected with the `edge` reason, the
+rescale derives the energy and keeps the driver's figure, and the engine records the saved reported
+value rather than the rescaled one. Gates from the clean checkout: **1610 passed, 83 skipped**
+(with the local C core: 1693 passed; the two DP-core micro-benchmarks exceeded their wall-clock
+thresholds while the host ran at load average ~15 and pass when it is not saturated -- their
+functional assertions passed in both runs), `audit: clean — 180 files scanned`, selfcheck 33/33,
+headless UI 186/0, `compileall`, `node --check` and `sh -n` clean. Frozen digest: 155 code + test
+files, `fdb6de470ca3ea24c911f3ff5d34a66639ccad6c6585de5a963fe80d9c617e52`; the path-list digest is
+unchanged (`c769154c...`).
+
+Deployed and observed live (2026-10-28T13:45Z): `/api/v1/health` reports `0.37.3` with the C
+optimizer core, and `/api/v1/batteries` states `learned 2.3008 · reported 1.92 · effective 2.3008 ·
+capped false · band 25.0`, with the state at 61 % of 2.3008 = 1.4035 kWh. The published plan is on
+the same scale: its first slot is `54.61 % -> 1.2565 kWh` (54.61 % x 2.3008) and its highest
+`soc_kwh` is 1.402, far below the 2.1858 ceiling. The instance's custom Zonneplan tariff sensors
+went `unavailable` at 12:15Z, before any of these deploys; a config-entry reload did not recover
+them, so the plan ran the documented no-price zero-export fallback (`sources.plan =
+self_consumption`, `price = none`, and a `forecast_unavailable` journal line per replan). That is
+an integration-side outage -- the add-on's capacity scale does not depend on prices, but selling
+stays paused until the tariff list returns.
 
 ---
 
