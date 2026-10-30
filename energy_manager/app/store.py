@@ -976,6 +976,28 @@ class Store:
                 self._connections.append(conn)
         return conn
 
+    def release_thread(self) -> None:
+        """Close this thread's cached connection, if it opened one.
+
+        The cache is per thread, so a thread spawner that outlives its work (a per-connection HTTP
+        request thread) must hand the connection back when it is done: every connection holds the
+        database, WAL and shared-memory file descriptors open, and a cache entry that is never
+        released is a file-descriptor leak that ends in ``EMFILE`` for the whole process.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        self._local.conn = None
+        with self._connections_lock:
+            try:
+                self._connections.remove(conn)
+            except ValueError:  # pragma: no cover - already dropped by close()
+                pass
+        try:
+            conn.close()
+        except sqlite3.Error:  # pragma: no cover - defensive
+            pass
+
     def close(self) -> None:
         """Close every connection this Store opened (all threads).
 

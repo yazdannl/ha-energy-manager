@@ -1115,6 +1115,45 @@ def test_real_http_round_trip():
         app.stop()
 
 
+def test_request_threads_do_not_leak_store_connections(tmp_path):
+    """A per-connection API thread must hand its SQLite connection back (EMFILE, 0.37.4).
+
+    ``ThreadingHTTPServer`` runs one thread per client connection while the store caches one
+    connection per thread, so an unreleased cache entry leaks the database/WAL descriptors: the
+    live add-on hit ``EMFILE`` after a few hundred requests, which took the UI down and made every
+    unguarded store read fail.  30 requests here are enough to show growth of a descriptor each.
+    """
+    if not os.path.isdir("/proc/self/fd"):  # pragma: no cover - the add-on runs on Linux
+        pytest.skip("needs /proc/self/fd")
+    from app.store import Store
+
+    store = Store(tmp_path / "store.db")
+
+    class StoreEngine(FakeEngine):
+        @property
+        def store(self):
+            return store
+
+        def snapshot(self):
+            store.connection.execute("SELECT 1").fetchone()  # a store read on every request
+            return super().snapshot()
+
+    store.release_thread()
+    app = ApiServer(StoreEngine(), host="127.0.0.1", port=0)
+    before = len(os.listdir("/proc/self/fd"))
+    app.start()
+    try:
+        base = f"http://127.0.0.1:{app.address[1]}"
+        for _ in range(30):
+            with urllib.request.urlopen(base + "/api/v1/health", timeout=10) as response:
+                assert response.status == 200
+    finally:
+        app.stop()
+    leaked = len(os.listdir("/proc/self/fd")) - before
+    assert leaked <= 5, f"{leaked} descriptors leaked over 30 requests"
+    assert len(store._connections) == 0, "a finished request thread kept its SQLite connection"
+
+
 def test_settings_meta_matches_the_frozen_spec_keys():
     """Every frozen SPEC 3 key is advertised (and nothing else is, see the DEFAULTS test)."""
     defaults = default_settings()

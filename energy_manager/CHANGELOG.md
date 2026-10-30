@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.37.4
+
+- **Fix: the API no longer leaks one SQLite connection (and two or three descriptors) per served
+  connection.** `ThreadingHTTPServer` runs one thread per client connection and the store caches one
+  connection per thread in a list that outlives the thread, so every request that touched the store
+  left a database + WAL + shared-memory descriptor open for the life of the process. After a few
+  hundred requests the add-on hit its descriptor limit: static assets failed with `EMFILE` (the UI
+  would not load) and the unguarded store reads behind `/health`, `/status` and `/forecast` raised
+  `sqlite3.OperationalError`, while the fail-soft routes quietly answered with empty data. The
+  request thread now hands its connection back when the client connection ends
+  (`Store.release_thread`), so the cache is bounded by the concurrent connections instead of by the
+  request count. Live 2026-10-30: the deployed instance was in that state (`No file descriptors
+  available` on `/app/app/web/index.html`, `OperationalError` on `/health`), reproduced locally at
+  a low descriptor limit, and fixed by this release.
+
 ## 0.37.3
 
 - **Fix: the pack's reported capacity keeps its own value through the plan-scale rescale.** 0.37.2's

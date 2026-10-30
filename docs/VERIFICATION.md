@@ -6,8 +6,8 @@ supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figur
 revisions described pre-audit trees and are obsolete.
 
 Verification was local and hardware-free: no real battery, no live provider call, no instance data.
-0.37.1, 0.37.2 and 0.37.3 were deployed to the live instance and verified there (see §8.35 and
-§8.36); the release gates below were repeated from a clean checkout; optional native C-core tests
+0.37.1, 0.37.2, 0.37.3 and 0.37.4 were deployed to the live instance and verified there (see §8.35,
+§8.36 and §8.37); the release gates below were repeated from a clean checkout; optional native C-core tests
 skip when no compiled extension is present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
 `sem_*`), loopback addresses and placeholder coordinates.
 
@@ -17,7 +17,7 @@ skip when no compiled extension is present. All synthetic values use reserved na
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **1610 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension); with the local C core built: **1693 passed, 0 skipped** when the host is not saturated (the two DP-core wall-clock micro-benchmarks are host-load sensitive; see §8.36) |
+| Test suite | `python3 -m pytest tests -q` | **1611 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension); with the local C core built: **1694 tests, 1693 passed** and `test_dp_core.py::test_terminal_row_benchmark` at 20.2 ms against its 20 ms wall-clock threshold on a saturated host (it fails identically on the pre-change tree; see §8.36) |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 180 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
@@ -29,11 +29,12 @@ skip when no compiled extension is present. All synthetic values use reserved na
 
 Frozen digest of the verified artifact (recipe in §11, normative):
 
-* **code + tests (155 files, documentation excluded)**:
-  `fdb6de470ca3ea24c911f3ff5d34a66639ccad6c6585de5a963fe80d9c617e52`
-* **path list of the same 155 files** (detects an added, removed or renamed file):
-  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (unchanged from 0.37.0:
-  0.37.1-0.37.3 changed file contents only)
+* **code + tests (158 files, documentation excluded)**:
+  `57dcd6f8329839a8fa2f874e9101efc59192d50bda2f8da68d3dbead4ef15c43`
+* **path list of the same 158 files** (detects an added, removed or renamed file):
+  `c1c39364f5900a18b40e0580adbb764dbc4d2b263ba0afb9598d1ac65b959d10` (0.37.4 added no file: the
+  0.37.3 tree measured the same path list, and §8.37 explains why the earlier 155-file count is
+  superseded)
 
 Historically, the 0.10.1 tree's code + tests digest was `28fdad8a…`, 0.10.0's `784dbf04…` and
 0.9.1's `fc5f9d44…`; at that point 0.11.0 (§8.10) changed file contents only and added no file, so
@@ -2214,6 +2215,53 @@ them, so the plan ran the documented no-price zero-export fallback (`sources.pla
 self_consumption`, `price = none`, and a `forecast_unavailable` journal line per replan). That is
 an integration-side outage -- the add-on's capacity scale does not depend on prices, but selling
 stays paused until the tariff list returns.
+
+---
+
+### 8.37 One SQLite connection per request thread (0.37.4)
+
+The live instance failed on 2026-10-30: every static asset answered 500
+`read_failed: [Errno 24] No file descriptors available: '/app/app/web/index.html'`, `/api/v1/health`
+and `/api/v1/status` and `/api/v1/forecast` answered 500 `internal error (OperationalError)`, and
+`/api/v1/batteries` returned an empty list, while `/plan`, `/log`, `/savings` and `/providers` still
+answered 200. The UI therefore could not load at all.
+
+The cause was a descriptor leak, not a database problem. `ApiServer` is a
+`ThreadingHTTPServer` -- one thread per client connection -- and `Store` caches one SQLite connection
+per thread, appending it to `_connections` and keeping that reference until `Store.close()`. Each
+cached connection holds the database, `-wal` and `-shm` descriptors open, so a thread that finished
+still pinned two or three descriptors for the life of the process: the cache grew with the number of
+served connections instead of with the number of live threads, and after a few hundred requests the
+process reached its descriptor limit. At that limit `open()` on a static file fails with `EMFILE`
+(the UI's 500s), an unguarded `Store.connection` raises `sqlite3.OperationalError: unable to open
+database file` (health/status/forecast, whose store reads are not fail-soft), and every fail-soft
+caller (`_store_call`, the savings/actuals readers) logs a warning and answers with empty data --
+which is exactly the mixed 500/200 pattern the instance showed.
+
+The fix is at the root: the API handler releases its thread's connection when the client connection
+ends (`Store.release_thread`, called from the request handler's `finish()`), so the cache is bounded
+by concurrent connections rather than by request count. No cap, eviction or global lock was added --
+evicting another thread's cached connection would hand that thread a closed database.
+
+Reproduced and verified locally at `RLIMIT_NOFILE=96` against the real `Store` and `ApiServer`: the
+pre-fix server went from 8 descriptors to the limit after ~75 requests, logged `unable to open
+database file` on every store read and failed the static fetch with the live `Errno 24` message; with
+the fix 200 requests keep the process at 8-12 descriptors, the store keeps no connection after a
+request, and `/health`, `/status`, `/plan`, `/log` and `/` all answer 200. One test
+(`test_request_threads_do_not_leak_store_connections`) asserts both the descriptor delta and the
+empty connection cache over 30 real socket round trips; it leaks 61 descriptors over those 30
+requests when the release is removed.
+
+Gates from the working tree: `compileall` clean, `audit: clean -- 180 files scanned`, selfcheck
+33/33, headless UI 186 passed / 0 failed, `node --check` and `sh -n` clean, and the suite at **1694
+tests, 1693 passed** with the local C core (the DP-core terminal-row benchmark measured 20.2 ms
+against its 20 ms wall-clock threshold on a host at load average ~15 and fails identically on the
+pre-change tree). The 158-file code + tests digest is `57dcd6f8...` and the path list
+`c1c39364...`; the record's previous 155-file digest `fdb6de47...` did not reproduce from the 0.37.3
+tree either (`022383b5...`), because three files were added after the value was written, so this
+release records the measured set and count.
+
+Deployed and observed live: see §8.37's deploy note below.
 
 ---
 

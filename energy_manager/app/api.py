@@ -975,6 +975,23 @@ class ApiServer:
 
     # -- request handling -------------------------------------------------------------
 
+    def release_worker_connections(self) -> None:
+        """Hand this request thread's store connection back (SPEC 11 descriptor ownership).
+
+        ``ThreadingHTTPServer`` runs one thread per client connection and the store caches one
+        SQLite connection per thread; each cached connection keeps the database, WAL and
+        shared-memory descriptors open.  The cache entry outlives the thread that made it, so
+        without this the process leaks a few descriptors per served connection and ends in
+        ``EMFILE`` (the UI stops loading, unguarded store reads fail) after a few hundred requests.
+        """
+        store = getattr(self.engine, "store", None)
+        release = getattr(store, "release_thread", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:  # pragma: no cover - a broken store must not break the reply
+                log.debug("store.release_thread failed", exc_info=True)
+
     def dispatch(self, method: str, target: str, body: bytes = b"") -> tuple[int, dict[str, str], bytes]:
         """Return ``(status, headers, body)``; never raises for a client mistake."""
         method = method.upper()
@@ -1698,5 +1715,12 @@ def _make_handler(app: ApiServer) -> type[BaseHTTPRequestHandler]:
 
         def log_message(self, fmt: str, *args: Any) -> None:
             log.debug("http %s", fmt % args)
+
+        def finish(self) -> None:
+            # One thread per client connection, so its cached store connection must not outlive it.
+            try:
+                app.release_worker_connections()
+            finally:
+                super().finish()
 
     return Handler
