@@ -762,10 +762,14 @@
   }
 
   // The exact dispatcher/Stop distinction, shared by the answer strip and the Settings help text.
-  function authorityNote(dryRun) {
+  // Mode-aware for the same reason as authorityText: Off and Advisory never write a setpoint.
+  function authorityNote(dryRun, mode) {
+    var tail = "Stop now still writes 0 W to the hardware, even in dry run.";
+    if (mode === "off") return "Off: the add-on dispatches nothing. " + tail;
+    if (mode === "advisory") return "Advisory: the plan is computed and logged, but nothing is written. " + tail;
     return dryRun
-      ? "Dry run on: the plan dispatcher writes nothing — it logs what it would send. Stop now still writes 0 W to the hardware, even in dry run."
-      : "Dry run off: the plan dispatcher writes setpoints to the batteries. Stop now still writes 0 W to the hardware.";
+      ? "Dry run on: the plan dispatcher writes nothing — it logs what it would send. " + tail
+      : "Dry run off: the plan dispatcher writes setpoints to the batteries. " + tail;
   }
 
   /* ------------------------------------------------------------------ router */
@@ -1059,12 +1063,20 @@
 
   // Who is in control, and whether the dispatcher writes (UI_REVIEW §3.1). The wording is the
   // same one the confirmation dialogs use, so the answer strip and the acknowledgement can never
-  // disagree.
+  // disagree. Dry run only matters to the dispatcher when the mode is auto: with Off or Advisory
+  // no new setpoint is written whether dry run is on or off, and saying otherwise on the answer
+  // strip is a safety-relevant lie.
   function authorityText(status) {
-    var mode = { off: "Off", advisory: "Advisory", auto: "Auto" }[status.mode] || String(status.mode || "unknown");
-    return mode + " · " + (status.dry_run
-      ? "dry run: the plan dispatcher writes nothing"
-      : "dry run off: the plan dispatcher writes to the batteries");
+    var mode = status && status.mode;
+    var dry = !!(status && status.dry_run);
+    if (mode === "off") return "Off · no new commands; a setpoint written earlier may still be in force";
+    if (mode === "advisory") return "Advisory · the plan is computed and logged, nothing is written";
+    if (mode === "auto") {
+      return dry
+        ? "Auto · dry run: the plan is logged, nothing is written"
+        : "Auto · live: the add-on writes setpoints to the batteries";
+    }
+    return "Mode unknown · write state unknown; a setpoint from an earlier session may still be in force";
   }
 
   function batteryName(battery) {
@@ -1159,36 +1171,125 @@
         el("p", { text: issue.text })
       ]));
     });
-    draw(el("p", { class: "legend-note", text: "Last plan " + timeAgo(status.last_plan_at) + ", last tick " + timeAgo(status.last_tick_at) + ". The device has no watchdog: advisory/off and dry run stop new writes, but a setpoint written earlier in a live session stays in force — use Stop now to neutralise it (Stop writes to the hardware even in dry run)." }));
+    draw(el("div", { class: "legend-note" }, [
+      el("p", { class: "legend-note", text: "Last plan " + timeAgo(status.last_plan_at) + " · last tick " + timeAgo(status.last_tick_at) + "." }),
+      el("details", { class: "disclosure disclosure-inline" }, [
+        el("summary", { text: "No device watchdog — what that means" }),
+        el("div", { class: "disclosure-body" }, [
+          el("p", { text: "Off, Advisory and dry run stop new writes, but this device cannot undo a setpoint that was written earlier. It stays in force until Stop now or the device's own app changes it." }),
+          el("p", { text: "Stop now writes 0 W to the hardware, even in dry run." })
+        ])
+      ])
+    ]));
+  }
+
+  // Repeated log lines are one event, not N events: a stalled loop used to fill the panel with the
+  // same error every few seconds, which buried the state that matters. A group keeps the count,
+  // the first and last occurrence, and an explicit state: an active/resolved/acknowledged flag from
+  // the server wins; the scheduler's live health settles watchdog_hold; anything else is honestly
+  // labelled "status unknown" instead of looking current (UI_REVIEW §3.6).
+  function alertGroups(alerts, status) {
+    var groups = [];
+    var byKey = {};
+    (Array.isArray(alerts) ? alerts : []).forEach(function (alert) {
+      if (!alert) return;
+      var level = alert.level || "info";
+      var key = level + "\u0000" + (alert.code || "") + "\u0000" + (alert.message || "");
+      var group = byKey[key];
+      if (!group) {
+        group = byKey[key] = {
+          level: level, code: alert.code || "", message: alert.message || alert.code || "(no message)",
+          count: 0, first: null, last: null, acknowledged: true, active: false, resolved: false
+        };
+        groups.push(group);
+      }
+      group.count += 1;
+      var at = parseDate(alert.ts);
+      if (at) {
+        if (!group.first || at < group.first) group.first = at;
+        if (!group.last || at > group.last) group.last = at;
+      }
+      if (alert.acknowledged !== true) group.acknowledged = false;
+      if (alert.active === true) group.active = true;
+      if (alert.resolved === true) group.resolved = true;
+    });
+    groups.forEach(function (group) {
+      if (group.active) group.state = "active";
+      else if (group.resolved) group.state = "resolved";
+      else if (group.code === "watchdog_hold" && status && status.scheduler_healthy === true) group.state = "resolved";
+      else if (group.code === "watchdog_hold" && status && status.scheduler_healthy === false) group.state = "active";
+      else if (group.acknowledged) group.state = "acknowledged";
+      else group.state = "unknown";
+    });
+    groups.sort(function (a, b) {
+      var left = a.last ? a.last.getTime() : 0;
+      var right = b.last ? b.last.getTime() : 0;
+      return right - left;
+    });
+    return groups;
+  }
+
+  var ALERT_STATE = {
+    active: { text: "Active now", kind: "err" },
+    resolved: { text: "Resolved", kind: "ok" },
+    acknowledged: { text: "Acknowledged", kind: "info" },
+    unknown: { text: "Status unknown", kind: "unknown" }
+  };
+
+  function alertGroupItem(group) {
+    var kind = group.level === "error" ? "err" : group.level === "warning" ? "warn" : "info";
+    var state = ALERT_STATE[group.state] || ALERT_STATE.unknown;
+    var meta = [badge(group.level, kind), " "];
+    if (group.level !== "info") {
+      if (group.count > 1) meta.push("× " + group.count + " reports · ");
+      meta.push(badge(state.text, state.kind), " ");
+    }
+    meta.push(group.last ? "last " + timeAgo(group.last) : "time unknown");
+    var kids = [
+      el("p", { class: "alert-meta" }, meta),
+      el("p", { class: "wrap-anywhere", text: group.message })
+    ];
+    if (group.count > 1) {
+      kids.push(el("p", { class: "alert-meta", text: group.first && group.last
+        ? "First " + fmtDateTime(group.first) + " · last " + fmtDateTime(group.last)
+        : "Occurrences without a timestamp" }));
+    }
+    return el("li", { dataset: { level: group.level, state: group.state } }, kids);
   }
 
   function renderAlerts(body, status) {
     var alerts = Array.isArray(status.alerts) ? status.alerts : [];
-    var actionable = alerts.filter(function (alert) { return (alert.level || "info") !== "info"; });
-    var activity = alerts.filter(function (alert) { return (alert.level || "info") === "info"; });
+    var groups = alertGroups(alerts, status);
+    var actionable = groups.filter(function (group) { return group.level !== "info"; });
+    var activity = groups.filter(function (group) { return group.level === "info"; });
+    // The scheduler's health is a live fact, so it gets a current banner even when the matching log
+    // line is old: the panel must never look calm while the loop is not running.
+    if (status && status.scheduler_healthy === false) {
+      body.appendChild(el("div", { class: "banner banner-error", dataset: { activeProblem: "1" } }, [
+        el("p", { class: "banner-title", text: "The control loop is not running" }),
+        el("p", { text: "The scheduler reports that it cannot apply the plan right now. The last log entries are listed below; check the Log view for the current cause." })
+      ]));
+    }
     if (!actionable.length) {
-      body.appendChild(el("p", { class: "muted", text: "No warnings or errors." }));
+      if (!(status && status.scheduler_healthy === false)) {
+        body.appendChild(el("p", { class: "muted", text: "No warnings or errors." }));
+      }
     } else {
+      var active = actionable.filter(function (group) { return group.state === "active"; }).length;
+      var unknown = actionable.filter(function (group) { return group.state === "unknown"; }).length;
+      var summary = actionable.length + " distinct issue" + (actionable.length === 1 ? "" : "s");
+      if (active) summary += " · " + active + " active now";
+      if (unknown) summary += " · " + unknown + " with status unknown";
+      body.appendChild(el("p", { class: "legend-note", text: summary + "." }));
       var list = el("ul", { class: "alert-list" });
-      actionable.forEach(function (alert) {
-        var level = alert.level || "warning";
-        list.appendChild(el("li", { dataset: { level: level } }, [
-          el("p", { class: "alert-meta" }, [badge(level, level === "warning" ? "warn" : "err"), " ", fmtDateTime(alert.ts), " (", timeAgo(alert.ts), ")"]),
-          el("p", { class: "wrap-anywhere", text: alert.message || alert.code || "(no message)" })
-        ]));
-      });
+      actionable.forEach(function (group) { list.appendChild(alertGroupItem(group)); });
       body.appendChild(list);
     }
     // Routine informational events ("a new plan was published") are activity history, not alerts.
     if (activity.length) {
       var details = el("details", { class: "disclosure" }, [el("summary", { text: "Recent activity (" + activity.length + ")" })]);
       var items = el("ul", { class: "alert-list" });
-      activity.forEach(function (alert) {
-        items.appendChild(el("li", { dataset: { level: "info" } }, [
-          el("p", { class: "alert-meta" }, [badge("info", "info"), " ", fmtDateTime(alert.ts), " (", timeAgo(alert.ts), ")"]),
-          el("p", { class: "wrap-anywhere", text: alert.message || alert.code || "(no message)" })
-        ]));
-      });
+      activity.forEach(function (group) { items.appendChild(alertGroupItem(group)); });
       details.appendChild(items);
       body.appendChild(details);
     }
@@ -1773,6 +1874,7 @@
       });
     });
     controls.appendChild(stop);
+    controls.appendChild(el("p", { class: "field-help", text: "Stop sends 0 W to the hardware, even when dry run is on. It is the only control that neutralises a setpoint written earlier." }));
 
     dryBox = el("input", { type: "checkbox", id: "dry-run-toggle", checked: true });
     var dryLabel = el("label", { class: "switch-label", for: "dry-run-toggle" }, [dryBox, " Dry run (the plan dispatcher writes nothing)"]);
@@ -1813,7 +1915,7 @@
         modeToolbar,
         confirmed,
         el("p", { class: "field-help", text: "Routine mode editing lives here; Stop now stays in the status strip above." }),
-        el("p", { class: "field-help", text: authorityNote(data.status ? data.status.dry_run : true) })
+        el("p", { class: "field-help", text: authorityNote(data.status ? data.status.dry_run : true, data.status ? data.status.mode : null) })
       ])
     ]);
     controls.appendChild(controlDisclosure);
@@ -2837,7 +2939,70 @@
     }
 
     routeTitle(host, "Plan", "What the optimiser intends to do with the batteries, and why.");
-    var controls = panel(host, "Plan controls");
+    // The answer first: the next action and its reason, then the summary and any warning. Controls
+    // used to sit above all of this, so a phone user saw Recompute before the plan (UI_REVIEW §3.7).
+    addPanel("Next actions", function (body, data) {
+      renderPlanWindows(body, data.plan, data.execution, planWindowContext(data));
+    });
+    addPanel("Plan summary", renderPlanSummary);
+    addPanel("Plan warnings", function (body, data) {
+        var plan = data.plan;
+        var info = planFlags(plan);
+        if (!info.flags.length) body.appendChild(el("p", { class: "muted", text: "No feasibility warnings. " + (info.sources.length ? "Sources — " + info.sources.join(", ") + "." : "") }));
+        info.flags.forEach(function (flag) {
+          body.appendChild(el("div", { class: "banner banner-" + (flag.level === "error" ? "error" : "warn") }, [
+            el("p", { class: "banner-title", text: flag.title }), el("p", { text: flag.text })
+          ]));
+        });
+        body.appendChild(el("p", { class: "legend-note", text: "Plan generated " + timeAgo(plan.generated_at) + " for " + fmtDateTime(plan.horizon_start) + " – " + fmtDateTime(plan.horizon_end) + "." }));
+    });
+
+    // Simple is the default: on a phone the full five-series price chart is harder to read than the
+    // next-actions list above it. Detailed restores every series, and the choice persists.
+    var timelineSimple = readStored("sem.timeline.simple", true) !== false;
+    var timeline = asyncPanel(host, "Timeline", {
+      load: load,
+      render: function (body, data) {
+        var plan = data.plan;
+        var chart = el("div", { class: "chart chart-md" });
+        body.appendChild(chart);
+        var efficiency = planEfficiency(plan.summary);
+        var planWear = isNum(plan.summary && plan.summary.wear_eur_per_kwh)
+          ? plan.summary.wear_eur_per_kwh
+          : (isNum(data.cycleCost) ? data.cycleCost : 0);
+        root.SEMCharts.plan(chart, plan, { wear: planWear, efficiency: efficiency, simple: timelineSimple });
+        body.appendChild(el("p", { class: "legend-note", text: timelineSimple
+          ? "Simple view: buy price and charge level. Switch to Detailed for sell price, stale-price slots and the break-even line."
+          : (efficiency
+              ? "A slot whose sale price sits below the dotted break-even line would lose money, which is why it stays idle with reason “efficiency_loss”; the exact figures are in All slots."
+              : "The break-even after round-trip loss line is unavailable for this plan: the summary carries no aggregate efficiency.") }));
+      }
+    });
+    panels.push(timeline);
+    var simpleBtn = button("Simple", "");
+    var detailBtn = button("Detailed", "");
+    function syncTimelineMode() {
+      simpleBtn.setAttribute("aria-pressed", timelineSimple ? "true" : "false");
+      detailBtn.setAttribute("aria-pressed", timelineSimple ? "false" : "true");
+    }
+    simpleBtn.addEventListener("click", function () {
+      timelineSimple = true;
+      writeStored("sem.timeline.simple", true);
+      syncTimelineMode();
+      timeline.reload();
+    });
+    detailBtn.addEventListener("click", function () {
+      timelineSimple = false;
+      writeStored("sem.timeline.simple", false);
+      syncTimelineMode();
+      timeline.reload();
+    });
+    syncTimelineMode();
+    timeline.head.appendChild(el("div", { class: "segmented", role: "group", "aria-label": "Chart detail" }, [simpleBtn, detailBtn]));
+
+    // Settings and exports are deliberate actions, so they follow the plan they act on. Exports
+    // live behind one disclosure instead of two buttons competing with Recompute.
+    var controls = panel(host, "Plan settings");
     var select = el("select", { id: "plan-horizon" });
     [12, 24, 36, 48].forEach(function (h) {
       var option = el("option", { value: h, text: h + " hours" });
@@ -2869,42 +3034,19 @@
     });
     controls.body.appendChild(el("div", { class: "toolbar" }, [
       el("label", { for: "plan-horizon" }, ["Horizon ", select]),
-      recompute,
-      el("a", { class: "btn", href: apiPath("/export", { what: "plan", format: "json" }), text: "Export JSON" }),
-      el("a", { class: "btn", href: apiPath("/export", { what: "plan", format: "csv" }), text: "Export CSV" })
+      recompute
     ]));
-    controls.body.appendChild(el("p", { class: "legend-note", text: "Exports download from the add-on directly (no data leaves your instance)." }));
+    controls.body.appendChild(el("details", { class: "disclosure" }, [
+      el("summary", { text: "Export the plan" }),
+      el("div", { class: "disclosure-body" }, [
+        el("div", { class: "toolbar" }, [
+          el("a", { class: "btn", href: apiPath("/export", { what: "plan", format: "json" }), text: "Export JSON" }),
+          el("a", { class: "btn", href: apiPath("/export", { what: "plan", format: "csv" }), text: "Export CSV" })
+        ]),
+        el("p", { class: "legend-note", text: "Exports download from the add-on directly (no data leaves your instance)." })
+      ])
+    ]));
 
-    addPanel("Plan warnings", function (body, data) {
-        var plan = data.plan;
-        var info = planFlags(plan);
-        if (!info.flags.length) body.appendChild(el("p", { class: "muted", text: "No feasibility warnings. " + (info.sources.length ? "Sources — " + info.sources.join(", ") + "." : "") }));
-        info.flags.forEach(function (flag) {
-          body.appendChild(el("div", { class: "banner banner-" + (flag.level === "error" ? "error" : "warn") }, [
-            el("p", { class: "banner-title", text: flag.title }), el("p", { text: flag.text })
-          ]));
-        });
-        body.appendChild(el("p", { class: "legend-note", text: "Plan generated " + timeAgo(plan.generated_at) + " for " + fmtDateTime(plan.horizon_start) + " – " + fmtDateTime(plan.horizon_end) + "." }));
-    });
-
-    addPanel("Timeline", function (body, data) {
-        var plan = data.plan;
-        var chart = el("div", { class: "chart chart-md" });
-        body.appendChild(chart);
-        var efficiency = planEfficiency(plan.summary);
-        var planWear = isNum(plan.summary && plan.summary.wear_eur_per_kwh)
-          ? plan.summary.wear_eur_per_kwh
-          : (isNum(data.cycleCost) ? data.cycleCost : 0);
-        root.SEMCharts.plan(chart, plan, { wear: planWear, efficiency: efficiency });
-        body.appendChild(el("p", { class: "legend-note", text: efficiency
-          ? "A slot whose sale price sits below the dotted break-even line would lose money, which is why it stays idle with reason “efficiency_loss”; the exact figures are in All slots."
-          : "The break-even after round-trip loss line is unavailable for this plan: the summary carries no aggregate efficiency." }));
-    });
-
-    addPanel("Plan summary", renderPlanSummary);
-    addPanel("Next actions", function (body, data) {
-      renderPlanWindows(body, data.plan, data.execution, planWindowContext(data));
-    });
     addPanel("All slots", function (body, data) { renderPlanSlots(body, data.plan); });
     var historyCache = null;
     var historyPanel = asyncPanel(host, "Plan history", {
@@ -5634,17 +5776,42 @@
           ? "unknown — no sampled interval in these periods could be re-priced against a baseline"
           : "unknown — no measured activity in this range yet")
       : "";
+    // The three headline figures must share one scope: the same re-priced periods and the same net
+    // basis. Comparing a covered-period baseline with the whole-range gross import cost cannot add
+    // up, however each figure is labelled on its own (UI_REVIEW §3.6).
+    var baselineSum = covered.length ? covered.reduce(function (sum, b) { return sum + (b.baseline_cost_eur || 0); }, 0) : null;
+    // A covered bucket can still lack a saving (an older payload): never turn that into a zero.
+    var savingsSum = covered.length ? covered.reduce(function (sum, b) { return sum + (isNum(b.savings_eur) ? b.savings_eur : NaN); }, 0) : null;
+    if (savingsSum != null && !isFinite(savingsSum)) savingsSum = null;
+    if (baselineSum == null && baselineKnown) baselineSum = t.baseline_cost_eur;
+    if (savingsSum == null && savingsKnown) savingsSum = t.savings_eur;
+    var netSum = baselineSum != null && savingsSum != null ? baselineSum - savingsSum : null;
+    var comparableKnown = baselineSum != null && savingsSum != null;
+    var scope = coveragePct == null ? "" : " over " + coveragePct + "% of the sampled time";
     // Loss, unknown and stale are three different states and never share one visual treatment
     // (UI_REVIEW §3.6).
     function savingsCard() {
-      if (!savingsKnown) return statCard("Savings", "--", reason, "unknown");
-      if (t.savings_eur < 0) return statCard("Savings", fmtEur(t.savings_eur), coveragePct == null ? "a loss: the battery cost more than doing nothing" : "a loss over " + coveragePct + "% of the sampled time: the battery cost more than doing nothing", "loss");
-      return statCard("Savings", fmtEur(t.savings_eur), coveragePct == null ? "baseline minus actual (net)" : "baseline minus actual (net), over " + coveragePct + "% of the sampled time", false);
+      if (!comparableKnown) return statCard("Savings", "--", reason, "unknown");
+      if (savingsSum < 0) return statCard("Savings", fmtEur(savingsSum), "a loss" + scope + ": the battery cost more than doing nothing", "loss");
+      return statCard("Savings", fmtEur(savingsSum), "baseline minus actual (net)" + scope, false);
     }
-    var cards = el("div", { class: "cards" }, [
+    // Time coverage first: it is the scope of the number, not a caveat to hide at the bottom.
+    if (comparableKnown && coveragePct != null && coveragePct < 100) {
+      body.appendChild(el("div", { class: "banner banner-info" }, [
+        el("p", { class: "banner-title", text: "Savings cover " + coveragePct + "% of the sampled time" }),
+        el("p", { text: "The baseline and the saving add up interval by interval: " + fmtHours(coveredHours) + " of " + fmtHours(sampledHours) + " had enough measured data to compare. An interval without a confirmed meter reading, battery flow or price is left out of both sides instead of guessed, so the figure stays exact for the time it covers." + legacyNote() })
+      ]));
+    }
+    body.appendChild(el("h3", { class: "group-title", text: "Comparable over the covered periods" }));
+    body.appendChild(el("div", { class: "cards" }, [
       savingsCard(),
+      statCard("Baseline cost", baselineSum == null ? "--" : fmtEur(baselineSum), baselineSum == null ? reason : "same load and tariffs, battery idle (net), same periods", baselineSum == null ? "unknown" : false),
+      statCard("Actual net cost", netSum == null ? "--" : fmtEur(netSum), netSum == null ? "unknown — the matched baseline is missing" : "import cost minus export revenue, same periods", netSum == null ? "unknown" : false)
+    ]));
+    body.appendChild(el("p", { class: "legend-note", text: "These three use the same measured periods, so they compare directly: baseline − actual net cost = saving." }));
+    body.appendChild(el("h3", { class: "group-title", text: "All metered activity" }));
+    body.appendChild(el("div", { class: "cards" }, [
       statCard("Import cost", fmtEur(t.cost_eur), "metered intervals, before export revenue"),
-      statCard("Baseline cost", fmtEur(t.baseline_cost_eur), baselineKnown ? "same load and tariffs, battery idle (net)" : reason, baselineKnown ? false : "unknown"),
       statCard("Import", fmtKwh(t.import_kwh), "from the grid"),
       statCard("Export", fmtKwh(t.export_kwh), "to the grid"),
       statCard("PV", fmtKwh(t.pv_kwh), "produced"),
@@ -5654,21 +5821,13 @@
         isNum(t.discharged_kwh) ? "measured discharge ÷ pack capacity" : "unknown: no confirmed battery measurement",
         isNum(t.discharged_kwh) ? false : "unknown"
       )
-    ]);
-    body.appendChild(cards);
-    // Time coverage first: it is the scope of the number, not a caveat to hide at the bottom.
-    if (savingsKnown && coveragePct != null && coveragePct < 100) {
-      body.appendChild(el("div", { class: "banner banner-info" }, [
-        el("p", { class: "banner-title", text: "Savings cover " + coveragePct + "% of the sampled time" }),
-        el("p", { text: "The baseline and the saving add up interval by interval: " + fmtHours(coveredHours) + " of " + fmtHours(sampledHours) + " could be re-priced. An interval without a confirmed meter reading, battery flow or price is left out of both sides of the comparison instead of guessed, so the figure stays exact for the time it covers." + legacyNote() })
-      ]));
-    }
+    ]));
     // Coverage first: a partial baseline is scope, not a total (UI_REVIEW §3.6).
     var missing = withData.length - covered.length;
     if (withData.length && covered.length && covered.length < withData.length) {
       body.appendChild(el("div", { class: "banner banner-warn" }, [
         el("p", { class: "banner-title", text: "Baseline available for " + covered.length + " of " + withData.length + " measured periods" }),
-        el("p", { text: missing + " measured period" + (missing === 1 ? " has" : "s have") + " no sampled interval that could be re-priced against a baseline (the meter, the realized load or the price was missing), so " + (missing === 1 ? "its" : "their") + " cost is not part of the comparison — the whole-range import/export/PV figures below still cover every metered interval." })
+        el("p", { text: missing + " measured period" + (missing === 1 ? " has" : "s have") + " no sampled interval that could be re-priced against a baseline (the meter, the realized load or the price was missing), so " + (missing === 1 ? "its" : "their") + " cost is not part of the comparison — the whole-range import/export/PV figures in All metered activity still cover every metered interval." })
       ]));
     }
     if (buckets.length && withData.length < buckets.length) {
@@ -5680,18 +5839,6 @@
         el("p", { class: "banner-title", text: "Baseline and savings are unknown for this range" }),
         el("p", { text: "The server reports null because the realised load for these periods could not be re-priced against a do-nothing baseline. Unknown is not zero: the add-on will not guess a saving. Periods that are knowable are still summed and shown." })
       ]));
-    }
-    // Comparable figures: baseline and actual net cost over the same covered periods.  The actual
-    // net cost of those periods is baseline − savings, which stays exact even when a bucket also
-    // contains rows that could not be re-priced (a month in the year/all range).
-    if (covered.length) {
-      var baselineSum = covered.reduce(function (sum, b) { return sum + (b.baseline_cost_eur || 0); }, 0);
-      var netSum = covered.reduce(function (sum, b) { return sum + (b.baseline_cost_eur - (b.savings_eur || 0)); }, 0);
-      body.appendChild(el("ul", { class: "stat-row" }, [
-        el("li", null, [el("span", { class: "stat-label", text: "Baseline cost (covered periods)" }), el("span", { class: "stat-value", text: fmtEur(baselineSum) })]),
-        el("li", null, [el("span", { class: "stat-label", text: "Actual net cost (same periods)" }), el("span", { class: "stat-value", text: fmtEur(netSum) })])
-      ]));
-      body.appendChild(el("p", { class: "legend-note", text: "Actual net cost is import cost minus export revenue over the same covered periods, so the two figures are comparable; the whole-range import/export/PV figures above are kept separately labelled." }));
     }
     if (isNum(t.arbitrage_kwh) || isNum(t.self_consumption_kwh)) {
       body.appendChild(el("ul", { class: "stat-row" }, [
@@ -5737,7 +5884,7 @@
     body.appendChild(el("div", { class: "banner banner-info" }, [
       el("p", { class: "banner-title", text: "How the baseline is defined" }),
       el("p", { text: payload.baseline_note || BASELINE_FALLBACK }),
-      el("p", { class: "legend-note", text: "The baseline is a do-nothing net cost: import cost minus export revenue for the same realised load, PV and tariff with no battery flows. It is a counterfactual re-pricing of the same kWh, not a measured bill change." })
+      el("p", { class: "legend-note", text: "The baseline is what the same energy would have cost without the battery: import cost minus export revenue for the same measured load, PV and tariff. It is an estimate of the alternative, not a bill change." })
     ]));
   }
 
@@ -5780,7 +5927,7 @@
     var range = ranges.indexOf(query.range) >= 0 ? query.range : "month";
     var load = once(function () { return get("/savings", { range: range }); });
 
-    routeTitle(host, "Savings", "Counterfactual saving against doing nothing — an estimate, not a bill change.");
+    routeTitle(host, "Savings", "Estimated saving compared with not using the battery — an estimate, not a bill change.");
     var controls = panel(host, "Savings range");
     var select = el("select", { id: "savings-range" });
     ranges.forEach(function (r) {
@@ -5790,7 +5937,7 @@
     });
     select.addEventListener("change", function () { root.location.hash = "#/savings?range=" + select.value; });
     controls.body.appendChild(el("div", { class: "toolbar" }, [el("label", { for: "savings-range" }, ["Range ", select])]));
-    controls.body.appendChild(el("p", { class: "legend-note", text: "Savings are computed from the stored actuals and the same prices, so trimming history never changes them. Baseline and savings are null (shown as --) when the realised load cannot be re-priced: there is no load/PV reading and no meter + battery pair to derive it from. Measured battery flows count only confirmed measurements — a dry-run, blocked or unconfirmed setpoint earns nothing." }));
+    controls.body.appendChild(el("p", { class: "legend-note", text: "Savings come from the stored measurements and the same prices, so trimming history never changes them. Baseline and savings show -- when the stored energy use cannot be compared: there is no load/PV reading and no meter + battery pair to derive it from. Measured battery flows count only confirmed measurements — a dry-run, blocked or unconfirmed setpoint earns nothing." }));
 
     asyncPanel(host, "Totals", { load: load, render: renderSavingsTotals });
     asyncPanel(host, "Savings vs baseline", {
@@ -6152,7 +6299,7 @@
   // dispatcher/Stop distinction here — the same wording the Dashboard answer strip uses
   // (UI_REVIEW §3.3).
   var KEY_HELP = {
-    mode: "off = no dispatch; advisory = plan and log but never write; auto = the plan dispatcher writes setpoints. Advisory and off stop new writes, but a setpoint already written is only neutralised by Stop now (a real write, even in dry run).",
+    mode: "off = no control; advisory = plan and log but never write; auto = the add-on writes setpoints. Advisory and off stop new writes, but a setpoint already written is only neutralised by Stop now (a real write, even in dry run).",
     dry_run: "On: the plan dispatcher writes nothing — it logs what it would send. Stop now still writes 0 W to the hardware, even in dry run."
   };
 
@@ -6948,9 +7095,9 @@
       return el("div", { class: "banner banner-safety" }, [
         el("p", { class: "banner-title", text: "Safety summary" }),
         el("p", {}, [
-          "Control authority: ",
-          el("strong", { text: modeText + (dry ? " · dry run on" : " · dry run off") }),
-          " — " + authorityNote(!!dry)
+          "In control: ",
+          el("strong", { text: modeText + (mode === "auto" ? (dry ? " · dry run on" : " · dry run off") : "") }),
+          " — " + authorityNote(!!dry, mode)
         ]),
         el("p", { class: "banner-actions" }, [
           hasSafety ? (function () {
@@ -7470,6 +7617,9 @@
     normalizeRoute: normalizeRoute,
     reasonText: reasonText,
     actionText: actionText,
+    alertGroups: alertGroups,
+    authorityText: authorityText,
+    authorityNote: authorityNote,
     forecastEmptyState: forecastEmptyState,
     priceFieldVisibility: priceFieldVisibility,
     solarFieldVisibility: solarFieldVisibility,

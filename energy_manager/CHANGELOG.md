@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.37.5
+
+- **Fix: the control-authority line no longer claims the dispatcher writes in Off or Advisory.**
+  Dry run only gates writes in Auto, so the old text ("dry run off: the plan dispatcher writes to
+  the batteries") contradicted Off/Advisory. The answer strip and the Settings safety summary now
+  derive their wording from mode *and* dry run, including the explicit earlier-setpoint warning.
+- **Fix: repeated alerts no longer bury the current state.** Identical lines group into one row with
+  a report count and first/last time, and each group is labelled Active now, Resolved, Acknowledged
+  or Status unknown. A watchdog-hold alert follows the live `scheduler_healthy` flag, and an
+  unhealthy scheduler adds a current banner above the historical entries.
+- **Fix: Savings headlines now compare like with like.** Coverage is stated first, then Savings,
+  Baseline cost and Actual net cost are computed over the same covered periods; whole-range import,
+  export, PV and cycle figures moved to a separate "All metered activity" group.
+- **Fix: the Plan answer comes before its controls.** Next actions, summary and warnings precede the
+  timeline and settings; exports sit behind one "Export the plan" disclosure instead of competing
+  with Recompute.
+- **Fix: the plan timeline defaults to a readable Simple view** (buy price and charge level), with a
+  persisted Detailed view for sell price, stale slots and break-even. Time ticks use locale dates
+  ("Fri 30 Oct") instead of uPlot's US slashes and 12am labels.
+- **Fix: safety prose is scannable.** The watchdog paragraph is a compact disclosure, and Stop now
+  carries its "writes 0 W even in dry run" warning directly beside the button.
+- **Fix: the phone header is one compact row.** The theme control moved to the footer preference
+  row, and route headings/nav spacing tighten below 480 px.
+- **Fix: primary labels use plain language** ("estimated saving compared with not using the battery",
+  "In control", "had enough measured data to compare") while technical detail stays available.
+
 ## 0.37.4
 
 - **Fix: the API no longer leaks one SQLite connection (and two or three descriptors) per served

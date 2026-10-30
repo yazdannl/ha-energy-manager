@@ -1,5 +1,5 @@
 name: Smart Energy Manager
-version: 0.37.4
+version: 0.37.5
 slug: energy_manager
 description: Plans and optionally executes battery dispatch to cut electricity cost from dynamic prices, solar forecasts and a learned load profile.
 url: https://github.com/yazdannl/ha-energy-manager

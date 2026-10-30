@@ -1672,12 +1672,12 @@
       },
       pending_holds: db.pendingHolds.slice(),
       mode_persisted: db.modePersisted,
-      alerts: [
+      alerts: Array.isArray(db.alerts) ? db.alerts : [
         { ts: iso(Date.now() - 600000), level: "warning", code: "forecast_unavailable", message: "Example alert: solar forecast provider returned no slots; using cache.", detail: { source: "capacity" }, acknowledged: false },
         { ts: iso(Date.now() - 3600000), level: "info", code: "plan_changed", message: "Example alert: a new plan was published.", detail: {}, acknowledged: false }
       ],
       provider_status: providers.solar.concat(providers.price, providers.load),
-      scheduler_healthy: true
+      scheduler_healthy: db.schedulerHealthy !== false
     };
   }
 
@@ -1997,6 +1997,16 @@
     setSafetyState: function (pending, persisted) {
       db.pendingHolds = Array.isArray(pending) ? pending.slice() : [];
       db.modePersisted = persisted !== false;
+      return statusPayload();
+    },
+    // Render-check hooks for the alert panel: repeated lines must group, and a live scheduler
+    // failure must be a current banner, not one more historical log row.
+    setSchedulerHealth: function (ok) {
+      db.schedulerHealthy = ok !== false;
+      return statusPayload();
+    },
+    setAlerts: function (alerts) {
+      db.alerts = Array.isArray(alerts) ? alerts.slice() : null;
       return statusPayload();
     }
   };

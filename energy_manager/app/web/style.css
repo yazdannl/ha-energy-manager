@@ -1476,6 +1476,22 @@ h1.route-title:focus { outline: none; }
 
 .footer-help p { max-width: 70ch; margin: var(--sp-1) 0 0; font-size: var(--type-12); }
 .footer-help[hidden] { display: none; }
+.footer-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; }
+
+/* ---------- scannable groups, alert state, inline disclosure ---------- */
+
+.group-title {
+  margin: var(--sp-3) 0 0;
+  font-size: var(--type-13);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.group-title:first-child { margin-top: 0; }
+.badge-unknown { border-color: var(--border); color: var(--text-muted); }
+.alert-list li[data-state="active"] { background: color-mix(in srgb, var(--danger) 6%, transparent); }
+.disclosure-inline > summary { min-height: 2.75rem; font-size: var(--type-12); }
+.disclosure-inline .disclosure-body { padding: var(--sp-2) 0 0; }
 
 /* ---------- compact topbar ---------- */
 
@@ -1523,6 +1539,14 @@ td, th { padding: var(--sp-2); }
 @media (max-width: 480px) {
   .btn { min-height: 2.75rem; }
   #nav .nav-primary a { min-height: 2.75rem; }
+  /* One compact header row: Home Assistant already names the add-on, so the brand shrinks to a
+     label instead of wrapping above the connection chip. Theme lives in the footer. */
+  .topbar { flex-wrap: wrap; gap: var(--sp-1) var(--sp-2); padding: var(--sp-1) var(--sp-2); }
+  .brand-title { font-size: var(--type-13); }
+  .conn { font-size: var(--type-12); padding: 0.1rem 0.45rem; }
+  h1.route-title { font-size: var(--type-22); margin: 0; }
+  .route-sub { font-size: var(--type-13); margin-top: 0; }
+  main { padding-top: var(--sp-2); }
 }
 
 /* ---------- cards inside panels ---------- */

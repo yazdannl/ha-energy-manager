@@ -326,12 +326,40 @@
     };
   }
 
+  // Locale-aware ticks. uPlot's default mixed US-style dates ("10/30/26") with EUR units and
+  // a 12-hour clock; the first tick of each local day now carries the date and every other tick
+  // the local time, so a 36 h plan reads in the same locale as the rest of the page.
+  function timeTickValues(u, splits, axisIdx, foundSpace) {
+    var previousDay = null;
+    // On a narrow axis (a phone, four ticks) the weekday pushes labels into each other; drop it
+    // and keep the day + month, which is what tells two days apart.
+    var compact = typeof foundSpace === "number" && foundSpace > 0 && foundSpace < 78;
+    return (splits || []).map(function (value) {
+      var d = new Date(value * 1000);
+      if (!isFinite(d.getTime())) return "";
+      var day = d.toDateString();
+      var newDay = day !== previousDay;
+      previousDay = day;
+      try {
+        if (newDay || d.getHours() === 0) {
+          return d.toLocaleDateString([], compact
+            ? { day: "numeric", month: "short" }
+            : { weekday: "short", day: "numeric", month: "short" });
+        }
+        return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      } catch (err) {
+        return d.toISOString().slice(0, 16).replace("T", " ");
+      }
+    });
+  }
+
   function timeAxis(p) {
     return {
       stroke: p.axis, font: "11px system-ui, sans-serif", size: 42,
       grid: { show: false },
       ticks: { stroke: p.grid, width: 1 },
-      border: { stroke: p.grid, width: 1 }
+      border: { stroke: p.grid, width: 1 },
+      values: timeTickValues
     };
   }
 
@@ -596,31 +624,38 @@
       return function (u, v) { return fmt(v, digits, unit); };
     };
 
+    var simple = options.simple === true;
     var seriesA = [
       {},
       Object.assign(line(p.price), {
         label: "Buy price", scale: "y", paths: barsPath(),
         fill: gradientFill(p.price, 0.95, 0.45), value: unitFmt(4, "EUR/kWh")
-      }),
-      {
-        label: "Stale price slot", scale: "y", paths: barsPath(), stroke: p.stale,
-        fill: withAlpha(p.stale, 0.9), width: 0, points: { show: false },
-        value: function (u, v) { return v == null ? "fresh" : "stale"; }
-      },
-      Object.assign(line(p.sell, true), { label: "Sell price (long dashes)", scale: "y", value: unitFmt(4, "EUR/kWh") })
+      })
     ];
-    var dataA = [xs, buy, staleBuy, sell];
-    if (showBreakEven) {
-      seriesA.push(Object.assign(thresholdLine(p.breakEven), {
-        label: "Break-even (dotted)", scale: "y",
-        value: unitFmt(4, "EUR/kWh")
-      }));
-      dataA.push(breakEven);
-    }
-    seriesA.push(Object.assign(line(p.soc), { label: "Charge level", scale: "soc", value: unitFmt(1, "%") }));
-    dataA.push(soc);
-    if (!priced) {
-      seriesA = [seriesA[0], seriesA[seriesA.length - 1]];
+    var dataA = [xs, buy];
+    if (priced) {
+      // The phone default keeps the two series a decision needs (buy price and charge level);
+      // Detailed restores the sell price, the stale-price bars and the break-even line.
+      if (!simple) {
+        seriesA.push({
+          label: "Stale price slot", scale: "y", paths: barsPath(), stroke: p.stale,
+          fill: withAlpha(p.stale, 0.9), width: 0, points: { show: false },
+          value: function (u, v) { return v == null ? "fresh" : "stale"; }
+        });
+        seriesA.push(Object.assign(line(p.sell, true), { label: "Sell price (long dashes)", scale: "y", value: unitFmt(4, "EUR/kWh") }));
+        dataA.push(staleBuy, sell);
+        if (showBreakEven) {
+          seriesA.push(Object.assign(thresholdLine(p.breakEven), {
+            label: "Break-even (dotted)", scale: "y",
+            value: unitFmt(4, "EUR/kWh")
+          }));
+          dataA.push(breakEven);
+        }
+      }
+      seriesA.push(Object.assign(line(p.soc), { label: "Charge level", scale: "soc", value: unitFmt(1, "%") }));
+      dataA.push(soc);
+    } else {
+      seriesA = [seriesA[0], Object.assign(line(p.soc), { label: "Charge level", scale: "soc", value: unitFmt(1, "%") })];
       dataA = [xs, soc];
     }
 
@@ -638,11 +673,15 @@
     var drawA = function (el) {
       mount(el, optsA, dataA, 200, drawA,
         priced
-          ? "Plan timeline: buy and sell price, the break-even price after round-trip loss, and battery charge over the horizon."
+          ? (simple
+              ? "Plan timeline: buy price and battery charge over the horizon."
+              : "Plan timeline: buy and sell price, the break-even price after round-trip loss, and battery charge over the horizon.")
           : "Plan timeline without prices: battery charge over the horizon for a zero-export self-consumption plan (no price forecast).",
-        priced
-          ? "Price in EUR/kWh (left axis) and battery charge in % (right axis). The dotted line is the break-even after round-trip loss; below it, discharging loses money."
-          : "Battery charge in %. No price forecast is available, so this plan is not priced: the battery catches the PV surplus and serves the load down to its floor.");
+        (priced
+          ? (simple
+              ? "Price in EUR/kWh (left axis) and battery charge in % (right axis). Simple view shows buy price and charge level only."
+              : "Price in EUR/kWh (left axis) and battery charge in % (right axis). The dotted line is the break-even after round-trip loss; below it, discharging loses money.")
+          : "Battery charge in %. No price forecast is available, so this plan is not priced: the battery catches the PV surplus and serves the load down to its floor."));
     };
     drawA(host);
 
@@ -1046,6 +1085,7 @@
     destroyTree: destroyTree,
     refresh: refresh,
     setPalette: setPalette,
-    palette: palette
+    palette: palette,
+    timeTickValues: timeTickValues
   };
 })(typeof globalThis !== "undefined" ? globalThis : this);

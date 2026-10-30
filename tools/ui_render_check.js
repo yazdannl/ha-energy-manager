@@ -423,6 +423,53 @@ function classTokens(text) {
     && (byClass(view(), "answer-authority")[0] || {}).textContent === authorityBefore,
     "the authority line changed or vanished");
 
+  /* ---------- 1b1a. the authority line matches mode *and* dry run ---------- */
+  // Dry run is a dispatcher concern: Off and Advisory write nothing whether it is on or off, so the
+  // answer strip must not claim "writes to the batteries" in those modes (UI_REVIEW §3.1).
+  console.log("\n1b1a. control authority wording");
+  const auth = (mode, dry) => A.authorityText({ mode, dry_run: dry });
+  check("Off never claims a write, whatever dry run says",
+    /no new commands/.test(auth("off", false)) && !/writes setpoints|writes to the batteries/.test(auth("off", false)),
+    auth("off", false));
+  check("Advisory never claims a write",
+    /nothing is written/.test(auth("advisory", false)) && !/writes setpoints/.test(auth("advisory", false)),
+    auth("advisory", false));
+  check("Auto with dry run promises no write", /nothing is written/.test(auth("auto", true)), auth("auto", true));
+  check("Auto without dry run names the live write", /writes setpoints/.test(auth("auto", false)), auth("auto", false));
+  check("an unknown mode never guesses", /write state unknown/.test(auth("mystery", false)), auth("mystery", false));
+
+  /* ---------- 1b1c. repeated alerts and the live scheduler state ---------- */
+  // Three identical "control loop stalled" errors in a row buried the question that matters: is
+  // the loop stalled *now*? Grouping keeps one entry with a count, and the scheduler's live health
+  // decides active vs resolved; anything without a flag is honestly "status unknown".
+  console.log("\n1b1c. repeated alerts group and show a current state");
+  const repeated = [
+    { ts: new Date(Date.now() - 30000).toISOString(), level: "error", code: "watchdog_hold", message: "control loop stalled: holding", acknowledged: false },
+    { ts: new Date(Date.now() - 15000).toISOString(), level: "error", code: "watchdog_hold", message: "control loop stalled: holding", acknowledged: false },
+  ];
+  const groupedHealthy = A.alertGroups(repeated, { scheduler_healthy: true });
+  check("identical log lines become one group with a count",
+    groupedHealthy.length === 1 && groupedHealthy[0].count === 2,
+    JSON.stringify(groupedHealthy));
+  check("a watchdog alert is resolved when the scheduler is healthy again",
+    groupedHealthy[0].state === "resolved", groupedHealthy[0].state);
+  check("an unacknowledged non-watchdog alert says status unknown instead of looking current",
+    A.alertGroups([{ ts: new Date().toISOString(), level: "warning", code: "forecast_unavailable", message: "no slots", acknowledged: false }], {})[0].state === "unknown");
+
+  M.setSchedulerHealth(false);
+  M.setAlerts(repeated);
+  await goto("/dashboard");
+  const liveAlertText = allText(view());
+  check("a stalled scheduler is a current banner, not a buried log row",
+    /The control loop is not running/.test(liveAlertText), liveAlertText.slice(0, 300));
+  check("the live group is labelled Active now with its report count",
+    /Active now/.test(liveAlertText) && /× 2 reports/.test(liveAlertText), liveAlertText.slice(0, 400));
+  M.setSchedulerHealth(true);
+  M.setAlerts(null);
+  await goto("/dashboard");
+  check("an alert with no current-state flag is labelled Status unknown",
+    /Status unknown/.test(allText(view())), allText(view()).slice(0, 400));
+
   /* ---------- 1b1b. a live safety condition must not strand the dashboard (0.20.6) ---------- */
   // /status.pending_holds drives the answer's "Safety state" banner through renderAutopilot's
   // append callback. A mismatch there (the banner was handed the callback as if it were a DOM
@@ -812,6 +859,50 @@ function classTokens(text) {
     /nothing measured yet/.test(A.windowSummary(syntheticWindows, { progress: { slots_elapsed: 0, slots_total: 3, coverage_pct: 0 } })));
 
   await goto("/plan");
+  const planPanelTitles = byClass(view(), "panel").map((p) => ((p.querySelector("h2") || {}).textContent || ""));
+  check("the plan answer is the first panel, before warnings and settings",
+    planPanelTitles.slice(0, 3).join("|") === "Next actions|Plan summary|Plan warnings",
+    planPanelTitles.join(" | "));
+  check("settings and exports follow the plan they act on",
+    planPanelTitles.indexOf("Plan settings") > planPanelTitles.indexOf("Timeline")
+    && planPanelTitles.indexOf("Plan settings") < planPanelTitles.indexOf("All slots"),
+    planPanelTitles.join(" | "));
+  check("exports live behind one disclosure, not beside Recompute",
+    /Export the plan/.test(allText(view())) && /Export JSON/.test(allText(view())));
+  check("the timeline offers a simple default and a detailed view",
+    /\bSimple\b/.test(allText(view())) && /\bDetailed\b/.test(allText(view())));
+  check("the default timeline explains the simple view",
+    /Simple view: buy price and charge level/.test(allText(view())),
+    allText(view()).slice(0, 400));
+  {
+    // The offline harness has no canvas, so assert the chosen mode through its persisted state.
+    const detailButton = [...view().querySelectorAll("button")].find((b) => b.textContent === "Detailed");
+    check("the timeline has a Detailed control", !!detailButton);
+    if (detailButton) {
+      detailButton.dispatchEvent({ type: "click" });
+      await sleep(80);
+      check("choosing Detailed persists the choice", storage.get("sem.timeline.simple") === "false",
+        String(storage.get("sem.timeline.simple")));
+      const simpleButton = [...view().querySelectorAll("button")].find((b) => b.textContent === "Simple");
+      if (simpleButton) {
+        simpleButton.dispatchEvent({ type: "click" });
+        await sleep(80);
+        check("choosing Simple persists the choice", storage.get("sem.timeline.simple") === "true",
+          String(storage.get("sem.timeline.simple")));
+      }
+    }
+  }
+  const tickStart = new Date(2026, 9, 29, 20, 0).getTime() / 1000;
+  const timeTicks = globalThis.SEMCharts.timeTickValues(
+    { scales: { x: { min: tickStart, max: tickStart + 36 * 3600 } } },
+    [tickStart, tickStart + 8 * 3600, tickStart + 16 * 3600],
+  );
+  check("chart time ticks use a locale date, not uPlot's US slash dates",
+    !/\d{1,2}\/\d{1,2}\/\d{2,4}/.test(timeTicks.join(" ")) && !/\b\d{1,2}am\b/i.test(timeTicks.join(" ")),
+    timeTicks.join(" | "));
+  check("the first tick of a day carries a readable date",
+    timeTicks[0] === new Date(tickStart * 1000).toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" }),
+    timeTicks[0]);
   const historyText = allText(view());
   check("Plan history renders separated dispatch and measured evidence, including unmatched rows",
     historyText.includes("Plan history") && historyText.includes("Dispatcher requested")
@@ -957,6 +1048,16 @@ function classTokens(text) {
     && /measured discharge ÷ pack capacity/.test(savingsText)
     && /baseline minus actual \(net\)/.test(savingsText),
     savingsText.slice(0, 240));
+  check("the comparable trio shares one scope and includes a net cost",
+    /Comparable over the covered periods/.test(savingsText)
+    && /Actual net cost/.test(savingsText)
+    && savingsText.indexOf("Comparable over the covered periods") < savingsText.indexOf("Actual net cost")
+    && savingsText.indexOf("Actual net cost") < savingsText.indexOf("All metered activity"),
+    savingsText.slice(0, 320));
+  check("the coverage scope is stated before the headline figures",
+    savingsText.indexOf("Savings cover ") >= 0
+    && savingsText.indexOf("Savings cover ") < savingsText.indexOf("Comparable over the covered periods"),
+    savingsText.slice(0, 320));
   check("the time-coverage figure is formatted as hours", A.fmtHours(0.5) === "0.50 h"
     && A.fmtHours(12) === "12.0 h" && A.fmtHours(null) === "--");
   const coverage = A.savingsCoverage([
@@ -1332,6 +1433,13 @@ function classTokens(text) {
   check("bootstrap is loaded before style.css", bootIdx >= 0 && styleIdx > bootIdx, `bootstrap=${bootIdx} style=${styleIdx}`);
   check("the shared chart sheet is loaded", refs.indexOf("chart-theme.css") > styleIdx, refs.join(", "));
   check("index.html still declares data-bs-theme", /data-bs-theme="(dark|light)"/.test(index));
+  check("the theme control lives in the footer preference row, not the phone header",
+    index.indexOf('id="theme-toggle"') > index.indexOf("<footer")
+    && index.indexOf('id="theme-toggle"') === index.lastIndexOf('id="theme-toggle"'),
+    "theme toggle moved or duplicated");
+  const topbarBlock = index.slice(index.indexOf('<div class="topbar-actions">'), index.indexOf("</header>"));
+  check("the top bar keeps only the connection chip",
+    topbarBlock.length > 0 && !/theme-toggle/.test(topbarBlock), topbarBlock.slice(0, 200));
 
   console.log(`\n${passed} passed, ${failures.length} failed`);
   if (failures.length) {
