@@ -6,9 +6,9 @@ supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figur
 revisions described pre-audit trees and are obsolete.
 
 Verification was local and hardware-free: no real battery, no live provider call, no instance data.
-0.37.1, 0.37.2, 0.37.3 and 0.37.4 were deployed to the live instance and verified there (see §8.35,
-§8.36 and §8.37); the release gates below were repeated from a clean checkout; optional native C-core tests
-skip when no compiled extension is present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
+0.37.1, 0.37.2, 0.37.3, 0.37.4 and 0.37.5 were deployed to the live instance and verified there
+(see §8.35–§8.38); the release gates below were repeated from a clean checkout; optional native C-core
+tests skip when no compiled extension is present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
 `sem_*`), loopback addresses and placeholder coordinates.
 
 ---
@@ -17,24 +17,29 @@ skip when no compiled extension is present. All synthetic values use reserved na
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **1611 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension); with the local C core built: **1694 tests, 1693 passed** and `test_dp_core.py::test_terminal_row_benchmark` at 20.2 ms against its 20 ms wall-clock threshold on a saturated host (it fails identically on the pre-change tree; see §8.36) |
+| Test suite | `python3 -m pytest tests -q` | **1611 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension); with the local C core built: **1694 tests, 1692 passed**, with only the two wall-clock micro-benchmarks (`test_120_slot_core_benchmark`, `test_terminal_row_benchmark`) failing on a saturated host at 21–26 ms against their 20 ms threshold. The 0.37.5 diff touches no Python, C or optimizer code; §8.36 records the terminal-row benchmark failing identically on the pre-change tree |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 180 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
-| Headless UI render check | `node tools/ui_render_check.js` | **186 passed, 0 failed**, exit 0 |
+| Headless UI render check | `node tools/ui_render_check.js` | **211 passed, 0 failed**, exit 0 |
 | First-party JavaScript syntax | `node --check` over non-vendored app/tool JavaScript | clean, exit 0 |
 | POSIX shell syntax | `sh -n tools/audit.sh && sh -n energy_manager/run.sh` | clean, exit 0 |
-| Add-on image + entrypoint | Native `aarch64` Docker build and CI-style startup smoke | image built; startup banner observed. APK index access was unavailable, so the optional C accelerator fell back to Python; the local builder supports ARM platforms only. |
+| Add-on image + entrypoint | Native `aarch64` Docker build and CI-style startup smoke | image built; startup banner observed; the deployed instance reports `optimizer_core.backend: c`. The local builder supports ARM platforms only. |
 | ShellCheck | `shellcheck -s sh tools/audit.sh energy_manager/run.sh` | skipped — not installed (optional in CI) |
 
 Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (158 files, documentation excluded)**:
-  `57dcd6f8329839a8fa2f874e9101efc59192d50bda2f8da68d3dbead4ef15c43`
+  `45fe3dc970050c27fd8ef54bcb08827804ec2daabe296089d20ba1663ba82242`
 * **path list of the same 158 files** (detects an added, removed or renamed file):
-  `c1c39364f5900a18b40e0580adbb764dbc4d2b263ba0afb9598d1ac65b959d10` (0.37.4 added no file: the
-  0.37.3 tree measured the same path list, and §8.37 explains why the earlier 155-file count is
+  `c1c39364f5900a18b40e0580adbb764dbc4d2b263ba0afb9598d1ac65b959d10` (0.37.4 and 0.37.5 added no
+  file: the earlier path list is unchanged, and §8.37 explains why the earlier 155-file count is
   superseded)
+* The 158-file set is measured in the working tree with the locally built native extension. A clean
+  clone without it selects 155 files and digests to
+  `1492daa0ffb7a2d81d7dd1840445c95098b930f68a4f3a7b4ffd2e0d9fb62250` (path list
+  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab`); the gates above were run on
+  that clone.
 
 Historically, the 0.10.1 tree's code + tests digest was `28fdad8a…`, 0.10.0's `784dbf04…` and
 0.9.1's `fc5f9d44…`; at that point 0.11.0 (§8.10) changed file contents only and added no file, so
@@ -2279,6 +2284,63 @@ charged, 3.236 kWh discharged over the horizon). 120 sequential `/api/v1/status`
 store-heavy route that grew a descriptor each time before -- all answered 200, after which `/`,
 `/app.js`, `/health` and `/forecast` still answered 200, and the journal held no warning or error
 entry since boot.
+
+---
+
+### 8.38 Phone UI review fixes (0.37.5)
+
+The owner reviewed the live add-on on a phone and asked for eight UI/UX corrections. All changes are
+front-end only (`app.js`, `charts.js`, `index.html`, `style.css`, `mock.js`) plus the headless render
+harness; no optimizer, dispatcher, API, storage or settings code changed.
+
+1. **Control authority is mode-aware.** The old line said "dry run off: the plan dispatcher writes to
+   the batteries" whenever dry run was off, including Off and Advisory, which write nothing. The
+   answer strip and the Settings safety summary now derive the sentence from mode *and* dry run, and
+   Off/Advisory keep the earlier-setpoint warning. The harness pins all four combinations and the
+   unknown-mode fallback.
+2. **Alerts group and state their currency.** Identical level+code+message rows became one entry with
+   a report count and first/last timestamp, labelled Active now, Resolved, Acknowledged or Status
+   unknown. A `watchdog_hold` group follows `/status.scheduler_healthy`, and an unhealthy scheduler
+   adds a current-error banner above the historical entries. A status with six repeated
+   "control loop stalled: holding" errors and `scheduler_healthy: true` therefore renders one
+   **Resolved** row, not six errors that look live.
+3. **Savings compare like with like.** Coverage is stated first, then Savings, Baseline cost and
+   Actual net cost are computed from the same covered buckets and shown as one trio; whole-range
+   import/export/PV/cycles moved to a separate "All metered activity" group. On the live month
+   payload the three satisfied baseline − saving = actual net cost.
+4. **The Plan answer precedes its controls.** Next actions, summary and warnings come before the
+   timeline; horizon and Recompute follow it; exports sit behind one disclosure.
+5. **The plan timeline is readable on a phone.** It defaults to a persisted Simple view (buy price and
+   charge level) with Detailed one tap away, and its ticks use locale dates/12-hour or 24-hour time
+   instead of uPlot's US slashes and `12am`; narrow axes drop the weekday before labels collide.
+6. **Safety prose is scannable.** The watchdog paragraph is a compact disclosure, and Stop now carries
+   its "writes 0 W even in dry run" warning directly beside the button.
+7. **The phone header is compact.** The theme control moved to the footer preference row and the top
+   bar is one row; route headings and nav spacing tighten below 480 px.
+8. **Primary labels are plain language** ("estimated saving compared with not using the battery",
+   "In control", "had enough measured data to compare"); technical detail stays available.
+
+Gates from the clean checkout of `b47f847` (no native extension): **1611 passed, 83 skipped**;
+`audit: clean — 177 files scanned`; selfcheck **33/33**; headless UI **211 passed / 0 failed**;
+`compileall` and first-party `node --check` clean. In the working tree (native extension present,
+180 audit files) the suite is **1694 tests, 1692 passed**: the 0.37.5 diff contains no Python, C or
+optimizer change, and the two failures are the wall-clock micro-benchmarks already recorded in
+§8.36. The native `aarch64` image built, and the CI-style startup smoke printed the banner with the
+synthetic token reaching the entrypoint. Code digest for the working tree is `45fe3dc9…` with the
+158-file path list unchanged (`c1c39364…`); the clean clone's 155-file values are recorded in §1.
+
+Deployed and observed live (2026-10-30T11:54Z, 0.37.4 → 0.37.5): `POST /store/reload` moved
+`version_latest` to 0.37.5, then `update.install` on `update.smart_energy_manager_update` succeeded
+without a timeout (the entity moved from 0.37.4 to 0.37.5; add-on state `started`).
+`GET /api/v1/health` reports `version 0.37.5` with `optimizer_core.backend: c`; the served
+`index.html` contains the footer preference row and `app.js` contains the new alert and savings code,
+so the no-cache assets updated in place. Live `/status` at verification time: `mode auto`,
+`dry_run false`, `scheduler_healthy true`, one `pending_holds` entry, and six `watchdog_hold` error
+alerts spanning 11:57:06Z–12:07:55Z; running the shipped `alertGroups` on that payload yields one
+group of six in state `resolved`. The phone screenshot shows the one-row header, the
+"Auto · live: the add-on writes setpoints to the batteries" answer and the compact watchdog
+disclosure. The pre-existing pending hold for `solarflow_800_plus` was visible as a Safety state
+banner before and after the update; this release issued no battery writes and changed no settings.
 
 ---
 
