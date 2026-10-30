@@ -2266,7 +2266,7 @@ tree either (`022383b5...`), because three files were added after the value was 
 release records the measured set and count.
 
 Deployed and observed live (2026-10-30T06:07Z, 0.37.3 -> 0.37.4 via `/store/reload` then
-`update.install` on `update.smart_energy_manager_update`). Before the update the instance was in the
+`update.install` on the add-on's update entity). Before the update the instance was in the
 leaked state: `/` and `/app.js` answered 500 `No file descriptors available`, `/api/v1/health`,
 `/api/v1/status` and `/api/v1/forecast` answered 500 `internal error (OperationalError)`, and
 `/api/v1/batteries` returned an empty list (its config comes from the store) while `/plan`,
