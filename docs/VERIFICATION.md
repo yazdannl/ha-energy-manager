@@ -2233,10 +2233,14 @@ cached connection holds the database, `-wal` and `-shm` descriptors open, so a t
 still pinned two or three descriptors for the life of the process: the cache grew with the number of
 served connections instead of with the number of live threads, and after a few hundred requests the
 process reached its descriptor limit. At that limit `open()` on a static file fails with `EMFILE`
-(the UI's 500s), an unguarded `Store.connection` raises `sqlite3.OperationalError: unable to open
-database file` (health/status/forecast, whose store reads are not fail-soft), and every fail-soft
-caller (`_store_call`, the savings/actuals readers) logs a warning and answers with empty data --
-which is exactly the mixed 500/200 pattern the instance showed.
+(the UI's 500s) and an unguarded `Store.connection` raises `sqlite3.OperationalError: unable to open
+database file` -- the error type the live `/health`, `/status` and `/forecast` reported -- while every
+fail-soft caller (`_store_call`, the savings/actuals readers) logs a warning and answers with empty
+data. That mixture is exactly the pattern the instance showed: 500s on those three routes, 200s with
+empty or stale bodies on the routes that swallow a store failure, and no static asset at all.
+`/status` is reproduced locally with this failure (its cost-basis ledger read is not fail-soft);
+`/health` and `/forecast` read the store only through paths this bare engine does not reach, so for
+them the record is the live error type, not a local repro.
 
 The fix is at the root: the API handler releases its thread's connection when the client connection
 ends (`Store.release_thread`, called from the request handler's `finish()`), so the cache is bounded
@@ -2261,7 +2265,20 @@ pre-change tree). The 158-file code + tests digest is `57dcd6f8...` and the path
 tree either (`022383b5...`), because three files were added after the value was written, so this
 release records the measured set and count.
 
-Deployed and observed live: see §8.37's deploy note below.
+Deployed and observed live (2026-10-30T06:07Z, 0.37.3 -> 0.37.4 via `/store/reload` then
+`update.install` on `update.smart_energy_manager_update`). Before the update the instance was in the
+leaked state: `/` and `/app.js` answered 500 `No file descriptors available`, `/api/v1/health`,
+`/api/v1/status` and `/api/v1/forecast` answered 500 `internal error (OperationalError)`, and
+`/api/v1/batteries` returned an empty list (its config comes from the store) while `/plan`,
+`/log`, `/savings` and `/providers` answered 200. After the update `/api/v1/health` reports `0.37.4`
+with the C optimizer core, every asset the UI loads answers 200 (`index.html` 3806 B, `app.js`
+407869 B, `style.css`, `chart-theme.css`, `mock.js`, `charts.js`, both vendored files), the battery
+config and state are back (SoC 76 %, `capacity_kwh` 2.3314), and a plan was rebuilt at 06:07:45Z
+(`mode auto`, `dry_run false`, price `zonneplan_entity`, solar `merge`, load `profile`; 2.154 kWh
+charged, 3.236 kWh discharged over the horizon). 120 sequential `/api/v1/status` requests -- the
+store-heavy route that grew a descriptor each time before -- all answered 200, after which `/`,
+`/app.js`, `/health` and `/forecast` still answered 200, and the journal held no warning or error
+entry since boot.
 
 ---
 
