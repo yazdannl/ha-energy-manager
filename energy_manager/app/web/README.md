@@ -36,8 +36,10 @@ For a plain static preview (`python3 -m http.server`), `index.html` works but AP
 
 The Forecasts view includes a selected-local-day energy timeline backed by the additive
 `GET /api/v1/daily-timeline` route. It uses existing measurement, actual, forecast and saved-plan
-records only; it adds no sampler and is not a dashboard-card feed. Missing/partial data stays explicit
-in the interval table, and the `?mock=1` fixture exercises its plan-detail link with synthetic values.
+records only; it adds no sampler and is not a dashboard-card feed. The power chart pans with a drag
+and zooms with a pinch, the wheel or a double-tap reset; the compact slot table shows one icon row per
+bin, and tapping a time opens the full interval detail where missing/partial coverage stays explicit.
+The `?mock=1` fixture exercises its plan-detail link with synthetic values.
 
 ## Dashboard card (SPEC 12)
 

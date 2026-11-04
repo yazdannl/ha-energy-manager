@@ -92,6 +92,13 @@
       "M7.4 4.9 8.5 6", "M16.6 4.9 15.5 6",
       "M12 16.4v4.7", "M10.2 18.6 12 20.4l1.8-1.8"
     ],
+    // Sun: direct or forecast PV.
+    sun: [
+      "M12 16.6a4.6 4.6 0 1 0 0-9.2 4.6 4.6 0 0 0 0 9.2Z",
+      "M12 2.4v2", "M12 19.6v2", "M2.4 12h2", "M19.6 12h2",
+      "M5.2 5.2l1.4 1.4", "M17.4 17.4l1.4 1.4",
+      "M17.4 5.2l1.4-1.4", "M5.2 17.4l1.4-1.4"
+    ],
     // Arrow up out of a tray: exporting to the grid.
     export: ["M12 16.6V5.2", "M8.2 9 12 5.2 15.8 9", "M4.6 14.6V18a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-3.4"],
     // A house: the load served from the battery instead of the grid.
@@ -3760,36 +3767,6 @@
   function renderDailyTimeline(result, payload) {
     clear(result);
     var rows = Array.isArray(payload.series) ? payload.series : [];
-    var n = rows.length;
-    var coverage = payload.coverage || {};
-    function count(key) {
-      var item = coverage[key] || {};
-      return (item.complete || 0) + "/" + (item.total || n) +
-        (item.partial ? " complete, " + item.partial + " partial" : " complete");
-    }
-    var stale = rows.filter(function (row) { return row.solar && row.solar.forecast_stale === true; }).length;
-    result.appendChild(el("p", { class: "daily-timeline-summary", role: "status", "aria-live": "polite", text:
-      n + " 15-minute bins · PV direct " + count("solar_actual") + " · PV derived " + count("solar_derived") +
-      " · load direct " + count("load_actual") + " · load derived " + count("load_derived") +
-      " · grid actual " + count("grid_actual") + " · battery actual " + count("battery_actual") +
-      " · PV/load forecasts " + count("solar_forecast") + " / " + count("load_forecast") +
-      " · saved plan actions " + count("planned_action") +
-      (stale ? " · PV forecast stale in " + stale + " bin(s)" : "")
-    }));
-    result.appendChild(el("p", { class: "field-help", text:
-      "Partial bins are covered-only in the table and gaps in the chart; missing is unavailable, not zero. Battery fleet completeness is unknown. Prices are saved-plan buy/sell only; independent historical actual prices, state of charge and per-battery flow breakdown are not available here. Planned values do not mean dispatched."
-    }));
-
-    var provenance = payload.provenance || {};
-    result.appendChild(el("details", { class: "daily-timeline-provenance" }, [
-      el("summary", { text: "Data sources and limits" }),
-      el("ul", null, Object.keys(provenance).map(function (key) {
-        return el("li", null, [el("strong", { text: key.replace(/_/g, " ") + ": " }), provenance[key]]);
-      }))
-    ]));
-    (Array.isArray(payload.notes) ? payload.notes : []).forEach(function (note) {
-      result.appendChild(el("p", { class: "field-help", text: note }));
-    });
 
     var chart = el("div", { class: "chart chart-md daily-timeline-chart" });
     result.appendChild(chart);
@@ -3803,14 +3780,38 @@
     var detailHost = el("div", { class: "daily-timeline-selection", role: "region", "aria-label": "Selected interval detail", "aria-live": "polite" });
     result.appendChild(tableHost);
     result.appendChild(detailHost);
-    var selectedIndex = 0;
+    var selectedIndex = -1;
     var planRequest = 0;
+
+    function clockOf(value) {
+      var match = /(\d{2}:\d{2})/.exec(String(value || ""));
+      if (match) return match[1];
+      var stamp = parseDate(value);
+      return stamp ? stamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : String(value || "");
+    }
+
+    function slotNumber(value) {
+      return isNum(value) ? value.toFixed(1) : "–";
+    }
+
+    /* One compact cell per series: an icon, a coloured value and a tooltip with the full reading.
+     * The hidden label keeps the value meaningful to a screen reader without printing it twice. */
+    function slotMetric(iconName, value, label, className, title, missing) {
+      return el("span", {
+        class: "slot-metric " + className + (missing ? " slot-missing" : ""),
+        title: title || (label + ": " + value)
+      }, [
+        icon(iconName, "icon-xs"),
+        el("span", { class: "visually-hidden", text: label + " " }),
+        el("span", { class: "slot-value", text: value })
+      ]);
+    }
 
     function renderSelection() {
       var row = rows[selectedIndex];
       clear(detailHost);
       if (!row) return;
-      detailHost.appendChild(el("h3", { text: "Interval detail · " + row.label + " – " + row.local_end }));
+      detailHost.appendChild(el("h3", { text: "Interval detail · " + clockOf(row.label) + "–" + clockOf(row.local_end) }));
       var solar = row.solar || {}, load = row.load || {}, grid = row.grid || {}, battery = row.battery || {}, plan = row.plan || {};
       var pvForecast = timelineForecastText("PV forecast", solar) + " · " + timelineForecastProvenance(solar);
       var loadForecast = timelineForecastText("Load forecast", load) + " · " + timelineForecastProvenance(load);
@@ -3862,24 +3863,9 @@
     function renderTable() {
       var tableRows = rows.map(function (row, index) {
         var solar = row.solar || {}, load = row.load || {}, grid = row.grid || {}, battery = row.battery || {}, plan = row.plan || {};
-        var actualLines = [
-          timelineMetricText("PV direct", solar, "no complete PV forecast comparison"), timelineDerivedMetricText("PV derived", solar.derived),
-          timelineMetricText("Load direct", load, "actual load/forecast comparison unavailable"), timelineDerivedMetricText("Load derived", load.derived),
-          timelineMetricText("Grid", grid), timelineMetricText("Battery", battery)
-        ];
-        var forecastLines = [
-          timelineForecastText("PV", solar),
-          timelineForecastText("Load", load)
-        ];
-        var actionLines = [timelinePlanAction(plan), timelinePlanPower(plan)];
-        var priceLines = timelinePlanPrices(plan);
-        var actualPvSources = Array.isArray(solar.actual_sources) ? solar.actual_sources : [];
-        var actualPvSource = solar.actual_source || actualPvSources.join(", ") || "no direct source samples";
-        var sources = "PV actual: " + actualPvSource +
-          " · PV forecast: " + timelineForecastProvenance(solar) +
-          " · Load forecast: " + timelineForecastProvenance(load) +
-          " · Plan: " + (plan.plan_id == null ? "unavailable" : "#" + plan.plan_id);
-        var inspect = button(row.label, "daily-timeline-interval", function () {
+        var start = clockOf(row.label);
+        var end = clockOf(row.local_end);
+        var inspect = button(start, "daily-timeline-interval", function () {
           selectedIndex = index;
           planRequest += 1;
           renderTable();
@@ -3888,22 +3874,72 @@
           renderSelection();
         });
         inspect.setAttribute("aria-pressed", String(index === selectedIndex));
-        return [
-          inspect,
-          el("div", { class: "daily-timeline-lines" }, actualLines.map(function (line) { return el("div", { text: line }); })),
-          el("div", { class: "daily-timeline-lines" }, forecastLines.map(function (line) { return el("div", { text: line }); })),
-          el("div", { class: "daily-timeline-lines" }, actionLines.map(function (line) { return el("div", { text: line }); })),
-          el("div", { class: "daily-timeline-lines" }, priceLines.map(function (line) { return el("div", { text: line }); })),
-          sources
-        ];
+        inspect.setAttribute("aria-label", "Inspect interval " + start + " to " + end);
+
+        var pv = solar.actual_kw;
+        var pvForecast = false;
+        if (!isNum(pv) && isNum(solar.forecast_kw)) { pv = solar.forecast_kw; pvForecast = true; }
+        var pvChip = slotMetric(
+          "sun",
+          (pvForecast ? "~" : "") + slotNumber(pv),
+          "PV",
+          "slot-pv" + (pvForecast ? " slot-forecast" : ""),
+          "PV " + (pvForecast ? "forecast " : "direct ") + fmtKw(pv) + " · forecast " + fmtKw(solar.forecast_kw),
+          !isNum(pv)
+        );
+
+        var loadValue = load.actual_kw;
+        var loadForecasted = false;
+        if (!isNum(loadValue) && isNum(load.forecast_kw)) { loadValue = load.forecast_kw; loadForecasted = true; }
+        var loadChip = slotMetric(
+          "self_consumption",
+          (loadForecasted ? "~" : "") + slotNumber(loadValue),
+          "Load",
+          "slot-load" + (loadForecasted ? " slot-forecast" : ""),
+          "Load " + (loadForecasted ? "forecast " : "direct ") + fmtKw(loadValue) + " · forecast " + fmtKw(load.forecast_kw),
+          !isNum(loadValue)
+        );
+
+        var gridChip = slotMetric(
+          "grid",
+          slotNumber(grid.actual_kw),
+          "Grid",
+          isNum(grid.actual_kw) && grid.actual_kw < 0 ? "slot-grid slot-export" : "slot-grid",
+          "Grid " + fmtKw(grid.actual_kw) + (isNum(grid.actual_kw) && grid.actual_kw < 0 ? " (export)" : " (import)"),
+          !isNum(grid.actual_kw)
+        );
+
+        var batteryChip = slotMetric(
+          "battery",
+          slotNumber(battery.actual_kw),
+          "Battery",
+          "slot-battery",
+          "Battery " + fmtKw(battery.actual_kw) + " · fleet completeness unknown",
+          !isNum(battery.actual_kw)
+        );
+
+        var segments = Array.isArray(plan.segments) ? plan.segments : [];
+        var segment = segments[0] || null;
+        var action = segment && segment.action ? segment.action : null;
+        var planTitle = timelinePlanAction(plan) + " · " + timelinePlanPower(plan);
+        var planChip = slotMetric(
+          actionIcon(action),
+          isNum(plan.planned_power_kw) ? slotNumber(plan.planned_power_kw) : (action ? actionText(action) : "–"),
+          "Plan " + (action ? actionText(action) : "unavailable"),
+          "slot-plan " + actionClass(action),
+          planTitle,
+          plan.plan_id == null
+        );
+
+        return [inspect, pvChip, loadChip, gridChip, batteryChip, planChip];
       });
       var attrs = rows.map(function (_row, index) {
         return index === selectedIndex ? { class: "daily-timeline-row-selected" } : null;
       });
       clear(tableHost);
       tableHost.appendChild(table(
-        "15-minute local intervals. Actual power is measured only; forecast and plan values stay separate. Incomplete values are not plotted as zero.",
-        ["Inspect interval", "Direct / derived / actual power (kW)", "Forecast power (kW)", "Planned action / setpoint", "Plan buy/sell (EUR/kWh)", "Sources"],
+        "Tap a time for the full interval detail.",
+        ["Time", "PV kW", "Load kW", "Grid kW", "Batt kW", "Plan"],
         tableRows, { numeric: [], rowAttrs: attrs }
       ));
     }
@@ -3948,7 +3984,6 @@
       next,
       refresh
     ]));
-    body.appendChild(el("p", { class: "field-help", text: "IANA timezone: " + timezoneName + ". Bins follow local midnight and UTC instants, including daylight-saving transitions." }));
     body.appendChild(status);
     body.appendChild(retry);
     body.appendChild(result);
@@ -3971,8 +4006,7 @@
       get("/daily-timeline", { date: selectedDate, timezone: timezoneName }).then(function (payload) {
         if (current !== request || !result.isConnected) return;
         status.className = "muted";
-        status.textContent = "Showing " + payload.date + " in " + timezoneName + " · " +
-          payload.expected_intervals + " DST-safe 15-minute intervals.";
+        status.textContent = payload.date + " · " + payload.expected_intervals + " slots · " + timezoneName;
         renderDailyTimeline(result, payload);
       }).catch(function (err) {
         if (current !== request || !result.isConnected) return;

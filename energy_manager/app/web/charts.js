@@ -245,8 +245,147 @@
       root.addEventListener("resize", entry.onResize);
     }
     if (registry) registry.set(host, entry);
+    if (opts.semPanZoom) enablePanZoom(u, data);
     if (typeof drawAgain === "function") watchers.push({ host: host, draw: drawAgain });
     return entry;
+  }
+
+  /* uPlot 1.6 zooms with a mouse drag but has no touch pan or pinch, and a touch drag on a phone
+   * only scrolls the page. Charts that opt in with `semPanZoom` get the gesture model a phone
+   * expects: one finger pans, two fingers pinch around their midpoint, the wheel zooms around the
+   * pointer, and a double tap puts the full range back. The full data range is the hard bound and
+   * the smallest window is one 15-minute slot, so the scale can never invert or leave the day. */
+  function enablePanZoom(u, data) {
+    var over = u.over;
+    var xs = data && data[0];
+    if (!over || !xs || xs.length < 2) return;
+    var fullMin = xs[0];
+    var fullMax = xs[xs.length - 1];
+    if (!(fullMax > fullMin)) return;
+    var minSpan = Math.min(15 * 60, fullMax - fullMin);
+    var pointers = {};
+    var drag = null;
+    var pinch = null;
+    var lastTap = 0;
+    var lastTapX = 0;
+    var lastTapY = 0;
+    over.classList.add("sem-pan");
+
+    function clamp(value, low, high) { return Math.max(low, Math.min(high, value)); }
+    function current() {
+      var scale = u.scales.x;
+      return { min: scale.min, max: scale.max };
+    }
+    function bounded(min, span) {
+      var width = clamp(span, minSpan, fullMax - fullMin);
+      if (min < fullMin) min = fullMin;
+      if (min + width > fullMax) min = fullMax - width;
+      return { min: min, max: min + width };
+    }
+    function set(min, span) {
+      var next = bounded(min, span);
+      var scale = u.scales.x;
+      if (Math.abs(scale.min - next.min) < 1e-6 && Math.abs(scale.max - next.max) < 1e-6) return;
+      u.setScale("x", next);
+    }
+    function fraction(clientX) {
+      var rect = over.getBoundingClientRect();
+      return rect.width > 0 ? clamp((clientX - rect.left) / rect.width, 0, 1) : 0.5;
+    }
+    function zoomAt(clientX, factor) {
+      var now = current();
+      var width = clamp((now.max - now.min) * factor, minSpan, fullMax - fullMin);
+      var at = fraction(clientX);
+      var anchor = now.min + (now.max - now.min) * at;
+      set(anchor - width * at, width);
+    }
+    function reset() { set(fullMin, fullMax - fullMin); }
+
+    over.addEventListener("wheel", function (event) {
+      if (!event.deltaY) return;
+      event.preventDefault();
+      zoomAt(event.clientX, Math.exp(event.deltaY * 0.0016));
+    }, { passive: false });
+
+    over.addEventListener("pointerdown", function (event) {
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+      if (typeof over.setPointerCapture === "function") {
+        try { over.setPointerCapture(event.pointerId); } catch (err) { /* detached */ }
+      }
+      pointers[event.pointerId] = { x: event.clientX, y: event.clientY };
+      var ids = Object.keys(pointers);
+      var now = current();
+      if (ids.length === 1) {
+        var rect = over.getBoundingClientRect();
+        drag = { x: event.clientX, min: now.min, span: now.max - now.min, width: Math.max(1, rect.width) };
+        pinch = null;
+      } else if (ids.length === 2) {
+        var a = pointers[ids[0]];
+        var b = pointers[ids[1]];
+        pinch = {
+          distance: Math.max(1, Math.abs(a.x - b.x)),
+          at: fraction((a.x + b.x) / 2),
+          min: now.min,
+          span: now.max - now.min
+        };
+        drag = null;
+      }
+    });
+
+    over.addEventListener("pointermove", function (event) {
+      if (!pointers[event.pointerId]) return;
+      pointers[event.pointerId] = { x: event.clientX, y: event.clientY };
+      var ids = Object.keys(pointers);
+      if (pinch && ids.length === 2) {
+        event.preventDefault();
+        var a = pointers[ids[0]];
+        var b = pointers[ids[1]];
+        var distance = Math.max(1, Math.abs(a.x - b.x));
+        var width = clamp(pinch.span * pinch.distance / distance, minSpan, fullMax - fullMin);
+        var anchor = pinch.min + pinch.span * pinch.at;
+        var at = fraction((a.x + b.x) / 2);
+        set(anchor - width * at, width);
+        over.classList.add("sem-panning");
+      } else if (drag && ids.length === 1) {
+        event.preventDefault();
+        var moved = (event.clientX - drag.x) / drag.width;
+        set(drag.min - moved * drag.span, drag.span);
+        over.classList.add("sem-panning");
+      }
+    });
+
+    function release(event) {
+      delete pointers[event.pointerId];
+      var ids = Object.keys(pointers);
+      if (ids.length === 1) {
+        var only = pointers[ids[0]];
+        var now = current();
+        var rect = over.getBoundingClientRect();
+        drag = { x: only.x, min: now.min, span: now.max - now.min, width: Math.max(1, rect.width) };
+        pinch = null;
+      } else if (!ids.length) {
+        drag = null;
+        pinch = null;
+        over.classList.remove("sem-panning");
+      }
+      if (event.type === "pointerup" && event.pointerType !== "mouse") {
+        var nowMs = Date.now();
+        if (nowMs - lastTap < 350 && Math.abs(event.clientX - lastTapX) < 24 && Math.abs(event.clientY - lastTapY) < 24) {
+          lastTap = 0;
+          reset();
+        } else {
+          lastTap = nowMs;
+          lastTapX = event.clientX;
+          lastTapY = event.clientY;
+        }
+      }
+    }
+    over.addEventListener("pointerup", release);
+    over.addEventListener("pointercancel", release);
+    over.addEventListener("dblclick", function (event) {
+      event.preventDefault();
+      reset();
+    });
   }
 
   function barsPath() {
@@ -880,33 +1019,35 @@
     var opts = baseOpts(p, {
       scales: { x: { time: true }, y: { auto: true } },
       axes: [
-        Object.assign(timeAxis(p), { values: function (_u, vals) {
-          return vals.map(function (v) {
-            try { return new Date(v * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZoneName: "short" }); }
-            catch (err) { return new Date(v * 1000).toISOString(); }
-          });
-        } }),
+        // The status line names the timezone, so a short local clock keeps the ticks from colliding
+        // on a phone; timeTickValues still prints the date on the first tick of each local day.
+        timeAxis(p),
         axisFor("y", "kW", 3, p, narrow, "kw")
       ],
       series: [
         {},
-        Object.assign(line(p.pv), { label: "Direct measured PV", value: unit }),
-        Object.assign(lineDotted(p.pv), { label: "Derived PV (inferred; dotted)", value: unit }),
-        Object.assign(lineDashed(p.pv), { label: "PV forecast (dashed)", value: unit }),
-        Object.assign(line(p.load), { label: "Direct load actual", value: unit }),
-        Object.assign(lineDotted(p.load), { label: "Derived load (inferred; dotted)", value: unit }),
-        Object.assign(lineDashed(p.load), { label: "Load forecast (dashed)", value: unit }),
-        Object.assign(line(p.baseline), { label: "Grid actual (+ import / − export)", value: unit }),
-        Object.assign(line(p.discharge), { label: "Battery actual (confirmed aggregate; fleet coverage unknown)", value: unit }),
-        Object.assign(lineDotted(p.soc), { label: "Plan setpoint (dotted; not proof of dispatch)", value: unit })
+        Object.assign(line(p.pv), { label: "PV direct", value: unit }),
+        Object.assign(lineDotted(p.pv), { label: "PV derived (dotted)", value: unit }),
+        Object.assign(lineDashed(p.pv), { label: "PV forecast", value: unit }),
+        Object.assign(line(p.load), { label: "Load direct", value: unit }),
+        Object.assign(lineDotted(p.load), { label: "Load derived (dotted)", value: unit }),
+        Object.assign(lineDashed(p.load), { label: "Load forecast", value: unit }),
+        Object.assign(line(p.baseline), { label: "Grid (+ import)", value: unit }),
+        Object.assign(line(p.discharge), { label: "Battery actual", value: unit }),
+        Object.assign(lineDotted(p.soc), { label: "Plan setpoint", value: unit })
       ],
-      cursor: { y: false, x: true, points: { show: true, size: 5 }, sync: { key: SYNC_KEY, setSeries: false } },
+      cursor: {
+        y: false, x: true, points: { show: true, size: 5 },
+        sync: { key: SYNC_KEY, setSeries: false },
+        drag: { setScale: false, x: false, y: false }
+      },
+      semPanZoom: true,
       plugins: [decorPlugin({ palette: p, zeroLine: true }), tooltipPlugin()]
     });
     var draw = function (el) {
       mount(el, opts, [xs, pv, pvDerived, pvForecast, load, loadDerived, loadForecast, grid, battery, planned], 220, draw,
         "Direct and derived PV and load, signed grid and confirmed battery power, with archived forecasts and saved plan setpoint, all in kW.",
-        "Power in kW. Solid direct actuals, dotted derived values and planned setpoint, dashed forecasts; incomplete bins are gaps. Battery fleet coverage may be partial.");
+        "Power in kW. Drag to pan, pinch or scroll to zoom, double-tap to reset. Solid direct actuals, dotted derived values and planned setpoint, dashed forecasts; incomplete bins are gaps.");
     };
     draw(host);
   }

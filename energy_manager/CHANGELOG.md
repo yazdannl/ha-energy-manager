@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.38.2
+
+- **Fix: the Forecasts daily timeline is a compact slot list.** The coverage/provenance paragraph and
+  the multi-line per-interval table are gone. Each 15-minute bin is one row with a coloured icon and
+  value for PV, load, grid, battery and the saved plan action; tapping the time opens the existing
+  provenance, sample coverage and saved-plan detail on demand.
+- **Fix: the daily timeline chart is zoomable and draggable.** Drag to pan, pinch or scroll to zoom
+  around the pointer, and double-tap to reset. The window is bounded to the day and to a 15-minute
+  minimum, so the scale cannot invert or leave the selected date. Ticks use short local times and the
+  legend labels are compact enough for a 360 px phone.
+
 ## 0.38.1
 
 - **Fix: a boot relearn with too little history keeps the learned round trip.** 0.38.0 gave the

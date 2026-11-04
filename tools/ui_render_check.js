@@ -202,7 +202,7 @@ function classTokens(text) {
   await sleep(220);
   check("daily history exposes a bounded 1–31 day selector", !!historyDays && !historyDays.hidden);
 
-  console.log("\n1g. Daily energy timeline: local bins, provenance, coverage and plan detail");
+  console.log("\n1g. Daily energy timeline: compact slot rows, chart and on-demand detail");
   const dailyDate = view().querySelectorAll("#daily-timeline-date")[0];
   const dailyControls = byClass(view(), "daily-timeline-controls")[0];
   const dailyNavLabels = dailyControls ? dailyControls.querySelectorAll("button").map((button) => button.getAttribute("aria-label")) : [];
@@ -212,51 +212,75 @@ function classTokens(text) {
   const dailyText = dailyResult ? allText(dailyResult) : "";
   const timelineRows = dailyTable ? dailyTable.querySelectorAll("tbody tr") : [];
   const timelineRowText = (index) => timelineRows[index] ? allText(timelineRows[index]) : "";
+  const detailAt = () => dailyResult ? dailyResult.querySelector(".daily-timeline-selection") : null;
+  const inspectAt = (index) => dailyResult ? dailyResult.querySelectorAll(".daily-timeline-interval")[index] : null;
   check(
     "daily timeline offers a local date selector and previous/next local-day controls",
     !!dailyDate && dailyDate.getAttribute("type") === "date"
       && dailyNavLabels.includes("Previous local day") && dailyNavLabels.includes("Next local day"),
   );
   check(
-    "daily timeline retains a timezone-labelled accessible interval table and explicit coverage",
+    "daily timeline renders one compact slot row with no prose block",
     !!dailyTable && dailyInspectButtons.length >= 92 && dailyInspectButtons.length <= 100
-      && dailyInspectButtons[0].getAttribute("aria-pressed") === "true"
-      && dailyInspectButtons[1].getAttribute("aria-pressed") === "false"
-      && /IANA timezone/.test(allText(view()))
-      && /Partial bins are covered-only/.test(dailyText)
-      && /unavailable/.test(dailyText) && /Data sources and limits/.test(dailyText),
+      && timelineRows.length >= 92
+      && timelineRows[0].querySelectorAll("td").length === 6
+      && dailyInspectButtons[0].textContent.trim() === "00:00"
+      && dailyInspectButtons[0].getAttribute("aria-pressed") === "false"
+      && !!detailAt() && allText(detailAt()) === ""
+      && !/Bins follow local midnight/.test(allText(view()))
+      && !/Partial bins are covered-only/.test(dailyText)
+      && !/Data sources and limits/.test(dailyText)
+      && !/15-minute bins/.test(dailyText),
     dailyText.slice(0, 420),
   );
+  const firstSlots = timelineRows[0] ? timelineRows[0].querySelectorAll(".slot-metric") : [];
+  const firstSlotClasses = firstSlots.map((node) => node.className).join(" ");
   check(
-    "daily timeline keeps direct, derived, forecast and saved-plan series separate",
-    /PV direct/.test(dailyText) && /PV derived/.test(dailyText)
-      && /load direct/.test(dailyText) && /load derived/.test(dailyText)
-      && /PV forecast/.test(dailyText) && /Load forecast/.test(dailyText)
-      && /Plan buy/.test(dailyText) && /Grid/.test(dailyText),
-    dailyText.slice(0, 420),
+    "daily slot rows carry one icon and colour per series",
+    firstSlots.length === 5
+      && firstSlots.every((node) => !!node.querySelector("svg"))
+      && ["slot-pv", "slot-load", "slot-grid", "slot-battery", "slot-plan"].every((cls) => firstSlotClasses.includes(cls)),
+    firstSlotClasses,
   );
-  check(
-    "daily intervals show stale PV, partial actual impact, missing forecast cause and provenance",
-    /marked stale; not fresh forecast evidence/.test(timelineRowText(0))
-      && /PV actual: sensor\.example_pv_power/.test(timelineRowText(0))
-      && /PV forecast: synthetic archived solar/.test(timelineRowText(0))
-      && /issued /.test(timelineRowText(0))
-      && /freshness not classified/.test(timelineRowText(0))
-      && /partial \(2\/3 samples\)/.test(timelineRowText(5))
-      && /no complete PV forecast comparison/.test(timelineRowText(5))
-      && /no archived value; cause not retained/.test(timelineRowText(8)),
-    timelineRowText(0) + " · " + timelineRowText(5) + " · " + timelineRowText(8),
-  );
-  check("daily timeline provides a graceful chart fallback beside the accessible table",
+  check("daily slot rows keep the stale, partial and missing detail out of the row",
+    !/PV direct/.test(timelineRowText(0)) && !/samples/.test(timelineRowText(0))
+      && !/stale/.test(timelineRowText(0)) && !/PV forecast/.test(timelineRowText(0)),
+    timelineRowText(0));
+  check("daily timeline provides a graceful chart fallback beside the compact table",
     !!dailyResult && !!dailyResult.querySelector(".daily-timeline-chart.chart-fallback") && !!dailyTable);
-  const intervalInspect = dailyTable && dailyTable.querySelector("tbody button");
-  if (intervalInspect) intervalInspect.dispatchEvent({ type: "click" });
+  const rowZero = inspectAt(0);
+  if (rowZero) rowZero.dispatchEvent({ type: "click" });
+  const detailText = detailAt() ? allText(detailAt()) : "";
+  check(
+    "daily interval detail opens only on tap and keeps every series and provenance",
+    /Interval detail/.test(detailText)
+      && /Direct PV/.test(detailText) && /Derived PV/.test(detailText)
+      && /PV forecast/.test(detailText) && /Load forecast/.test(detailText)
+      && /Measured grid/.test(detailText) && /Measured battery/.test(detailText)
+      && /Plan buy\/sell/.test(detailText)
+      && /marked stale; not fresh forecast evidence/.test(detailText)
+      && /entity sensor\.example_pv_power/.test(detailText)
+      && /PV forecast: .*synthetic archived solar/.test(detailText)
+      && /issued /.test(detailText),
+    detailText.slice(0, 420),
+  );
+  const partialInspect = inspectAt(5);
+  if (partialInspect) partialInspect.dispatchEvent({ type: "click" });
+  const partialDetail = detailAt() ? allText(detailAt()) : "";
+  const missingInspect = inspectAt(8);
+  if (missingInspect) missingInspect.dispatchEvent({ type: "click" });
+  const missingDetail = detailAt() ? allText(detailAt()) : "";
+  check("daily interval detail keeps partial and missing coverage explicit on demand",
+    /partial \(2\/3 samples\)/.test(partialDetail)
+      && /no archived value; cause not retained/.test(missingDetail),
+    partialDetail.slice(0, 240) + " · " + missingDetail.slice(0, 240),
+  );
   const planDetailButton = dailyResult && dailyResult.querySelector(".daily-timeline-selection button");
   if (planDetailButton) planDetailButton.dispatchEvent({ type: "click" });
   await sleep(240);
   check(
     "daily interval opens exact saved-plan detail without claiming causal measured flow",
-    !!planDetailButton && /plan-slot timestamps only/i.test(dailyText + allText(dailyResult))
+    !!planDetailButton && /plan-slot timestamps only/i.test(allText(dailyResult))
       && /does not prove plan causality/.test(allText(dailyResult)),
     dailyResult ? allText(dailyResult).slice(-420) : "no daily result",
   );
