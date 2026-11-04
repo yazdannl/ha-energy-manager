@@ -343,3 +343,36 @@ def test_the_payload_is_stamped_with_the_current_schema():
     assert payload["schema"] == efficiency_learning.SCHEMA
     # 4: complete cycles only, scored by energy balance, on windows that book their taper.
     assert efficiency_learning.SCHEMA == 4
+
+
+def test_a_relearn_with_too_little_history_keeps_a_confident_estimate(tmp_path):
+    """0.38.1: a boot with no pairs must not replace a good profile with ``None``."""
+    from app.models import BatteryConfig
+    from app.store import Store
+
+    store = Store(tmp_path / "efficiency.db")
+    battery = BatteryConfig(
+        id="battery_1", name="Example battery", driver="generic", capacity_kwh=2.0
+    )
+    eta = 0.8**0.5
+    store.profile_put(
+        efficiency_learning.PROFILE_KIND,
+        "battery_1",
+        {
+            "round_trip": 0.8,
+            "median_round_trip": 0.8,
+            "eta_charge": eta,
+            "eta_discharge": eta,
+            "samples": 3,
+            "pairs": [],
+            "schema": efficiency_learning.SCHEMA,
+            "updated_at": T0.isoformat(),
+        },
+        T0,
+    )
+    learned = efficiency_learning.learn_round_trip(store, battery, T0 + timedelta(days=1))
+    assert learned is not None and learned.get("kept_previous") is True
+    assert learned["round_trip"] == pytest.approx(0.8)
+    stored = efficiency_learning.load_estimate(store, "battery_1")
+    assert stored is not None and stored["round_trip"] == pytest.approx(0.8)
+    store.close()

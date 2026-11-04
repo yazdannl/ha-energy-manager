@@ -6,8 +6,8 @@ supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figur
 revisions described pre-audit trees and are obsolete.
 
 Verification was local and hardware-free: no real battery, no live provider call, no instance data.
-0.37.1, 0.37.2, 0.37.3, 0.37.4, 0.37.5 and 0.38.0 were deployed to the live instance and verified
-there (see §8.35–§8.40); the release gates below were repeated from a clean checkout; optional native C-core
+0.37.1, 0.37.2, 0.37.3, 0.37.4, 0.37.5, 0.38.0 and 0.38.1 were deployed to the live instance and
+verified there (see §8.35–§8.41); the release gates below were repeated from a clean checkout; optional native C-core
 tests skip when no compiled extension is present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
 `sem_*`), loopback addresses and placeholder coordinates.
 
@@ -17,7 +17,7 @@ tests skip when no compiled extension is present. All synthetic values use reser
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **1619 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension). The 0.38.0 diff changes Python and SQLite only (no C or optimizer code); the with-C-core figure is not re-measured here |
+| Test suite | `python3 -m pytest tests -q` | **1620 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension). The 0.38.0 diff changes Python and SQLite only (no C or optimizer code); the with-C-core figure is not re-measured here |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 177 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
@@ -31,7 +31,7 @@ Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (155 files, documentation excluded, clean clone without the optional native
   extension)**:
-  `9dc624a4bc69e35ff9fb58f985822930212578105d090af57450f9fbb13e89ae`
+  `88ed9718fae321f57ffd29254fb22c6804cc9eca14976ad39ab8fa3b9fdf9355`
 * **path list of the same 155 files** (detects an added, removed or renamed file):
   `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (0.37.4–0.38.0 added no
   file: the earlier path list is unchanged, and §8.37 explains why the earlier 155-file count is
@@ -2449,12 +2449,29 @@ boot run rewrote the round-trip profile with no pairs (the typed 0.8464 is now i
 the measured 0.845); the capacity no-wipe rule should be mirrored for the round trip in a follow-up,
 since a boot with too little history can still discard a good efficiency payload.
 
-Gates from the working tree: **1619 passed, 83 skipped** (`python3 -m pytest tests -q`; the optional C
+Gates from the working tree: **1620 passed, 83 skipped** (`python3 -m pytest tests -q`; the optional C
 core is not built here, so its cases skip and no C code changed), `audit: clean — 177 files scanned`,
 selfcheck **33/33**, headless UI **211 passed / 0 failed**, `compileall`, `node --check` and `sh -n`
 clean. Frozen code + tests digest: 155 files,
-`9dc624a4bc69e35ff9fb58f985822930212578105d090af57450f9fbb13e89ae`; the path-list digest is unchanged
+`88ed9718fae321f57ffd29254fb22c6804cc9eca14976ad39ab8fa3b9fdf9355`; the path-list digest is unchanged
 (`c769154c...`, no files added). The live deploy is recorded below after it is observed.
+
+### 8.41 A boot keeps the learned round trip (0.38.1)
+
+0.38.0 gave the capacity profile a no-wipe rule but not the efficiency one. The 0.38.0 deploy's boot
+relearn ran before any mean-sampled rows existed, wrote `round_trip = None` over the confident 0.8398
+profile, and the typed 0.8464 took over: `/api/v1/batteries` then showed `efficiency_samples 0` and
+`learned_round_trip null`. The capacity profile was correctly reset (its previous payload was schema 5
+and thus not keepable); the efficiency payload was schema 4 and still perfectly good.
+
+`learn_round_trip` now mirrors `capacity._keepable`: when the new pairs are too few to publish, a
+confident, fresh, current-schema payload is returned with `kept_previous` instead of being overwritten,
+and it still ages out on its own timestamp. One test pins the boot case
+(`tests/test_efficiency_learning.py::test_a_relearn_with_too_little_history_keeps_a_confident_estimate`).
+
+Gates: **1620 passed, 83 skipped**, `audit: clean — 177 files scanned`, selfcheck 33/33, headless UI
+211/0, `compileall`/`node --check`/`sh -n` clean (no C change). Frozen code + tests digest: 155 files,
+`88ed9718fae321f57ffd29254fb22c6804cc9eca14976ad39ab8fa3b9fdf9355`; path list unchanged (`c769154c...`).
 
 ---
 
@@ -2550,7 +2567,7 @@ and access to its base image; the final release gate also repeats these checks f
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 1619 passed, 83 skipped; C-core-specific cases skip without the extension)
+# 2. Full test suite (expect: 1620 passed, 83 skipped; C-core-specific cases skip without the extension)
 #    Needs pytest and PyYAML, which only the manifest test uses — the add-on itself imports nothing
 #    outside the standard library.
 python3 -m pytest tests -q

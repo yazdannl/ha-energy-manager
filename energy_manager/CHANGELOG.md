@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.38.1
+
+- **Fix: a boot relearn with too little history keeps the learned round trip.** 0.38.0 gave the
+  capacity profile a no-wipe rule but not the efficiency one; a restart with no fresh pairs wrote
+  `round_trip = None` over a confident profile, and the typed value took over until three new cycles
+  accumulated (observed live on the 0.38.0 deploy). The efficiency learner now keeps a confident,
+  fresh, current-schema payload and lets it age out on its own timestamp, exactly like capacity.
+- Capacity payload schema stays 6; store schema v10. No optimizer or C change.
+
 ## 0.38.0
 
 - **Fix: a 5-minute measurement bucket is the mean of its ticks, not the last 20-second tick.** The

@@ -461,8 +461,28 @@ def learn_round_trip(
         now=moment,
     )
     payload["seed_round_trip"] = float(battery.round_trip_efficiency)
+    previous = load_estimate(store, battery.id)
+    if payload.get("round_trip") is None and _keepable(previous, moment):
+        # A boot (or any run with too little fresh history) must not throw away a confident pair
+        # estimate: like the capacity profile, it stays (and ages out on its own timestamp) until a
+        # new measurement replaces it.  0.38.1.
+        return {**previous, "kept_previous": True}
     try:
         writer(PROFILE_KIND, battery.id, payload, moment)
     except Exception:  # noqa: BLE001 - a write failure leaves the previous estimate in place
         return payload
     return payload
+
+
+def _keepable(previous: Mapping[str, Any] | None, now: datetime) -> bool:
+    """True when a confident, current-schema profile is worth keeping over an empty relearn."""
+    if not previous:
+        return False
+    if _finite(previous.get("schema")) != float(SCHEMA):
+        return False
+    status = round_trip_status(previous, now)
+    return bool(
+        status.get("learned_round_trip") is not None
+        and int(status.get("samples") or 0) >= MIN_ACCEPTED_PAIRS
+        and not status.get("stale")
+    )
