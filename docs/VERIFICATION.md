@@ -2473,6 +2473,13 @@ Gates: **1620 passed, 83 skipped**, `audit: clean — 177 files scanned`, selfch
 211/0, `compileall`/`node --check`/`sh -n` clean (no C change). Frozen code + tests digest: 155 files,
 `88ed9718fae321f57ffd29254fb22c6804cc9eca14976ad39ab8fa3b9fdf9355`; path list unchanged (`c769154c...`).
 
+**Deployed and observed live (2026-11-04T16:05Z).** The store reload + `update.install` moved the
+add-on to 0.38.1; `/api/v1/health` reports 0.38.1 with the C core and both packs stay at **effective
+1.92 kWh / 1.824 kWh at 95 %**. The 0.38.1 boot had nothing to keep yet (the 0.38.0 boot had already
+replaced the old efficiency payload), so the typed 0.8464 remains in force; the next daily relearn
+with three mean-sampled pairs writes a learned payload, and any later boot now keeps it. The no-wipe
+path is pinned by the new test and was exercised against the live database schema (no migration).
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
