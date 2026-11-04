@@ -230,7 +230,8 @@ function classTokens(text) {
       && !/Bins follow local midnight/.test(allText(view()))
       && !/Partial bins are covered-only/.test(dailyText)
       && !/Data sources and limits/.test(dailyText)
-      && !/15-minute bins/.test(dailyText),
+      && !/15-minute bins/.test(dailyText)
+      && !/-0\.0/.test(dailyText),
     dailyText.slice(0, 420),
   );
   const firstSlots = timelineRows[0] ? timelineRows[0].querySelectorAll(".slot-metric") : [];

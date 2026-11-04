@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.38.3
+
+- **Fix: a near-zero measurement reads 0.0, not -0.0.** The compact slot row rounded a small
+  negative grid or battery reading to "-0.0", which looks like a sign error. Values below 0.05 kW
+  now read "0.0"; the full precision stays in the row tooltip and the interval detail.
+
 ## 0.38.2
 
 - **Fix: the Forecasts daily timeline is a compact slot list.** The coverage/provenance paragraph and

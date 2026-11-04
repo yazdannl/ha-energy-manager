@@ -3791,7 +3791,9 @@
     }
 
     function slotNumber(value) {
-      return isNum(value) ? value.toFixed(1) : "–";
+      if (!isNum(value)) return "–";
+      // A measured -0.02 kW is zero for this reading; "-0.0" looks like a sign error.
+      return Math.abs(value) < 0.05 ? "0.0" : value.toFixed(1);
     }
 
     /* One compact cell per series: an icon, a coloured value and a tooltip with the full reading.
