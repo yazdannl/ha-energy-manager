@@ -6,8 +6,8 @@ supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figur
 revisions described pre-audit trees and are obsolete.
 
 Verification was local and hardware-free: no real battery, no live provider call, no instance data.
-0.37.1, 0.37.2, 0.37.3, 0.37.4, 0.37.5, 0.38.0 and 0.38.1 were deployed to the live instance and
-verified there (see §8.35–§8.41); the release gates below were repeated from a clean checkout; optional native C-core
+0.37.1, 0.37.2, 0.37.3, 0.37.4, 0.37.5, 0.38.0, 0.38.1, 0.38.2 and 0.38.3 were deployed to the
+live instance and verified there (see §8.35–§8.42); the release gates below were repeated from a clean checkout; optional native C-core
 tests skip when no compiled extension is present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
 `sem_*`), loopback addresses and placeholder coordinates.
 
@@ -17,11 +17,11 @@ tests skip when no compiled extension is present. All synthetic values use reser
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **1620 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension). The 0.38.0 diff changes Python and SQLite only (no C or optimizer code); the with-C-core figure is not re-measured here |
+| Test suite | `python3 -m pytest tests -q` | **1620 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension). The 0.38.2/0.38.3 diff is UI-only (no Python runtime, SQLite, optimizer or C change); the with-C-core figure is not re-measured here |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 177 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
-| Headless UI render check | `node tools/ui_render_check.js` | **211 passed, 0 failed**, exit 0 |
+| Headless UI render check | `node tools/ui_render_check.js` | **213 passed, 0 failed**, exit 0 |
 | First-party JavaScript syntax | `node --check` over non-vendored app/tool JavaScript | clean, exit 0 |
 | POSIX shell syntax | `sh -n tools/audit.sh && sh -n energy_manager/run.sh` | clean, exit 0 |
 | Add-on image + entrypoint | Native `aarch64` Docker build and CI-style startup smoke | image built; startup banner observed; the deployed instance reports `optimizer_core.backend: c`. The local builder supports ARM platforms only. |
@@ -31,11 +31,10 @@ Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (155 files, documentation excluded, clean clone without the optional native
   extension)**:
-  `88ed9718fae321f57ffd29254fb22c6804cc9eca14976ad39ab8fa3b9fdf9355`
+  `0f63e8dacfa6cfcfbb76bd681bdd51d217ba7c948298fee3537d5a84d1407785`
 * **path list of the same 155 files** (detects an added, removed or renamed file):
-  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (0.37.4–0.38.0 added no
-  file: the earlier path list is unchanged, and §8.37 explains why the earlier 155-file count is
-  superseded)
+  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (0.38.2–0.38.3 added no
+  file: the earlier path list is unchanged)
 * The 0.37.5 record measured 158 files in a working tree with the locally built native extension
   (`45fe3dc9…`, path list `c1c39364…`). The 0.38.0 clean tree selects 155 files; the gates above
   were run on it.
@@ -2479,6 +2478,33 @@ add-on to 0.38.1; `/api/v1/health` reports 0.38.1 with the C core and both packs
 replaced the old efficiency payload), so the typed 0.8464 remains in force; the next daily relearn
 with three mean-sampled pairs writes a learned payload, and any later boot now keeps it. The no-wipe
 path is pinned by the new test and was exercised against the live database schema (no migration).
+
+### 8.42 One compact forecast slot row and a pan/zoom chart (0.38.2, 0.38.3)
+
+The Forecasts daily timeline was the densest screen in the product: a coverage paragraph, a
+provenance disclosure, a six-column interval table where every row repeated sample counts, stale
+flags and source text, and a uPlot chart that only a mouse drag could zoom. The paragraph and
+disclosure are removed. The slot table is one compact row per 15-minute bin with an icon and coloured
+value for PV, load, grid, battery and the saved plan action; tapping the time opens the existing
+sample/provenance/plan detail on demand. The chart opts into a small uPlot gesture layer
+(`semPanZoom`): drag pans, pinch or wheel zooms around the pointer, and a double tap restores the
+full day. The scale is bounded to the data range and to a 15-minute minimum, so it cannot invert or
+leave the selected date. Ticks drop the repeated timezone suffix and the legend labels are short
+enough for a 360 px phone. 0.38.3 keeps a rounded near-zero reading at "0.0" instead of "-0.0".
+
+Gates from the working tree: **1620 passed, 83 skipped** (`python3 -m pytest tests -q`; the optional C
+core is not built here), `audit: clean — 177 files scanned`, selfcheck **33/33**, headless UI
+**213 passed / 0 failed**, `compileall`, `node --check` and `sh -n` clean. Frozen code + tests digest:
+155 files, `0f63e8dacfa6cfcfbb76bd681bdd51d217ba7c948298fee3537d5a84d1407785`; path list unchanged
+(`c769154c...`, no files added).
+
+**Deployed and observed live (2026-11-04T20:55Z).** The store reload + `update.install` moved the
+add-on to 0.38.3; `/api/v1/health` reports 0.38.3 with the C core, and the served `app.js` SHA-256
+matches the worktree. The phone shows `2026-11-04 · 96 slots · Europe/Amsterdam`, the short-tick
+chart, and the compact slot table; scrolling the slot rows confirms one icon line per bin and no
+"Data sources and limits" / "96 15-minute bins" block. The live `/api/v1/daily-timeline` query for
+the full local day answered in 43–62 s during the check; the UI renders that same response and adds
+no request. That backend latency is pre-existing and unchanged by this diff.
 
 ---
 
