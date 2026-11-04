@@ -2375,10 +2375,11 @@ plan runs both: each inverter took 1,000 W (measured grid-input power 999 W and 
 Known limitation found during the deploy: the first two-battery ticks spent two sequential bounded
 read-back windows (8 s each) while the 5 s tick interval gave the watchdog a 15 s budget
 (three ticks), so the guard held both batteries and the next tick re-commanded them -- a visible
-0/1000 W flap. Raising the live `control.tick_seconds` to 10 s (30 s budget) restored
-`scheduler_healthy: true`, and both batteries hold 1,000 W with idempotent skips. A future release
-should scale the watchdog budget by the drivers' read-back deadlines instead of relying on the tick
-interval. The gates above are the clean-checkout values for the release commit; the audit fix in
+0/1000 W flap. A first raise to 10 s was still not enough when a minute replan overlapped two
+write verifications; the live `control.tick_seconds` is now 20 s (60 s budget), which restored
+`scheduler_healthy: true` and both batteries hold ~900-1,000 W with idempotent skips. A future
+release should scale the watchdog budget by the drivers' read-back deadlines and the replan time
+instead of relying on the tick interval. The gates above are the clean-checkout values for the release commit; the audit fix in
 that commit also rewrites one instance entity id out of the 0.37.5 live note, which had left `main`
 unclean under R1 since 74f1298.
 
