@@ -53,7 +53,7 @@ __all__ = [
     "table_exists",
 ]
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 #: One migration step: a SQL statement, or a Python step for work SQL cannot express (the history
 #: seed parses the instant it copies, and a stored ``+02:00`` offset is not a string operation).
@@ -459,6 +459,20 @@ MIGRATIONS: list[tuple[int, tuple[MigrationStep, ...]]] = [
             # Plan history keeps exact links for new dispatch attempts. Existing rows intentionally
             # remain NULL: a timestamp-only join cannot identify which overlapping replan they used.
             _add_plan_dispatch_history,
+        ),
+    ),
+    (
+        10,
+        (
+            # 0.38.0: a 5-minute measurement bucket is the **mean** of the ticks in it, not the
+            # last 20-second point sample.  The old upsert kept only the last tick, so a bucket
+            # whose power was on for part of the interval could book a full 5 minutes at that
+            # point: the live capacity learner read 2.43 kWh on a 1.92 kWh pack.  Old rows keep
+            # NULL (their method is unknown); the learner ignores them instead of mixing a point
+            # sample with a bucket mean, and every new row counts its ticks in ``samples``.
+            lambda conn: _add_columns_if_missing(
+                conn, "measurements", {"samples": "INTEGER"}
+            ),
         ),
     ),
 ]
@@ -1426,10 +1440,20 @@ class Store:
         if not rows:
             return 0
         with _transaction(self.connection) as conn:
+            # A bucket is the MEAN of the ticks in it (0.38.0): the engine samples every 20 s, so
+            # the last tick alone is a point sample of a power that came on and off inside the
+            # interval.  ``samples`` is the tick count behind the mean; a legacy row keeps NULL.
             conn.executemany(
-                "INSERT INTO measurements(ts, entity_role, value, unit, entity_id, observed_at) "
-                "VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(ts, entity_role) DO UPDATE SET "
-                "value = excluded.value, unit = excluded.unit, entity_id = excluded.entity_id, "
+                "INSERT INTO measurements(ts, entity_role, value, unit, entity_id, observed_at, "
+                "samples) VALUES(?, ?, ?, ?, ?, ?, 1) ON CONFLICT(ts, entity_role) DO UPDATE SET "
+                # A legacy row (samples NULL) is replaced by the first new tick rather than
+                # averaged with it: the two numbers were produced by different methods.
+                "value = CASE WHEN measurements.samples IS NULL THEN excluded.value "
+                "ELSE (measurements.value * measurements.samples + excluded.value) "
+                "/ (measurements.samples + 1) END, "
+                "samples = CASE WHEN measurements.samples IS NULL THEN 1 "
+                "ELSE measurements.samples + 1 END, "
+                "unit = excluded.unit, entity_id = excluded.entity_id, "
                 "observed_at = excluded.observed_at",
                 rows,
             )

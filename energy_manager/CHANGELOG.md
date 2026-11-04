@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.38.0
+
+- **Fix: a 5-minute measurement bucket is the mean of its ticks, not the last 20-second tick.** The
+  sampler upserted every tick into one bucket and kept only the last value, so a power that came on
+  for part of the interval could be booked for the full five minutes at the last point sample. The
+  capacity learner then credited the energy of a full bucket to a shorter SoC move. Live 2026-11-04:
+  `learned 2.4348 kWh` from 41 windows on the 1.92 kWh pack (applied as 2.40 through the 25 % band),
+  while the same rows' five-minute means give ~2.05. The upsert now folds each tick into a running
+  mean and counts it in `measurements.samples`; pre-0.38 rows keep `samples = NULL` and the learner
+  never mixes a point sample with a bucket mean (schema v10).
+- **Fix: the pack's reported capacity is a hard ceiling for an AC-only estimate.** 0.37.2 widened the
+  cap to 25 % because a stale 2.30 kWh estimate looked like evidence that the pack's SoC scale was
+  larger. It is not: the two leg efficiencies are not separately identifiable from AC energy and SoC
+  (the same AC-per-point data fits 1.92 kWh at 86/98 % legs or 2.05 kWh at 92/92 %, with the same
+  measured round trip), so a higher number is a stale scale or a bad window. The applied value is
+  capped at `capacity_entity` again; a below-report estimate (aging) still applies, and the raw
+  measurement stays visible as `learned_kwh`/`capped_kwh`.
+- **Fix: capacity learning never reads the signed setpoint.** `battery_power` is the
+  `power_setpoint_entity`: a command the pack may not follow (a taper, a manager still ramping) and
+  the exact failure mode 0.31.0 fixed. Only the measured `battery_charge`/`battery_discharge` pair
+  is a measurement; without it there is no estimate.
+- **Fix: rows from two entity ids for one role are never mixed.** Only the newest entity id per role
+  feeds a window's median, so a renamed mapping cannot merge two sensors' scales (the live mapping
+  survived a device rename, and the old ids stayed in the 45-day window).
+- **Fix: a leading SoC plateau is trimmed exactly like the trailing one.** Energy moved before the
+  reported SoC starts ticking is not capacity; 0.31.1 fixed the trailing edge, 0.38.0 the mirror.
+- **Fix: a relearn with too few windows keeps the confident estimate.** Replacing a good profile with
+  `None` because this month had no clean cycle threw away evidence; the stored value now stays (and
+  ages out on its own timestamp) until a new measurement replaces it.
+- Capacity payload schema 6; store schema v10. The live 2.43 was a combination of last-tick sampling,
+  pre-0.25 legacy rows and the 25 % band, not a real 2.3 kWh SoC scale.
+
 ## 0.37.6
 
 - **Fix: two SolarFlow batteries on one Zendure manager can both be controlled on the device path.**

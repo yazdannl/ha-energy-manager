@@ -17,7 +17,7 @@ tests skip when no compiled extension is present. All synthetic values use reser
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **1614 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension). The 0.37.6 diff adds three Python tests and touches no C or optimizer code; the 0.37.5 with-C-core figure (1694 tests, 1692 passed, two wall-clock micro-benchmarks over their 20 ms threshold) is not re-measured here |
+| Test suite | `python3 -m pytest tests -q` | **1619 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension). The 0.38.0 diff changes Python and SQLite only (no C or optimizer code); the with-C-core figure is not re-measured here |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 177 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
@@ -31,13 +31,13 @@ Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (155 files, documentation excluded, clean clone without the optional native
   extension)**:
-  `75f4f82ddb649c8bb387e51ab15964fa38383703bf20c06763b85670cd7dec08`
+  `9dc624a4bc69e35ff9fb58f985822930212578105d090af57450f9fbb13e89ae`
 * **path list of the same 155 files** (detects an added, removed or renamed file):
-  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (0.37.4–0.37.6 added no
+  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (0.37.4–0.38.0 added no
   file: the earlier path list is unchanged, and §8.37 explains why the earlier 155-file count is
   superseded)
 * The 0.37.5 record measured 158 files in a working tree with the locally built native extension
-  (`45fe3dc9…`, path list `c1c39364…`). The 0.37.6 clean clone selects 155 files; the gates above
+  (`45fe3dc9…`, path list `c1c39364…`). The 0.38.0 clean tree selects 155 files; the gates above
   were run on it.
 
 Historically, the 0.10.1 tree's code + tests digest was `28fdad8a…`, 0.10.0's `784dbf04…` and
@@ -2383,6 +2383,67 @@ instead of relying on the tick interval. The gates above are the clean-checkout 
 that commit also rewrites one instance entity id out of the 0.37.5 live note, which had left `main`
 unclean under R1 since 74f1298.
 
+### 8.40 A bucket mean, a hard capacity ceiling (0.38.0)
+
+The owner reported that the learned capacity still read high. Live 2026-11-04, `/api/v1/batteries`
+confirmed it: the first AB2000 (1.92 kWh label, 1.92 kWh `capacity_entity`) had
+`learned 2.4348 kWh` from 41 windows, and because 0.37.2's band allowed `1.92 x 1.25 = 2.40`, the
+effective capacity was **2.40** and the state at 95 % was derived as 2.28 kWh. The second, newer unit
+had no estimate yet and used 1.92. The add-on was planning a 20 % larger pack than the hardware says
+it holds.
+
+**Reconstruction of the same data.** The instance's 5-minute recorder statistics for the pack's own
+SoC and the mapped AC charge/discharge pair (2026-10-28..11-04) run through `extract_windows` with
+5-minute *means* give 24 accepted charge windows and a charge-side median of **2.0458 kWh** (band
+trims 2.03..2.18; per-direction AC capacities 2.0475/2.0617). The add-on's 41-window, 45-day median
+was 2.4348. Rebuilding the add-on's own bucket rule from Home Assistant's raw state history -- the
+**last 20-second tick** in each 5-minute bucket, which is what `add_measurements` used to keep -- gives
+**2.30..2.36** on the same day. The last tick is a point sample: a bucket whose power came on for part
+of the interval was booked for a full five minutes at that point, and a short SoC move then received a
+full bucket's energy. The pre-rename rows were also still inside the 45-day query.
+
+The pack's own DC flow was checked as an independent basis and **not** adopted. The AB2000's V x I
+reads about 2.6 % high while charging and 2.6 % low while discharging (the two directions average to
+the 1.92 label, and the discharge ratio comes out slightly above 1), so it is a direction-biased
+sensor, not ground truth. The AC round trip from the device's cumulative counters is 0.843..0.850,
+and AC energy plus SoC cannot identify the two leg efficiencies separately: the same AC-per-point
+data fits 1.92 kWh at 86/98 % legs or 2.05 kWh at 92/92 %, with the same measured round trip. A
+higher AC-only estimate is therefore not evidence that the pack holds more.
+
+**Fixes.**
+
+1. **A bucket is the mean of its ticks.** `Store.add_measurements` folds every 20-second tick into a
+   running mean and counts it in the new `measurements.samples` column (store schema v10). A pre-0.38
+   row keeps `samples = NULL`; the capacity learner ignores it, so a point sample is never mixed with
+   a bucket mean. A legacy row that receives a new tick is replaced by it, not averaged with it.
+2. **The reported capacity is a hard ceiling.** `ABOVE_REPORTED_TOLERANCE` is 0 again: the applied
+   value is `min(learned, reported)`; a below-report estimate (aging) still applies, and the raw
+   `learned_kwh`/`capped_kwh` stays visible. Capacity payload schema 6 refuses the 2.4348 schema-5
+   payload, so the seed 1.92 is used from the first replan after the upgrade, not after the next
+   relearn.
+3. **No command is a measurement.** The learner reads only `battery_charge`/`battery_discharge`; the
+   signed `battery_power` role is the `power_setpoint_entity` and is never used, so a taper or a
+   manager ramp cannot inflate a window.
+4. **One entity per role.** Only the newest entity id per role feeds the windows; the older ids from
+   a renamed mapping are dropped rather than mixed.
+5. **Leading plateau trim.** Energy before the reported SoC starts moving is subtracted, the mirror of
+   the 0.31.1 trailing fix.
+6. **No wipe.** A relearn with too few accepted windows keeps a confident, fresh profile (with its
+   own timestamp, so it ages out) instead of replacing it with `None`.
+
+**Offline expected result.** With the 5-minute means, the charge-side estimate is ~2.05 kWh, the hard
+cap applies 1.92, the state at 95 % is 1.824 kWh and the plan ceiling is 1.824. The UI states the
+measured number, the reported ceiling and why the ceiling wins; the journal logs both. Three new
+mean-sampled charge windows are needed before a new payload is published; until then the seed is in
+force.
+
+Gates from the working tree: **1619 passed, 83 skipped** (`python3 -m pytest tests -q`; the optional C
+core is not built here, so its cases skip and no C code changed), `audit: clean — 177 files scanned`,
+selfcheck **33/33**, headless UI **211 passed / 0 failed**, `compileall`, `node --check` and `sh -n`
+clean. Frozen code + tests digest: 155 files,
+`9dc624a4bc69e35ff9fb58f985822930212578105d090af57450f9fbb13e89ae`; the path-list digest is unchanged
+(`c769154c...`, no files added). The live deploy is recorded below after it is observed.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
@@ -2477,7 +2538,7 @@ and access to its base image; the final release gate also repeats these checks f
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 1614 passed, 83 skipped; C-core-specific cases skip without the extension)
+# 2. Full test suite (expect: 1619 passed, 83 skipped; C-core-specific cases skip without the extension)
 #    Needs pytest and PyYAML, which only the manifest test uses — the add-on itself imports nothing
 #    outside the standard library.
 python3 -m pytest tests -q

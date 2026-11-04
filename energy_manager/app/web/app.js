@@ -4789,8 +4789,8 @@
       reason: String((record && record.capacity_reason) || info.reason || ""),
       stale: !!info.stale,
       applied: !!info.applied,
-      // SPEC 5: an estimate is planned inside a bounded band above what the pack reports holding;
-      // ``learned`` stays the measurement's own number so both can be shown.
+      // SPEC 5: an AC-only estimate is planned at or below what the pack reports holding; the
+      // pack's figure is a hard ceiling, while ``learned`` stays the measurement's own number.
       capped: !!info.capped,
       capKwh: isNum(info.cap_kwh) ? info.cap_kwh : null,
       reportedKwh: isNum(info.reported_kwh) ? info.reported_kwh : null,
@@ -4840,8 +4840,7 @@
     // One pack, one capacity: measured while charging, because the discharge side delivers that
     // capacity *less* the round-trip loss rather than a second capacity.
     if (cap.capped) {
-      var band = cap.bandPct != null ? "a " + cap.bandPct + " % band above" : "a small band above";
-      return "Learned from measured" + (cap.basis === "discharge" ? " discharge" : " charging") + " cycles: " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " accepted window(s), last learned " + timeAgo(cap.updated) + ". That is above the " + fmtKwh(cap.reportedKwh) + " kWh the pack reports holding, so planning allows " + band + " it and uses " + fmtKwh(cap.effective) + " kWh; the raw estimate stays visible. Pin a value to override it.";
+      return "Learned from measured" + (cap.basis === "discharge" ? " discharge" : " charging") + " cycles: " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " accepted window(s), last learned " + timeAgo(cap.updated) + ". That is above the " + fmtKwh(cap.reportedKwh) + " kWh the pack reports holding; AC energy and SoC cannot prove a higher scale, so planning uses the pack's " + fmtKwh(cap.effective) + " kWh. The raw estimate stays visible. Pin a value to override it.";
     }
     var base = "Learned from measured" + (cap.basis === "discharge" ? " discharge" : " charging") + " cycles: " + fmtKwh(cap.learned) + " kWh from " + cap.samples + " accepted window(s), last learned " + timeAgo(cap.updated) + ". Effective capacity " + fmtKwh(cap.effective) + " kWh.";
     if (cap.reportedKwh != null && Math.abs(cap.reportedKwh - cap.effective) > 0.01) {

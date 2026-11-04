@@ -85,9 +85,6 @@ def _estimated(
     )
 
 
-# ----------------------------------------------------------------------------------- estimator
-
-
 def test_charge_and_discharge_use_their_own_efficiency():
     """The eta belongs on the matching leg: charge multiplies, discharge divides."""
     # 500 W for 60 min = 0.5 kWh AC, 20 SoC points.
@@ -244,15 +241,15 @@ def test_windows_are_capped_and_payload_is_finite():
     assert len(payload["windows"]) == MAX_KEPT_WINDOWS
 
 
-def test_samples_from_rows_reads_signed_or_paired_power():
+def test_samples_from_rows_reads_only_measured_power_not_the_setpoint():
     stamp = to_iso(T0)
-    rows = [
+    command = [
         {"ts": stamp, "entity_role": "battery_power:battery_1", "value": 500.0},
         {"ts": stamp, "entity_role": "battery_soc:battery_1", "value": 42.0},
         {"ts": stamp, "entity_role": "battery_soc:battery_2", "value": 99.0},
     ]
-    samples = samples_from_rows(rows, "battery_1")
-    assert samples == [(T0, 500.0, 42.0)]
+    # 0.38.0: the signed role is the setpoint *command*, never a capacity measurement.
+    assert samples_from_rows(command, "battery_1") == []
 
     paired = [
         {"ts": stamp, "entity_role": "battery_charge:battery_1", "value": 600.0},
@@ -265,6 +262,35 @@ def test_samples_from_rows_reads_signed_or_paired_power():
     # a pack that did not follow the setpoint (a taper) would otherwise inflate the AC energy.
     both = paired + [{"ts": stamp, "entity_role": "battery_power:battery_1", "value": 900.0}]
     assert samples_from_rows(both, "battery_1") == [(T0, 500.0, 42.0)]
+
+
+def test_rows_from_two_entity_ids_are_never_mixed():
+    """A renamed mapping must not merge two sensors' scales into one median."""
+    old = T0
+    new = T0 + timedelta(minutes=5)
+    rows = [
+        {"ts": to_iso(old), "entity_role": "battery_charge:battery_1", "value": 500.0,
+         "entity_id": "sensor.example_old_charge"},
+        {"ts": to_iso(old), "entity_role": "battery_soc:battery_1", "value": 40.0,
+         "entity_id": "sensor.example_old_soc"},
+        {"ts": to_iso(new), "entity_role": "battery_charge:battery_1", "value": 600.0,
+         "entity_id": "sensor.example_new_charge"},
+        {"ts": to_iso(new), "entity_role": "battery_soc:battery_1", "value": 42.0,
+         "entity_id": "sensor.example_new_soc"},
+    ]
+    assert samples_from_rows(rows, "battery_1") == [(new, 600.0, 42.0)]
+
+
+def test_legacy_point_sample_rows_are_not_mixed_with_bucket_means():
+    """0.38.0: old rows kept only the last tick; the learner must not mix them with a bucket mean."""
+    stamp = to_iso(T0)
+    rows = [
+        {"ts": stamp, "entity_role": "battery_charge:battery_1", "value": 500.0, "samples": None},
+        {"ts": stamp, "entity_role": "battery_soc:battery_1", "value": 40.0, "samples": None},
+        {"ts": stamp, "entity_role": "battery_charge:battery_1", "value": 600.0, "samples": 2},
+        {"ts": stamp, "entity_role": "battery_soc:battery_1", "value": 42.0, "samples": 2},
+    ]
+    assert samples_from_rows(rows, "battery_1") == [(T0, 600.0, 42.0)]
 
 
 def test_a_payload_from_the_old_formula_is_reported_but_never_applied():
@@ -302,7 +328,7 @@ def test_learn_capacity_writes_a_profile_and_survives_a_missing_store(tmp_path):
     rows = []
     for index, power in enumerate((500.0, 500.0, 500.0)):
         for ts, watts, soc in _window(T0 + timedelta(hours=2 * index), 40.0, 60.0, power):
-            rows.append(Measurement(ts=ts, role="battery_power:battery_1", value=watts, unit="W"))
+            rows.append(Measurement(ts=ts, role="battery_charge:battery_1", value=watts, unit="W"))
             rows.append(Measurement(ts=ts, role="battery_soc:battery_1", value=soc, unit="%"))
     store.add_measurements(rows)
 
@@ -458,7 +484,16 @@ def test_plan_and_allocation_use_the_learned_capacity():
     assert plan.batteries[0]["capacity_kwh"] == pytest.approx(LEARNED_KWH)
 
 
-def put_round_trip(store, battery_id: str, *, round_trip: float, samples: int, now: datetime) -> None:
+def put_round_trip(
+    store,
+    battery_id: str,
+    *,
+    round_trip: float,
+    samples: int,
+    now: datetime,
+    eta_charge: float | None = None,
+    eta_discharge: float | None = None,
+) -> None:
     eta = round_trip**0.5
     store.profile_put(
         efficiency_learning.PROFILE_KIND,
@@ -466,8 +501,9 @@ def put_round_trip(store, battery_id: str, *, round_trip: float, samples: int, n
         {
             "round_trip": round_trip,
             "median_round_trip": round_trip,
-            "eta_charge": eta,
-            "eta_discharge": eta,
+            "eta_charge": eta if eta_charge is None else eta_charge,
+            "eta_discharge": eta if eta_discharge is None else eta_discharge,
+            "basis": "even_split" if eta_charge is None else "measured_legs",
             "samples": samples,
             "pairs": [],
             "schema": efficiency_learning.SCHEMA,
@@ -508,7 +544,7 @@ def test_learn_capacities_updates_the_profile_from_measurements():
     rows = []
     for index in range(3):
         for ts, watts, soc in _window(clock.now - timedelta(days=1, hours=2 * index), 40.0, 60.0, 500.0):
-            rows.append({"ts": to_iso(ts), "entity_role": "battery_power:example_battery_1", "value": watts})
+            rows.append({"ts": to_iso(ts), "entity_role": "battery_charge:example_battery_1", "value": watts})
             rows.append({"ts": to_iso(ts), "entity_role": "battery_soc:example_battery_1", "value": soc})
     store.measurements_range = lambda start, end, roles=None: rows  # noqa: ARG005
     summary = engine.learn_capacities(clock.now)
@@ -549,10 +585,11 @@ def test_cap_to_reported_only_ever_lowers_the_estimate():
     assert cap_to_reported(8.5, 0.0) == 8.5
     assert cap_to_reported(8.5, -1.0) == 8.5
     assert cap_to_reported(None, 6.0) is None
-    # 0.37.2: a small measured overshoot is planned (the charge-side estimate carries the unknown
-    # efficiency split), only the excess is trimmed.
+    # 0.38.0: the pack's reported capacity is a hard ceiling (AC energy and SoC cannot prove a
+    # higher scale); the tolerance argument stays for an explicitly measured scale and defaults 0.
     ceiling = 6.0 * (1.0 + ABOVE_REPORTED_TOLERANCE)
-    assert cap_to_reported(6.2, 6.0, tolerance=ABOVE_REPORTED_TOLERANCE) == 6.2
+    assert ceiling == pytest.approx(6.0)
+    assert cap_to_reported(6.2, 6.0, tolerance=ABOVE_REPORTED_TOLERANCE) == pytest.approx(ceiling)
     assert cap_to_reported(8.5, 6.0, tolerance=ABOVE_REPORTED_TOLERANCE) == pytest.approx(ceiling)
 
 
@@ -599,9 +636,9 @@ def test_the_reported_capacity_survives_the_plan_scale_rescale():
     engine._note_ha_read([state])
     status = engine.capacity_status(EXAMPLE_BATTERY.id)
     assert status["reported_kwh"] == pytest.approx(1.92)
-    assert status["capped"] is True  # 8.5 is trimmed by the 25 % band around the *reported* 1.92
-    assert status["cap_kwh"] == pytest.approx(1.92 * 1.25)
-    assert engine.effective_capacity_kwh(EXAMPLE_BATTERY) == pytest.approx(1.92 * 1.25)
+    assert status["capped"] is True  # 8.5 is trimmed at the *reported* 1.92
+    assert status["cap_kwh"] == pytest.approx(1.92 * (1.0 + TOLERANCE))
+    assert engine.effective_capacity_kwh(EXAMPLE_BATTERY) == pytest.approx(1.92 * (1.0 + TOLERANCE))
 
 
 def test_batteries_view_exposes_the_cap_and_keeps_the_raw_estimate():
@@ -643,3 +680,27 @@ def test_a_window_that_ends_at_the_clamped_soc_ceiling_is_rejected():
     payload = _estimated(just_below)
     assert payload["samples"] == 1  # accepted (one window is not yet a published estimate)
     assert payload["rejected"]["edge"] == 0
+
+
+def test_an_unconfident_relearn_keeps_the_previous_estimate(tmp_path):
+    store = Store(tmp_path / "measure.db")
+    battery = BatteryConfig(
+        id="battery_1",
+        name="Example battery",
+        driver="generic",
+        capacity_kwh=5.0,
+        max_charge_w=MAX_POWER,
+        max_discharge_w=MAX_POWER,
+    )
+    put_estimate(store, "battery_1", kwh=4.2, samples=6, now=T0)
+    payload = learn_capacity(store, battery, T0 + timedelta(hours=1))
+    assert payload is not None and payload.get("kept_previous") is True
+    assert payload["capacity_kwh"] == pytest.approx(4.2)
+    stored = load_estimate(store, "battery_1")
+    assert stored is not None and stored["capacity_kwh"] == pytest.approx(4.2)
+    store.close()
+
+
+def test_the_reported_capacity_is_a_hard_ceiling():
+    """The stale 2.30 kWh estimate on the 1.92 kWh live pack must be trimmed to the pack's figure."""
+    assert ABOVE_REPORTED_TOLERANCE == pytest.approx(0.0)

@@ -61,7 +61,9 @@ __all__ = [
     "role_entities",
 ]
 
-#: SPEC.md section 7.3 resolution: every tick upserts into this bucket instead of a new row.
+#: SPEC.md section 7.3 resolution: every tick upserts into this bucket instead of a new row, and the
+#: bucket keeps the **mean** of the ticks (0.38.0).  The mean matters: a point sample of a power that
+#: came on and off inside the interval made the capacity learner over-read (live 2026-11-04).
 MEASUREMENT_MINUTES = 5
 _POWER_TO_W = {"w": 1.0, "kw": 1e3, "mw": 1e6}
 

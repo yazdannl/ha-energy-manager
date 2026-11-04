@@ -6,7 +6,9 @@ seed/fallback and lets the planner use the value measured from the pack's own cy
 confident; ``pinned`` always uses the typed value.
 
 The estimate is derived from the persisted 5-minute measurement rows only (``sources/measure.py``),
-never from user settings: each *window* is a maximal run of same-direction AC power whose SoC moved
+never from user settings: since 0.38.0 a row is the **mean** of the ticks in its bucket (with the
+tick count in ``measurements.samples``), and a pre-0.38 row (count NULL) is ignored because it kept
+only the last tick.  Each *window* is a maximal run of same-direction AC power whose SoC moved
 enough and fast enough to be trusted, and the window's capacity is the energy moved divided by the
 SoC it moved
 
@@ -28,6 +30,13 @@ Discharge windows are only a fallback when too few charge windows exist to publi
 always says which side it used (``basis``). Estimates are combined with a median after a
 median-absolute-deviation outlier filter, clamped to a plausible range and published only after at
 least three accepted windows.
+
+Two things are deliberately **not** used. The signed ``battery_power`` role is the setpoint *command*,
+not a measurement (a pack that does not follow a taper would inflate the estimate), and rows from two
+different entity ids for the same role are never mixed (a renamed mapping must not merge two sensors'
+scales). The applied number is the estimate capped at the pack's own reported capacity: a measurement
+can confirm that a pack holds *less* than its label (aging), but an AC-only estimate cannot prove it
+holds more (the two leg efficiencies are not separately identifiable from AC energy and SoC).
 
 Everything in this module is pure except :func:`learn_capacity`, which writes the profile through the
 store it is handed; a missing or unreadable store is not an error, only "no estimate yet".
@@ -80,10 +89,12 @@ PROFILE_KIND = "battery_capacity"
 #: inflate short windows); schema 4 (0.32.0) takes the capacity from the **charging side only**, so one
 #: pack reports one capacity instead of a charge population and a discharge population a few percent
 #: apart; schema 5 (0.37.2) refuses windows that touch the clamped ends of the reported SoC range (a
-#: pack held at 100 % keeps accepting charge the SoC cannot show, so those windows over-read).  A
-#: payload from an older schema is reported but not trusted -- the typed seed stands until the next
-#: maintenance relearn rewrites it.
-SCHEMA = 5
+#: pack held at 100 % keeps accepting charge the SoC cannot show, so those windows over-read); schema 6
+#: (0.38.0) never learns from the signed setpoint command, keeps only the newest entity id per role
+#: (a renamed mapping cannot mix two sensors' scales), and trims leading SoC plateaus exactly like
+#: trailing ones.  A payload from an older schema is reported but not trusted -- the typed seed
+#: stands until the next maintenance relearn rewrites it.
+SCHEMA = 6
 
 #: A window's SoC must move at least this many points to be trusted.
 MIN_DSOC_PCT = 10.0
@@ -102,13 +113,13 @@ STALE_AFTER_DAYS = 30.0
 #: Plausible usable-capacity envelope; anything outside is a bad measurement, never a battery.
 MIN_PLAUSIBLE_KWH = 1.0
 MAX_PLAUSIBLE_KWH = 200.0
-#: Gross-error guard above the pack's own reported capacity (SPEC 5).  The reported figure is the
-#: integration's *nominal* capacity, while the learner measures the AC energy behind one point of the
-#: pack's reported SoC: the BMS SoC basis can differ from the label (live 2026-10-27: 2.30 measured
-#: on a 1.92-labelled pack, and the AC per SoC point confirms it), so a band must let a real
-#: measurement through.  Beyond it the sample is far more likely a bad energy reading than a real
-#: pack, and the excess is trimmed; the raw estimate stays visible.  Downward is never limited.
-ABOVE_REPORTED_TOLERANCE = 0.25
+#: Gross-error guard above the pack's own reported capacity (SPEC 5).  AC energy and SoC cannot
+#: identify the two leg efficiencies separately, so an AC-only estimate above the pack's own figure
+#: is not evidence that the pack holds more: live, a stale 2.30 kWh estimate sat 20 % above a
+#: 1.92 kWh pack whose AC cycles and DC flow both support the label.  The reported value is therefore
+#: a hard ceiling; a measurement is always free to correct *downward* (aging).  Downward is never
+#: limited.
+ABOVE_REPORTED_TOLERANCE = 0.0
 #: A window whose SoC touches the clamped ends of the reported range is over-read: the pack keeps
 #: accepting charge (or delivering it) while the reported SoC has stopped moving.
 SOC_EDGE_PCT = 1.0
@@ -126,6 +137,9 @@ REASON_UNAVAILABLE = "capacity_learned_unavailable"
 
 _POWER_ROLES = ("battery_power", "battery_charge", "battery_discharge")
 _SOC_ROLE = "battery_soc"
+#: Roles the learner reads.  The signed ``battery_power`` is the setpoint entity (a command), so it
+#: is deliberately absent: a measurement is the only thing that can teach a capacity.
+_LEARNED_ROLES = ("battery_charge", "battery_discharge", _SOC_ROLE)
 
 #: Public aliases: :mod:`app.efficiency` reads the same measurement vocabulary.
 POWER_ROLES = _POWER_ROLES
@@ -196,12 +210,16 @@ def extract_windows(
 
     Returns ``(accepted, rejected)``. Each accepted window is
     ``{kind, capacity_kwh, dsoc_pct, mean_power_w, samples, ac_kwh, start, end, soc_start_pct,
-    soc_end_pct}``. A run is broken
-    (and never joined
-    across the break) by a direction change, a zero/invalid power sample or a gap longer than one
-    sample, so a missing measurement can only shorten a window, never bridge it. Energy is booked
-    only for the sample pairs that moved the SoC in the run's direction, so a window's ``ac_kwh``
-    always paid for its ``dsoc_pct`` (a pack resting at its limit does not add phantom energy).
+    soc_end_pct}``. A run is broken (and never joined across the break) by a direction change, a
+    zero/invalid power sample or a gap longer than one sample, so a missing measurement can only
+    shorten a window, never bridge it.
+
+    Energy is booked only for the sample pairs that moved the SoC in the run's direction.  A leading
+    or trailing plateau (the pack resting at its limit, or a SoC reading that stopped ticking) is
+    subtracted, so a window's ``ac_kwh`` always paid for its ``dsoc_pct``; a *mid-run* plateau stays
+    booked because SoC movement on either side pays for it.  The trailing trim was 0.31.1; the
+    leading mirror is 0.38.0 (a run that starts while the SoC is still clamped must not book the
+    energy it moved before the reading caught up).
     """
     accepted: list[dict[str, Any]] = []
     rejected = {"gaps": 0, "direction": 0, "dsoc": 0, "power": 0, "invalid": 0, "edge": 0}
@@ -240,7 +258,11 @@ def extract_windows(
         if limit <= 0 or mean_power < MIN_POWER_FRACTION * limit:
             rejected["power"] += 1
             return
-        ac_kwh = current["ac_kwh"] - current.get("tail_ac", 0.0)
+        ac_kwh = (
+            current["ac_kwh"]
+            - current.get("head_ac", 0.0)
+            - current.get("tail_ac", 0.0)
+        )
         if ac_kwh <= 0 or not math.isfinite(ac_kwh):
             rejected["invalid"] += 1
             return
@@ -306,28 +328,28 @@ def extract_windows(
                 "ac_kwh": 0.0,
                 "power_abs": 0.0,
                 "count": 0,
+                "head_ac": 0.0,
                 "tail_ac": 0.0,
-                "tail_count": 0,
+                "moved": False,
             }
         energy = abs(power) * gap / 60.0 / 1000.0
         moved = (soc_end - soc_start) * sign > 0
         if moved:
             run["end_soc"] = soc_end
             run["end_ts"] = t1
+            run["moved"] = True
+            run["tail_ac"] = 0.0
+        elif run["moved"]:
+            # A trailing plateau: the run kept drawing after the SoC stopped moving.
+            run["tail_ac"] += energy
+        else:
+            # ...and the mirror case at the start: the pack was already accepting power before the
+            # reported SoC began to move.  Booking it would credit the window with energy it never
+            # moved and inflate its capacity.
+            run["head_ac"] += energy
         run["ac_kwh"] += energy
         run["power_abs"] += abs(power)
         run["count"] += 1
-        # Keep the energy of the *trailing* sample pairs that did not move the SoC apart.  A pack
-        # resting at its limit (or a whole-percent reading that stopped ticking) leaves the run one
-        # or more samples long after it stopped storing energy; booking that would credit the window
-        # with energy it never moved and inflate its capacity.  Mid-run plateaus are quantization and
-        # stay booked -- they are paid for by SoC movement on either side.
-        if moved:
-            run["tail_ac"] = 0.0
-            run["tail_count"] = 0
-        else:
-            run["tail_ac"] += energy
-            run["tail_count"] += 1
     flush()
     return accepted, rejected
 
@@ -411,12 +433,13 @@ def cap_to_reported(
     """The estimate to plan with: never more than the pack itself reports holding.
 
     A measurement may legitimately read *below* the label (an aged pack) and the typed seed is only
-    a guess, so a downward correction always wins.  Reading *above* the pack's own reported
-    capacity is not a second opinion: it is the BMS compressing the top of its SoC range (module
-    docstring), a lagging energy sample, or a window that spans two different packs.  Planning that
-    extra kWh schedules charge the pack cannot accept and a SoC its own counters contradict, so the
-    reported value is a ceiling, not a target.  ``None``/non-positive reported values leave the
-    estimate untouched (no hardware statement, no cap).
+    a guess, so a downward correction always wins.  An AC-only estimate above the pack's own figure
+    is not evidence that the pack holds more: the two leg efficiencies are not separately identifiable
+    from AC energy and SoC, so a higher number is a stale SoC scale, a lagging sample, or a window
+    that spans two different packs.  Planning that extra energy schedules charge the pack cannot
+    accept and a SoC its own counters contradict, so the reported value is a ceiling, not a target.
+    ``tolerance`` exists for an explicitly measured scale and is 0 by default.  ``None``/non-positive
+    reported values leave the estimate untouched (no hardware statement, no cap).
     """
     if kwh is None:
         return None
@@ -498,22 +521,49 @@ def samples_from_rows(
     """Collapse measurement rows into one ``(ts, ac_power_w, soc_pct)`` sample per bucket.
 
     The **measured** AC pair ``battery_charge:<id> - battery_discharge:<id>`` wins (a missing side
-    counts as 0, the same AC-side convention as :mod:`app.sources.measure`); the signed
-    ``battery_power:<id>`` role is only a fallback.  That role is the ``power_setpoint_entity`` --
-    a command written to the device (``app.sources.measure.role_entities``), and a command that the
-    pack/BMS did not fully follow (a taper, a manager still ramping) would inflate the AC energy and
-    so the learned capacity.  Learning must integrate what the pack really moved, exactly like the
-    savings ledger refuses an unconfirmed command (SPEC 5/10).  A bucket without both power and SoC
-    is skipped rather than half-read.
+    counts as 0, the same AC-side convention as :mod:`app.sources.measure`).  The signed
+    ``battery_power:<id>`` role is **not** read: it is the ``power_setpoint_entity`` -- a command
+    written to the device -- and a command the pack/BMS did not follow (a taper, a manager still
+    ramping) would inflate the energy and so the learned capacity (0.38.0).  Learning integrates
+    what the pack really moved, exactly like the savings ledger refuses an unconfirmed command.
+
+    Rows from two entity ids for the same role are never mixed: only the newest entity id per role
+    survives (a renamed mapping must not merge two sensors' scales into one median).  A bucket
+    without both a measured power and a SoC is skipped rather than half-read.
     """
+    learned = set(_LEARNED_ROLES)
+    latest: dict[str, tuple[datetime, str]] = {}
+    for row in rows:
+        if "samples" in row and row.get("samples") is None:
+            # A pre-0.38 row kept the last tick, not the bucket mean; never mix the two methods.
+            continue
+        role = str(row.get("entity_role") or row.get("role") or "")
+        if not role.endswith(f":{battery_id}"):
+            continue
+        base = role.split(":", 1)[0]
+        if base not in learned or _finite(row.get("value")) is None:
+            continue
+        moment = from_iso(row.get("ts"))
+        entity = str(row.get("entity_id") or "")
+        if moment is None or not entity:
+            continue
+        if base not in latest or moment >= latest[base][0]:
+            latest[base] = (moment, entity)
+    dominant = {base: entity for base, (_moment, entity) in latest.items()}
+
     buckets: dict[str, dict[str, float]] = {}
     for row in rows:
+        if "samples" in row and row.get("samples") is None:
+            continue
         role = str(row.get("entity_role") or row.get("role") or "")
         value = _finite(row.get("value"))
         if value is None or not role.endswith(f":{battery_id}"):
             continue
         base = role.split(":", 1)[0]
-        if base not in _POWER_ROLES and base != _SOC_ROLE:
+        if base not in learned:
+            continue
+        entity = str(row.get("entity_id") or "")
+        if entity and dominant.get(base) and entity != dominant[base]:
             continue
         key = str(row.get("ts") or "")
         buckets.setdefault(key, {})[base] = value
@@ -524,8 +574,6 @@ def samples_from_rows(
             continue
         if "battery_charge" in values or "battery_discharge" in values:
             power = values.get("battery_charge", 0.0) - values.get("battery_discharge", 0.0)
-        elif "battery_power" in values:
-            power = values["battery_power"]
         else:
             continue
         moment = from_iso(key)
@@ -565,8 +613,11 @@ def learn_capacity(
     Returns the stored payload, or ``None`` when there is no store/rows. A store failure is
     swallowed on purpose: learning is an optimisation, and the manual capacity stays correct.
     ``eta_charge``/``eta_discharge`` default to the battery's configured values and are overridden
-    with the learned round trip when one is available (SPEC 5): capacity and efficiency then come
-    from the same measurement, so they cannot contradict each other.
+    with the learned round trip when one is available (SPEC 5).
+
+    A run with too few usable windows no longer throws away a confident estimate: the stored value
+    is kept (and ages out on its own timestamp) instead of being replaced by ``None``.  That is the
+    difference between "this month has no clean cycle" and "the pack changed".
     """
     reader = getattr(store, "measurements_range", None)
     writer = getattr(store, "profile_put", None)
@@ -574,7 +625,7 @@ def learn_capacity(
         return None
     moment = now or utcnow()
     start = moment - timedelta(days=max(1.0, float(days)))
-    roles = [f"{base}:{battery.id}" for base in (*_POWER_ROLES, _SOC_ROLE)]
+    roles = [f"{base}:{battery.id}" for base in _LEARNED_ROLES]
     try:
         rows = reader(start, moment, roles=roles) or []
     except Exception:  # noqa: BLE001 - no history is not an error
@@ -589,8 +640,25 @@ def learn_capacity(
         now=moment,
     )
     payload["seed_kwh"] = float(battery.capacity_kwh)
+    previous = load_estimate(store, battery.id)
+    if payload.get("capacity_kwh") is None and _keepable(previous, moment):
+        return {**previous, "kept_previous": True}
     try:
         writer(PROFILE_KIND, battery.id, payload, moment)
     except Exception:  # noqa: BLE001 - a write failure leaves the previous estimate in place
         return payload
     return payload
+
+
+def _keepable(previous: Mapping[str, Any] | None, now: datetime) -> bool:
+    """True when a confident, current-schema profile is worth keeping over an empty relearn."""
+    if not previous:
+        return False
+    if _finite(previous.get("schema")) != float(SCHEMA):
+        return False
+    status = capacity_status(previous, now)
+    return bool(
+        status.get("learned_kwh") is not None
+        and int(status.get("samples") or 0) >= MIN_ACCEPTED_WINDOWS
+        and not status.get("stale")
+    )
