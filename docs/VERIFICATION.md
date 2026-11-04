@@ -17,8 +17,8 @@ tests skip when no compiled extension is present. All synthetic values use reser
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **1611 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension); with the local C core built: **1694 tests, 1692 passed**, with only the two wall-clock micro-benchmarks (`test_120_slot_core_benchmark`, `test_terminal_row_benchmark`) failing on a saturated host at 21–26 ms against their 20 ms threshold. The 0.37.5 diff touches no Python, C or optimizer code; §8.36 records the terminal-row benchmark failing identically on the pre-change tree |
-| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 180 files scanned`, exit 0 |
+| Test suite | `python3 -m pytest tests -q` | **1614 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension). The 0.37.6 diff adds three Python tests and touches no C or optimizer code; the 0.37.5 with-C-core figure (1694 tests, 1692 passed, two wall-clock micro-benchmarks over their 20 ms threshold) is not re-measured here |
+| PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 177 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
 | Headless UI render check | `node tools/ui_render_check.js` | **211 passed, 0 failed**, exit 0 |
@@ -29,17 +29,16 @@ tests skip when no compiled extension is present. All synthetic values use reser
 
 Frozen digest of the verified artifact (recipe in §11, normative):
 
-* **code + tests (158 files, documentation excluded)**:
-  `45fe3dc970050c27fd8ef54bcb08827804ec2daabe296089d20ba1663ba82242`
-* **path list of the same 158 files** (detects an added, removed or renamed file):
-  `c1c39364f5900a18b40e0580adbb764dbc4d2b263ba0afb9598d1ac65b959d10` (0.37.4 and 0.37.5 added no
+* **code + tests (155 files, documentation excluded, clean clone without the optional native
+  extension)**:
+  `75f4f82ddb649c8bb387e51ab15964fa38383703bf20c06763b85670cd7dec08`
+* **path list of the same 155 files** (detects an added, removed or renamed file):
+  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (0.37.4–0.37.6 added no
   file: the earlier path list is unchanged, and §8.37 explains why the earlier 155-file count is
   superseded)
-* The 158-file set is measured in the working tree with the locally built native extension. A clean
-  clone without it selects 155 files and digests to
-  `1492daa0ffb7a2d81d7dd1840445c95098b930f68a4f3a7b4ffd2e0d9fb62250` (path list
-  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab`); the gates above were run on
-  that clone.
+* The 0.37.5 record measured 158 files in a working tree with the locally built native extension
+  (`45fe3dc9…`, path list `c1c39364…`). The 0.37.6 clean clone selects 155 files; the gates above
+  were run on it.
 
 Historically, the 0.10.1 tree's code + tests digest was `28fdad8a…`, 0.10.0's `784dbf04…` and
 0.9.1's `fc5f9d44…`; at that point 0.11.0 (§8.10) changed file contents only and added no file, so
@@ -2344,6 +2343,47 @@ banner before and after the update; this release issued no battery writes and ch
 
 ---
 
+### 8.39 Two Zendure batteries on one manager (0.37.6)
+
+The owner added a second SolarFlow 800 Plus ("Kees") and renamed the first ("Jan"). The add-on
+already had both battery entries (Kees created by the wizard, Jan's mapping renamed to the new
+entity ids), but the live journal showed `driver_conflict`: the first sorted battery claimed the
+manager's system-wide manual-power entity and the second was excluded as `battery_unavailable`.
+The guard treated the manager's system-wide roles as used by every Zendure mapping the registry
+resolver filled in, even when a battery was pinned to `control_path: device` and never wrote the
+setpoint. The Zendure manager itself could not help: both inverters report fuse group 0 and the
+integration logged "No devices online, not possible to start the operation", so the device path was
+the only path that could drive either battery.
+
+`ZendureDriver.control_path_for(config)` now exposes the path decision before a driver is built, and
+`_control_path()` delegates to it. `_sync_drivers` claims the manual-power entity only for the
+manager path, keeps claiming a per-device `power_setpoint_entity`, and compares the shared operation
+select's wanted value (`manual` for the manager and device-setpoint paths, `off` for device limits):
+two device-path batteries coexist, while a manager+device pair and two manager batteries are still
+refused. Three tests pin both directions (`tests/test_wp2b_engine.py`): two device-path batteries
+get drivers, a mixed pair conflicts on the operation select, and two manager-path batteries still
+conflict on the system-wide setpoint.
+
+Live: 0.37.6 deployed (store reload + update.install; the add-on moved from 0.37.5 to 0.37.6 and is
+`started`). `/health` reports 0.37.6 with the C optimizer core. Kees's battery settings were patched
+to Jan's parameters through the add-on API (max SoC 95, round-trip 92% per direction, EUR 330,
+10,000 cycles, control path device); every non-identity field now matches. Both drivers report
+`mapping_resolved: true`, `control_path: device_limits`, `available: true` and fresh states, and the
+plan runs both: each inverter took 1,000 W (measured grid-input power 999 W and 993 W). No
+`driver_conflict` was journaled after the patch.
+
+Known limitation found during the deploy: the first two-battery ticks spent two sequential bounded
+read-back windows (8 s each) while the 5 s tick interval gave the watchdog a 15 s budget
+(three ticks), so the guard held both batteries and the next tick re-commanded them -- a visible
+0/1000 W flap. Raising the live `control.tick_seconds` to 10 s (30 s budget) restored
+`scheduler_healthy: true`, and both batteries hold 1,000 W with idempotent skips. A future release
+should scale the watchdog budget by the drivers' read-back deadlines instead of relying on the tick
+interval. The gates above are the clean-checkout values for the release commit; the audit fix in
+that commit also rewrites one instance entity id out of the 0.37.5 live note, which had left `main`
+unclean under R1 since 74f1298.
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:
@@ -2436,7 +2476,7 @@ and access to its base image; the final release gate also repeats these checks f
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 1607 passed, 83 skipped; C-core-specific cases skip without the extension)
+# 2. Full test suite (expect: 1614 passed, 83 skipped; C-core-specific cases skip without the extension)
 #    Needs pytest and PyYAML, which only the manifest test uses — the add-on itself imports nothing
 #    outside the standard library.
 python3 -m pytest tests -q
@@ -2447,7 +2487,7 @@ sh tools/audit.sh
 # 4. End-to-end selfcheck (expect: 33/33 checks passed, exit 0)
 PYTHONPATH=energy_manager python3 -m app.main --selfcheck
 
-# 5. Render the front-end headless and check its structure (expect: 186 passed, 0 failed; also run by
+# 5. Render the front-end headless and check its structure (expect: 211 passed, 0 failed; also run by)
 #    tests/test_wp3_ui_render.py, which skips when node is absent)
 node tools/ui_render_check.js
 
