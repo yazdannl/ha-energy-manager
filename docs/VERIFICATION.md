@@ -6,8 +6,8 @@ supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figur
 revisions described pre-audit trees and are obsolete.
 
 Verification was local and hardware-free: no real battery, no live provider call, no instance data.
-0.37.1, 0.37.2, 0.37.3, 0.37.4 and 0.37.5 were deployed to the live instance and verified there
-(see §8.35–§8.38); the release gates below were repeated from a clean checkout; optional native C-core
+0.37.1, 0.37.2, 0.37.3, 0.37.4, 0.37.5 and 0.38.0 were deployed to the live instance and verified
+there (see §8.35–§8.40); the release gates below were repeated from a clean checkout; optional native C-core
 tests skip when no compiled extension is present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
 `sem_*`), loopback addresses and placeholder coordinates.
 
@@ -2436,6 +2436,18 @@ cap applies 1.92, the state at 95 % is 1.824 kWh and the plan ceiling is 1.824. 
 measured number, the reported ceiling and why the ceiling wins; the journal logs both. Three new
 mean-sampled charge windows are needed before a new payload is published; until then the seed is in
 force.
+
+**Deployed and observed live (2026-11-04T16:20Z).** The store reload + `update.install` moved the
+add-on from 0.37.6 to 0.38.0; `/api/v1/health` reports 0.38.0 with the C optimizer core. The v10
+migration ran on the live database. `/api/v1/batteries` now reports both packs at **effective 1.92
+kWh** (state 1.824 kWh at 95 %) instead of the 2.40 the first pack was planned at, and the published
+plan's aggregate `soc_kwh` ceiling is **3.648 kWh** (95 % of 2 x 1.92) where the pre-fix fleet would
+have been 4.104 (2.40 + 1.92). The boot relearn wrote an empty schema-6 payload because every
+pre-0.38 row is a point sample the learner refuses, so `learned` is null and the seed is in force
+until three mean-sampled windows accumulate; the stale 2.4348 payload is not applied. The same
+boot run rewrote the round-trip profile with no pairs (the typed 0.8464 is now in force, which equals
+the measured 0.845); the capacity no-wipe rule should be mirrored for the round trip in a follow-up,
+since a boot with too little history can still discard a good efficiency payload.
 
 Gates from the working tree: **1619 passed, 83 skipped** (`python3 -m pytest tests -q`; the optional C
 core is not built here, so its cases skip and no C code changed), `audit: clean — 177 files scanned`,
