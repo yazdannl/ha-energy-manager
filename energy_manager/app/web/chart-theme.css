@@ -93,3 +93,8 @@
   line-height: 1.4;
   max-width: 70ch;
 }
+
+/* Pan/zoom opt-in (charts.js `semPanZoom`, the daily timeline): the overlay owns the touch gesture
+   so a one-finger drag pans the time axis instead of scrolling the page. */
+.u-over.sem-pan { touch-action: none; cursor: grab; }
+.u-over.sem-panning { cursor: grabbing; }

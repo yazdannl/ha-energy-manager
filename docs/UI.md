@@ -147,17 +147,19 @@ The **Daily energy timeline** uses `GET /api/v1/daily-timeline?date=YYYY-MM-DD&t
 show one selected local day in 15-minute bins. Previous/next and the date input move by local calendar
 day; the API builds bins from UTC instants, so normal spring/fall DST days contain 92/100 bins.
 One power chart distinguishes direct actuals, dotted derived PV/load, dashed archived PV/load forecasts,
-signed grid power and confirmed aggregate battery power from the dotted plan setpoint. The accessible
-interval table retains unavailable vs partial coverage and opens a selected bin's provenance; saved-plan
-detail is loaded only on request and uses exact plan/slot links. Missing data is never plotted as zero.
-Derived PV/load never replace direct fields, the battery note states that fleet completeness is unknown,
-and planned actions/setpoints do not prove dispatch. Buy/sell context appears only from retained plan
-slots; independent historical actual prices, state of charge, and other unsupported series are explicitly
-unavailable/omitted. Each interval row spells out actual sample coverage, a stale PV forecast flag,
-and forecast source/issue time where available. Missing archived values state that their cause is not
+signed grid power and confirmed aggregate battery power from the dotted plan setpoint. The chart can be
+explored: drag to pan, pinch or scroll to zoom around the pointer, and double-tap to reset to the full
+day. The compact slot table shows one row per bin with a coloured icon and value for PV, load, grid,
+battery and the saved plan action; tapping a time opens that bin's interval detail, where unavailable
+vs partial coverage, stale PV forecasts, forecast source/issue time and plan buy/sell prices stay
+explicit. Saved-plan dispatch detail is loaded only on request and uses exact plan/slot links. Missing
+data is never plotted as zero. Derived PV/load never replace direct fields, the battery detail states
+that fleet completeness is unknown, and planned actions/setpoints do not prove dispatch. Independent
+historical actual prices, state of charge, and other unsupported series are explicitly
+unavailable/omitted. Missing archived values state that their cause is not
 retained; current provider health is not assigned to historical bins. Load-forecast freshness is not
-classified because this timeline API does not provide a stale flag for it. The accessible table is the
-textual alternative to the chart. The view adds no telemetry sampler and no dashboard-card feed.
+classified because this timeline API does not provide a stale flag for it. The view adds no telemetry
+sampler and no dashboard-card feed.
 
 The **Forecast history** panel queries `GET /api/v1/forecast-history` with the browser's IANA
 timezone and a local date. Previous/next controls move by local calendar day; resolution is 15 minutes,

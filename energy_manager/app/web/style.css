@@ -909,18 +909,29 @@ tbody tr:hover { background: var(--panel-2); }
 .forecast-history-quality p { margin: var(--sp-1) 0 0; }
 .forecast-history-summary { font-weight: 600; }
 .daily-timeline-result, .daily-timeline-table, .daily-timeline-selection { min-width: 0; }
-.daily-timeline-summary { font-weight: 600; }
 .daily-timeline-controls { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: flex-end; }
 .daily-timeline-controls label { display: grid; gap: var(--sp-1); color: var(--text-muted); font-size: 0.8rem; }
 .daily-timeline-controls input { min-height: 2.5rem; }
-.daily-timeline-provenance { margin: var(--sp-2) 0; }
-.daily-timeline-provenance ul { margin-bottom: 0; }
 .daily-timeline-chart { min-width: 0; }
-.daily-timeline-table table { min-width: 58rem; }
-.daily-timeline-lines { min-width: 9rem; }
-.daily-timeline-lines > div { margin-bottom: var(--sp-1); }
-.daily-timeline-lines > div:last-child { margin-bottom: 0; }
-.daily-timeline-interval { white-space: nowrap; min-height: 2.5rem; }
+/* The slot table is the phone's primary reading: one compact line per interval, no horizontal scroll. */
+.daily-timeline-table table { min-width: 0; }
+.daily-timeline-table th, .daily-timeline-table td { padding: var(--sp-1) 2px; }
+.daily-timeline-table th { font-size: 0.7rem; }
+.daily-timeline-table .daily-timeline-interval { white-space: nowrap; min-height: 2.25rem; padding: 0 var(--sp-1); font-size: 0.8rem; }
+.slot-metric {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.slot-metric .icon { width: 0.95rem; height: 0.95rem; }
+.slot-value { font-size: 0.82rem; }
+.slot-pv { color: var(--chart-pv); }
+.slot-load { color: var(--chart-load); }
+.slot-grid { color: var(--warn); }
+.slot-grid.slot-export { color: var(--chart-sell); }
+.slot-battery { color: var(--chart-soc); }
+.slot-plan { color: var(--tint, var(--text-muted)); }
+.slot-forecast .slot-value { text-decoration: underline dashed; text-underline-offset: 2px; }
+.slot-missing { color: var(--text-dim); }
 .daily-timeline-row-selected td { background: var(--panel-2); }
 .daily-timeline-selection { margin-top: var(--sp-3); }
 .daily-timeline-selection h3 { font-size: 1rem; }
