@@ -433,17 +433,23 @@ fewer than 3 charge windows exist, and the payload always names the side it used
 A
 window is accepted only with ``|dSoC| >= 10`` points, ``mean |power| >= 20 %`` of that battery's own
 limit for the direction, finite values and no gap longer than one sample; the window's energy is
-every same-direction sample pair except the *trailing* ones that left the SoC where it was (a pack
-resting at its limit must not add phantom energy to the window, while a mid-run SoC plateau is the
-taper doing real work and stays booked); accepted windows are
+every same-direction sample pair except the *leading and trailing* ones that left the SoC where it
+was (a pack resting at its limit must not add phantom energy to the window, while a mid-run SoC
+plateau is the taper doing real work and stays booked; the trailing trim shipped in 0.31.1, the
+leading mirror in 0.38.0). Accepted windows are
 combined with a median after a median-absolute-deviation outlier filter, kept to the last 20, clamped
 to a plausible 1..200 kWh and published only with at least 3 accepted windows. An estimate older than
-30 days is stale. The estimate is a correction, never a licence to exceed the pack (0.37.1/0.37.2):
-the applied value is planned inside a documented gross-error band above the capacity the pack itself
-reports (``capacity_entity``, when it resolves), capped beyond it (the reported figure is the
-integration's nominal capacity while the estimate measures the AC energy behind one point of the
-pack's own SoC scale, so the band must let a real measurement through),
-and always free to correct downward (an aged pack). A pack with no reported capacity is unchanged.
+30 days is stale. A run with too few accepted windows keeps a confident stored estimate instead of
+replacing it with ``None`` (0.38.0): no clean cycle this month is not evidence that the pack changed,
+and the kept estimate still ages out on its own timestamp.
+The estimate is a correction, never a licence to exceed the pack: the applied value is capped at the
+capacity the pack itself reports (``capacity_entity``, when it resolves), and is free to correct it
+downward (an aged pack). 0.37.1 capped it at the reported value and 0.37.2 briefly widened that to a
+25 % band because a stale AC-only estimate looked like evidence that the pack's SoC scale was larger;
+that measurement cannot carry that weight (the two leg efficiencies are not separately identifiable
+from AC energy and SoC: the same AC-per-point data fits 1.92 kWh at 86/98 % legs or 2.05 kWh at
+92/92 %, with the same measured round trip), so 0.38.0 restores the hard ceiling. The live pack's
+stale 2.30 kWh was 20 % above its own 1.92 kWh label. A pack with no reported capacity is unchanged.
 The raw measurement stays visible (``learned_kwh``, ``capped_kwh``, ``cap_kwh``). Windows whose
 reported SoC touches the clamped ends of its range are refused (schema 5): the pack keeps accepting
 charge while the reported SoC cannot show it, so those windows over-read. **One scale:** the stored
@@ -451,8 +457,11 @@ energy the planner sees is derived from the reported SoC with the capacity in fo
 (``soc * capacity / 100``), never the device's nominal kWh, so a learned or pinned capacity cannot
 mix with the label. The window's AC energy is the **measured**
 ``battery_charge``/``battery_discharge``
-pair; the signed ``battery_power`` role is only a fallback because it is a command
-(``power_setpoint_entity``) that a tapering BMS need not follow. In ``auto`` a missing, stale or
+pair; the signed ``battery_power`` role is **never** read as a measurement (0.38.0) because it is a
+command (``power_setpoint_entity``) that a tapering BMS or a manager still ramping need not follow --
+the exact failure mode that inflated an early estimate. Rows from two entity ids for the same role are
+never mixed either: only the newest entity id per role is used, so renaming a mapping cannot merge two
+sensors' scales into one median. In ``auto`` a missing, stale or
 low-confidence estimate falls back to the seed, and every transition is logged with a stable reason
 slug (``capacity_learned`` / ``capacity_learned_stale`` / ``capacity_learned_low_confidence`` /
 ``capacity_learned_unavailable``; ``capacity_manual`` is the pinned case).
@@ -1102,6 +1111,13 @@ fallback profile and reports `confidence: low`.
 Every `control.tick_seconds`, sample grid power, PV power, load power, per-battery power and SoC into
 `actuals` (5-minute resolution, upsert, targeted per-entity reads only). These rows are the ground truth for savings and accuracy
 accounting, so sampling must never be skipped because a write failed.
+
+**0.38.0 amendment: a bucket is the mean of its ticks, not the last tick.** The engine samples every
+20 s into one 5-minute row; keeping the last tick was a point sample of a power that could be on for
+part of the interval, and the capacity learner then credited a full five minutes at that point (live
+2026-11-04: 2.43 kWh learned on a 1.92 kWh pack, while the same rows' 5-minute means give ~2.05). The
+upsert now folds each tick into a running mean and counts the ticks in `measurements.samples`; a
+pre-0.38 row keeps `samples = NULL` and is never mixed with a bucket mean by the learner.
 
 ---
 

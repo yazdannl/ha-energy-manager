@@ -187,11 +187,27 @@ def test_plan_dispatch_links_and_legacy_rows_remain_unlinked(store):
     assert rows[1]["plan_id"] == plan_id and rows[1]["plan_slot_ts"] == NOW.isoformat()
 
 
+def test_a_legacy_point_sample_bucket_is_replaced_not_averaged(store):
+    """0.38.0: a pre-mean row (``samples`` NULL) is a different method; replace it, never mix it."""
+    store.connection.execute(
+        "INSERT INTO measurements(ts, entity_role, value, unit) VALUES(?, ?, ?, ?)",
+        (to_iso(NOW), "pv_power", 1000.0, "W"),
+    )
+    store.connection.commit()
+    store.add_measurements([Measurement(ts=NOW, role="pv_power", value=600.0, unit="W")])
+    rows = store.measurements_range(NOW - timedelta(minutes=1), NOW + timedelta(minutes=1))
+    assert len(rows) == 1 and rows[0]["value"] == pytest.approx(600.0)
+    assert rows[0]["samples"] == 1
+
+
 def test_measurements_and_actuals_upsert(store):
     store.add_measurements([Measurement(ts=NOW, role="pv_power", value=1000.0, unit="W")])
     store.add_measurements([Measurement(ts=NOW, role="pv_power", value=1200.0, unit="W")])
     rows = store.measurements_range(NOW - timedelta(minutes=1), NOW + timedelta(minutes=1))
-    assert len(rows) == 1 and rows[0]["value"] == 1200.0
+    # 0.38.0: a bucket is the mean of its ticks (here two), not the last one; the count is kept so
+    # the capacity learner can tell a bucket mean from a pre-0.38 point sample.
+    assert len(rows) == 1 and rows[0]["value"] == pytest.approx(1100.0)
+    assert rows[0]["samples"] == 2
     assert store.measurements_range(NOW, NOW + timedelta(minutes=1), roles=["grid_power"]) == []
 
     store.upsert_actuals(NOW, pv_kw=1.2, load_kw=0.4)
@@ -672,7 +688,7 @@ def test_schema_v5_seeds_the_history_from_the_pre_upgrade_rows(tmp_path):
     conn.close()
     store = Store(path)
     try:
-        assert store.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 9
+        assert store.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 10
         seeded = store.connection.execute(
             "SELECT at, origin FROM settings_history WHERE key = 'mode'"
         ).fetchone()
@@ -772,7 +788,7 @@ def test_schema_v2_migrates_a_v1_database_and_keeps_its_rows(tmp_path):
         store.upsert_savings_daily("2026-01-02", charged_kwh=1.5, battery_measured=1)
         assert store.savings_daily_range("2026-01-02", "2026-01-02")[0]["charged_kwh"] == 1.5
         version = store.connection.execute("SELECT version FROM schema_version").fetchone()[0]
-        assert version == SCHEMA_VERSION == 9
+        assert version == SCHEMA_VERSION == 10
     finally:
         store.close()
 

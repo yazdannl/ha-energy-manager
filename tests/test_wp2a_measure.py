@@ -211,14 +211,15 @@ def test_collect_reads_only_mapped_entities_and_upserts_five_minute_buckets(stor
     bucket = NOW.replace(minute=0, second=0, microsecond=0)
     assert measurements[0].ts == bucket and actuals["ts"] == bucket
 
-    # two ticks inside the same documented bucket upsert a single row (last value wins)
+    # two ticks inside the same documented bucket upsert a single row holding their mean (0.38.0)
     store.add_measurements(measurements)
     client.states = {"sensor.example_load_power": state("sensor.example_load_power", 600, "W")}
     later, later_actuals = collect(client, settings, now=NOW + timedelta(minutes=2))
     assert later[0].ts == bucket and later_actuals["ts"] == bucket
     store.add_measurements(later)
     rows = store.measurements_range(NOW - timedelta(minutes=10), NOW + timedelta(minutes=10))
-    assert len(rows) == 1 and rows[0]["value"] == pytest.approx(600.0)
+    assert len(rows) == 1 and rows[0]["value"] == pytest.approx(500.0)
+    assert rows[0]["samples"] == 2
     assert rows[0]["ts"] == "2026-01-05T12:00:00+00:00"
 
 
