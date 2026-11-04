@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.37.6
+
+- **Fix: two SolarFlow batteries on one Zendure manager can both be controlled on the device path.**
+  The driver-conflict guard claimed the manager's system-wide `manual_power`/`operation` entities for
+  every Zendure battery, including a `control_path: device` battery that never writes the setpoint.
+  With two units configured the first sorted battery claimed them and the second was journaled as
+  `driver_conflict` and excluded (`battery_unavailable`), even though both were meant to drive their
+  own `input_limit`/`output_limit`. The guard now claims `manual_power` only for a manager-path
+  battery and compares the shared operation select's wanted value (`manual` for the
+  manager/device-setpoint paths, `off` for the device-limits path), so two device-path batteries
+  coexist while a mixed manager+device pair and two manager batteries are still refused.
+- `ZendureDriver.control_path_for()` exposes the same path decision to the engine before it builds a
+  driver; `_control_path()` delegates to it, so the two cannot drift.
+
 ## 0.37.5
 
 - **Fix: the control-authority line no longer claims the dispatcher writes in Off or Advisory.**

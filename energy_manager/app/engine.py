@@ -1950,19 +1950,30 @@ class Engine:
         if signature == self._driver_signature:
             return
         drivers: dict[str, Any] = {}
-        # A Zendure manager has ONE system-wide manual_power entity: two batteries sharing it would
-        # fight over the same setpoint, so only the first one gets a driver (docs/EXTERNAL_APIS 6).
+        # A Zendure manager has ONE system-wide manual_power entity: two batteries that use the
+        # manager path would fight over it, so only the first one may claim it (docs/EXTERNAL_APIS
+        # 6).  A device-path battery never writes that setpoint -- it only holds the shared
+        # operation select on "off" -- so two device-path batteries may coexist; the operation
+        # select only conflicts when the two paths want different values.
         # A native device is addressed by host+serial, so two batteries pointing at the same
         # inverter would overwrite each other's limits; only the first one gets a driver too.
         claimed: dict[tuple[str, ...], str] = {}
+        operation_claims: dict[str, tuple[str, str]] = {}
         if self._ha is not None:
             for config in sorted(configs, key=lambda c: c.id):
                 if not config.enabled:
                     continue
                 prepared = effective[config.id]
                 conflict = ""
+                pending: list[tuple[tuple[str, ...], str]] = []
+                operation_claim: tuple[str, str] | None = None
                 if prepared.driver == driver_registry.ZendureDriver.driver_name:
-                    for key in ("manual_power_entity", "operation_entity", "power_setpoint_entity"):
+                    driver_type = driver_registry.ZendureDriver
+                    path = driver_type.control_path_for(prepared)
+                    keys = ["power_setpoint_entity"]
+                    if path == "manager_manual_power":
+                        keys.append("manual_power_entity")
+                    for key in keys:
                         entity = str(prepared.mapping.get(key) or "")
                         if not entity:
                             continue
@@ -1973,7 +1984,29 @@ class Engine:
                                 "Zendure manager setpoint is system-wide, model it as one battery"
                             )
                             break
-                        claimed[(key, entity)] = config.id
+                        pending.append(((key, entity), config.id))
+                    operation = str(prepared.mapping.get("operation_entity") or "")
+                    if not conflict and operation:
+                        wanted = ""
+                        if path in ("manager_manual_power", "device_setpoint"):
+                            wanted = str(
+                                prepared.mapping.get("operation_manual_value")
+                                or driver_type.default_operation_value
+                            )
+                        elif path == "device_limits":
+                            wanted = str(
+                                prepared.mapping.get("operation_off_value")
+                                or driver_type.default_operation_off_value
+                            )
+                        owner, owner_wanted = operation_claims.get(operation, ("", ""))
+                        if owner and owner_wanted.strip().lower() != wanted.strip().lower():
+                            conflict = (
+                                f"operation_entity {operation} is already controlled by battery "
+                                f"{owner} with {owner_wanted!r}; a manager-path and a device-path "
+                                "battery cannot share one Zendure manager"
+                            )
+                        elif wanted:
+                            operation_claim = (operation, wanted)
                 if prepared.driver == driver_registry.ZendureNativeDriver.driver_name:
                     host = str(prepared.mapping.get("host") or "").strip().lower()
                     serial = str(prepared.mapping.get("serial") or "").strip()
@@ -1986,13 +2019,18 @@ class Engine:
                                 f"battery {owner}; two batteries cannot drive the same inverter"
                             )
                         else:
-                            claimed[key] = config.id
+                            pending.append((key, config.id))
                 if conflict:
                     self._journal.event(
                         "error", "driver_conflict", f"battery {config.id}: {conflict}",
                         {"battery_id": config.id},
                     )
                     continue
+                for claim_key, owner_id in pending:
+                    claimed[claim_key] = owner_id
+                if operation_claim is not None:
+                    operation, wanted = operation_claim
+                    operation_claims[operation] = (config.id, wanted)
                 try:
                     if self._driver_factory is not None:
                         # An injected plant replaces the registry driver wholesale, so a replay

@@ -2330,7 +2330,7 @@ synthetic token reaching the entrypoint. Code digest for the working tree is `45
 158-file path list unchanged (`c1c39364…`); the clean clone's 155-file values are recorded in §1.
 
 Deployed and observed live (2026-10-30T11:54Z, 0.37.4 → 0.37.5): `POST /store/reload` moved
-`version_latest` to 0.37.5, then `update.install` on `update.smart_energy_manager_update` succeeded
+`version_latest` to 0.37.5, then `update.install` on the add-on's update entity succeeded
 without a timeout (the entity moved from 0.37.4 to 0.37.5; add-on state `started`).
 `GET /api/v1/health` reports `version 0.37.5` with `optimizer_core.backend: c`; the served
 `index.html` contains the footer preference row and `app.js` contains the new alert and savings code,

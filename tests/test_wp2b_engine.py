@@ -2517,3 +2517,88 @@ def test_the_terminal_kill_switch_builds_no_request_and_no_block():
     assert plan.summary.terminal_mode == "salvage"
     assert plan.summary.terminal_ok is None
     assert engine._terminal_request() is None
+
+
+# ------------------------- two Zendure batteries and the one shared manager (0.37.6)
+
+def _zendure_battery(battery_id: str, prefix: str, control_path: str = "device") -> BatteryConfig:
+    """A Zendure battery that carries both the per-device limits and the shared manager pair.
+
+    The registry resolver fills the manager roles into every Zendure mapping, so this is the
+    shape ``_sync_drivers`` sees on the live install after two units were added.
+    """
+    return BatteryConfig(
+        id=battery_id,
+        name=battery_id.replace("_", " ").title(),
+        driver="zendure",
+        capacity_kwh=1.92,
+        min_soc_pct=10.0,
+        max_soc_pct=95.0,
+        max_charge_w=1000.0,
+        max_discharge_w=800.0,
+        eta_charge=0.92,
+        eta_discharge=0.92,
+        mapping={
+            "manual_power_entity": "number.example_manager_manual_power",
+            "operation_entity": "select.example_manager_operation",
+            "soc_entity": f"sensor.{prefix}_soc",
+            "charge_limit_entity": f"number.{prefix}_input_limit",
+            "discharge_limit_entity": f"number.{prefix}_output_limit",
+            "ac_mode_entity": f"select.{prefix}_ac_mode",
+        },
+        control_path=control_path,
+    )
+
+
+def test_two_device_path_zendure_batteries_both_get_a_driver():
+    """Two inverters on one manager can share the ``off`` select: only the manager setpoint is
+    system-wide.  Before 0.37.6 the resolved ``manual_power_entity`` on the first battery made the
+    second a ``driver_conflict`` even though neither used the manager path."""
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings.add_battery(_zendure_battery("example_jan", "jan"))
+    settings.add_battery(_zendure_battery("example_kees", "kees"))
+
+    engine._sync_drivers()
+
+    assert {"example_jan", "example_kees"} <= set(engine._drivers)
+    conflicts = [
+        entry for entry in engine.journal.entries(limit=50) if entry.get("code") == "driver_conflict"
+    ]
+    assert conflicts == []
+    # Both drivers keep the device path; neither fell back to the shared manager setpoint.
+    assert engine._drivers["example_jan"].capabilities()["control_path"] == "device_limits"
+    assert engine._drivers["example_kees"].capabilities()["control_path"] == "device_limits"
+
+
+def test_a_manager_path_and_a_device_path_still_cannot_share_the_operation_select():
+    """The paths ask the one select for different values (``manual`` vs ``off``), so they conflict."""
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings.add_battery(_zendure_battery("example_a_manager", "am", control_path="manager"))
+    settings.add_battery(_zendure_battery("example_b_device", "bd", control_path="device"))
+
+    engine._sync_drivers()
+
+    assert "example_a_manager" in engine._drivers
+    assert "example_b_device" not in engine._drivers
+    conflicts = [
+        entry for entry in engine.journal.entries(limit=50) if entry.get("code") == "driver_conflict"
+    ]
+    assert conflicts, "the mixed paths must be refused"
+    assert "operation_entity" in conflicts[-1]["message"]
+
+
+def test_two_manager_path_batteries_still_cannot_share_one_manual_setpoint():
+    """The original protection stays: ``manual_power`` is system-wide, so only the first manager
+    battery gets a driver."""
+    engine, _store, _ha, _clock, settings = build_engine()
+    settings.add_battery(_zendure_battery("example_a", "aa", control_path="manager"))
+    settings.add_battery(_zendure_battery("example_b", "bb", control_path="manager"))
+
+    engine._sync_drivers()
+
+    assert "example_a" in engine._drivers
+    assert "example_b" not in engine._drivers
+    conflicts = [
+        entry for entry in engine.journal.entries(limit=50) if entry.get("code") == "driver_conflict"
+    ]
+    assert conflicts and "manual_power_entity" in conflicts[-1]["message"]

@@ -232,6 +232,12 @@ class ZendureDriver(BaseDriver):
     """Zendure SolarFlow battery behind the ``zendure_ha`` integration."""
     driver_name = "zendure"
     default_tolerance_w = ZENDURE_TOLERANCE_W
+    #: The shared manager select's value on each path: the manager path asserts ``manual`` and
+    #: the device path holds it on ``off`` so the manager cannot overwrite the device's own
+    #: limits.  The engine's conflict check reads these to tell "both quiet it" from "one needs
+    #: it manual".
+    default_operation_value = DEFAULT_OPERATION_VALUE
+    default_operation_off_value = DEFAULT_OPERATION_OFF_VALUE
 
     @classmethod
     def validate_mapping(cls, mapping: dict[str, str]) -> list[str]:
@@ -342,28 +348,39 @@ class ZendureDriver(BaseDriver):
 
     # -- mapping helpers ---------------------------------------------------------------
 
-    def _control_path(self) -> str:
-        """The write path in use (SPEC 9.2).
+    @classmethod
+    def control_path_for(cls, config: BatteryConfig) -> str:
+        """The write path a config resolves to, without building a driver (SPEC 9.2).
 
         ``config.control_path`` picks it explicitly: ``manager`` is the Zendure manager's
         system-wide ``manual_power`` (applied on its next P1 event, and the only path that can
         split power across a fuse group), ``device`` is the inverter's own direction select plus
         ``input_limit``/``output_limit`` (applied by the device itself, no P1 event involved).
         ``auto`` keeps the manager first for compatibility, then a device setpoint, then the
-        limits.
+        limits.  The engine uses this to decide which shared entities two batteries would fight
+        over before it builds either driver.
         """
-        preference = str(getattr(self.config, "control_path", "auto") or "auto").strip().lower()
+        mapping = {key: value for key, value in (config.mapping or {}).items() if value}
+        preference = str(getattr(config, "control_path", "auto") or "auto").strip().lower()
         if preference == "device":
-            return "device_limits" if self._device_limits_mapped() else "unresolved"
+            if mapping.get("charge_limit_entity") and mapping.get("discharge_limit_entity"):
+                return "device_limits"
+            return "unresolved"
         if preference == "manager":
-            return "manager_manual_power" if self._manager_mapped() else "unresolved"
-        if self._manager_mapped():
+            if mapping.get("manual_power_entity") and is_entity_id(mapping.get("operation_entity")):
+                return "manager_manual_power"
+            return "unresolved"
+        if mapping.get("manual_power_entity") and is_entity_id(mapping.get("operation_entity")):
             return "manager_manual_power"
-        if self.effective_mapping().get("power_setpoint_entity"):
+        if mapping.get("power_setpoint_entity"):
             return "device_setpoint"
-        if self._device_limits_mapped():
+        if mapping.get("charge_limit_entity") and mapping.get("discharge_limit_entity"):
             return "device_limits"
         return "unresolved"
+
+    def _control_path(self) -> str:
+        """The write path in use (SPEC 9.2); see :meth:`control_path_for`."""
+        return self.control_path_for(self.config)
 
     def _manager_mapped(self) -> bool:
         return bool(self.effective_mapping().get("manual_power_entity")) and self._operation_entity() is not None
