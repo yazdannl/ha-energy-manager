@@ -413,7 +413,7 @@
       maintenance: MOCK_MAINTENANCE,
       feed_in: null,
       slots: slots,
-      batteries: [{ id: "battery_1", name: "Example Battery 1", share_w: slots.length ? slots[0].power_w : 0, round_trip_efficiency: roundTrip, wear_eur_per_kwh: MOCK_WEAR, break_even_sell_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR }]
+      batteries: [{ id: "battery_1", name: "Example Battery 1", share_w: slots.length ? slots[0].power_w : 0, capacity_kwh: CAP_KWH, max_charge_w: 1200.0, max_discharge_w: 1200.0, round_trip_efficiency: roundTrip, wear_eur_per_kwh: MOCK_WEAR, break_even_sell_eur_per_kwh: medianBuy / roundTrip + MOCK_WEAR }]
     };
   }
 

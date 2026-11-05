@@ -2432,17 +2432,78 @@
           : "efficiency not reported"
     });
     facts.push({ label: "Battery", value: energy.length ? energy.join(" · ") : "no battery energy" });
-    facts.push({
-      label: "SoC",
-      value: isNum(win.socStart) && isNum(win.socEnd)
-        ? fmtPct(win.socStart, 0) + " → " + fmtPct(win.socEnd, 0) + (isNum(ctx.floorPct) ? " · floor " + fmtPct(ctx.floorPct, 0) : "")
-        : "not reported"
-    });
+    // The SoC path is not repeated here: the charge gauge above the facts already spells it out,
+    // and a phone card that says the same number twice costs a row of height for nothing.
     facts.push({
       label: "Grid cost",
       value: grid + " · " + (cost < 0 ? "earns " + fmtEur(Math.abs(cost)) : "costs " + fmtEur(cost))
     });
     return facts;
+  }
+
+  // Per-battery split of a window's aggregated power, by the same rule the dispatcher applies to
+  // the fleet at dispatch time: each battery offers the room between the plan's SoC and its own
+  // floor, capped by its own rating, and the demand is shared proportionally.  It is a projection
+  // of the plan (the plan tracks one aggregate SoC), never a recorded command; the window's status
+  // line carries the driver-reported per-battery watts once an attempt exists.  An empty list means
+  // the payload cannot describe the fleet (no SoC path, no capacity or rating, or one battery only).
+  function windowBatteryShares(win, ctx) {
+    ctx = ctx || {};
+    var batteries = Array.isArray(ctx.batteries) ? ctx.batteries.filter(function (battery) {
+      return battery && battery.id;
+    }) : [];
+    var demand = win && isNum(win.power_w) ? Math.abs(win.power_w) : 0;
+    if (batteries.length < 2 || demand < 1) return [];
+    // No split beats a split that drops or invents a battery: every battery needs the size its
+    // room is measured from and the rating that bounds it, or the row states nothing at all.
+    var described = batteries.every(function (battery) {
+      return isNum(battery.capacity_kwh) && battery.capacity_kwh > 0
+        && isNum(win.power_w > 0 ? battery.max_charge_w : battery.max_discharge_w);
+    });
+    if (!described) return [];
+    var soc = isNum(win.socStart) ? clampPct(win.socStart) : null;
+    if (soc === null) return [];
+    var charging = win.power_w > 0;
+    var hours = isNum(win.hours) && win.hours > 0 ? win.hours : 0.25;
+    var eta = charging
+      ? (ctx.efficiency && isNum(ctx.efficiency.eta_charge) ? ctx.efficiency.eta_charge : null)
+      : (ctx.efficiency && isNum(ctx.efficiency.eta_discharge) ? ctx.efficiency.eta_discharge : null);
+    if (!isNum(eta) || !(eta > 0)) return [];
+    var floorDefault = isNum(ctx.floorPct) ? ctx.floorPct : 0;
+    var rooms = batteries.map(function (battery) {
+      var floor = isNum(battery.floor_soc_pct) ? battery.floor_soc_pct
+        : isNum(battery.min_soc_pct) ? battery.min_soc_pct : floorDefault;
+      // Charging room is what the pack can still absorb; discharge room is what sits above its floor.
+      var energy = charging
+        ? Math.max(0, battery.capacity_kwh * Math.max(0, 100 - soc) / 100) / eta
+        : Math.max(0, battery.capacity_kwh * Math.max(0, soc - floor) / 100) * eta;
+      var rating = charging ? battery.max_charge_w : battery.max_discharge_w;
+      return Math.max(0, Math.min(rating, energy / hours * 1000));
+    });
+    var total = rooms.reduce(function (sum, room) { return sum + room; }, 0);
+    if (!(total > 0)) return [];
+    var scale = Math.min(demand, total) / total;
+    return batteries.map(function (battery, index) {
+      return { id: battery.id, name: battery.name || battery.id, w: rooms[index] * scale };
+    });
+  }
+
+  // The split as compact chips under the charge gauge: one name and its share of the window's
+  // power, with the window's per-battery energy spelled out in the group label for a reader who
+  // cannot see the row.  A single-battery fleet needs no chips: the headline is already the split.
+  function windowBatteryChips(win, ctx) {
+    var shares = windowBatteryShares(win, ctx);
+    if (shares.length < 2) return null;
+    var hours = isNum(win.hours) && win.hours > 0 ? win.hours : 0;
+    var label = "Per battery: " + shares.map(function (share) {
+      return share.name + " " + fmtPower(Math.abs(share.w)) + " (" + fmtKwh(Math.abs(share.w) / 1000 * hours) + ")";
+    }).join(", ");
+    return el("div", { class: "window-batteries", role: "group", "aria-label": label }, shares.map(function (share) {
+      return el("span", { class: "window-battery" + (share.w > 0 ? "" : " is-idle") }, [
+        el("span", { text: share.name }),
+        el("span", { class: "window-battery-power num", text: fmtPower(Math.abs(share.w)) })
+      ]);
+    }));
   }
 
   // What actually happened in the window: dispatched vs applied vs measured, or why nothing was.
@@ -2669,6 +2730,7 @@
         ])
       ]),
       track ? windowSocGraphic(track, win, ctx.floorPct) : null,
+      windowBatteryChips(win, ctx),
       el("p", { class: "window-reason" }, ["because: ", reasonText(win.reason)]),
       el("ul", { class: "stat-row window-facts" }, windowFacts(win, ctx).map(function (fact) {
         return el("li", null, [
@@ -2677,13 +2739,16 @@
           el("span", { class: "stat-value", text: fact.value })
         ]);
       })),
-      el("p", { class: "window-context" }, [
-        "PV " + fmtKw(win.pv_kw) + " · load " + fmtKw(win.load_kw) + (isNum(win.bandLow) && isNum(win.bandHigh)
-          ? " (" + fmtKw(win.bandLow) + "–" + fmtKw(win.bandHigh) + " band)"
-          : "")
-      ]),
       el("p", { class: "window-status" }, [windowStatusText(win, ctx)]),
-      el("p", { class: "window-price" }, [windowPriceText(win, ctx)]),
+      // PV/load and the price's provenance are both fine print; one wrapped meta line keeps them
+      // together without spending a second row of the phone card on a gap.
+      el("p", { class: "window-meta" }, [
+        el("span", { class: "window-context", text: "PV " + fmtKw(win.pv_kw) + " · load " + fmtKw(win.load_kw) + (isNum(win.bandLow) && isNum(win.bandHigh)
+          ? " (" + fmtKw(win.bandLow) + "–" + fmtKw(win.bandHigh) + " band)"
+          : "") }),
+        " · ",
+        el("span", { class: "window-price", text: windowPriceText(win, ctx) })
+      ]),
       win.stale ? el("p", { class: "window-flag" }, [badge("stale price", "stale")]) : null
     ]);
   }
@@ -2726,6 +2791,25 @@
     var provider = null;
     providers.forEach(function (item) { if (item && item.active) provider = item; });
     var floors = execution.floors || {};
+    // The fleet as the plan snapshot and the execution floors describe it, merged by id: the
+    // snapshot carries size and rating, the execution payload carries each battery's own floor.
+    // A battery present on only one side still appears, so a split never silently loses one.
+    var fleet = [];
+    var fleetById = {};
+    function addBattery(entry) {
+      if (!entry || !entry.id) return;
+      var row = fleetById[entry.id];
+      if (!row) {
+        row = fleetById[entry.id] = { id: entry.id, name: entry.name || entry.id };
+        fleet.push(row);
+      }
+      if (!row.name && entry.name) row.name = entry.name;
+      ["capacity_kwh", "max_charge_w", "max_discharge_w", "floor_soc_pct", "min_soc_pct"].forEach(function (key) {
+        if (!isNum(row[key]) && isNum(entry[key])) row[key] = entry[key];
+      });
+    }
+    (Array.isArray(plan.batteries) ? plan.batteries : []).forEach(addBattery);
+    (Array.isArray(execution.batteries) ? execution.batteries : []).forEach(addBattery);
     return {
       efficiency: planEfficiency(summary),
       wear: isNum(summary.wear_eur_per_kwh) ? summary.wear_eur_per_kwh : (isNum(data && data.cycleCost) ? data.cycleCost : 0),
@@ -2735,7 +2819,8 @@
       mode: plan.mode,
       dry_run: plan.dry_run,
       priceProvider: provider,
-      progress: execution.progress || null
+      progress: execution.progress || null,
+      batteries: fleet
     };
   }
 
@@ -7688,6 +7773,8 @@
     planSlotMinutes: planSlotMinutes,
     planActionWindows: planActionWindows,
     windowFacts: windowFacts,
+    windowBatteryShares: windowBatteryShares,
+    windowBatteryChips: windowBatteryChips,
     planFlags: planFlags,
     planNetText: planNetText,
     planIsUnpriced: planIsUnpriced,

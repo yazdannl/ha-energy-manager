@@ -92,7 +92,7 @@ def make_plan(hours: int = 4) -> Plan:
         slot_minutes=15,
         slots=slots,
         summary=PlanSummary(cost_estimate_eur=1.0, baseline_cost_eur=1.2, saved_eur=0.2),
-        batteries=[{"id": "example_battery_1", "name": "Example Battery 1", "capacity_kwh": 5.0, "share_w": 500.0}],
+        batteries=[{"id": "example_battery_1", "name": "Example Battery 1", "capacity_kwh": 5.0, "max_charge_w": 1200.0, "max_discharge_w": 800.0, "share_w": 500.0}],
         sources={"price": "example_price", "solar": "example_solar", "load": "example_load"},
     )
 
@@ -491,6 +491,10 @@ def test_plan_route_shape_and_hour_filter():
             "round_trip_efficiency": None,
             "wear_eur_per_kwh": None,
             "break_even_sell_eur_per_kwh": None,
+            # The plan snapshot's size and ratings, so the UI can split a window per battery.
+            "capacity_kwh": 5.0,
+            "max_charge_w": 1200.0,
+            "max_discharge_w": 800.0,
         }
     ]
 
@@ -932,7 +936,8 @@ def test_plan_slots_carry_the_documented_fields():
         assert key in slot, key
     assert slot["soc_pct"] is not None and 0.0 <= slot["soc_pct"] <= 100.0
     assert slot["pv_source"] and slot["price_source"]
-    assert body["batteries"] and {"id", "name", "share_w"} <= set(body["batteries"][0])
+    assert body["batteries"] and {"id", "name", "share_w", "capacity_kwh", "max_charge_w", "max_discharge_w"} <= set(body["batteries"][0])
+    assert body["batteries"][0]["capacity_kwh"] == 5.0 and body["batteries"][0]["max_discharge_w"] == 800.0
 
 
 def test_plan_horizon_default_comes_from_the_settings():

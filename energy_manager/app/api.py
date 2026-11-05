@@ -432,6 +432,13 @@ def plan_dict(plan: Plan | None, now: datetime, hours: int | None = None) -> dic
                 "round_trip_efficiency": entry.get("round_trip_efficiency"),
                 "wear_eur_per_kwh": entry.get("wear_eur_per_kwh"),
                 "break_even_sell_eur_per_kwh": entry.get("break_even_sell_eur_per_kwh"),
+                # The plan's own snapshot of this battery's size and ratings, so a client can
+                # split a window's aggregated power across the fleet the way the dispatcher
+                # would (headroom down to the battery's floor, capped by its rating).  Additive;
+                # a snapshot written before these fields existed reports null and no split.
+                "capacity_kwh": entry.get("capacity_kwh"),
+                "max_charge_w": entry.get("max_charge_w"),
+                "max_discharge_w": entry.get("max_discharge_w"),
             }
             for entry in plan.batteries
         ],

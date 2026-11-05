@@ -351,7 +351,8 @@ def test_health_status_and_plan_fields(wired):
     assert all(slot["price_source"] for slot in plan["slots"])
     assert isinstance(plan["batteries"], list)
     if plan["batteries"]:
-        assert {"id", "name", "share_w"} <= set(plan["batteries"][0])
+        assert {"id", "name", "share_w", "capacity_kwh", "max_charge_w", "max_discharge_w"} <= set(plan["batteries"][0])
+        assert plan["batteries"][0]["capacity_kwh"] > 0 and plan["batteries"][0]["max_discharge_w"] > 0
     note(f"plan: {len(plan['slots'])} slots, slot keys ok, soc_pct/pv_source/price_source present")
 
 

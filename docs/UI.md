@@ -112,6 +112,14 @@ SoC path and the floor it defends, the planned grid flow and what it costs or ea
 provider's age and the window's rank in the horizon — plus what actually happened (applied vs
 requested, clamped/dry-run/advisory, measured vs planned, or why nothing was dispatched). It reads
 `GET /plan/execution` beside `/plan`; both are optional, so the rows state less rather than failing.
+A window that moves battery power also names each battery's share of it (`.window-batteries`): the
+split follows the dispatcher's own rule — proportional to each battery's room above its own floor,
+capped by its own rating — applied to the plan's aggregate SoC path, so it is a projection of the
+plan and never a recorded command; the status line keeps carrying the driver-reported per-battery
+watts. A battery that is at its floor stays visible at 0 W, a fleet of one gets no redundant chips,
+and a payload without the plan snapshot's capacity/ratings reports no split at all. The card's SoC
+path is stated once, by the charge gauge, and PV/load plus price provenance share one meta line, so
+the phone card does not repeat a figure to say it twice.
 Its action layer is inline SVG only (no image, no icon font, nothing fetched): the horizon totals
 behind a list glyph, a `.window-ribbon` placing every window across the plan with day ticks, a now
 marker and a legend naming each action, one card per window tinted by its action with an action glyph
@@ -429,7 +437,10 @@ if they are absent:
 - `GET /api/v1/plan`: the aggregate `eta_charge`/`eta_discharge`/round trip and the per-delivered-kWh
   `wear_eur_per_kwh` the plan assumed (for the
   summary and the break-even line) and, in `batteries[]`, each battery's own round trip, wear and
-  break-even, because per-battery values are not the aggregate mean. Slot `reason` values include
+  break-even, because per-battery values are not the aggregate mean. The same rows carry the plan
+  snapshot's `capacity_kwh`, `max_charge_w` and `max_discharge_w` (0.38.4) plus the execution
+  payload's `floor_soc_pct`, which is what lets a window split its aggregated power per battery;
+  without them the card reports no split instead of inventing one. Slot `reason` values include
   `efficiency_loss`, which the table renders like any other reason slug.
 - `GET /api/v1/daily-timeline`: one local-day `series[]` at 15-minute resolution; UTC `start`/`end`,
   offset-bearing local labels, coverage/status and provenance. `solar` contains direct PV plus separately
