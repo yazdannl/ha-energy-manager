@@ -1370,8 +1370,11 @@ h1.route-title:focus { outline: none; }
 
 .window-reason { margin: 0; color: var(--text-muted); font-size: var(--type-13); }
 /* Per-window facts reuse .stat-row/.stat-label/.stat-value; only the density and the glyph are local. */
+/* Two columns, not auto-fit: the SPA's own page padding leaves a phone card about 260 px of
+   content, so a 8.5 rem minimum silently collapsed to one fact per row. The values wrap; the
+   label/value pair stays side by side with the fact beside it. */
 .window-facts {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--sp-1) var(--sp-2);
 }
 .window-facts li { min-width: 0; }
