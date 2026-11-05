@@ -1370,8 +1370,11 @@ h1.route-title:focus { outline: none; }
 
 .window-reason { margin: 0; color: var(--text-muted); font-size: var(--type-13); }
 /* Per-window facts reuse .stat-row/.stat-label/.stat-value; only the density and the glyph are local. */
-.window-facts { gap: var(--sp-1) var(--sp-3); }
-.window-facts li { min-width: 9rem; }
+.window-facts {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+  gap: var(--sp-1) var(--sp-2);
+}
+.window-facts li { min-width: 0; }
 .window-facts .stat-label { font-size: var(--type-11); }
 .window-facts .stat-value { font-size: var(--type-13); }
 .fact-icon { display: inline-grid; place-items: center; margin-right: 5px; color: var(--tint); vertical-align: -2px; }
@@ -1379,12 +1382,12 @@ h1.route-title:focus { outline: none; }
    aggregated number above. A zero share stays visible (that battery is at its floor), dimmed
    rather than hidden; a single-battery fleet gets no chips at all. */
 .window-batteries {
-  display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1) var(--sp-2);
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1);
   font-size: var(--type-12); font-variant-numeric: tabular-nums;
 }
 .window-battery {
   display: inline-flex; align-items: baseline; gap: var(--sp-1);
-  padding: 0 var(--sp-2);
+  padding: 0 var(--sp-1);
   border: 1px solid color-mix(in srgb, var(--tint) 30%, var(--border));
   border-radius: var(--radius-pill);
   background: color-mix(in srgb, var(--tint) 10%, transparent);
@@ -1393,11 +1396,8 @@ h1.route-title:focus { outline: none; }
 .window-battery-power { color: var(--tint); font-weight: 650; }
 .window-battery.is-idle { opacity: 0.6; }
 /* PV/load and the price provenance share one wrapped fine-print line instead of two rows. */
-.window-meta {
-  display: flex; flex-wrap: wrap; gap: 0 var(--sp-1);
-  margin: 0; color: var(--text-muted); font-size: var(--type-11); font-variant-numeric: tabular-nums;
-}
-.window-meta .window-context, .window-meta .window-price { margin: 0; color: inherit; font-size: inherit; }
+.window-meta { margin: 0; color: var(--text-muted); font-size: var(--type-11); font-variant-numeric: tabular-nums; }
+.window-meta .window-context, .window-meta .window-price { color: inherit; font-size: inherit; }
 /* Dispatched/measured evidence reads as a result line, not as another muted hint. */
 .window-status { margin: 0; font-size: var(--type-13); }
 .window-flag { margin: 0; }
