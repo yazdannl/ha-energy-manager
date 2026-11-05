@@ -6,8 +6,8 @@ supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figur
 revisions described pre-audit trees and are obsolete.
 
 Verification was local and hardware-free: no real battery, no live provider call, no instance data.
-0.37.1, 0.37.2, 0.37.3, 0.37.4, 0.37.5, 0.38.0, 0.38.1, 0.38.2 and 0.38.3 were deployed to the
-live instance and verified there (see §8.35–§8.42); the release gates below were repeated from a clean checkout; optional native C-core
+0.37.1, 0.37.2, 0.37.3, 0.37.4, 0.37.5, 0.38.0, 0.38.1, 0.38.2, 0.38.3, 0.38.4, 0.38.5 and 0.38.6
+were deployed to the live instance and verified there (see §8.35–§8.43); the release gates below were repeated from a clean checkout; optional native C-core
 tests skip when no compiled extension is present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
 `sem_*`), loopback addresses and placeholder coordinates.
 
@@ -17,11 +17,11 @@ tests skip when no compiled extension is present. All synthetic values use reser
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **1620 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension). The 0.38.2/0.38.3 diff is UI-only (no Python runtime, SQLite, optimizer or C change); the with-C-core figure is not re-measured here |
+| Test suite | `python3 -m pytest tests -q` | **1620 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension). The 0.38.2–0.38.6 diff is UI plus one additive `/plan` payload field (no Python runtime, SQLite, optimizer or C change); the with-C-core figure is not re-measured here |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 177 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
-| Headless UI render check | `node tools/ui_render_check.js` | **213 passed, 0 failed**, exit 0 |
+| Headless UI render check | `node tools/ui_render_check.js` | **222 passed, 0 failed**, exit 0 |
 | First-party JavaScript syntax | `node --check` over non-vendored app/tool JavaScript | clean, exit 0 |
 | POSIX shell syntax | `sh -n tools/audit.sh && sh -n energy_manager/run.sh` | clean, exit 0 |
 | Add-on image + entrypoint | Native `aarch64` Docker build and CI-style startup smoke | image built; startup banner observed; the deployed instance reports `optimizer_core.backend: c`. The local builder supports ARM platforms only. |
@@ -31,9 +31,9 @@ Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (155 files, documentation excluded, clean clone without the optional native
   extension)**:
-  `0f63e8dacfa6cfcfbb76bd681bdd51d217ba7c948298fee3537d5a84d1407785`
+  `904501a522f47631c0dca1f23d3a5be498beec50f0885bf309654080804e38ff`
 * **path list of the same 155 files** (detects an added, removed or renamed file):
-  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (0.38.2–0.38.3 added no
+  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (0.38.2–0.38.6 added no
   file: the earlier path list is unchanged)
 * The 0.37.5 record measured 158 files in a working tree with the locally built native extension
   (`45fe3dc9…`, path list `c1c39364…`). The 0.38.0 clean tree selects 155 files; the gates above
@@ -2506,6 +2506,50 @@ chart, and the compact slot table; scrolling the slot rows confirms one icon lin
 the full local day answered in 43–62 s during the check; the UI renders that same response and adds
 no request. That backend latency is pre-existing and unchanged by this diff.
 
+### 8.43 A per-battery split on the plan tiles, in a compact card (0.38.4–0.38.6)
+
+The Plan view's Next actions cards showed only a window's aggregated battery power and total kWh, so
+the operator could not tell which battery the plan would discharge. Each card now draws one chip per
+battery (`.window-batteries`) with that battery's share of the window's power. The split is the pure
+helper `windowBatteryShares()`: proportional to each battery's room above its own floor at the
+plan's SoC, capped by that battery's own rating -- the same rule the dispatcher applies through
+`optimize/allocate.allocate_power`. Two things keep it honest: the plan tracks one aggregate SoC, so
+the row is a projection of the plan (the status line still carries the driver-reported applied watts
+per battery), and the card draws no row at all when the payload cannot describe the fleet -- no SoC
+path, no per-battery capacity/rating/efficiency, or a single battery. The API now forwards the plan
+snapshot's `capacity_kwh`, `max_charge_w` and `max_discharge_w` in `/plan` `batteries[]`, and
+`planWindowContext()` merges those with `/plan/execution`'s per-battery `floor_soc_pct` by id. A
+battery at its floor is still named at 0 W, dimmed, so "why is this one not helping?" is answered by
+the tile itself.
+
+The card is denser on a phone: the SoC path is stated once by the charge gauge (the duplicate "SoC"
+fact is gone), PV/load and the price's provenance share one inline meta line, the four facts are a
+fixed 2x2 grid (label above value), the card padding is 8/16 px instead of 16 px all round, and the
+action tile is 1.9 rem instead of 2.3 rem.
+
+The live phone found two layout defects the structural gates cannot see, fixed in 0.38.5 and 0.38.6
+and re-checked on the device: the separator between the meta spans was a flex item and landed alone
+on a line (the meta is now one inline paragraph), the three chips wrapped to a second row at 360 px
+(4 px chip padding/gap), and `repeat(auto-fit, minmax(8.5rem, 1fr))` silently collapsed the facts to
+one per row because the SPA's page padding leaves the card about 260 px of content (it is now
+`repeat(2, minmax(0, 1fr))`).
+
+Gates from a clean clone of 6665a16: **1620 passed, 83 skipped**, `audit: clean — 177 files scanned`,
+selfcheck **33/33**, headless UI **222 passed / 0 failed** (nine new checks pin the split rule, its
+refusal cases and the compacted card), `compileall`, `node --check` and `sh -n` clean. Frozen code +
+tests digest: 155 files, `904501a522f47631c0dca1f23d3a5be498beec50f0885bf309654080804e38ff`; path
+list unchanged (`c769154c...`, no files added). The native `aarch64` image build was not repeated for
+this UI plus payload-field diff; the Dockerfile, runtime and C core are unchanged.
+
+**Deployed and observed live (2026-11-05).** Store reload + `update.install` moved the add-on through
+0.38.4 and 0.38.5 to 0.38.6; `/api/v1/health` reports 0.38.6 with the C core, and the served
+`style.css`/`app.js` SHA-256 match the worktree. Live `/plan` `batteries[]` carries the three packs'
+`capacity_kwh` 1.92 and ratings 1000 W charge / 800 W discharge. On the phone's 360 px browser the
+Discharge card (2.40 kW, 17:00–17:45) shows `Kees 800 W`, `Pieter 800 W`, `Jan 800 W` on one line,
+the facts grid shows Buy → sell and Break-even side by side with Battery and Grid cost beneath, no
+duplicate SoC fact, and the PV/load plus price provenance paragraph wraps without a stray separator.
+Nothing was written to a battery by the deploy.
+
 ---
 
 ## 9. R1 scanner (`tools/audit.sh`)
@@ -2611,7 +2655,7 @@ sh tools/audit.sh
 # 4. End-to-end selfcheck (expect: 33/33 checks passed, exit 0)
 PYTHONPATH=energy_manager python3 -m app.main --selfcheck
 
-# 5. Render the front-end headless and check its structure (expect: 211 passed, 0 failed; also run by)
+# 5. Render the front-end headless and check its structure (expect: 222 passed, 0 failed; also run by)
 #    tests/test_wp3_ui_render.py, which skips when node is absent)
 node tools/ui_render_check.js
 
