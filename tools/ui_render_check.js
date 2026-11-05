@@ -732,10 +732,10 @@ function classTokens(text) {
   check("a window states the prices behind the decision", /Buy → sell/.test(labels) && /20\.0 ct\/kWh/.test(facts[0].value) && /30\.0 ct\/kWh/.test(facts[0].value) && /\+10\.0 ct\/kWh/.test(facts[0].value), facts[0] ? facts[0].value : "no facts");
   check("a window states its break-even and the margin over it",
     /Break-even/.test(labels) && /clear/.test(facts[1].value) && /24\.2 ct\/kWh/.test(facts[1].value), facts[1] ? facts[1].value : "no break-even");
-  check("a window states the battery energy and the SoC path",
+  check("a window states the battery energy, and leaves the SoC path to the charge gauge",
     /Battery/.test(labels) && /1\.60 kWh out/.test(facts[2].value)
-    && /SoC/.test(labels) && /50 % → 40 %/.test(facts[3].value) && /floor 20 %/.test(facts[3].value),
-    `${facts[2].value} / ${facts[3].value}`);
+    && !/SoC/.test(labels) && discharge.socStart === 50 && discharge.socEnd === 40,
+    `${facts[2].value} / facts: ${labels}`);
   // 0.20.1 (SPEC 8.16): a partial first slot carries its own modelled duration, so its energy and
   // cost use the window the solver did; the timestamp grid (and the window end) stays clock-aligned.
   const partialPlan = {
@@ -752,7 +752,7 @@ function classTokens(text) {
     && partialWindows[0].endMs === partialWindows[0].startMs + 2 * HOUR,
     `${partialWindows.length} windows, ${partialWindows[0] && partialWindows[0].minutes} min`);
   check("a window states its grid flow and what it earns",
-    /Grid cost/.test(labels) && /exports 1\.00 kWh/.test(facts[4].value) && /earns/.test(facts[4].value), facts[4] ? facts[4].value : "no grid fact");
+    /Grid cost/.test(labels) && /exports 1\.00 kWh/.test(facts[3].value) && /earns/.test(facts[3].value), facts[3] ? facts[3].value : "no grid fact");
   // 0.35.0 (SPEC 5): the plan states what it did to the pack, which candidate won and by how much.
   const variantPlan = {
     slot_minutes: 60,
@@ -948,9 +948,16 @@ function classTokens(text) {
     && byClass(view(), "window-price").length === mockWindows.length
     && byClass(view(), "window-summary").length === 1);
   const factText = byClass(view(), "window-facts").map((node) => node.textContent).join(" | ");
-  check("the rendered facts name the prices, break-even, energy, SoC and grid cost",
+  check("the rendered facts name the prices, break-even, energy and grid cost, with no SoC duplicate",
     /Buy → sell/.test(factText) && /Break-even/.test(factText) && /Battery/.test(factText)
-    && /SoC/.test(factText) && /Grid cost/.test(factText), factText.slice(0, 160));
+    && /Grid cost/.test(factText) && !/SoC/.test(factText), factText.slice(0, 160));
+  check("PV/load and the price provenance share one meta line per window",
+    byClass(view(), "window-meta").length === mockWindows.length
+    && byClass(view(), "window-meta").every((node) => node.querySelector(".window-context") && node.querySelector(".window-price")),
+    `${byClass(view(), "window-meta").length} meta lines for ${mockWindows.length} windows`);
+  check("a single-battery fleet renders no redundant split chips",
+    byClass(view(), "window-batteries").length === 0,
+    `${byClass(view(), "window-battery").length} chips`);
   check("the rendered rows mark the window that is running now",
     byClass(view(), "badge-info").length >= 1, `${byClass(view(), "badge-info").length} now badges`);
   check("the plan view marks a maintenance plan from its payload",
@@ -1046,6 +1053,62 @@ function classTokens(text) {
     && A.socTrack({ socStart: 55, socEnd: 20 }, 10).moved === true
     && A.socTrack({ socStart: null, socEnd: 20 }, 10) === null
     && A.socTrack({ socStart: 55, socEnd: 20 }, 10).rising === false);
+  // Per battery (0.38.4): the tile splits its window's aggregated power with the dispatcher's own
+  // rule -- proportional to each battery's room above its own floor, capped by its own rating --
+  // from the plan's SoC path. It is a projection, so the status line keeps carrying what was
+  // actually applied.
+  const splitFleet = [
+    { id: "battery_1", name: "Battery 1", capacity_kwh: 10.0, max_charge_w: 1000.0, max_discharge_w: 2000.0 },
+    { id: "battery_2", name: "Battery 2", capacity_kwh: 5.0, max_charge_w: 500.0, max_discharge_w: 500.0 },
+    { id: "battery_3", name: "Battery 3", capacity_kwh: 2.0, max_charge_w: 400.0, max_discharge_w: 400.0 },
+  ];
+  const splitFloors = [
+    { id: "battery_1", name: "Battery 1", capacity_kwh: 10.0, floor_soc_pct: 20.0 },
+    { id: "battery_2", name: "Battery 2", capacity_kwh: 5.0, floor_soc_pct: 40.0 },
+    { id: "battery_3", name: "Battery 3", capacity_kwh: 2.0, floor_soc_pct: 60.0 },
+  ];
+  const splitCtx = A.planWindowContext({
+    plan: Object.assign({}, syntheticPlan, { batteries: splitFleet }),
+    execution: { floors: { floor_soc_pct: 20.0 }, batteries: splitFloors },
+    providers: {},
+  });
+  check("the window context merges each battery's size and rating with its own floor",
+    splitCtx.batteries.length === 3 && splitCtx.batteries[2].floor_soc_pct === 60
+    && splitCtx.batteries[0].max_discharge_w === 2000, JSON.stringify(splitCtx.batteries));
+  const splitShares = A.windowBatteryShares(discharge, splitCtx);
+  const splitSum = splitShares.reduce((sum, share) => sum + share.w, 0);
+  check("a discharge window splits its power by headroom, cap and each battery's floor",
+    splitShares.length === 3 && Math.abs(splitSum - 800) < 0.5
+    && splitShares[0].w > splitShares[1].w && splitShares[1].w > 0
+    && splitShares[2].w === 0, splitShares.map((s) => `${s.id} ${s.w.toFixed(1)} W`).join(", "));
+  const cappedCtx = Object.assign({}, splitCtx, { batteries: splitCtx.batteries.map((b) => b.id === "battery_1" ? Object.assign({}, b, { max_discharge_w: 300.0 }) : b) });
+  const cappedShares = A.windowBatteryShares(discharge, cappedCtx);
+  check("a battery's own rating is never exceeded by the split",
+    cappedShares[0].w === 300 && cappedShares.reduce((sum, share) => sum + share.w, 0) < 800,
+    cappedShares.map((s) => `${s.id} ${s.w.toFixed(1)} W`).join(", "));
+  const chargePlan = { slot_minutes: 60, summary: syntheticPlan.summary, slots: [slotAt(0, { power_w: 400.0, action: "charge", reason: "arbitrage_charge" })] };
+  const chargeWindow = A.planActionWindows(chargePlan, { slots: [] })[0];
+  const chargeCtx = A.planWindowContext({ plan: Object.assign({}, chargePlan, { batteries: splitFleet }), execution: { floors: { floor_soc_pct: 20.0 }, batteries: splitFloors }, providers: {} });
+  const chargeShares = A.windowBatteryShares(chargeWindow, chargeCtx);
+  check("a charging window uses the charge ratings and needs no floor headroom",
+    chargeShares.length === 3 && chargeShares[2].w > 0
+    && Math.abs(chargeShares.reduce((sum, share) => sum + share.w, 0) - 400) < 0.5,
+    chargeShares.map((s) => `${s.id} ${s.w.toFixed(1)} W`).join(", "));
+  check("no split is invented without a capacity, a rating, an efficiency or an SoC path",
+    A.windowBatteryShares(discharge, Object.assign({}, splitCtx, { batteries: splitCtx.batteries.map((b) => Object.assign({}, b, { max_discharge_w: null })) })).length === 0
+    && A.windowBatteryShares(discharge, Object.assign({}, splitCtx, { batteries: splitCtx.batteries.map((b) => Object.assign({}, b, { capacity_kwh: null })) })).length === 0
+    && A.windowBatteryShares(discharge, Object.assign({}, splitCtx, { efficiency: null })).length === 0
+    && A.windowBatteryShares(Object.assign({}, discharge, { socStart: null }), splitCtx).length === 0);
+  const splitChips = A.windowBatteryChips(discharge, splitCtx);
+  check("the split renders one chip per battery, including one that sits at its floor",
+    splitChips && splitChips.querySelectorAll(".window-battery").length === 3
+    && splitChips.querySelectorAll(".window-battery.is-idle").length === 1
+    && /Battery 1\s*686 W/.test(splitChips.textContent) && /Battery 2\s*114 W/.test(splitChips.textContent)
+    && /Battery 3\s*0 W/.test(splitChips.textContent)
+    && /^Per battery: Battery 1 686 W \(1\.37 kWh\), Battery 2 114 W \(0\.23 kWh\), Battery 3 0 W/.test(splitChips.getAttribute("aria-label") || ""),
+    splitChips ? `${splitChips.textContent} / ${splitChips.getAttribute("aria-label")}` : "no chips");
+  check("one battery on its own needs no split chips",
+    A.windowBatteryChips(discharge, Object.assign({}, splitCtx, { batteries: [splitCtx.batteries[0]] })) === null);
 
   /* ---------- 1d. savings: measured battery flows only (0.13.0) ---------- */
   console.log("\n1d. savings measured battery flows");

@@ -324,7 +324,7 @@ def test_plan_payload_matches_section_10(fixtures):
         assert slot["action"] in actions, slot["action"]
         assert isinstance(slot["price_stale"], bool)
     for battery in plan["batteries"]:
-        assert_fields(battery, ["id", "name", "share_w"], "plan batteries[]")
+        assert_fields(battery, ["id", "name", "share_w", "capacity_kwh", "max_charge_w", "max_discharge_w"], "plan batteries[]")
 
 
 def test_plan_history_payload_keeps_command_and_measurement_evidence_distinct(fixtures):

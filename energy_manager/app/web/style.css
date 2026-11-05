@@ -1308,7 +1308,7 @@ h1.route-title:focus { outline: none; }
 .window {
   display: grid;
   gap: var(--sp-2);
-  padding: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
   border: 1px solid var(--border);
   border-left: 3px solid var(--tint);
   border-radius: var(--radius);
@@ -1320,10 +1320,10 @@ h1.route-title:focus { outline: none; }
 .window[data-stale="true"] { border-left-style: dashed; }
 .window.is-current { box-shadow: var(--shadow-1), inset 0 0 0 1px color-mix(in srgb, var(--tint) 45%, transparent); }
 
-.window-head { display: flex; gap: var(--sp-2); align-items: flex-start; }
+.window-head { display: flex; gap: var(--sp-2); align-items: center; }
 .window-icon {
   display: grid; place-items: center; flex: none;
-  width: 2.3rem; height: 2.3rem;
+  width: 1.9rem; height: 1.9rem;
   border-radius: var(--radius-sm);
   color: var(--tint);
   background: color-mix(in srgb, var(--tint) 14%, transparent);
@@ -1375,10 +1375,31 @@ h1.route-title:focus { outline: none; }
 .window-facts .stat-label { font-size: var(--type-11); }
 .window-facts .stat-value { font-size: var(--type-13); }
 .fact-icon { display: inline-grid; place-items: center; margin-right: 5px; color: var(--tint); vertical-align: -2px; }
-.window-context { margin: 0; color: var(--text-muted); font-size: var(--type-12); font-variant-numeric: tabular-nums; }
+/* The per-battery split of the window's power: one chip per battery with its share of the
+   aggregated number above. A zero share stays visible (that battery is at its floor), dimmed
+   rather than hidden; a single-battery fleet gets no chips at all. */
+.window-batteries {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1) var(--sp-2);
+  font-size: var(--type-12); font-variant-numeric: tabular-nums;
+}
+.window-battery {
+  display: inline-flex; align-items: baseline; gap: var(--sp-1);
+  padding: 0 var(--sp-2);
+  border: 1px solid color-mix(in srgb, var(--tint) 30%, var(--border));
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--tint) 10%, transparent);
+  color: var(--text-muted);
+}
+.window-battery-power { color: var(--tint); font-weight: 650; }
+.window-battery.is-idle { opacity: 0.6; }
+/* PV/load and the price provenance share one wrapped fine-print line instead of two rows. */
+.window-meta {
+  display: flex; flex-wrap: wrap; gap: 0 var(--sp-1);
+  margin: 0; color: var(--text-muted); font-size: var(--type-11); font-variant-numeric: tabular-nums;
+}
+.window-meta .window-context, .window-meta .window-price { margin: 0; color: inherit; font-size: inherit; }
 /* Dispatched/measured evidence reads as a result line, not as another muted hint. */
 .window-status { margin: 0; font-size: var(--type-13); }
-.window-price { margin: 0; color: var(--text-muted); font-size: var(--type-11); }
 .window-flag { margin: 0; }
 
 /* ---------- log: message first ---------- */
