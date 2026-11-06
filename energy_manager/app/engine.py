@@ -2513,10 +2513,14 @@ class Engine:
 
     def _control_tick_unlocked(self, now: datetime | None = None) -> TickOutcome:
         moment = now or self._clock()
+        # Tell the watchdog the tick is alive before the first slow HA round trip; the per-battery
+        # reads and writes inside the dispatcher advance the same mark again.
+        self._dispatcher.note_progress(moment)
         self._sync_drivers()
         self._sync_mode()
         self._load_cell_voltage_latch()
         measurements = self._sample(moment)
+        self._dispatcher.note_progress()
         batteries = self.effective_battery_configs()
         live: list[BatteryState] | None = None
         if not self._battery_read_ok:
@@ -2577,6 +2581,7 @@ class Engine:
         self._note_live_writes(outcome)
         if outcome.results and any(result.writes for result in outcome.results):
             self._maybe_notify_applied()
+        self._dispatcher.note_progress()
         return outcome
 
     def _note_live_writes(self, outcome: TickOutcome) -> None:

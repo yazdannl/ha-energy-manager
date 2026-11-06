@@ -6,8 +6,8 @@ supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figur
 revisions described pre-audit trees and are obsolete.
 
 Verification was local and hardware-free: no real battery, no live provider call, no instance data.
-0.37.1, 0.37.2, 0.37.3, 0.37.4, 0.37.5, 0.38.0, 0.38.1, 0.38.2, 0.38.3, 0.38.4, 0.38.5 and 0.38.6
-were deployed to the live instance and verified there (see §8.35–§8.43); the release gates below were repeated from a clean checkout; optional native C-core
+0.37.1, 0.37.2, 0.37.3, 0.37.4, 0.37.5, 0.38.0, 0.38.1, 0.38.2, 0.38.3, 0.38.4, 0.38.5, 0.38.6 and 0.38.7
+were deployed to the live instance and verified there (see §8.35–§8.44); the release gates below were repeated from a clean checkout; optional native C-core
 tests skip when no compiled extension is present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
 `sem_*`), loopback addresses and placeholder coordinates.
 
@@ -17,7 +17,7 @@ tests skip when no compiled extension is present. All synthetic values use reser
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **1620 passed, 83 skipped**, exit 0, from a clean checkout (C-core cases skip without the optional extension). The 0.38.2–0.38.6 diff is UI plus one additive `/plan` payload field (no Python runtime, SQLite, optimizer or C change); the with-C-core figure is not re-measured here |
+| Test suite | `python3 -m pytest tests -q` | **1622 passed, 83 skipped**, exit 0, from the 0.38.7 tree (C-core cases skip without the optional extension). The 0.38.2–0.38.6 diff is UI plus one additive `/plan` payload field (no Python runtime, SQLite, optimizer or C change); the with-C-core figure is not re-measured here |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 177 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
@@ -31,9 +31,9 @@ Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (155 files, documentation excluded, clean clone without the optional native
   extension)**:
-  `904501a522f47631c0dca1f23d3a5be498beec50f0885bf309654080804e38ff`
+  `7136981d632169befd07ba1096be640548d964df1d93d10aace47b3fd3509d7f`
 * **path list of the same 155 files** (detects an added, removed or renamed file):
-  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (0.38.2–0.38.6 added no
+  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (0.38.2–0.38.7 added no
   file: the earlier path list is unchanged)
 * The 0.37.5 record measured 158 files in a working tree with the locally built native extension
   (`45fe3dc9…`, path list `c1c39364…`). The 0.38.0 clean tree selects 155 files; the gates above
@@ -2552,6 +2552,50 @@ Nothing was written to a battery by the deploy.
 
 ---
 
+### 8.44 A heartbeat that follows progress, not the tick boundary (0.38.7)
+
+The dashboard read `Measured 4 batteries: discharging 450 W` (two packs at -225 W, two idle) while
+all four were really pushing ~800 W each, and the battery powers on `/status` alternated between
+~800 W and 0 W every minute or two. The readings were not fabricated: the add-on itself was writing
+0 W to every inverter, repeatedly.
+
+Root cause, from the live journal: `watchdog_hold` fired every 2-3 minutes (17:04:35, 17:06:45,
+17:09:01, 17:11:09, 17:13:37, 17:18:50, 17:21:08, 17:23:14, 17:25:34, 17:27:56, 17:30:13, 17:32:33,
+17:34:55), and each watchdog run wrote `hold()` for real to all four batteries (reason
+`stale_state`, 9-10 s apart). `Dispatcher.stalled()` compared *now* against `_last_tick`, a stamp the
+control loop only wrote at the **end** of a tick and set to that tick's **start** moment, with a
+budget of `3 x control.tick_seconds` (90 s at the live 30 s tick). A four-pack tick that waits for
+each Zendure write's read-back already takes ~45 s, so every other tick reported a stall while it
+was still working: the guard zeroed the fleet, the next tick re-commanded the plan, and the
+measured pair - the same pair the plan and the split are judged on - saw a 0 W pack right after
+each hold. The alternating `-225 W` sample was such a hold mid-flight; `pending_holds` never cleared
+because the fleet was re-commanded before a neutral hold could be confirmed.
+
+`Dispatcher` now keeps a fine-grained liveness mark (`_last_progress`): `note_progress()` is called
+at tick start (before the first HA round trip), after every measurement sample, after every battery
+read, after every completed driver write, after every watchdog hold, and at the end of the tick.
+The mark only ever moves forward, so a finished tick reporting its own start moment can no longer
+rewind it, and `stalled()` judges `now - _last_progress`. A loop that is still reading and writing is
+alive however long four sequential read-backs take; a loop that has made no progress at all for
+three tick intervals still trips the watchdog and still holds the fleet, which is unchanged
+(`test_dispatcher_watchdog_holds_everything`, `test_watchdog_holds_when_the_control_loop_stalls`).
+Two regression tests pin the live shape and the rewind: a tick whose read plus write outlives
+`3 x tick_seconds` is not stalled (`test_a_slow_tick_that_keeps_working_is_not_a_stall`), and ending
+that tick must not move the mark backwards (`test_finishing_a_slow_tick_does_not_rewind_the_heartbeat`).
+
+Gates on this tree: **1622 passed, 83 skipped**, `audit: clean — 177 files scanned`, selfcheck
+**33/33**, headless UI **222 passed / 0 failed**, `compileall`, `node --check` and `sh -n` clean.
+Frozen code + tests digest: 155 files,
+`7136981d632169befd07ba1096be640548d964df1d93d10aace47b3fd3509d7f`; the path list is unchanged
+(`c769154c...`, no files added). The native image was not rebuilt: the diff is Python control-loop
+liveness plus tests, and the runtime/Dockerfile/C core are untouched.
+
+The multi-battery caveat recorded under 0.37.6 ("sequential read-backs plus minute replans exceed
+the 3x tick watchdog") is what this release fixes; the read-back cost itself is unchanged and stays
+worth reducing (see §10).
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:
@@ -2631,7 +2675,10 @@ Known behaviour, accepted and deliberate:
 * the safety path still blocks 0 W when the base load alone exceeds a configured grid cap
   (conservative: it never worsens the grid flow, it simply refuses to act);
 * the HTTP API binds `0.0.0.0` and is unauthenticated by design, because ingress supplies the login;
-  `config.yaml` publishes no port and 8099 must not be mapped.
+  `config.yaml` publishes no port and 8099 must not be mapped;
+* a device write is verified by waiting for its read-back (`readback_deadline_s`, 8 s per battery), so
+  a four-pack tick spends tens of seconds inside writes. The watchdog follows progress instead of the
+  tick boundary (0.38.7), but the fleet can still only tick as fast as its slowest battery.
 
 ---
 
@@ -2644,7 +2691,7 @@ and access to its base image; the final release gate also repeats these checks f
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 1620 passed, 83 skipped; C-core-specific cases skip without the extension)
+# 2. Full test suite (expect: 1622 passed, 83 skipped; C-core-specific cases skip without the extension)
 #    Needs pytest and PyYAML, which only the manifest test uses — the add-on itself imports nothing
 #    outside the standard library.
 python3 -m pytest tests -q
