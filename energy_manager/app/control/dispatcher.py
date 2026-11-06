@@ -93,6 +93,12 @@ class Dispatcher:
         self._drivers = dict(drivers)
         self._clock = clock
         self._last_tick: datetime | None = None
+        #: Fine-grained liveness mark for the watchdog, advanced at tick start, after every battery
+        #: read and after every driver write.  A four-pack tick spends ~10 s per Zendure read-back,
+        #: so a tick that is still writing outlives ``3 x tick_seconds`` on its own; judging the
+        #: loop by the tick's *start* stamp zeroed the whole fleet every couple of minutes (live
+        #: 2026-11-05: batteries alternated 800 W / 0 W while the dashboard read 450 W).
+        self._last_progress: datetime | None = None
 
     # -- loop helpers -----------------------------------------------------------------
 
@@ -108,13 +114,28 @@ class Dispatcher:
 
     def note_tick(self, moment: datetime) -> None:
         self._last_tick = moment
+        self.note_progress(moment)
+
+    def note_progress(self, moment: datetime | None = None) -> None:
+        """Mark control-loop progress; the mark only ever moves forward.
+
+        A completed tick reports its *start* moment, so assigning it blindly would rewind the
+        heartbeat by the tick's own duration -- the very staleness this replaces.
+        """
+        stamp = moment if moment is not None else self._clock()
+        if self._last_progress is None or stamp > self._last_progress:
+            self._last_progress = stamp
 
     def stalled(self, now: datetime | None = None) -> bool:
-        """True when the control thread has not ticked within three tick intervals."""
-        if self._last_tick is None:
+        """True when the control thread has made no progress for three tick intervals.
+
+        Progress, not the tick boundary, is what a hung loop lacks: a tick that keeps reading and
+        writing is alive however long four sequential read-backs take.
+        """
+        if self._last_progress is None:
             return False
         moment = now or self._clock()
-        return (moment - self._last_tick).total_seconds() > 3.0 * self.tick_interval_s()
+        return (moment - self._last_progress).total_seconds() > 3.0 * self.tick_interval_s()
 
     def watchdog(self, now: datetime | None = None) -> list[DispatchResult]:
         """Fail-safe hold for all drivers after a stalled loop (SPEC 9.1 step 5 / R4)."""
@@ -123,6 +144,7 @@ class Dispatcher:
         for driver in self._ordered_drivers(None):
             result = driver.hold(dry_run=False)
             results.append(result)
+            self.note_progress()
             self._journal.dispatch(
                 self._entry(result, mode=Mode.AUTO.value, dry_run=False, reason=Reason.STALE_STATE)
             )
@@ -170,6 +192,7 @@ class Dispatcher:
             self._attach_cell_voltage(driver, configs.get(driver.id()), state)
             _plan_capacity_scale(state, configs.get(driver.id()))
             states.append(state)
+            self.note_progress()
         return states
 
     @staticmethod
@@ -244,6 +267,7 @@ class Dispatcher:
         sell_floor_eur_per_kwh: float | None = None,
     ) -> TickOutcome:
         moment = now or self._clock()
+        self.note_progress(moment)
         snapshot = dict(measurements or {})
         outcome = TickOutcome(ts=moment, mode=str(state.mode), dry_run=bool(state.dry_run))
         outcome.measurements = snapshot
@@ -456,6 +480,9 @@ class Dispatcher:
                 )
             else:
                 result = driver.apply(applied_target, dry_run=bool(state.dry_run))
+                # The write is the slow step (an HA round trip per entity, plus read-back): a
+                # completed write is progress even when the tick is not finished yet.
+                self.note_progress()
                 if not result.ok:
                     self._journal.event(
                         "warning",

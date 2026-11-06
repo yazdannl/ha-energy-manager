@@ -1454,6 +1454,89 @@ def test_dispatcher_watchdog_holds_everything():
     assert any(code == "watchdog_hold" for _, code, _, _ in journal.events)
 
 
+class _SlowClock:
+    def __init__(self, now):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += timedelta(seconds=seconds)
+
+
+class SlowWriteDriver:
+    """Driver whose every read and write costs real time (a Zendure read-back is ~10 s)."""
+
+    def __init__(self, cfg, clock, seconds):
+        self.config = cfg
+        self._clock = clock
+        self._seconds = seconds
+
+    def id(self):
+        return self.config.id
+
+    def read_state(self):
+        self._clock.advance(self._seconds)
+        return BatteryState(
+            id=self.config.id,
+            available=True,
+            soc_pct=50.0,
+            power_w=0.0,
+            energy_kwh=2.5,
+            read_at=self._clock.now,
+        )
+
+    def apply(self, power_w, *, dry_run):
+        self._clock.advance(self._seconds)
+        return DispatchResult(
+            battery_id=self.config.id,
+            ts=self._clock.now,
+            requested_w=power_w,
+            applied_w=power_w,
+            ok=True,
+            dry_run=dry_run,
+            writes=[{"entity_id": "number.example_power", "value": power_w, "service": "set"}],
+        )
+
+
+def test_a_slow_tick_that_keeps_working_is_not_a_stall():
+    """0.38.7: one tick legitimately outlives ``3 x tick_seconds`` with four batteries.
+
+    Live 2026-11-05: each Zendure write waits for its read-back, so a four-pack tick needs ~75 s
+    while the guard's budget was 3 x 30 s.  The watchdog then zeroed the whole fleet every other
+    minute -- the batteries alternated 800 W / 0 W and the dashboard showed 450 W of discharge
+    while the fleet was exporting 3 kW.  Progress inside the tick must keep it alive.
+    """
+    cfg = config()
+    clock = _SlowClock(NOW)
+    dispatcher = Dispatcher(
+        SETTINGS, FakeJournal(), {cfg.id: SlowWriteDriver(cfg, clock, 50)}, clock=clock
+    )
+    outcome = dispatcher.tick(
+        clock.now,
+        state=system_state(),
+        plan=make_plan([plan_slot(power_w=-600.0)]),
+        batteries=[cfg],
+    )
+
+    assert outcome.results and outcome.results[0].applied_w == -600.0
+    assert (clock.now - NOW).total_seconds() > 3 * SETTINGS["control.tick_seconds"]
+    assert dispatcher.stalled(clock.now) is False
+
+
+def test_finishing_a_slow_tick_does_not_rewind_the_heartbeat():
+    """A tick reports its start moment when it ends; the liveness mark must not move back."""
+    ha = FakeHA({"number.example_power": {"state": "0", "attributes": {}}})
+    cfg = config()
+    dispatcher, _ = dispatcher_with(ha, cfg)
+    dispatcher.note_tick(NOW)
+    dispatcher.note_progress(NOW + timedelta(seconds=80))
+    dispatcher.note_tick(NOW)
+    assert dispatcher.stalled(NOW + timedelta(seconds=120)) is False
+    assert dispatcher.stalled(NOW + timedelta(seconds=200)) is True
+
+
 def test_dispatcher_needs_replan_reasons():
     cfg = config()
     ha = FakeHA({"number.example_power": {"state": "0", "attributes": {}}})
