@@ -1551,7 +1551,16 @@ class Store:
             tuple[datetime | str, datetime | str, str, str, float, float | None, bool]
         ],
     ) -> int:
-        """Append immutable solar vintages as interval energy (kWh)."""
+        """Append immutable solar vintages as interval energy (kWh).
+
+        0.38.8: a vintage that repeats the forecast already archived *last* for its target and
+        source is dropped.  The engine archives the whole horizon on every replan (~1/min), each
+        time with a fresh ``issued_at``, so an unchanged forecast used to add a row per target per
+        minute (~173k rows/day of identical content) and the table grew without bound on the live
+        install.  A changed forecast -- including a change back to an earlier value -- is still
+        archived in full, because the comparison is against the tail of each (target, source)
+        series, so the latest-vintage-as-of-target selection keeps its meaning.
+        """
         payload = []
         for target, issued, source, model_json, value, uncertainty, stale in rows:
             target_ts, issued_at = _utc_stamp(target), _utc_stamp(issued)
@@ -1577,28 +1586,52 @@ class Store:
             )
         if not payload:
             return 0
+        low = min(row[0] for row in payload)
+        high = max(row[0] for row in payload)
         with _transaction(self.connection) as conn:
-            conn.executemany(
-                "INSERT OR IGNORE INTO forecast_vintages"
-                "(target_ts, interval_minutes, issued_at, source, model_json, forecast_kwh,"
-                " uncertainty_pct, stale) VALUES(?,?,?,?,?,?,?,?)",
-                payload,
-            )
+            tail = {
+                (row["target_ts"], row["source"]): (row["model_json"], row["forecast_kwh"])
+                for row in conn.execute(
+                    "SELECT target_ts, source, model_json, forecast_kwh FROM ("
+                    "SELECT v.target_ts, v.source, v.model_json, v.forecast_kwh,"
+                    " ROW_NUMBER() OVER (PARTITION BY v.target_ts, v.source"
+                    " ORDER BY v.issued_at DESC) AS rank"
+                    " FROM forecast_vintages v WHERE v.target_ts >= ? AND v.target_ts <= ?)"
+                    " WHERE rank = 1",
+                    (low, high),
+                ).fetchall()
+            }
+            fresh = [
+                row for row in payload if tail.get((row[0], row[3])) != (row[4], row[5])
+            ]
+            if fresh:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO forecast_vintages"
+                    "(target_ts, interval_minutes, issued_at, source, model_json, forecast_kwh,"
+                    " uncertainty_pct, stale) VALUES(?,?,?,?,?,?,?,?)",
+                    fresh,
+                )
         return len(payload)
 
     def forecast_vintages_range(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
-        """Return the latest captured vintage no later than each target interval start."""
+        """Return the latest captured vintage no later than each target interval start.
+
+        0.38.8: one window function instead of a correlated ``NOT EXISTS``.  Every replan
+        archives the whole horizon again with a fresh ``issued_at``, so a target collects one row
+        per minute (~1 440/day) and the anti-join compared each of them against the others: a
+        single day cost ~10^8 row comparisons and ``GET /api/v1/accuracy`` never answered on the
+        live install (the Savings panel and the scorecards sat loading for minutes).  The rank
+        is the same winner -- latest ``issued_at`` at or before the target, then source and model
+        descending -- read once through the ``(target_ts, issued_at)`` index.
+        """
         start_ts, end_ts = _utc_stamp(start), _utc_stamp(end)
         rows = self.connection.execute(
-            "SELECT v.* FROM forecast_vintages v "
-            "WHERE v.target_ts >= ? AND v.target_ts < ? AND v.issued_at <= v.target_ts "
-            "AND NOT EXISTS (SELECT 1 FROM forecast_vintages newer "
-            "WHERE newer.target_ts = v.target_ts AND newer.issued_at <= newer.target_ts "
-            "AND (newer.issued_at > v.issued_at OR "
-            "(newer.issued_at = v.issued_at AND "
-            "(newer.source > v.source OR "
-            "(newer.source = v.source AND newer.model_json > v.model_json))))) "
-            "ORDER BY v.target_ts",
+            "SELECT target_ts, interval_minutes, issued_at, source, model_json, forecast_kwh,"
+            " uncertainty_pct, stale FROM ("
+            "SELECT v.*, ROW_NUMBER() OVER (PARTITION BY v.target_ts ORDER BY v.issued_at DESC,"
+            " v.source DESC, v.model_json DESC) AS rank FROM forecast_vintages v "
+            "WHERE v.target_ts >= ? AND v.target_ts < ? AND v.issued_at <= v.target_ts) "
+            "WHERE rank = 1 ORDER BY target_ts",
             (start_ts, end_ts),
         ).fetchall()
         return [dict(row) for row in rows]
