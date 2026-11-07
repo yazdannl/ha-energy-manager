@@ -6,8 +6,8 @@ supersedes the earlier WP5 report — the 292 / 359 / 398-test and 83-file figur
 revisions described pre-audit trees and are obsolete.
 
 Verification was local and hardware-free: no real battery, no live provider call, no instance data.
-0.37.1, 0.37.2, 0.37.3, 0.37.4, 0.37.5, 0.38.0, 0.38.1, 0.38.2, 0.38.3, 0.38.4, 0.38.5, 0.38.6 and 0.38.7
-were deployed to the live instance and verified there (see §8.35–§8.44); the release gates below were repeated from a clean checkout; optional native C-core
+0.37.1, 0.37.2, 0.37.3, 0.37.4, 0.37.5, 0.38.0, 0.38.1, 0.38.2, 0.38.3, 0.38.4, 0.38.5, 0.38.6, 0.38.7 and 0.38.8
+were deployed to the live instance and verified there (see §8.35–§8.45); the release gates below were repeated from a clean checkout; optional native C-core
 tests skip when no compiled extension is present. All synthetic values use reserved namespaces (`sensor.example_*`, `number.example_*`,
 `sem_*`), loopback addresses and placeholder coordinates.
 
@@ -17,7 +17,7 @@ tests skip when no compiled extension is present. All synthetic values use reser
 
 | Gate | Command (from the repository root) | Result |
 | --- | --- | --- |
-| Test suite | `python3 -m pytest tests -q` | **1622 passed, 83 skipped**, exit 0, from the 0.38.7 tree (C-core cases skip without the optional extension). The 0.38.2–0.38.6 diff is UI plus one additive `/plan` payload field (no Python runtime, SQLite, optimizer or C change); the with-C-core figure is not re-measured here |
+| Test suite | `python3 -m pytest tests -q` | **1623 passed, 83 skipped**, exit 0, from the 0.38.8 tree (C-core cases skip without the optional extension). The 0.38.2–0.38.6 diff is UI plus one additive `/plan` payload field (no Python runtime, SQLite, optimizer or C change); 0.38.7 is control-loop liveness and 0.38.8 is one SQLite query plus the archive writer; the with-C-core figure is not re-measured here |
 | PII / secret scanner | `sh tools/audit.sh` | `audit: clean — 177 files scanned`, exit 0 |
 | Add-on selfcheck | `PYTHONPATH=energy_manager python3 -m app.main --selfcheck` | **33/33 checks passed**, exit 0 |
 | Syntax / imports | `python3 -m compileall -q energy_manager/app tools/make_icons.py tests` | clean, exit 0 |
@@ -31,9 +31,9 @@ Frozen digest of the verified artifact (recipe in §11, normative):
 
 * **code + tests (155 files, documentation excluded, clean clone without the optional native
   extension)**:
-  `7136981d632169befd07ba1096be640548d964df1d93d10aace47b3fd3509d7f`
+  `4c13c260c2456fdf7c7152511dec67c9502a94c2be1aa2c56a11b3e8513afb5d`
 * **path list of the same 155 files** (detects an added, removed or renamed file):
-  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (0.38.2–0.38.7 added no
+  `c769154c6363636e82cf1351643cf54caa067307f9d26d57d29af49bc93490ab` (0.38.2–0.38.8 added no
   file: the earlier path list is unchanged)
 * The 0.37.5 record measured 158 files in a working tree with the locally built native extension
   (`45fe3dc9…`, path list `c1c39364…`). The 0.38.0 clean tree selects 155 files; the gates above
@@ -2596,6 +2596,39 @@ worth reducing (see §10).
 
 ---
 
+### 8.45 A vintage query that could never finish, and an archive that never stopped growing (0.38.8)
+
+`GET /api/v1/accuracy` and `GET /api/v1/forecast-history` stopped answering on the live install
+(>3 min with no response; an empty date answered in 46 ms), so the Savings panel and the PV
+scorecards sat loading. Two defects compounded:
+
+* `_archive_solar_history` runs on **every replan**, and the live install replans once a minute
+  (`control.replan_minutes: 1`). It re-offered the whole remaining 30 h horizon with a fresh
+  `issued_at`, which the primary key treats as a new vintage, so one target collected a row per
+  minute (~173k rows/day) holding the same energy and model as the row before it.
+* `Store.forecast_vintages_range` selected the latest vintage per target with a correlated
+  `NOT EXISTS` over every other version of that target: O(V²) per target with V ≈ 1 440. One day
+  cost ~10^8 row comparisons; the accuracy call walks 14 of them and the scorecard walks a day.
+
+The query is now a single `ROW_NUMBER() OVER (PARTITION BY target_ts ORDER BY issued_at DESC,
+source DESC, model_json DESC)`, reading the `(target_ts, issued_at)` index once, with the same
+winner as before (verified row-for-row against the old SQL on synthetic archives: 800 versions per
+target, 76 800 rows, 4.58 s → 0.22 s, identical output). The archiver compares each offered vintage
+with the tail of its own `(target_ts, source)` series and drops an unchanged repeat, so a changed
+forecast is still archived and a change *back* to an earlier value is recorded again (a test pins
+both). Sixty replans of a 120-slot horizon now store 120 rows instead of 7 200.
+
+Rows archived before this release are untouched: the query is fast over them, only new duplicates
+stop. A compacting migration (keep the tail per target and source) was deliberately not added --
+it would rewrite millions of rows in one transaction on a small box.
+
+Gates: **1623 passed, 83 skipped**, `audit: clean — 177 files scanned`, selfcheck **33/33**, headless
+UI **222 passed / 0 failed**, `compileall`, `node --check` and `sh -n` clean. Frozen code + tests
+digest: 155 files, `4c13c260c2456fdf7c7152511dec67c9502a94c2be1aa2c56a11b3e8513afb5d`; path list
+unchanged (`c769154c...`). The native image was not rebuilt (SQLite/Python only).
+
+---
+
 ## 9. R1 scanner (`tools/audit.sh`)
 
 It is a **tripwire, not a proof**. The committed tree is clean under it, and it catches:
@@ -2691,7 +2724,7 @@ and access to its base image; the final release gate also repeats these checks f
 # 1. Syntax / imports
 python3 -m compileall -q energy_manager/app tools/make_icons.py tests
 
-# 2. Full test suite (expect: 1622 passed, 83 skipped; C-core-specific cases skip without the extension)
+# 2. Full test suite (expect: 1623 passed, 83 skipped; C-core-specific cases skip without the extension)
 #    Needs pytest and PyYAML, which only the manifest test uses — the add-on itself imports nothing
 #    outside the standard library.
 python3 -m pytest tests -q

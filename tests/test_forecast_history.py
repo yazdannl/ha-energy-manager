@@ -137,6 +137,39 @@ def test_vintages_are_immutable_and_latest_as_of_target_is_selected(store: Store
     assert selected[0]["stale"] == 1
 
 
+def test_repeating_a_forecast_is_archived_once_but_a_change_is_kept(store: Store):
+    """0.38.8: every replan re-offers the horizon; only a changed forecast may add a vintage.
+
+    Live 2026-11-06: one replan a minute archived the whole 30 h horizon again with a fresh
+    ``issued_at``, so a target collected ~1 440 identical rows a day, the table never stopped
+    growing and ``forecast_vintages_range`` (an anti-join over all of them) stopped answering:
+    ``GET /api/v1/accuracy`` and ``/api/v1/forecast-history`` hung for minutes.
+    """
+    target = START + timedelta(hours=1)
+    model = '{"version":"one"}'
+    for minute in (0, 1, 2, 3):
+        store.archive_forecast_vintages(
+            [(target, START + timedelta(minutes=minute), "capacity", model, 0.50, 20.0, False)]
+        )
+    stored = store.connection.execute("SELECT COUNT(*) FROM forecast_vintages").fetchone()[0]
+    assert stored == 1
+
+    # A real change is archived, and so is a change back: the comparison is against each
+    # (target, source) series' tail, not against every row it ever held.
+    store.archive_forecast_vintages(
+        [(target, START + timedelta(minutes=5), "capacity", model, 0.80, 20.0, False)]
+    )
+    store.archive_forecast_vintages(
+        [(target, START + timedelta(minutes=6), "capacity", model, 0.50, 20.0, False)]
+    )
+    stored = store.connection.execute("SELECT COUNT(*) FROM forecast_vintages").fetchone()[0]
+    assert stored == 3
+    selected = store.forecast_vintages_range(target, target + timedelta(minutes=15))
+    assert len(selected) == 1
+    assert selected[0]["forecast_kwh"] == pytest.approx(0.50)
+    assert selected[0]["issued_at"] == (START + timedelta(minutes=6)).isoformat()
+
+
 def test_direct_pv_samples_integrate_to_interval_energy_with_provenance(store: Store):
     target = START
     add_vintage(store, target, 0.6, model={"name": "example-model", "version": "1"})
